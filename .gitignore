@@ -143,6 +143,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.tmp/
 
 # Spyder project settings
 .spyderproject
@@ -205,3 +206,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Trading project
+models/
+stock_data/
+data_dump/
