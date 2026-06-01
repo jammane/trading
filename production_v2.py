@@ -1,18 +1,30 @@
+"""
+production_v2.py — Live and paper trading engine for the trained StockNN / MasterNN models.
+
+Fetches today's market data from yfinance, runs model inference, submits orders
+to Alpaca, and performs one upkeep evolution step using yesterday's data as input.
+
+Usage:
+    python production_v2.py --paper              # paper trading mode (no order submission)
+    python production_v2.py --paper --output     # paper trading + submit orders to Alpaca
+    python production_v2.py --output             # live trading
+    python production_v2.py --paper --withdraw 500.0
+"""
+
+import argparse
+import json
+import os
+import random
+from datetime import datetime
+
+import keyring
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import json
-import argparse
-import os
-import random
-import statistics
 import yfinance as yf
-
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import LimitOrderRequest, StopOrderRequest, GetOrdersRequest
-from alpaca.trading.enums import OrderSide, OrderType, TimeInForce, QueryOrderStatus
-import keyring
-from datetime import datetime
+from alpaca.trading.enums import OrderSide, OrderType, QueryOrderStatus, TimeInForce
+from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, StopOrderRequest
 
 MAX_SINGLE_STOCK_PCT = 0.60   # max fraction of industry cash in one stock
 
@@ -36,7 +48,7 @@ class StockNN(nn.Module):
     Seed(60→120), Inject×14(180→120), Today(328→208), Flat×2(208), Funnel(208→140→90→48)
     ~513k params"""
     def __init__(self):
-        super(StockNN, self).__init__()
+        super().__init__()
         self.fc_seed   = nn.Linear(60,  120)
         self.fc_inject = nn.ModuleList([nn.Linear(180, 120) for _ in range(14)])
         self.fc_today  = nn.Linear(328, 208)
@@ -68,7 +80,7 @@ class MasterNN(nn.Module):
     Seed(60→120), Inject×14(180→120), Today(349→229), Flat×2(229), Funnel(229→150→90→36)
     ~548k params"""
     def __init__(self):
-        super(MasterNN, self).__init__()
+        super().__init__()
         self.fc_seed   = nn.Linear(60,  120)
         self.fc_inject = nn.ModuleList([nn.Linear(180, 120) for _ in range(14)])
         self.fc_today  = nn.Linear(349, 229)
@@ -99,11 +111,11 @@ STOCK_DATA_DIR = 'stock_data'
 OWNERS_DIR = 'owners'
 OWNERS_FILE = os.path.join(OWNERS_DIR, 'owners.json')
 
-# Load the current state from file or initialize if not present
 def load_state():
+    """Load trading state from state.json, or return default initial state if absent."""
     try:
         if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, 'r') as f:
+            with open(STATE_FILE) as f:
                 return json.load(f)
     except Exception as e:
         print(f"Error loading state file {STATE_FILE}: {e}")
@@ -124,16 +136,16 @@ def load_state():
     symbols = [sym for syms in industries.values() for sym in syms]
     return {'industries': industries, 'histories': {sym: [] for sym in symbols}, 'cash': 20000.0, 'holdings': {sym: 0.0 for sym in symbols}}
 
-# Save the current state to file
 def save_state(state):
+    """Persist the current trading state to state.json."""
     try:
         with open(STATE_FILE, 'w') as f:
             json.dump(state, f)
     except Exception as e:
         print(f"Error saving state file {STATE_FILE}: {e}")
 
-# Compute total portfolio value (cash + value of holdings)
 def compute_total_portfolio_value(cash, holdings, day_data, histories):
+    """Return total portfolio value: cash plus all holdings marked at close prices."""
     total_value = cash
     for sym, qty in holdings.items():
         if qty > 0:
@@ -143,8 +155,8 @@ def compute_total_portfolio_value(cash, holdings, day_data, histories):
                 total_value += qty * price
     return total_value
 
-# Create or update owners.json with total portfolio value (only in live trading)
 def update_owners_file(total_value, paper):
+    """Update the total_value field in owners/owners.json (skipped in paper mode)."""
     if not paper:
         try:
             if not os.path.exists(OWNERS_DIR):
@@ -156,7 +168,7 @@ def update_owners_file(total_value, paper):
                     json.dump(owners_data, f)
                 print(f"Created owners.json with total value: {total_value}")
             else:
-                with open(OWNERS_FILE, 'r') as f:
+                with open(OWNERS_FILE) as f:
                     owners_data = json.load(f)
                 owners_data["total value"] = total_value
                 with open(OWNERS_FILE, 'w') as f:
@@ -262,9 +274,11 @@ def train_industry_one_day_prod(industry, symbols, yesterday_data, primed_portfo
 
 
 def _flat_cos_history_path(model_dir):
+    """Return the path to the rolling flat_cos history JSON file for the master model."""
     return os.path.join(model_dir, 'master_flat_cos_history.json')
 
 def _load_flat_cos_history(model_dir):
+    """Load up to 15 recent flat_cos values from disk; returns [] on any failure."""
     path = _flat_cos_history_path(model_dir)
     try:
         with open(path) as f:
@@ -273,6 +287,7 @@ def _load_flat_cos_history(model_dir):
         return []
 
 def _save_flat_cos_history(model_dir, history):
+    """Persist the last 15 flat_cos values to disk, silently ignoring write errors."""
     try:
         with open(_flat_cos_history_path(model_dir), 'w') as f:
             json.dump({'history': list(history)[-15:]}, f)
@@ -346,14 +361,14 @@ def build_primed_portfolios(trading_client, industries, allocations):
 
     return ind_primed, master_primed
 
-# Load historical stock data from stock_data directory
 def load_stock_data(symbols):
+    """Load rolling 15-day OHLCV histories from stock_data/ for each symbol."""
     histories = {}
     for sym in symbols:
         try:
             file_path = f"{STOCK_DATA_DIR}/{sym}.json"
             if os.path.exists(file_path):
-                with open(file_path, 'r') as f:
+                with open(file_path) as f:
                     data = json.load(f)
                 histories[sym] = [[d['open'], d['close'], d['high'], d['low'], d['volume']] for d in data.get('days', [])[-15:]]
             else:
@@ -363,13 +378,13 @@ def load_stock_data(symbols):
             histories[sym] = []
     return histories
 
-# Save today's stock data to stock_data directory
 def save_stock_data(symbol, day_data):
+    """Append today's OHLCV to stock_data/<symbol>.json, retaining the last 15 days."""
     try:
         file_path = f"{STOCK_DATA_DIR}/{symbol}.json"
         existing_data = []
         if os.path.exists(file_path):
-            with open(file_path, 'r') as f:
+            with open(file_path) as f:
                 existing_data = json.load(f).get('days', [])
         today_str = datetime.today().strftime('%Y-%m-%d')
         new_data_point = {
@@ -669,6 +684,7 @@ def generate_liquidation_sells(industry, symbols, liquidation_target,
 
 
 def main():
+    """Run one daily trading cycle: fetch data, infer, optionally submit orders, retrain."""
     parser = argparse.ArgumentParser(description="Run stock trading system v2.")
     parser.add_argument('--paper', action='store_true', help='Run in paper trading mode')
     parser.add_argument('--output', action='store_true', help='Submit orders to Alpaca')

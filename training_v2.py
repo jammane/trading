@@ -1,18 +1,29 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+"""
+training_v2.py — Evolutionary training loop for StockNN (industry) and MasterNN (master allocator).
+
+Single-threaded: loads one model weight file at a time, infers, trades, and evicts.
+See training_v3.py for the parallel variant (7 worker threads, in-RAM model cache).
+
+Usage:
+    python training_v2.py --output models [--load-dir models] [--start-day N] [--stop-day N]
+                          [--passes N] [--sigma 0.01] [--daily] [--promote uat,prod]
+"""
+
+import argparse
 import copy
 import gc
-import random
 import json
-import argparse
-import os
 import math
+import os
+import random
 import statistics
-import yfinance as yf
 from collections import defaultdict
 from datetime import datetime
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import yfinance as yf
 
 # ── Broker fees (Alpaca: $0 commission; regulatory fees still apply on sells) ─
 BUY_FILL            = 1.0        # multiplier on buy  fill price (1.0 = no commission)
@@ -39,7 +50,7 @@ MAX_SINGLE_STOCK_PCT  = 0.60        # no single stock may exceed 60% of portfoli
 
 
 class HardFlagError(Exception):
-    pass
+    """Raised when a HARD-flagged day's gain exceeds the configured threshold."""
 
 
 def _dump_day(actual_day, prefix, flag_type, baseline, best_delta, pct_gain, scores, day_data, fill_data, models=None):
@@ -462,7 +473,7 @@ class StockNN(nn.Module):
       col 3: sell_qty             (ReLU)
     """
     def __init__(self):
-        super(StockNN, self).__init__()
+        super().__init__()
         self.fc_seed   = nn.Linear(60,  120)
         self.fc_inject = nn.ModuleList([
             nn.Linear(180 + 5 * i, 125 + 5 * i) for i in range(14)
@@ -515,7 +526,7 @@ class MasterNN(nn.Module):
       [24:36] Sigmoid  → liquidation trigger per industry
     """
     def __init__(self):
-        super(MasterNN, self).__init__()
+        super().__init__()
         self.fc_seed   = nn.Linear(61,  120)
         self.fc_inject = nn.ModuleList([
             nn.Linear(181 + 5 * i, 125 + 5 * i) for i in range(14)
@@ -548,6 +559,7 @@ class MasterNN(nn.Module):
 # ── Evolution helpers ──────────────────────────────────────────────────────────
 
 def mutate(model, sigma=0.01):
+    """Return a new model with Gaussian noise added to all weights and biases."""
     state = copy.deepcopy(model.state_dict())
     for key in state:
         if 'weight' in key or 'bias' in key:
@@ -561,6 +573,7 @@ def mutate(model, sigma=0.01):
 # ── Portfolio helpers ──────────────────────────────────────────────────────────
 
 def compute_value(portfolio, day_data, symbols):
+    """Return total portfolio value: cash plus all holdings at day_data close prices."""
     val = portfolio['cash']
     for sym in symbols:
         qty = portfolio['holdings'].get(sym, 0.0)
@@ -627,13 +640,16 @@ def compute_alloc_from_predicted(predicted, industry_list):
 # ── Per-slot model I/O ─────────────────────────────────────────────────────────
 
 def _model_path(prefix, directory, slot):
+    """Return the .pt file path for a given prefix, directory, and slot index."""
     return os.path.join(directory, f"{prefix}_model_{slot}.pt")
 
 def _meta_path(prefix, directory):
+    """Return the top10_meta.json path for a given prefix and directory."""
     return os.path.join(directory, f"{prefix}_top10_meta.json")
 
 
 def save_slot_model(prefix, directory, slot, model):
+    """Save model weights to disk for the given slot, logging on failure."""
     try:
         torch.save(model.state_dict(), _model_path(prefix, directory, slot))
     except Exception as e:
@@ -641,6 +657,7 @@ def save_slot_model(prefix, directory, slot, model):
 
 
 def load_slot_model(prefix, directory, slot, model_class):
+    """Load one model from disk; returns an untrained default if the file is missing."""
     path  = _model_path(prefix, directory, slot)
     model = model_class()
     if os.path.exists(path):
@@ -652,6 +669,7 @@ def load_slot_model(prefix, directory, slot, model_class):
 
 
 def save_top10_meta(prefix, directory, top10_meta):
+    """Persist the top-10 elite metadata list to <prefix>_top10_meta.json."""
     try:
         with open(_meta_path(prefix, directory), 'w') as f:
             json.dump(top10_meta, f, indent=2)
@@ -660,6 +678,7 @@ def save_top10_meta(prefix, directory, top10_meta):
 
 
 def load_top10_meta(prefix, directory):
+    """Load top-10 metadata from disk; returns [] if the file is missing or corrupt."""
     path = _meta_path(prefix, directory)
     if os.path.exists(path):
         try:
@@ -671,6 +690,7 @@ def load_top10_meta(prefix, directory):
 
 
 def copy_best_model(prefix, directory, top10_meta):
+    """Copy slot 0's weights to <prefix>_best.pt for production use."""
     if not top10_meta:
         return
     best_slot = top10_meta[0]['slot']
@@ -687,6 +707,7 @@ def copy_best_model(prefix, directory, top10_meta):
 # ── Weighted average ───────────────────────────────────────────────────────────
 
 def _normalize_weights(values):
+    """Clip negatives to zero and normalise *values* to sum to 1.0; returns equal weights on all-zero."""
     clipped = [max(float(v), 0.0) for v in values]
     total   = sum(clipped)
     if total <= 0:
@@ -721,6 +742,7 @@ def compute_weighted_avg_model(prefix, directory, slots, values, model_class):
 
 
 def compute_weighted_avg_portfolio(portfolios, values):
+    """Return a new portfolio dict that is the performance-weighted average of *portfolios*."""
     weights = _normalize_weights(values)
     result  = {}
     for key in portfolios[0]:
@@ -755,6 +777,7 @@ def blend_model_halfway(elite_model, model_class):
 # ── Pool initialisation ────────────────────────────────────────────────────────
 
 def initialise_pool(prefix, directory, load_models_dir, model_class, n=N_SLOTS):
+    """Create or load all N model slot files; copies elite slots from load_models_dir if provided."""
     os.makedirs(directory, exist_ok=True)
     log(f"[{sn(prefix)}] Initialising {n} model slots in {directory}")
 
@@ -1224,6 +1247,10 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
                 f"Zero-trade filter: {len(inactive_slots)} slot(s) excluded")
 
     # ── Delta-based selection scores with invested_pct multiplier ────────────
+    # Selection score = raw delta adjusted by invested_pct:
+    # positive-delta slots are scaled down proportional to cash held,
+    # so a slot that earned $50 by deploying 80% outranks one that
+    # earned $50 while sitting 90% in cash.
     scores_dict = dict(scores)
     below_floor = {s for s, v in scores if v < survival_floor}
     sel_scores  = []
@@ -1811,6 +1838,7 @@ def train_master_one_day(day_data, industries, primed_portfolio, model_dir,
 # ── Data loading ───────────────────────────────────────────────────────────────
 
 def load_stock_data_from_files(all_symbols, stock_data_dir):
+    """Load all JSON files from stock_data_dir and merge into {date: {sym: ohlcv}} dict."""
     all_data = {}
     loaded   = 0
     for sym in all_symbols:
@@ -1839,6 +1867,7 @@ def load_stock_data_from_files(all_symbols, stock_data_dir):
 
 
 def fetch_stock_data_from_yfinance(all_symbols):
+    """Fetch the last 15 days of daily OHLCV for all symbols via yfinance; returns {date: {sym: ohlcv}}."""
     all_data = {}
     try:
         tickers = yf.Tickers(' '.join(all_symbols))
@@ -1868,6 +1897,7 @@ def fetch_stock_data_from_yfinance(all_symbols):
 
 
 def trim_stock_data_files(all_symbols, stock_data_dir, keep_days=15):
+    """Trim each symbol's JSON file to the last *keep_days* entries to save disk space."""
     trimmed = 0
     for sym in all_symbols:
         path = os.path.join(stock_data_dir, f"{sym}.json")
@@ -1891,6 +1921,7 @@ def trim_stock_data_files(all_symbols, stock_data_dir, keep_days=15):
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
+    """Parse CLI args and run multi-pass evolutionary training across all industries and master."""
     parser = argparse.ArgumentParser(description="Train neural networks for stock trading (v2 single-threaded).")
     parser.add_argument('--output',    required=True,  help='Output directory for models')
     parser.add_argument('--load-dir',                  help='Seed top-10 models from this directory')

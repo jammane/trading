@@ -1,20 +1,34 @@
+"""
+training_v3.py — Parallel evolutionary training loop (7 worker threads, in-RAM model cache).
+
+v3 vs v2 differences:
+  - NUM_THREADS = 7: inference runs in parallel across all 100 slots per industry
+  - _model_cache: all models for a prefix loaded into RAM once, flushed after selection
+  - PortfolioArray: numpy-backed wrapper for vectorised cash/holdings access
+  - No SLIPPAGE_RATE on limit fills (v3 trades without slippage)
+  - _port_path: slot-level portfolio JSON persisted alongside model weights
+
+Usage identical to training_v2.py.
+"""
+
+import argparse
+import copy
+import gc
+import json
+import math
+import os
+import random
+import statistics
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from threading import Lock
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import copy
-import gc
-import random
-import json
-import argparse
-import os
-import math
-import statistics
-import numpy as np
 import yfinance as yf
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
-from threading import Lock
 
 # ── v3: parallel training — 7 worker threads, relaxed RAM constraints ──────────
 NUM_THREADS = 7      # intra-industry inference parallelism
@@ -328,6 +342,7 @@ def _dump_day(actual_day, prefix, flag_type, baseline, best_delta, pct_gain, sco
 
 
 def _fmt_slot(slot):
+    """Convert a slot index to the elite.mutation display label."""
     if slot < ELITE_COUNT: return f"{slot}.0"
     if slot == ELITE_COUNT:     return "w5"
     if slot == ELITE_COUNT + 1: return "w10"
@@ -344,7 +359,7 @@ class StockNN(nn.Module):
     Seed(60→120), Inject×14(180+5i→125+5i, grows 120→190), Today(398→300),
     Flat×2(300), Funnel(300→237→174→111→48)"""
     def __init__(self):
-        super(StockNN, self).__init__()
+        super().__init__()
         self.fc_seed   = nn.Linear(60,  120)
         self.fc_inject = nn.ModuleList([
             nn.Linear(180 + 5 * i, 125 + 5 * i) for i in range(14)
@@ -381,7 +396,7 @@ class MasterNN(nn.Module):
     Flat×2(300), Funnel(300→234→168→102→36)
     history[:,i,60] = flat_cos for that day (regime signal)"""
     def __init__(self):
-        super(MasterNN, self).__init__()
+        super().__init__()
         self.fc_seed   = nn.Linear(61,  120)
         self.fc_inject = nn.ModuleList([
             nn.Linear(181 + 5 * i, 125 + 5 * i) for i in range(14)
@@ -414,6 +429,7 @@ class MasterNN(nn.Module):
 # ── Evolution helpers ──────────────────────────────────────────────────────────
 
 def mutate(model, sigma=0.01):
+    """Return a new model with Gaussian noise added to all weights and biases."""
     state = copy.deepcopy(model.state_dict())
     for key in state:
         if 'weight' in key or 'bias' in key:
@@ -427,6 +443,7 @@ def mutate(model, sigma=0.01):
 # ── Portfolio helpers ──────────────────────────────────────────────────────────
 
 def compute_value(portfolio, day_data, symbols):
+    """Return total portfolio value: cash plus all holdings at day_data close prices."""
     val = portfolio['cash']
     for sym in symbols:
         qty = portfolio['holdings'].get(sym, 0.0)
@@ -500,14 +517,18 @@ def compute_alloc_from_predicted(predicted, industry_list):
 class _CashView:
     """Numpy-style accessor for the cash field across all slots."""
     __slots__ = ('_slots',)
-    def __init__(self, slots): self._slots = slots
+    def __init__(self, slots):
+        """Initialise view over slot cash fields."""
+        self._slots = slots
 
     def __getitem__(self, idx):
+        """Return cash for slot *idx*, or ndarray slice."""
         if isinstance(idx, slice):
             return np.array([s['cash'] for s in self._slots[idx]], dtype=np.float64)
         return self._slots[idx]['cash']
 
     def __setitem__(self, idx, val):
+        """Set cash for slot *idx* or broadcast scalar to slice."""
         if isinstance(idx, slice):
             fv = float(val)
             for s in self._slots[idx]:
@@ -520,10 +541,12 @@ class _HoldingsView:
     """Numpy-style accessor for the holdings array across all slots."""
     __slots__ = ('_slots', '_symbols')
     def __init__(self, slots, symbols):
+        """Initialise view over slot holdings fields."""
         self._slots   = slots
         self._symbols = symbols
 
     def __getitem__(self, idx):
+        """Return holdings for slot *idx* as a 1D ndarray, or slice as 2D."""
         if isinstance(idx, tuple):
             slot_idx, col_idx = idx
             row = np.array([self._slots[slot_idx]['holdings'].get(sym, 0.0)
@@ -537,6 +560,7 @@ class _HoldingsView:
             return np.array([h.get(sym, 0.0) for sym in self._symbols], dtype=np.float64)
 
     def __setitem__(self, idx, val):
+        """Set holdings for slot *idx* from a 1D array or broadcast to slice."""
         arr = np.asarray(val, dtype=np.float64).ravel()
         if isinstance(idx, tuple):
             slot_idx, _ = idx
@@ -564,6 +588,7 @@ class PortfolioArray:
       .reset_all_to(cash, hold_array) → broadcast-reset all slots
     """
     def __init__(self, symbols, n=N_SLOTS, init_cash=IND_STARTING_CASH):
+        """Allocate N portfolio dicts with init_cash each; wire up CashView and HoldingsView."""
         self.symbols  = list(symbols)
         self.n        = n
         self._slots   = [
@@ -574,9 +599,11 @@ class PortfolioArray:
         self.holdings = _HoldingsView(self._slots, self.symbols)
 
     def __getitem__(self, idx):
+        """Return the raw slot dict at *idx*."""
         return self._slots[idx]
 
     def __setitem__(self, idx, val):
+        """Replace slot at *idx* with *val* (dict or duck-type with cash/holdings)."""
         if isinstance(val, dict):
             self._slots[idx] = val
         else:
@@ -584,12 +611,14 @@ class PortfolioArray:
                                 'holdings': dict(val['holdings'])}
 
     def sym_prices(self, day_data):
+        """Return a (n_syms,) float64 array of close prices from day_data."""
         return np.array([
             day_data[sym]['close'] if sym in day_data else 0.0
             for sym in self.symbols
         ], dtype=np.float64)
 
     def all_values(self, prices):
+        """Return a (N,) float64 array of total portfolio value per slot at *prices*."""
         p      = np.asarray(prices, dtype=np.float64)
         result = np.empty(self.n, dtype=np.float64)
         syms   = self.symbols
@@ -617,16 +646,20 @@ class PortfolioArray:
 # ── Per-slot model I/O (only 1 model weight tensor in RAM at a time) ──────────
 
 def _model_path(prefix, directory, slot):
+    """Return the .pt file path for a given prefix, directory, and slot index."""
     return os.path.join(directory, f"{prefix}_model_{slot}.pt")
 
 def _port_path(prefix, directory, slot):
+    """Return the per-slot portfolio JSON path (v3 only)."""
     return os.path.join(directory, f"{prefix}_port_{slot}.json")
 
 def _meta_path(prefix, directory):
+    """Return the top10_meta.json path for a given prefix and directory."""
     return os.path.join(directory, f"{prefix}_top10_meta.json")
 
 
 def save_slot_model(prefix, directory, slot, model):
+    """Save model weights to disk for the given slot, logging on failure."""
     try:
         torch.save(model.state_dict(), _model_path(prefix, directory, slot))
     except Exception as e:
@@ -673,6 +706,7 @@ def invalidate_cache(prefix):
 
 
 def save_top10_meta(prefix, directory, top10_meta):
+    """Persist the top-10 elite metadata list to <prefix>_top10_meta.json."""
     try:
         with open(_meta_path(prefix, directory), 'w') as f:
             json.dump(top10_meta, f, indent=2)
@@ -681,6 +715,7 @@ def save_top10_meta(prefix, directory, top10_meta):
 
 
 def load_top10_meta(prefix, directory):
+    """Load top-10 metadata from disk; returns [] if the file is missing or corrupt."""
     path = _meta_path(prefix, directory)
     if os.path.exists(path):
         try:
@@ -692,6 +727,7 @@ def load_top10_meta(prefix, directory):
 
 
 def copy_best_model(prefix, directory, top10_meta):
+    """Copy slot 0's weights to <prefix>_best.pt for production use."""
     if not top10_meta:
         return
     best_slot = top10_meta[0]['slot']
@@ -708,6 +744,7 @@ def copy_best_model(prefix, directory, top10_meta):
 # ── Weighted average (streaming: load one model at a time) ────────────────────
 
 def _normalize_weights(values):
+    """Clip negatives to zero and normalise *values* to sum to 1.0; returns equal weights on all-zero."""
     clipped = [max(float(v), 0.0) for v in values]
     total   = sum(clipped)
     if total <= 0:
@@ -754,6 +791,7 @@ def compute_weighted_avg_model(prefix, directory, slots, values, model_class):
 
 
 def compute_weighted_avg_portfolio(portfolios, values):
+    """Return a new portfolio dict that is the performance-weighted average of *portfolios*."""
     weights = _normalize_weights(values)
     result  = {}
     for key in portfolios[0]:
@@ -1273,6 +1311,10 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
             log(f"[{sn(industry)}] Day {actual_day + 1}/{total_avail}   Zero-trade filter: {len(inactive_slots)} slot(s) excluded from elite candidacy")
 
     # ── Delta-based selection scores with invested_pct multiplier ────────────
+    # Selection score = raw delta adjusted by invested_pct:
+    # positive-delta slots are scaled down proportional to cash held,
+    # so a slot that earned $50 by deploying 80% outranks one that
+    # earned $50 while sitting 90% in cash.
     scores_dict = dict(ranked_scores)
     below_floor = {s for s, v in ranked_scores if v < survival_floor}
     sel_scores  = []
@@ -1903,6 +1945,7 @@ def train_master_one_day(day_data, industries, primed_portfolio, model_dir,
 # ── Data loading ───────────────────────────────────────────────────────────────
 
 def load_stock_data_from_files(all_symbols, stock_data_dir):
+    """Load all JSON files from stock_data_dir and merge into {date: {sym: ohlcv}} dict."""
     all_data = {}
     loaded   = 0
     for sym in all_symbols:
@@ -1931,6 +1974,7 @@ def load_stock_data_from_files(all_symbols, stock_data_dir):
 
 
 def fetch_stock_data_from_yfinance(all_symbols):
+    """Fetch the last 15 days of daily OHLCV for all symbols via yfinance; returns {date: {sym: ohlcv}}."""
     all_data = {}
     try:
         tickers = yf.Tickers(' '.join(all_symbols))
@@ -1988,6 +2032,7 @@ def trim_stock_data_files(all_symbols, stock_data_dir, keep_days=15):
 
 
 def main():
+    """Parse CLI args and run multi-pass evolutionary training across all industries and master."""
     parser = argparse.ArgumentParser(description="Train neural networks for stock trading v3.")
     parser.add_argument('--output',    required=True,       help='Output directory for models and checkpoints')
     parser.add_argument('--load-dir',                       help='Directory to seed top-10 models from (optional)')
@@ -2060,7 +2105,7 @@ def main():
     # Prefer pre-downloaded local JSON files; fall back to live yfinance
     sample_path = os.path.join('stock_data', f"{all_symbols[0]}.json")
     if os.path.exists(sample_path):
-        log(f"Loading stock data from stock_data/ ...")
+        log("Loading stock data from stock_data/ ...")
         all_data = load_stock_data_from_files(all_symbols, 'stock_data')
     else:
         log("No local stock data found — fetching from yfinance (last 1 month) ...")

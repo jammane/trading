@@ -16,9 +16,9 @@ Files edited:
 """
 
 import json
+import os
 import re
 import sys
-import os
 
 TARGET_FILES = [
     'download_5y_data.py',
@@ -29,7 +29,8 @@ TARGET_FILES = [
 
 
 def swap_in_file(path: str, symbol_map: dict[str, str]) -> int:
-    with open(path, 'r') as f:
+    """Replace quoted ticker symbols in *path* using *symbol_map*; returns replacement count."""
+    with open(path) as f:
         original = f.read()
 
     text = original
@@ -52,6 +53,7 @@ def swap_in_file(path: str, symbol_map: dict[str, str]) -> int:
 
 
 def main():
+    """Parse the JSON symbol-map from argv[1] and apply it to all TARGET_FILES."""
     if len(sys.argv) != 2:
         print("Usage: python swap_symbols.py '{\"OLD\": \"NEW\", ...}'")
         sys.exit(1)

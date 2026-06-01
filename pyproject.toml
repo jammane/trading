@@ -1,0 +1,21 @@
+[project]
+name = "trading"
+version = "1.0.0"
+requires-python = ">=3.12"
+description = "Neural network-based stock trading system using evolutionary algorithms."
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "SIM"]
+ignore = [
+    "E266",   # Unicode box-drawing section dividers (deliberate style)
+    "E501",   # line-length handled by line-length=120; 3 log-format lines get # noqa
+    "SIM108", # ternary rewrites hurt readability in fill-simulation logic
+    "B007",   # unused loop variable false positives on range() loops
+]
+
+[tool.ruff.lint.isort]
+known-third-party = ["torch", "yfinance", "alpaca", "keyring", "numpy"]
