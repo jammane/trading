@@ -42,13 +42,12 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime, timedelta
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import yfinance as yf
-from datetime import datetime, timedelta
-
 
 # ── Constants (must match training_v2.py exactly) ─────────────────────────────
 BUY_FILL            = 1.0
@@ -60,6 +59,7 @@ SLIPPAGE_RATE       = 0.001      # 0.10% adverse slippage on limit & stop fills
 
 
 def _sell_net(shares, price):
+    """Net cash received on an equity sell after SEC fee and FINRA TAF."""
     gross = shares * price * SELL_FILL
     fees  = gross * SEC_FEE_RATE + min(shares * FINRA_TAF_PER_SHARE, FINRA_TAF_MAX)
     return gross - fees
@@ -84,6 +84,9 @@ INDUSTRIES = {
 
 # ── Model (identical to training_v2.py) ───────────────────────────────────────
 class StockNN(nn.Module):
+    """LSTM-based stock decision model as used in the inspect_trades audit path.
+    history:(1,15,208) + state:(13,) → (1,48) reshaped to (12,4)."""
+
     def __init__(self):
         super().__init__()
         self.lstm1 = nn.LSTM(input_size=208, hidden_size=208, num_layers=1, batch_first=True)
@@ -113,13 +116,16 @@ class StockNN(nn.Module):
 
 # ── Data helpers ───────────────────────────────────────────────────────────────
 def _model_path(prefix, directory, slot):
+    """Return .pt file path for the given slot."""
     return os.path.join(directory, f"{prefix}_model_{slot}.pt")
 
 def _meta_path(prefix, directory):
+    """Return top10_meta.json path for the given prefix."""
     return os.path.join(directory, f"{prefix}_top10_meta.json")
 
 
 def load_top10_meta(prefix, directory):
+    """Load top-N elite metadata list from disk; returns [] if missing."""
     path = _meta_path(prefix, directory)
     if not os.path.exists(path):
         return []
@@ -128,6 +134,7 @@ def load_top10_meta(prefix, directory):
 
 
 def load_model(prefix, directory, slot):
+    """Load one StockNN from disk into eval mode; uses random weights if missing."""
     model = StockNN()
     path  = _model_path(prefix, directory, slot)
     if not os.path.exists(path):
@@ -249,6 +256,9 @@ def resolve_date_from_index(day_index, stock_data_dir, all_symbols):
 
 # ── Feature builder (mirrors step_industry in training_v2.py) ─────────────────
 def build_input(symbols, histories, day_data, cash, holdings):
+    """Build history_t (1,15,208) and state_t (13,) tensors for one forward pass.
+    Mirrors the feature engineering in training_v2.step_industry.
+    Returns (input_t, state_t, sym_stats)."""
     sym_stats = {}
     for sym in symbols:
         h = histories[sym]
@@ -621,6 +631,7 @@ def compute_attribution(symbols, trade_records, next_day_data, day_data):
 def print_model_report(model_rank, slot, score, symbols, day_data, next_day_data,
                         trade_records, final_cash, final_holdings, portfolio_value,
                         starting_cash, date_str, fill_date_str):
+    """Print the per-model trade detail block for one elite slot."""
     sep  = "─" * 90
     sep2 = "═" * 90
 
@@ -658,7 +669,7 @@ def print_model_report(model_rank, slot, score, symbols, day_data, next_day_data
     # Gain attribution table
     attrib = compute_attribution(symbols, trade_records, next_day_data, day_data)
     if attrib:
-        print(f"\n  Gain attribution (fill price → fill-day close):")
+        print("\n  Gain attribution (fill price → fill-day close):")
         print(f"  {'Symbol':6s}  {'Shares':>8s}  {'Fill@':>8s}  {'Close':>8s}  {'Gain':>9s}  {'Gain%':>7s}")
         print(f"  {'─'*54}")
         total_attrib = 0.0
@@ -673,7 +684,7 @@ def print_model_report(model_rank, slot, score, symbols, day_data, next_day_data
         print(f"  {'Total':6s}  {'':8s}  {'':8s}  {'':8s}  {sign}${total_attrib:7.2f}")
 
     # Per-symbol detail
-    print(f"\n  Per-symbol details:")
+    print("\n  Per-symbol details:")
     print(f"  {sep}")
 
     for rec in trade_records:
@@ -720,6 +731,7 @@ def print_model_report(model_rank, slot, score, symbols, day_data, next_day_data
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
+    """Parse CLI args, resolve the target date, and run the trade audit report."""
     parser = argparse.ArgumentParser(
         description="Inspect elite model trade decisions for a given industry + date.")
     parser.add_argument('--industry',      required=True,

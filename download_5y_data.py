@@ -1,9 +1,19 @@
+"""
+download_5y_data.py — Download historical daily OHLCV data for all 144 symbols.
+
+Saves one JSON file per symbol under stock_data/<SYM>.json.
+Rate-limited to ~50 requests/minute to stay within yfinance limits.
+
+Usage:
+    python download_5y_data.py [--years N]
+"""
+
 import argparse
-import yfinance as yf
 import json
 import os
-from datetime import datetime
 import time
+
+import yfinance as yf
 
 parser = argparse.ArgumentParser(description='Download historical stock data.')
 parser.add_argument('--years', type=int, default=5, help='Number of years of history to download (default: 5)')
@@ -91,7 +101,7 @@ for sym in all_symbols:
         continue
 
     try:
-        with open(file_path, 'r') as f:
+        with open(file_path) as f:
             payload = json.load(f)
         saved_counts[sym] = len(payload.get("days", []))
     except Exception as e:
@@ -119,5 +129,5 @@ else:
     for sym, count in incomplete_symbols:
         print(f"   - {sym}: {count}/{expected_days} days")
 
-print(f"   You can now run initial training:")
-print(f"   python training_v2.py --output models")
+print("   You can now run initial training:")
+print("   python training_v2.py --output models")

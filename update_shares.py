@@ -1,7 +1,16 @@
-import json
-import os
+"""
+update_shares.py — Manage owner share counts in owners/owners.json.
+
+Usage:
+    python update_shares.py --invest    <name> <amount>
+    python update_shares.py --withdrawal <name> <amount>
+    python update_shares.py --value
+"""
+
 import argparse
 import csv
+import json
+import os
 
 OWNERS_DIR = 'owners'
 OWNERS_FILE = os.path.join(OWNERS_DIR, 'owners.json')
@@ -11,7 +20,7 @@ def load_owners():
     """Load owners.json, initializing if it doesn't exist."""
     try:
         if os.path.exists(OWNERS_FILE):
-            with open(OWNERS_FILE, 'r') as f:
+            with open(OWNERS_FILE) as f:
                 owners = json.load(f)
                 total_shares = sum(owners.get("owners", {}).values())
                 if owners["total value"] > 100 and total_shares > 1:
@@ -53,6 +62,7 @@ def update_value_csv(owners_data):
         print(f"Error generating {csv_path}: {e}")
 
 def main():
+    """Parse CLI args and dispatch to invest, withdraw, or CSV export."""
     parser = argparse.ArgumentParser(description="Update shares in owners.json based on investments or withdrawals.")
     parser.add_argument('--invest', nargs=2, metavar=('name', 'amount'), help='Invest dollar amount for name')
     parser.add_argument('--withdrawal', nargs=2, metavar=('name', 'amount'), help='Withdraw dollar amount for name')
