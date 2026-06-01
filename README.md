@@ -214,6 +214,18 @@ Notable symbol changes from the original universe:
 
 ---
 
+## License
+
+This project is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).
+Commercial use requires a separate agreement — see [COMMERCIAL.md](COMMERCIAL.md) or contact the project owner.
+
+## Contributing
+
+Contributions are welcome. By submitting a pull request you agree to the terms of the
+[Contributor License Agreement](CLA.md). See [CONTRIBUTORS.md](CONTRIBUTORS.md) for the attribution log.
+
+---
+
 ## Notes
 
 - `models/`, `stock_data/`, and `data_dump/` are git-ignored (large binary, data, and diagnostic files).
