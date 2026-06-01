@@ -6,7 +6,7 @@ A neural network-based algorithmic trading system that trains an evolutionary po
 
 > **Development Status**
 >
-> This project is under active development and is not yet production-ready. Core training and paper-trading functionality is operational; live trading has been partially validated but should be treated as experimental. Breaking changes to model architecture, configuration, and CLI flags may occur between versions. Use in live trading environments is at your own risk.
+> This project is under active development and is not yet production-ready. Core training functionality is operational; paper and live trading have not been fully tested and should be treated as experimental. Breaking changes to model architecture, configuration, and CLI flags may occur between versions. Use in live trading environments is at your own risk.
 
 ---
 
