@@ -191,7 +191,6 @@ Requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` set in the environment (or sto
 | `training_v3.py` | Parallel training variant (7 worker threads, in-RAM model cache) |
 | `inspect_trades.py` | Audit elite model trade decisions for a given day and industry |
 | `production_v2.py` | Daily trading cycle: fetch data, infer, submit orders, upkeep training |
-| `update_shares.py` | Manage owner share counts in `owners/owners.json` |
 | `swap_symbols.py` | Replace ticker symbols across all source files |
 
 ---
