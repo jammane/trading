@@ -30,23 +30,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import yfinance as yf
 
+from fees import BUY_FILL, FINRA_TAF_MAX, FINRA_TAF_PER_SHARE, SEC_FEE_RATE, SELL_FILL, _sell_net
+from models import MasterNN, StockNN
+from universe import INDUSTRIES
+
 # ── v3: parallel training — 7 worker threads, relaxed RAM constraints ──────────
 NUM_THREADS = 7      # intra-industry inference parallelism
 _log_lock   = Lock() # serialise console output across threads
-
-# ── Broker fees (Alpaca: $0 commission; regulatory fees still apply on sells) ─
-BUY_FILL            = 1.0        # multiplier on buy  fill price (1.0 = no commission)
-SELL_FILL           = 1.0        # multiplier on sell fill price (1.0 = no commission)
-SEC_FEE_RATE        = 0.0000278  # SEC Section 31: $0.0000278 per $ of sale proceeds (FY2025)
-FINRA_TAF_PER_SHARE = 0.000166   # FINRA TAF: $0.000166 per share sold
-FINRA_TAF_MAX       = 8.30       # FINRA TAF per-trade cap
-
-
-def _sell_net(shares: float, price: float) -> float:
-    """Net cash received on an equity sell after SEC fee and FINRA TAF."""
-    gross = shares * price * SELL_FILL
-    fees  = gross * SEC_FEE_RATE + min(shares * FINRA_TAF_PER_SHARE, FINRA_TAF_MAX)
-    return gross - fees
 
 # In-memory model cache: {prefix: [model_0, ..., model_99]}
 # Populated on first load; written back to disk only after selection mutates weights.
@@ -350,80 +340,6 @@ def _fmt_slot(slot):
     parent   = (slot - ELITE_POOL) // MUTATIONS_PER_PARENT
     mutation = (slot - ELITE_POOL) % MUTATIONS_PER_PARENT + 1
     return f"{parent}.{mutation}"
-
-
-# ── Model definitions ──────────────────────────────────────────────────────────
-
-class StockNN(nn.Module):
-    """FC injection: history(1,15,60) + today(1,208) → (1,48)
-    Seed(60→120), Inject×14(180+5i→125+5i, grows 120→190), Today(398→300),
-    Flat×2(300), Funnel(300→237→174→111→48)"""
-    def __init__(self):
-        super().__init__()
-        self.fc_seed   = nn.Linear(60,  120)
-        self.fc_inject = nn.ModuleList([
-            nn.Linear(180 + 5 * i, 125 + 5 * i) for i in range(14)
-        ])
-        self.fc_today  = nn.Linear(398, 300)
-        self.fc_flat1  = nn.Linear(300, 300)
-        self.fc_flat2  = nn.Linear(300, 300)
-        self.fc_fc1    = nn.Linear(300, 237)
-        self.fc_fc2    = nn.Linear(237, 174)
-        self.fc_fc3    = nn.Linear(174, 111)
-        self.fc_out    = nn.Linear(111,  48)
-
-    def forward(self, history, today):
-        x = F.relu(self.fc_seed(history[:, 0, :]))
-        for i, layer in enumerate(self.fc_inject):
-            x = F.relu(layer(torch.cat([x, history[:, i + 1, :]], dim=1)))
-        x   = F.relu(self.fc_today(torch.cat([x, today], dim=1)))
-        x   = F.relu(self.fc_flat1(x))
-        x   = F.relu(self.fc_flat2(x))
-        x   = F.relu(self.fc_fc1(x))
-        x   = F.relu(self.fc_fc2(x))
-        x   = F.relu(self.fc_fc3(x))
-        out = self.fc_out(x).view(12, 4)
-        qty_buy   = F.relu(out[:, 0:1])
-        price_buy = torch.sigmoid(out[:, 1:2])
-        price_sal = torch.sigmoid(out[:, 2:3])
-        qty_sell  = F.relu(out[:, 3:4])
-        return torch.cat([qty_buy, price_buy, price_sal, qty_sell], dim=1).view(1, 48)
-
-
-class MasterNN(nn.Module):
-    """FC injection: history(1,15,61) + today(1,229) → (1,36)
-    Seed(61→120), Inject×14(181+5i→125+5i, grows 120→190), Today(419→300),
-    Flat×2(300), Funnel(300→234→168→102→36)
-    history[:,i,60] = flat_cos for that day (regime signal)"""
-    def __init__(self):
-        super().__init__()
-        self.fc_seed   = nn.Linear(61,  120)
-        self.fc_inject = nn.ModuleList([
-            nn.Linear(181 + 5 * i, 125 + 5 * i) for i in range(14)
-        ])
-        self.fc_today  = nn.Linear(419, 300)
-        self.fc_flat1  = nn.Linear(300, 300)
-        self.fc_flat2  = nn.Linear(300, 300)
-        self.fc_fc1    = nn.Linear(300, 234)
-        self.fc_fc2    = nn.Linear(234, 168)
-        self.fc_fc3    = nn.Linear(168, 102)
-        self.fc_out    = nn.Linear(102,  36)
-
-    def forward(self, history, today):
-        x = F.relu(self.fc_seed(history[:, 0, :]))
-        for i, layer in enumerate(self.fc_inject):
-            x = F.relu(layer(torch.cat([x, history[:, i + 1, :]], dim=1)))
-        x   = F.relu(self.fc_today(torch.cat([x, today], dim=1)))
-        x   = F.relu(self.fc_flat1(x))
-        x   = F.relu(self.fc_flat2(x))
-        x   = F.relu(self.fc_fc1(x))
-        x   = F.relu(self.fc_fc2(x))
-        x   = F.relu(self.fc_fc3(x))
-        out = self.fc_out(x)
-        alloc   = F.softmax(out[:, :12], dim=-1)
-        depth   = torch.sigmoid(out[:, 12:24])
-        trigger = torch.sigmoid(out[:, 24:36])
-        return torch.cat([alloc, depth, trigger], dim=-1)
 
 
 # ── Evolution helpers ──────────────────────────────────────────────────────────
@@ -2073,32 +1989,7 @@ def main():
     except Exception:
         pass
 
-    industries = {
-        # High-beta semiconductors & hardware
-        'tech_hardware':          ['NVDA','AMD', 'MU',  'SMCI','MRVL','ON',  'AMAT','LRCX','KLAC','TSM', 'SWKS','MPWR'],
-        # High-beta cloud / AI software
-        'tech_software_ai':       ['PLTR','SNOW','DDOG','NET', 'CRWD','ZS',  'PANW','NOW', 'ADBE','CRM', 'FTNT','OKTA'],
-        # High-beta fintech + traditional finance
-        'financials':             ['XYZ', 'PYPL','AFRM','UPST','MELI','COIN','GS',  'SCHW',  'C',   'COF', 'BX',   'APO'  ],
-        # EVs, autos, travel — already volatile
-        'consumer_discretionary': ['TSLA','RCL', 'XPEV','LI',  'APTV',   'GM',  'LEA','WYNN','BKNG','ABNB','UBER','LYFT'],
-        # Streaming, social, gig economy — replaces low-vol restaurants
-        'consumer_services':      ['NFLX','ROKU','SPOT','META','IAC','PINS','DASH','RBLX','TTWO','LYV',  'MTCH','WBD'],
-        # Biotech / genomics — replaces large-cap pharma
-        'health_care':            ['MRNA','BNTX','IMVT','CRSP','ARWR','MYGN','EXAS','INMD','HIMS','BEAM','ACAD','BMRN'],
-        # Airlines + industrials — already volatile
-        'industrials':            ['BA',  'GE',  'CAT', 'DE',  'DAL', 'UAL', 'XPO', 'LUV', 'ALK', 'GNRC','BTU', 'STLD' ],
-        # High-beta lifestyle/consumer — replaces low-vol staples
-        'consumer_staples':       ['CELH','SFM','ELF', 'LULU','DECK','YETI','NKE', 'CROX', 'DKNG','PENN','MGM', 'CZR' ],
-        # Volatile E&P + services — already performing
-        'energy':                 ['FANG','DVN', 'OXY', 'CTRA','AR',  'EQT', 'RRC', 'SM',  'SLB', 'COP', 'EOG', 'VLO' ],
-        # Clean energy / renewables — replaces stable utility stocks
-        'utilities':              ['ENPH','FSLR','SEDG','CWEN', 'VST','BE',  'BEP','DQ',  'CSIQ','JKS', 'HASI','NRG' ],
-        # Homebuilders + proptech — replaces low-vol REITs
-        'real_estate':            ['DHI', 'LEN', 'PHM', 'TOL', 'MTH', 'KBH', 'TPH', 'TMHC','LGIH','CSGP','Z',   'SKY' ],
-        # Volatile precious-metal miners — replaces ETFs
-        'materials':              ['NEM', 'AEM', 'FCX', 'SCCO','TECK', 'AA', 'SQM','WPM', 'AU',  'PAAS','GFI',  'CDE' ],
-    }
+    industries = INDUSTRIES
 
     all_symbols = [sym for syms in industries.values() for sym in syms]
 

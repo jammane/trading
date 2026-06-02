@@ -9,10 +9,7 @@ literals (e.g. 'OLDTICKER' → 'NEWTICKER'), so partial-match false positives
 (e.g. 'C' inside 'CRWD') are impossible.
 
 Files edited:
-    download_5y_data.py
-    training_v2.py
-    training_v3.py
-    production_v2.py
+    universe.py  (single source of truth for all ticker symbols)
 """
 
 import json
@@ -21,10 +18,7 @@ import re
 import sys
 
 TARGET_FILES = [
-    'download_5y_data.py',
-    'training_v2.py',
-    'training_v3.py',
-    'production_v2.py',
+    'universe.py',
 ]
 
 

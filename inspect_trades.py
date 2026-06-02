@@ -49,69 +49,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import yfinance as yf
 
-# ── Constants (must match training_v2.py exactly) ─────────────────────────────
-BUY_FILL            = 1.0
-SELL_FILL           = 1.0
-SEC_FEE_RATE        = 0.0000278
-FINRA_TAF_PER_SHARE = 0.000166
-FINRA_TAF_MAX       = 8.30
-SLIPPAGE_RATE       = 0.001      # 0.10% adverse slippage on limit & stop fills
-
-
-def _sell_net(shares, price):
-    """Net cash received on an equity sell after SEC fee and FINRA TAF."""
-    gross = shares * price * SELL_FILL
-    fees  = gross * SEC_FEE_RATE + min(shares * FINRA_TAF_PER_SHARE, FINRA_TAF_MAX)
-    return gross - fees
-
-
-# ── Industry registry ──────────────────────────────────────────────────────────
-INDUSTRIES = {
-    'tech_hardware':          ['NVDA','AMD', 'MU',  'SMCI','MRVL','ON',  'AMAT','LRCX','KLAC','TSM', 'SWKS','MPWR'],
-    'tech_software_ai':       ['PLTR','SNOW','DDOG','NET', 'CRWD','ZS',  'PANW','NOW', 'ADBE','CRM', 'FTNT','OKTA'],
-    'financials':             ['SQ',  'PYPL','AFRM','UPST','MELI','COIN','GS',  'MS',  'C',   'COF', 'V',   'MA'  ],
-    'consumer_discretionary': ['TSLA','NIO', 'XPEV','LI',  'F',   'GM',  'STLA','RACE','BKNG','ABNB','UBER','LYFT'],
-    'consumer_services':      ['NFLX','ROKU','SPOT','META','SNAP','PINS','DASH','RBLX','TTWO','EA',  'CMCSA','WBD'],
-    'health_care':            ['MRNA','BNTX','NVAX','CRSP','EDIT','NTLA','EXAS','TDOC','HIMS','BEAM','RXRX','PACB'],
-    'industrials':            ['BA',  'GE',  'CAT', 'DE',  'DAL', 'UAL', 'AAL', 'LUV', 'ALK', 'JBLU','X',   'CLF' ],
-    'consumer_staples':       ['CELH','BYND','ELF', 'LULU','DECK','YETI','NKE', 'UAA', 'DKNG','PENN','MGM', 'CZR' ],
-    'energy':                 ['FANG','DVN', 'OXY', 'CTRA','AR',  'EQT', 'RRC', 'SM',  'SLB', 'COP', 'EOG', 'VLO' ],
-    'utilities':              ['ENPH','FSLR','SEDG','RUN', 'PLUG','BE',  'NOVA','DQ',  'CSIQ','JKS', 'HASI','AES' ],
-    'real_estate':            ['DHI', 'LEN', 'PHM', 'TOL', 'MTH', 'KBH', 'TPH', 'TMHC','NVR', 'RDFN','Z',   'SKY' ],
-    'materials':              ['NEM', 'AEM', 'FCX', 'SCCO','BHP', 'RIO', 'VALE','WPM', 'HL',  'PAAS','AG',  'CDE' ],
-}
-
-
-# ── Model (identical to training_v2.py) ───────────────────────────────────────
-class StockNN(nn.Module):
-    """LSTM-based stock decision model as used in the inspect_trades audit path.
-    history:(1,15,208) + state:(13,) → (1,48) reshaped to (12,4)."""
-
-    def __init__(self):
-        super().__init__()
-        self.lstm1 = nn.LSTM(input_size=208, hidden_size=208, num_layers=1, batch_first=True)
-        self.lstm2 = nn.LSTM(input_size=208, hidden_size=208, num_layers=1, batch_first=True)
-        self.lstm3 = nn.LSTM(input_size=208, hidden_size=208, num_layers=1, batch_first=True)
-        self.lstm4 = nn.LSTM(input_size=208, hidden_size=155, num_layers=1, batch_first=True)
-        self.fc1   = nn.Linear(155 + 13, 128)
-        self.fc2   = nn.Linear(128, 88)
-        self.fc3   = nn.Linear(88,  48)
-
-    def forward(self, x, state):
-        x, _ = self.lstm1(x)
-        x, _ = self.lstm2(x)
-        x, _ = self.lstm3(x)
-        x, _ = self.lstm4(x)
-        last     = x[:, -1, :]
-        combined = torch.cat((last, state.unsqueeze(0)), dim=1)
-        x   = F.relu(self.fc1(combined))
-        x   = F.relu(self.fc2(x))
-        out = self.fc3(x).view(12, 4)
-        qty_buy   = F.relu(out[:, 0:1])
-        price_buy = torch.sigmoid(out[:, 1:2])
-        price_sal = torch.sigmoid(out[:, 2:3])
-        qty_sell  = F.relu(out[:, 3:4])
-        return torch.cat([qty_buy, price_buy, price_sal, qty_sell], dim=1).view(1, 48)
+from fees import BUY_FILL, FINRA_TAF_MAX, FINRA_TAF_PER_SHARE, SEC_FEE_RATE, SELL_FILL, SLIPPAGE_RATE, _sell_net
+from models import StockNN
+from universe import INDUSTRIES
 
 
 # ── Data helpers ───────────────────────────────────────────────────────────────
@@ -256,9 +196,9 @@ def resolve_date_from_index(day_index, stock_data_dir, all_symbols):
 
 # ── Feature builder (mirrors step_industry in training_v2.py) ─────────────────
 def build_input(symbols, histories, day_data, cash, holdings):
-    """Build history_t (1,15,208) and state_t (13,) tensors for one forward pass.
-    Mirrors the feature engineering in training_v2.step_industry.
-    Returns (input_t, state_t, sym_stats)."""
+    """Build history_t (1,15,60) and today_t (1,208) tensors for one forward pass.
+    Mirrors the feature engineering in training_v2.step_industry exactly.
+    Returns (history_t, today_t, sym_stats)."""
     sym_stats = {}
     for sym in symbols:
         h = histories[sym]
@@ -283,51 +223,46 @@ def build_input(symbols, histories, day_data, cash, holdings):
             sym_stats[sym] = {'hi15': 1.0, 'lo15': 0.0, 'avg_c': 1.0,
                               'avg_v': 1.0, 'avg_dv': 1.0, 'volatility': 0.0}
 
-    num_past = min(len(histories[s]) for s in symbols) if symbols else 0
-
-    ind_agg_per_t = []
-    for t in range(15):
-        if t >= num_past:
-            ind_agg_per_t.append([0.0] * 15)
-        else:
-            dl = [histories[sym][-(t+1)][5:] for sym in symbols if len(histories[sym]) > t]
-            if dl:
-                tr   = list(zip(*dl))
-                aggs = []
-                for tp in tr:
-                    aggs += [max(tp), min(tp), sum(tp)/len(tp)]
-                ind_agg_per_t.append(aggs[:15])
-            else:
-                ind_agg_per_t.append([0.0] * 15)
-
-    state_vec = [cash] + [holdings.get(s, 0.0) for s in symbols]
-
-    timesteps = []
-    for t in range(15):
-        step = []
+    # history_t: (1, 15, 60) — OHLCV × 12 stocks, oldest day first
+    history_rows = []
+    for t in range(14, -1, -1):          # t=14 oldest (h[-15]), t=0 most recent (h[-1])
+        row = []
         for sym in symbols:
-            h  = histories[sym]
-            st = sym_stats[sym]
-            if len(h) > t:
-                row    = h[-(t+1)]
-                raw    = row[:5]
-                deltas = row[5:10]
-                rng    = max(st['hi15'] - st['lo15'], 1e-9)
-                step  += (raw + deltas +
-                          [(raw[1] - st['lo15']) / rng,
-                           raw[1] / st['avg_c'],
-                           st['volatility'],
-                           raw[4] / st['avg_v'],
-                           (raw[0] * raw[4]) / st['avg_dv']])
-            else:
-                step += [0.0] * 15
-        step += ind_agg_per_t[t]
-        step += state_vec
-        timesteps.append(step)
+            h = histories[sym]
+            row += list(h[-(t + 1)][:5]) if len(h) > t else [0.0] * 5
+        history_rows.append(row)
+    history_t = torch.tensor(history_rows, dtype=torch.float32).unsqueeze(0)  # (1,15,60)
 
-    input_t = torch.tensor(timesteps, dtype=torch.float32).unsqueeze(0)
-    state_t = torch.tensor(state_vec,  dtype=torch.float32)
-    return input_t, state_t, sym_stats
+    # today_t: (1, 208) — full feature set for current day
+    state_vec = [cash] + [holdings.get(sym, 0.0) for sym in symbols]
+    today_row = []
+    today_dl  = []
+    for sym in symbols:
+        st    = sym_stats[sym]
+        d     = day_data.get(sym, {})
+        raw_t = [d.get('open', 0.0), d.get('close', 0.0),
+                 d.get('high', 0.0), d.get('low', 0.0), d.get('volume', 0.0)]
+        prev  = histories[sym][-1] if histories[sym] else None
+        dlt_t = [raw_t[i] - prev[i] for i in range(5)] if prev else [0.0] * 5
+        rng   = max(st['hi15'] - st['lo15'], 1e-9)
+        today_row += (raw_t + dlt_t + [
+            (raw_t[1] - st['lo15']) / rng,
+            raw_t[1] / st['avg_c'],
+            st['volatility'],
+            raw_t[4] / st['avg_v'],
+            (raw_t[0] * raw_t[4]) / st['avg_dv'],
+        ])
+        today_dl.append(dlt_t)
+    if today_dl:
+        tr = list(zip(*today_dl))
+        for tp in tr:
+            today_row += [max(tp), min(tp), sum(tp) / len(tp)]
+    else:
+        today_row += [0.0] * 15
+    today_row += state_vec
+    today_t = torch.tensor(today_row, dtype=torch.float32).unsqueeze(0)    # (1,208)
+
+    return history_t, today_t, sym_stats
 
 
 # ── Trade simulation ───────────────────────────────────────────────────────────
@@ -816,10 +751,10 @@ def main():
         cash     = args.starting_cash
         holdings = {sym: 0.0 for sym in symbols}
 
-        input_t, state_t, _ = build_input(symbols, histories, day_data, cash, holdings)
+        history_t, today_t, _ = build_input(symbols, histories, day_data, cash, holdings)
 
         with torch.inference_mode():
-            out = model(input_t, state_t)
+            out = model(history_t, today_t)
 
         trade_records, final_cash, final_holdings, portfolio_value, _ = simulate_trades(
             symbols, out, day_data, next_day_data, cash, holdings)
