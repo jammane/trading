@@ -15,37 +15,13 @@ import time
 
 import yfinance as yf
 
+from universe import INDUSTRIES
+
 parser = argparse.ArgumentParser(description='Download historical stock data.')
 parser.add_argument('--years', type=int, default=5, help='Number of years of history to download (default: 5)')
 args = parser.parse_args()
 
-# Same industries as in your training_v2.py and production_v2.py
-industries = {
-    # High-beta semiconductors & hardware
-    'tech_hardware':          ['NVDA','AMD', 'MU',  'SMCI','MRVL','ON',  'AMAT','LRCX','KLAC','TSM', 'SWKS','MPWR'],
-    # High-beta cloud / AI software
-    'tech_software_ai':       ['PLTR','SNOW','DDOG','NET', 'CRWD','ZS',  'PANW','NOW', 'ADBE','CRM', 'FTNT','OKTA'],
-    # High-beta fintech + traditional finance
-    'financials':             ['XYZ', 'PYPL','AFRM','UPST','MELI','COIN','GS',  'SCHW',  'C',   'COF', 'BX',   'APO'  ],
-    # EVs, autos, travel — already volatile
-    'consumer_discretionary': ['TSLA','RCL', 'XPEV','LI',  'APTV',   'GM',  'LEA','WYNN','BKNG','ABNB','UBER','LYFT'],
-    # Streaming, social, gig economy — replaces low-vol restaurants
-    'consumer_services':      ['NFLX','ROKU','SPOT','META','IAC','PINS','DASH','RBLX','TTWO','LYV',  'MTCH','WBD'],
-    # Biotech / genomics — replaces large-cap pharma
-    'health_care':            ['MRNA','BNTX','IMVT','CRSP','ARWR','MYGN','EXAS','INMD','HIMS','BEAM','ACAD','BMRN'],
-    # Airlines + industrials — already volatile
-    'industrials':            ['BA',  'GE',  'CAT', 'DE',  'DAL', 'UAL', 'XPO', 'LUV', 'ALK', 'GNRC','BTU', 'STLD' ],
-    # High-beta lifestyle/consumer — replaces low-vol staples
-    'consumer_staples':       ['CELH','SFM','ELF', 'LULU','DECK','YETI','NKE', 'CROX', 'DKNG','PENN','MGM', 'CZR' ],
-    # Volatile E&P + services — already performing
-    'energy':                 ['FANG','DVN', 'OXY', 'CTRA','AR',  'EQT', 'RRC', 'SM',  'SLB', 'COP', 'EOG', 'VLO' ],
-    # Clean energy / renewables — replaces stable utility stocks
-    'utilities':              ['ENPH','FSLR','SEDG','CWEN', 'VST','BE',  'BEP','DQ',  'CSIQ','JKS', 'HASI','NRG' ],
-    # Homebuilders + proptech — replaces low-vol REITs
-    'real_estate':            ['DHI', 'LEN', 'PHM', 'TOL', 'MTH', 'KBH', 'TPH', 'TMHC','LGIH','CSGP','Z',   'SKY' ],
-    # Volatile precious-metal miners — replaces ETFs
-    'materials':              ['NEM', 'AEM', 'FCX', 'SCCO','TECK', 'AA', 'SQM','WPM', 'AU',  'PAAS','GFI',  'CDE' ],
-}
+industries = INDUSTRIES
 
 os.makedirs('stock_data', exist_ok=True)
 

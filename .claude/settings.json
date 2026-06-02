@@ -7,6 +7,10 @@
           {
             "type": "command",
             "command": "echo \"$CLAUDE_TOOL_INPUT\" | grep -q 'git commit' && bash /home/jammane/Repos/trading/.claude/update_changelog.sh || true"
+          },
+          {
+            "type": "command",
+            "command": "echo \"$CLAUDE_TOOL_INPUT\" | grep -qE 'git (commit|push)' && bash /home/jammane/Repos/trading/.claude/run_tests.sh || true"
           }
         ]
       }

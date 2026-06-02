@@ -26,84 +26,11 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, OrderType, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, StopOrderRequest
 
+from fees import BUY_FILL, FINRA_TAF_MAX, FINRA_TAF_PER_SHARE, SEC_FEE_RATE, SELL_FILL, _sell_net
+from models import MasterNN, StockNN
+from universe import INDUSTRIES
+
 MAX_SINGLE_STOCK_PCT = 0.60   # max fraction of industry cash in one stock
-
-# ── Broker fees (Alpaca: $0 commission; regulatory fees still apply on sells) ─
-BUY_FILL            = 1.0        # multiplier on buy  fill price (1.0 = no commission)
-SELL_FILL           = 1.0        # multiplier on sell fill price (1.0 = no commission)
-SEC_FEE_RATE        = 0.0000278  # SEC Section 31: $0.0000278 per $ of sale proceeds
-FINRA_TAF_PER_SHARE = 0.000166   # FINRA TAF: $0.000166 per share sold
-FINRA_TAF_MAX       = 8.30       # FINRA TAF per-trade cap
-
-
-def _sell_net(shares: float, price: float) -> float:
-    """Net cash received on an equity sell after SEC fee and FINRA TAF."""
-    gross = shares * price * SELL_FILL
-    fees  = gross * SEC_FEE_RATE + min(shares * FINRA_TAF_PER_SHARE, FINRA_TAF_MAX)
-    return gross - fees
-
-
-class StockNN(nn.Module):
-    """FC injection: history(1,15,60) + today(1,208) → (1,48)
-    Seed(60→120), Inject×14(180→120), Today(328→208), Flat×2(208), Funnel(208→140→90→48)
-    ~513k params"""
-    def __init__(self):
-        super().__init__()
-        self.fc_seed   = nn.Linear(60,  120)
-        self.fc_inject = nn.ModuleList([nn.Linear(180, 120) for _ in range(14)])
-        self.fc_today  = nn.Linear(328, 208)
-        self.fc_flat1  = nn.Linear(208, 208)
-        self.fc_flat2  = nn.Linear(208, 208)
-        self.fc_f1     = nn.Linear(208, 140)
-        self.fc_f2     = nn.Linear(140,  90)
-        self.fc_out    = nn.Linear(90,   48)
-
-    def forward(self, history, today):
-        x = F.relu(self.fc_seed(history[:, 0, :]))
-        for i, layer in enumerate(self.fc_inject):
-            x = F.relu(layer(torch.cat([x, history[:, i + 1, :]], dim=1)))
-        x   = F.relu(self.fc_today(torch.cat([x, today], dim=1)))
-        x   = F.relu(self.fc_flat1(x))
-        x   = F.relu(self.fc_flat2(x))
-        x   = F.relu(self.fc_f1(x))
-        x   = F.relu(self.fc_f2(x))
-        out = self.fc_out(x).view(12, 4)
-        qty_buy   = F.relu(out[:, 0:1])
-        price_buy = torch.sigmoid(out[:, 1:2])
-        price_sal = torch.sigmoid(out[:, 2:3])
-        qty_sell  = F.relu(out[:, 3:4])
-        return torch.cat([qty_buy, price_buy, price_sal, qty_sell], dim=1).view(1, 48)
-
-
-class MasterNN(nn.Module):
-    """FC injection: history(1,15,60) + today(1,229) → (1,36)
-    Seed(60→120), Inject×14(180→120), Today(349→229), Flat×2(229), Funnel(229→150→90→36)
-    ~548k params"""
-    def __init__(self):
-        super().__init__()
-        self.fc_seed   = nn.Linear(60,  120)
-        self.fc_inject = nn.ModuleList([nn.Linear(180, 120) for _ in range(14)])
-        self.fc_today  = nn.Linear(349, 229)
-        self.fc_flat1  = nn.Linear(229, 229)
-        self.fc_flat2  = nn.Linear(229, 229)
-        self.fc_f1     = nn.Linear(229, 150)
-        self.fc_f2     = nn.Linear(150,  90)
-        self.fc_out    = nn.Linear(90,   36)
-
-    def forward(self, history, today):
-        x = F.relu(self.fc_seed(history[:, 0, :]))
-        for i, layer in enumerate(self.fc_inject):
-            x = F.relu(layer(torch.cat([x, history[:, i + 1, :]], dim=1)))
-        x   = F.relu(self.fc_today(torch.cat([x, today], dim=1)))
-        x   = F.relu(self.fc_flat1(x))
-        x   = F.relu(self.fc_flat2(x))
-        x   = F.relu(self.fc_f1(x))
-        x   = F.relu(self.fc_f2(x))
-        out = self.fc_out(x)
-        alloc   = F.softmax(out[:, :12], dim=-1)
-        depth   = torch.sigmoid(out[:, 12:24])
-        trigger = torch.sigmoid(out[:, 24:36])
-        return torch.cat([alloc, depth, trigger], dim=-1)
 
 MODEL_DIR = 'models'
 STATE_FILE = 'state.json'
@@ -119,20 +46,7 @@ def load_state():
                 return json.load(f)
     except Exception as e:
         print(f"Error loading state file {STATE_FILE}: {e}")
-    industries = {
-        'tech_hardware':          ['NVDA','AMD', 'MU',  'SMCI','MRVL','ON',  'AMAT','LRCX','KLAC','TSM', 'SWKS','MPWR'],
-        'tech_software_ai':       ['PLTR','SNOW','DDOG','NET', 'CRWD','ZS',  'PANW','NOW', 'ADBE','CRM', 'FTNT','OKTA'],
-        'financials':             ['XYZ', 'PYPL','AFRM','UPST','MELI','COIN','GS',  'SCHW',  'C',   'COF', 'BX',   'APO'  ],
-        'consumer_discretionary': ['TSLA','RCL', 'XPEV','LI',  'APTV',   'GM',  'LEA','WYNN','BKNG','ABNB','UBER','LYFT'],
-        'consumer_services':      ['NFLX','ROKU','SPOT','META','IAC','PINS','DASH','RBLX','TTWO','LYV',  'MTCH','WBD'],
-        'health_care':            ['MRNA','BNTX','IMVT','CRSP','ARWR','MYGN','EXAS','INMD','HIMS','BEAM','ACAD','BMRN'],
-        'industrials':            ['BA',  'GE',  'CAT', 'DE',  'DAL', 'UAL', 'XPO', 'LUV', 'ALK', 'GNRC','BTU', 'STLD' ],
-        'consumer_staples':       ['CELH','SFM','ELF', 'LULU','DECK','YETI','NKE', 'CROX', 'DKNG','PENN','MGM', 'CZR' ],
-        'energy':                 ['FANG','DVN', 'OXY', 'CTRA','AR',  'EQT', 'RRC', 'SM',  'SLB', 'COP', 'EOG', 'VLO' ],
-        'utilities':              ['ENPH','FSLR','SEDG','CWEN', 'VST','BE',  'BEP','DQ',  'CSIQ','JKS', 'HASI','NRG' ],
-        'real_estate':            ['DHI', 'LEN', 'PHM', 'TOL', 'MTH', 'KBH', 'TPH', 'TMHC','LGIH','CSGP','Z',   'SKY' ],
-        'materials':              ['NEM', 'AEM', 'FCX', 'SCCO','TECK', 'AA', 'SQM','WPM', 'AU',  'PAAS','GFI',  'CDE' ],
-    }
+    industries = INDUSTRIES
     symbols = [sym for syms in industries.values() for sym in syms]
     return {'industries': industries, 'histories': {sym: [] for sym in symbols}, 'cash': 20000.0, 'holdings': {sym: 0.0 for sym in symbols}}
 
