@@ -45,8 +45,6 @@ import sys
 from datetime import datetime, timedelta
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import yfinance as yf
 
 from fees import BUY_FILL, FINRA_TAF_MAX, FINRA_TAF_PER_SHARE, SEC_FEE_RATE, SELL_FILL, SLIPPAGE_RATE, _sell_net
