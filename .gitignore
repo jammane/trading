@@ -211,3 +211,5 @@ __marimo__/
 models/
 stock_data/
 data_dump/
+owners/
+training_log.csv
