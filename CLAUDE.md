@@ -73,7 +73,7 @@ All four main scripts (`training_v2.py`, `training_v3.py`, `production_v2.py`, `
 - `test_universe.py` — industry count, symbols per industry, no duplicates, formatting
 - `test_fees.py` — fee constant values, `_sell_net` calculations, FINRA cap boundary
 
-A `PostToolUse` hook in `.claude/settings.json` runs the suite automatically after every `git commit` or `git push`. Failures are reported back into the conversation so Claude can self-correct before the user sees a broken commit.
+A `PreToolUse` hook in `.claude/settings.json` runs the suite automatically before every `git commit` or `git push`. Failures are reported before the commit runs, so Claude can self-correct without creating a broken commit. The changelog hook remains `PostToolUse` (it needs the commit hash to exist before it can amend).
 
 ## Architecture
 
