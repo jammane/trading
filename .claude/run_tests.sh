@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Run pytest after git commit / push.
-# Output is captured by Claude Code and fed back into the conversation,
-# so test failures are visible to Claude immediately and can be self-corrected.
+# Run pytest before git commit / push (PreToolUse hook).
+# Failures are reported to Claude before the commit runs, allowing self-correction
+# without creating a broken commit.
 
 REPO_DIR="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 cd "$REPO_DIR"
