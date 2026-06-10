@@ -58,10 +58,11 @@ python production_v2.py --paper --model-dir models
 python production_v2.py --model-dir models         # live (requires ALPACA_API_KEY / ALPACA_SECRET_KEY)
 ```
 
-**Replace ticker symbols across all source files:**
+**Replace ticker symbols (full guided workflow):**
 ```bash
-python swap_symbols.py '{"OLDTICKER": "NEWTICKER"}'
+./swap_symbols.sh '{"OLDTICKER": "NEWTICKER"}'
 ```
+Runs all four steps: updates `universe.py`, removes stale `stock_data/` JSON, downloads new symbol data, and prompts to rebuild the Docker image.  Run locally — not inside a container.
 
 ## Shared modules
 
@@ -71,7 +72,7 @@ python swap_symbols.py '{"OLDTICKER": "NEWTICKER"}'
 | `universe.py` | `INDUSTRIES` dict, `ALL_SYMBOLS`, `INDUSTRY_NAMES` — 144-symbol universe |
 | `fees.py` | Fee constants (`BUY_FILL`, `SEC_FEE_RATE`, etc.) and `_sell_net()` helper |
 
-All training scripts (`training_v2.py`, `training_v3.py`, `training_v4.py`), `production_v2.py`, and `inspect_trades.py` import from these modules. `download_5y_data.py` imports from `universe.py`. To add or change a ticker, edit `universe.py` only — or run `swap_symbols.py`.
+All training scripts (`training_v2.py`, `training_v3.py`, `training_v4.py`), `production_v2.py`, and `inspect_trades.py` import from these modules. `download_5y_data.py` imports from `universe.py`. To add or change a ticker, edit `universe.py` only — or run `swap_symbols.sh` for the full guided workflow.
 
 ## Tests
 

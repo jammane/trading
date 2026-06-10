@@ -83,17 +83,9 @@ After all training passes complete, a summary table is printed showing per-indus
 
 ### 1. Install dependencies
 
-**Linux / Fedora**
 ```bash
 bash install_python.sh
 source .venv/bin/activate
-pip install keyring
-```
-
-**Windows**
-```bat
-install_python.bat
-call env\Scripts\activate
 pip install keyring
 ```
 
@@ -108,7 +100,7 @@ Saves approximately five years of daily OHLCV JSON for all 144 symbols under `st
 
 ### 3. Train models
 
-Full run from scratch (recommended — 2-thread parallel):
+Full run from scratch (recommended — 2-process parallel):
 ```bash
 python training_v4.py --output models
 ```
@@ -123,7 +115,7 @@ Short diagnostic run (days 17–22 only):
 python training_v4.py --output models --preserve-stock-data --start-day 16 --stop-day 21 --passes 1
 ```
 
-For single-threaded training on memory-constrained hardware, use `training_v2.py` with the same flags.
+For single-process training on memory-constrained hardware, use `training_v2.py` with the same flags.
 
 ### 4. Inspect trade decisions
 
@@ -212,8 +204,8 @@ Requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` set in the environment (or sto
 
 | File | Purpose |
 |------|---------|
-| `training_v4.py` | **Recommended.** Parallel training: v2 per-slot loading + dynamic 2-thread industry pool |
-| `training_v2.py` | Single-threaded training — lower RAM requirement, identical logic to v4 |
+| `training_v4.py` | **Recommended.** Parallel training: v2 per-slot loading + dynamic 2-process industry pool |
+| `training_v2.py` | Single-process training — lower RAM requirement, identical logic to v4 |
 | `training_v3.py` | 7-thread parallel variant using an in-RAM model cache (requires ≥4 GB RAM) |
 
 ### Data and tooling
@@ -222,7 +214,8 @@ Requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` set in the environment (or sto
 |------|---------|
 | `download_5y_data.py` | Download ~5 years of daily OHLCV data into `stock_data/` |
 | `inspect_trades.py` | Audit elite model trade decisions for a given day and industry |
-| `swap_symbols.py` | Replace ticker symbols across all source files via exact quoted-string match |
+| `swap_symbols.sh` | Guided ticker-replacement: updates `universe.py`, cleans old data, downloads new data, prompts to rebuild Docker image |
+| `swap_symbols.py` | Core replacement logic called by `swap_symbols.sh` — exact quoted-string match in `universe.py` |
 
 ### Production
 
@@ -234,8 +227,7 @@ Requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` set in the environment (or sto
 
 | File | Purpose |
 |------|---------|
-| `install_python.sh` | Linux/Fedora: create `.venv` and install all packages |
-| `install_python.bat` | Windows: create `env` and install all packages |
+| `install_python.sh` | Create `.venv` and install all packages (Fedora/Linux) |
 
 ---
 
