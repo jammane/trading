@@ -17,17 +17,17 @@ INDUSTRIES: dict[str, list[str]] = {
     # Streaming, social, gig economy
     'consumer_services':      ['NFLX','ROKU','SPOT','META','IAC', 'PINS','DASH','RBLX','TTWO','LYV', 'MTCH','WBD' ],
     # Biotech / genomics
-    'health_care':            ['MRNA','BNTX','IMVT','CRSP','ARWR','MYGN','EXAS','INMD','HIMS','BEAM','ACAD','BMRN'],
+    'health_care':            ['MRNA','BNTX','IMVT','CRSP','ARWR','MYGN','NTRA','INMD','HIMS','BEAM','ACAD','BMRN'],
     # Airlines + industrials
     'industrials':            ['BA',  'GE',  'CAT', 'DE',  'DAL', 'UAL', 'XPO', 'LUV', 'ALK', 'GNRC','BTU', 'STLD'],
     # High-beta lifestyle/consumer
     'consumer_staples':       ['CELH','SFM', 'ELF', 'LULU','DECK','YETI','NKE', 'CROX','DKNG','PENN','MGM', 'CZR' ],
     # Volatile E&P + services
-    'energy':                 ['FANG','DVN', 'OXY', 'CTRA','AR',  'EQT', 'RRC', 'SM',  'SLB', 'COP', 'EOG', 'VLO' ],
+    'energy':                 ['FANG','DVN', 'OXY', 'APA','AR',  'EQT', 'RRC', 'SM',  'SLB', 'COP', 'EOG', 'VLO' ],
     # Clean energy / renewables
     'utilities':              ['ENPH','FSLR','SEDG','CWEN','VST', 'BE',  'BEP', 'DQ',  'CSIQ','JKS', 'HASI','NRG' ],
     # Homebuilders + proptech
-    'real_estate':            ['DHI', 'LEN', 'PHM', 'TOL', 'MTH', 'KBH', 'TPH', 'TMHC','LGIH','CSGP','Z',   'SKY' ],
+    'real_estate':            ['DHI', 'LEN', 'PHM', 'TOL', 'MTH', 'KBH', 'BZH', 'TMHC','LGIH','CSGP','Z',   'SKY' ],
     # Volatile precious-metal miners
     'materials':              ['NEM', 'AEM', 'FCX', 'SCCO','TECK','AA',  'SQM', 'WPM', 'AU',  'PAAS','GFI', 'CDE' ],
 }
