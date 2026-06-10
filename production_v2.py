@@ -315,6 +315,22 @@ def save_stock_data(symbol, day_data):
     except Exception as e:
         print(f"Error saving stock data for {symbol}: {e}")
 
+LOG_DIR = 'logs'
+
+def log_data_failure(sym, reason, mode):
+    os.makedirs(LOG_DIR, exist_ok=True)
+    path = os.path.join(LOG_DIR, 'data_fetch_failures.log')
+    entry = json.dumps({
+        'ts': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+        'mode': mode,
+        'symbol': sym,
+        'reason': reason,
+    })
+    with open(path, 'a') as f:
+        f.write(entry + '\n')
+    print(f"ALERT: data fetch failed for {sym} ({reason}) — logged to {path}")
+
+
 def fetch_intraday_data(symbols):
     """
     Download 1-minute bars for today's session for each symbol.
@@ -651,6 +667,7 @@ def main():
                     'high': _last[2], 'low': _last[3], 'volume': _last[4]
                 }
 
+        mode = 'paper' if args.paper else 'prod'
         day_data = {}
         try:
             tickers = yf.Tickers(' '.join(symbols))
@@ -667,8 +684,10 @@ def main():
                             'volume': float(hist['Volume'].iloc[0])
                         }
                         save_stock_data(sym, day_data[sym])
+                    else:
+                        log_data_failure(sym, 'empty response', mode)
                 except Exception as e:
-                    print(f"Error fetching data for {sym}: {e}")
+                    log_data_failure(sym, str(e), mode)
         except Exception as e:
             print(f"Error fetching data from yfinance: {e}")
 
