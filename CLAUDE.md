@@ -34,7 +34,14 @@ python training_v2.py --output models --load-dir models          # resume from c
 python training_v2.py --output models --start-day 16 --stop-day 21 --passes 1 --preserve-stock-data  # short diagnostic run
 ```
 
-**Train (parallel, 7 threads):**
+**Train (parallel, 2-thread dynamic industry pool):**
+```bash
+python training_v4.py --output models
+python training_v4.py --output models --load-dir models          # resume from checkpoint
+python training_v4.py --output models --start-day 16 --stop-day 21 --passes 1 --preserve-stock-data  # short diagnostic run
+```
+
+**Train (parallel, 7 threads — requires ≥4 GB RAM):**
 ```bash
 python training_v3.py --output models
 ```
