@@ -1,9 +1,9 @@
 """
-training_v3.py — Parallel evolutionary training loop (7 worker threads, in-RAM model cache).
+training_v3.py — Parallel evolutionary training loop (2 worker threads, rolling model cache).
 
 v3 vs v2 differences:
-  - NUM_THREADS = 7: inference runs in parallel across all 100 slots per industry
-  - _model_cache: all models for a prefix loaded into RAM once, flushed after selection
+  - NUM_THREADS = 2: inference runs in parallel across all slots per industry (one per vCPU)
+  - _model_cache: rolling cache — one prefix loaded at a time, evicted after each daily step
   - PortfolioArray: numpy-backed wrapper for vectorised cash/holdings access
   - No SLIPPAGE_RATE on limit fills (v3 trades without slippage)
   - _port_path: slot-level portfolio JSON persisted alongside model weights
@@ -35,7 +35,7 @@ from models import MasterNN, StockNN
 from universe import INDUSTRIES
 
 # ── v3: parallel training — 7 worker threads, relaxed RAM constraints ──────────
-NUM_THREADS = 7      # intra-industry inference parallelism
+NUM_THREADS = 2      # matches 2 vCPUs on droplet
 _log_lock   = Lock() # serialise console output across threads
 
 # In-memory model cache: {prefix: [model_0, ..., model_99]}
@@ -598,7 +598,7 @@ def load_all_models(prefix, directory, model_class, n=N_SLOTS):
     """
     Return the in-memory model list for this prefix, loading from disk on first call.
     Subsequent calls return the cached list directly — no disk I/O.
-    v3 only: assumes RAM headroom for 13 × 100 models simultaneously.
+    v3 only: prefix is evicted from cache after each daily step; peak = 1 prefix × 200 models.
     """
     if prefix not in _model_cache:
         models = []
@@ -2096,6 +2096,7 @@ def main():
                 else:
                     ind_best_deltas[ind]     = 0.0
                     ind_capital_state[ind]   = (0.0, 0.0)
+                invalidate_cache(ind)
 
             master_best_delta, master_flat_cos, master_slot0_pred = step_master(
                 args.output, mst_portfolios, mst_histories, industries,
@@ -2104,6 +2105,7 @@ def main():
                 industry_top_scores=industry_top_scores,
                 ind_capital_state=ind_capital_state,
                 sigma=current_master_sigma)
+            invalidate_cache('master')
 
             # Append one row to the training CSV
             row  = [f"{pass_num + 1:<7}", f"{actual_day + 1:<4}"]
