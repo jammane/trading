@@ -1964,6 +1964,14 @@ def main():
 
         ind_streaks = {}   # {ind: consecutive all-zero-trade days}
 
+        # The executor is created once per pass and kept alive for all days.
+        # Workers are forked here — before step_master() ever runs in the main
+        # process.  Forking after step_master() would inherit PyTorch's
+        # OpenMP/BLAS thread-pool state with locked mutexes but without the
+        # threads that own them, causing a futex deadlock on every day after
+        # the first.  Keeping workers alive across days also eliminates
+        # per-day fork overhead.
+        executor = ProcessPoolExecutor(max_workers=NUM_WORKERS)
         hard_flag_hit = False
         for day_num, day in enumerate(days_slice):
             if hard_flag_hit:
@@ -1985,52 +1993,52 @@ def main():
                 # interpreter and GIL, enabling genuine parallel execution of
                 # the trade simulation loop.  Accumulation in the main process
                 # via as_completed is deterministic regardless of completion order.
-                # HardFlagError raised in any worker propagates via future.result(),
-                # exits the executor context (pending tasks cancelled, running
-                # tasks allowed to finish), and is caught by the outer handler.
-                with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
-                    futures = {
-                        executor.submit(
-                            _run_industry_proc,
-                            ind, syms, args.output,
-                            ind_portfolios[ind], ind_histories[ind],
-                            day, actual_day, total_days, day_num, num_days,
-                            next_day,
-                            ind_streaks.get(ind, 0),
-                            current_sigma if args.daily else None,
-                            args.master_only,
-                            seq_flags,
-                        ): ind
-                        for ind, syms in industries.items()
-                    }
-                    for future in as_completed(futures):
-                        ind, portfolio, history, result = future.result()
-                        # Reassign the worker's mutated copies back to main process.
-                        ind_portfolios[ind] = portfolio
-                        ind_histories[ind]  = history
-                        if result is not None:
-                            baseline, top_val, best_delta, top_hold, top_cash, new_streak = result
-                            industry_top_scores[ind] = (baseline, top_val)
-                            ind_best_deltas[ind]     = top_val - baseline
-                            ind_capital_state[ind]   = (top_hold, top_cash)
-                            ind_streaks[ind]         = new_streak
-                            if ind not in ind_start_scores:
-                                ind_start_scores[ind] = baseline
-                            ind_end_scores[ind]  = top_val
-                            ind_end_prices[ind]  = {
-                                sym: day['data'].get(sym, {}).get('close', 0.0)
-                                for sym in syms
-                            }
-                            day_delta = top_val - baseline
-                            if day_delta > 0:
-                                ind_pos_days[ind]  = ind_pos_days.get(ind, 0) + 1
-                            elif day_delta < 0:
-                                ind_neg_days[ind]  = ind_neg_days.get(ind, 0) + 1
-                            else:
-                                ind_zero_days[ind] = ind_zero_days.get(ind, 0) + 1
+                # HardFlagError raised in any worker propagates via future.result()
+                # and is caught by the outer handler; hard_flag_hit then breaks
+                # the day loop, exiting the executor context (pending tasks
+                # cancelled, running tasks allowed to finish).
+                futures = {
+                    executor.submit(
+                        _run_industry_proc,
+                        ind, syms, args.output,
+                        ind_portfolios[ind], ind_histories[ind],
+                        day, actual_day, total_days, day_num, num_days,
+                        next_day,
+                        ind_streaks.get(ind, 0),
+                        current_sigma if args.daily else None,
+                        args.master_only,
+                        seq_flags,
+                    ): ind
+                    for ind, syms in industries.items()
+                }
+                for future in as_completed(futures):
+                    ind, portfolio, history, result = future.result()
+                    # Reassign the worker's mutated copies back to main process.
+                    ind_portfolios[ind] = portfolio
+                    ind_histories[ind]  = history
+                    if result is not None:
+                        baseline, top_val, best_delta, top_hold, top_cash, new_streak = result
+                        industry_top_scores[ind] = (baseline, top_val)
+                        ind_best_deltas[ind]     = top_val - baseline
+                        ind_capital_state[ind]   = (top_hold, top_cash)
+                        ind_streaks[ind]         = new_streak
+                        if ind not in ind_start_scores:
+                            ind_start_scores[ind] = baseline
+                        ind_end_scores[ind]  = top_val
+                        ind_end_prices[ind]  = {
+                            sym: day['data'].get(sym, {}).get('close', 0.0)
+                            for sym in syms
+                        }
+                        day_delta = top_val - baseline
+                        if day_delta > 0:
+                            ind_pos_days[ind]  = ind_pos_days.get(ind, 0) + 1
+                        elif day_delta < 0:
+                            ind_neg_days[ind]  = ind_neg_days.get(ind, 0) + 1
                         else:
-                            ind_best_deltas[ind]   = 0.0
-                            ind_capital_state[ind] = (0.0, 0.0)
+                            ind_zero_days[ind] = ind_zero_days.get(ind, 0) + 1
+                    else:
+                        ind_best_deltas[ind]   = 0.0
+                        ind_capital_state[ind] = (0.0, 0.0)
 
                 master_best_delta, master_flat_cos, master_slot0_pred = step_master(
                     args.output, mst_portfolios, mst_histories, industries,
@@ -2088,6 +2096,8 @@ def main():
                 if os.path.exists(_src):
                     shutil.copy2(_src, os.path.join(_snap_dir, 'master_model_0.pt'))
                 log(f"[checkpoint] 255-day elite snapshot saved → {_snap_dir}")
+
+        executor.shutdown(wait=True)
 
         # ── End-of-pass checkpoints ───────────────────────────────────────────
         for ind, syms in industries.items():
