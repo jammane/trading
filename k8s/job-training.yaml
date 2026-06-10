@@ -1,7 +1,7 @@
 # Manual trigger: kubectl apply -f k8s/job-training.yaml
 # To monitor:    kubectl logs -f -n trading -l job-name=training-job
 # To cancel:     kubectl delete -f k8s/job-training.yaml
-# NOTE: no activeDeadlineSeconds — training takes ~23 days.
+# NOTE: no activeDeadlineSeconds — training takes ~17 days (v4, 2 threads).
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -19,7 +19,7 @@ spec:
           imagePullPolicy: Always
           command:
             - python
-            - training_v2.py
+            - training_v4.py
             - --output
             - /app/models/training
             - --passes
@@ -38,10 +38,10 @@ spec:
           resources:
             requests:
               memory: "600Mi"
-              cpu: "800m"
+              cpu: "1500m"
             limits:
               memory: "900Mi"
-              cpu: "1000m"
+              cpu: "2000m"
           volumeMounts:
             - name: stock-data
               mountPath: /app/stock_data

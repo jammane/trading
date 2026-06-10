@@ -2,8 +2,8 @@
 models.py — Shared neural network definitions.
 
 Single source of truth for StockNN and MasterNN.
-Import these classes in training_v2.py, training_v3.py, production_v2.py, and inspect_trades.py
-instead of redefining them locally.
+All training scripts (training_v2.py, training_v3.py, training_v4.py), production_v2.py,
+and inspect_trades.py import from this module rather than defining their own copies.
 """
 
 import torch

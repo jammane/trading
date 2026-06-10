@@ -16,6 +16,8 @@ RUN pip install --no-cache-dir \
 
 # Source files only — data volumes mounted at runtime
 COPY models.py fees.py universe.py \
-     production_v2.py training_v2.py download_5y_data.py ./
+     production_v2.py \
+     training_v2.py training_v3.py training_v4.py \
+     inspect_trades.py download_5y_data.py swap_symbols.py ./
 
 CMD ["python", "production_v2.py", "--paper"]

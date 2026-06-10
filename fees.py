@@ -3,9 +3,6 @@ fees.py — Broker fee constants and sell-net helper.
 
 Alpaca charges $0 commission. Regulatory fees still apply on sells.
 SEC Section 31 rate is set annually; FINRA TAF is fixed.
-
-training_v3.py intentionally omits SLIPPAGE_RATE (v3 trades without slippage).
-All other files import SLIPPAGE_RATE from here.
 """
 
 BUY_FILL            = 1.0        # multiplier on buy  fill price (1.0 = no commission)

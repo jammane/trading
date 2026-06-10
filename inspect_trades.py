@@ -5,7 +5,7 @@ Usage (by calendar date):
   python inspect_trades.py --industry tech_hardware --date 2024-11-15 --models-dir ./models
   python inspect_trades.py --industry energy --date 2024-11-15 --models-dir ./models --top-n 5
 
-Usage (by training day index, matching training_v2.py --start-day):
+Usage (by training day index, matching --start-day used in any training script):
   python inspect_trades.py --industry tech_hardware --day-index 17 --models-dir ./models
   python inspect_trades.py --industry energy --day-index 17 --models-dir ./models --top-n 5
 
