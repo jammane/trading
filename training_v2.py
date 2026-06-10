@@ -16,6 +16,7 @@ import json
 import math
 import os
 import random
+import shutil
 import statistics
 from collections import defaultdict
 from datetime import datetime
@@ -2011,6 +2012,22 @@ def main():
                         f"{len(prior)}-day avg={mean_pred:.4f} (1σ={std_pred:.4f}) **")
 
             gc.collect()
+
+            # ── 255-day elite snapshot (one trading year) ─────────────────────
+            if (day_num + 1) % 255 == 0:
+                _elite_base = os.path.join(
+                    os.path.dirname(os.path.normpath(args.output)), 'elite_training')
+                _snap_dir = os.path.join(
+                    _elite_base, f'pass{pass_num + 1}_day{actual_day + 1}')
+                os.makedirs(_snap_dir, exist_ok=True)
+                for _ind in industries:
+                    _src = os.path.join(args.output, f'{_ind}_model_0.pt')
+                    if os.path.exists(_src):
+                        shutil.copy2(_src, os.path.join(_snap_dir, f'{_ind}_model_0.pt'))
+                _src = os.path.join(args.output, 'master_model_0.pt')
+                if os.path.exists(_src):
+                    shutil.copy2(_src, os.path.join(_snap_dir, 'master_model_0.pt'))
+                log(f"[checkpoint] 255-day elite snapshot saved → {_snap_dir}")
 
         # ── End-of-pass checkpoints ───────────────────────────────────────────
         for ind, syms in industries.items():
