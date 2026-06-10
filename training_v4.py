@@ -25,9 +25,11 @@ import os
 import random
 import shutil
 import statistics
+import sys
+import time
 from collections import defaultdict
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from datetime import datetime
 
 import torch
@@ -50,6 +52,7 @@ MUTATIONS_PER_PARENT  = 9           # each of the ELITE_POOL parents gets this m
 # Layout: 0–16 direct elites | 17 w5 | 18 w10 | 19 w15 | 20–199 mutations (9 per parent)
 
 NUM_WORKERS           = 2           # worker processes for industry parallelism; raise to 4 on a 4-vCPU host
+DAY_TIMEOUT_SECS      = 420         # 7 min wall-clock limit per training day; v2 baseline ~5 min — exit if exceeded
 
 IND_STARTING_CASH     = 25_000.0    # per-industry portfolio starting capital
 MST_STARTING_CASH     = 300_000.0   # master starting capital (12 × IND_STARTING_CASH)
@@ -1816,6 +1819,34 @@ def trim_stock_data_files(all_symbols, stock_data_dir, keep_days=15):
         log(f"Trimmed {trimmed} stock data file(s) to the last {keep_days} days.")
 
 
+# ── Day-timeout watchdog ───────────────────────────────────────────────────────
+
+def _dump_day_timeout(actual_day, total_days, elapsed, completed_inds, hung_inds, output_dir):
+    """Write a JSON diagnostic file when a day exceeds DAY_TIMEOUT_SECS.
+
+    Records elapsed time, which industries completed vs hung, and RSS memory
+    of the main process.  Written to data_dump/timeout_day_N.json so it
+    survives after the process exits for post-mortem analysis.
+    """
+    import resource
+    rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    os.makedirs(DUMP_DIR, exist_ok=True)
+    path = os.path.join(DUMP_DIR, f'timeout_day_{actual_day + 1}.json')
+    payload = {
+        'day':                 actual_day + 1,
+        'total_days':          total_days,
+        'elapsed_seconds':     round(elapsed, 1),
+        'timeout_seconds':     DAY_TIMEOUT_SECS,
+        'completed_industries': completed_inds,
+        'hung_industries':     hung_inds,
+        'main_rss_mb':         round(rss_mb, 1),
+        'timestamp':           datetime.now().isoformat(),
+    }
+    with open(path, 'w') as f:
+        json.dump(payload, f, indent=2)
+    return path
+
+
 # ── Process-pool worker ────────────────────────────────────────────────────────
 
 def _run_industry_proc(ind, syms, output_dir, portfolio, history,
@@ -1986,6 +2017,9 @@ def main():
             seq_flags = {sym: (random.random() < 0.5)
                          for syms in industries.values() for sym in syms}
 
+            day_wall_start = time.monotonic()
+            completed_inds = []
+
             try:
                 # ── Parallel industry phase: dynamic work queue ───────────────
                 # Each future returns (ind, portfolio, history, result).
@@ -1995,8 +2029,7 @@ def main():
                 # via as_completed is deterministic regardless of completion order.
                 # HardFlagError raised in any worker propagates via future.result()
                 # and is caught by the outer handler; hard_flag_hit then breaks
-                # the day loop, exiting the executor context (pending tasks
-                # cancelled, running tasks allowed to finish).
+                # the day loop and the executor is shut down cleanly.
                 futures = {
                     executor.submit(
                         _run_industry_proc,
@@ -2011,8 +2044,9 @@ def main():
                     ): ind
                     for ind, syms in industries.items()
                 }
-                for future in as_completed(futures):
+                for future in as_completed(futures, timeout=DAY_TIMEOUT_SECS):
                     ind, portfolio, history, result = future.result()
+                    completed_inds.append(ind)
                     # Reassign the worker's mutated copies back to main process.
                     ind_portfolios[ind] = portfolio
                     ind_histories[ind]  = history
@@ -2048,6 +2082,29 @@ def main():
                     ind_capital_state=ind_capital_state,
                     next_day=next_day,
                     sigma=master_sigma)
+
+                day_elapsed = time.monotonic() - day_wall_start
+                if day_elapsed > DAY_TIMEOUT_SECS:
+                    hung = [i for i in industries if i not in completed_inds]
+                    dump_path = _dump_day_timeout(
+                        actual_day, total_days, day_elapsed, completed_inds, hung, args.output)
+                    log(f"*** DAY TIMEOUT: Day {actual_day + 1}/{total_days} took "
+                        f"{day_elapsed:.0f}s (limit={DAY_TIMEOUT_SECS}s) — "
+                        f"master phase overran — data → {dump_path} ***")
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    sys.exit(1)
+
+            except FuturesTimeoutError:
+                day_elapsed = time.monotonic() - day_wall_start
+                hung = [i for i in industries if i not in completed_inds]
+                dump_path = _dump_day_timeout(
+                    actual_day, total_days, day_elapsed, completed_inds, hung, args.output)
+                log(f"*** DAY TIMEOUT: Day {actual_day + 1}/{total_days} took "
+                    f">{day_elapsed:.0f}s (limit={DAY_TIMEOUT_SECS}s) — "
+                    f"{len(hung)} hung industr{'y' if len(hung)==1 else 'ies'}: "
+                    f"{[sn(i) for i in hung]} — data → {dump_path} ***")
+                executor.shutdown(wait=False, cancel_futures=True)
+                sys.exit(1)
 
             except HardFlagError as e:
                 log(f"*** HARD FLAG — halting training: {e} ***")
