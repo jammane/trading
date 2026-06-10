@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo \"$CLAUDE_TOOL_INPUT\" | grep -qE 'git (commit|push)' && bash /home/jammane/Repos/trading/.claude/run_tests.sh || true"
+            "command": "echo \"$CLAUDE_TOOL_INPUT\" | grep -qE 'git (commit|push)' && bash .claude/run_tests.sh || true"
           }
         ]
       }
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo \"$CLAUDE_TOOL_INPUT\" | grep -q 'git commit' && bash /home/jammane/Repos/trading/.claude/update_changelog.sh || true"
+            "command": "echo \"$CLAUDE_TOOL_INPUT\" | grep -q 'git commit' && bash .claude/update_changelog.sh || true"
           }
         ]
       }
