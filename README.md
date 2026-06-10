@@ -108,20 +108,22 @@ Saves approximately five years of daily OHLCV JSON for all 144 symbols under `st
 
 ### 3. Train models
 
-Full run from scratch:
+Full run from scratch (recommended — 2-thread parallel):
 ```bash
-python training_v2.py --output models
+python training_v4.py --output models
 ```
 
 Continue from an existing checkpoint:
 ```bash
-python training_v2.py --output models --load-dir models
+python training_v4.py --output models --load-dir models
 ```
 
 Short diagnostic run (days 17–22 only):
 ```bash
-python training_v2.py --output models --preserve-stock-data --start-day 16 --stop-day 21 --passes 1
+python training_v4.py --output models --preserve-stock-data --start-day 16 --stop-day 21 --passes 1
 ```
+
+For single-threaded training on memory-constrained hardware, use `training_v2.py` with the same flags.
 
 ### 4. Inspect trade decisions
 
@@ -153,7 +155,11 @@ Requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` set in the environment (or sto
 
 ## CLI Reference
 
-### `training_v2.py`
+### `training_v4.py` / `training_v2.py`
+
+`training_v4.py` (parallel, 2-thread dynamic industry pool — recommended) and `training_v2.py`
+(single-threaded) share identical CLI flags. The thread count in v4 is a source-level constant
+(`NUM_THREADS = 2`) rather than a CLI argument.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -162,19 +168,31 @@ Requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` set in the environment (or sto
 | `--start-day` | 0 | First training day index (0-based, relative to sorted `all_data` dates) |
 | `--stop-day` | end | Last training day index (exclusive) |
 | `--passes` | 1 | Number of full passes over the day range |
-| `--sigma` | 0.01 | Initial Gaussian mutation standard deviation |
+| `--sigma` | 0.01 | Initial Gaussian mutation standard deviation for industry models |
+| `--master-sigma` | same as `--sigma` | Mutation standard deviation for the master model |
 | `--sigma-decay` | 0.5 | Multiply sigma by this value after each pass |
 | `--daily` | False | Run 4 burst-refinement passes per day after normal selection |
 | `--preserve-stock-data` | False | Do not trim `stock_data/` JSON files after training |
-| `--promote` | None | Comma-separated sibling directories to copy best models to after training (e.g. `uat,prod`) |
+| `--promote` | None | Comma-separated sibling directories to copy best models into after training (e.g. `uat,prod`) |
 | `--master-only` | False | Freeze industry models; train master allocator only |
+
+### `inspect_trades.py`
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--industry` | *(required)* | Industry key (e.g. `energy`, `tech_hardware`) |
+| `--date` | — | Calendar date to inspect (`YYYY-MM-DD`) |
+| `--day-index` | — | Training log day number (`N` in `Day N/...`) — alternative to `--date` |
+| `--models-dir` | *(required)* | Directory containing trained `.pt` files and `top10_meta.json` |
+| `--top-n` | 3 | Number of elite models to report (max 10) |
+| `--stock-data` | `./stock_data` | Path to historical data directory |
+| `--starting-cash` | 1666.67 | Starting cash per portfolio for the audit simulation |
 
 ### `production_v2.py`
 
 | Flag | Description |
 |------|-------------|
-| `--paper` | Paper trading mode (no orders submitted unless combined with `--output`) |
-| `--output` | Submit orders to Alpaca |
+| `--paper` | Paper trading mode (no orders submitted) |
 | `--model-dir` | Directory containing trained `.pt` model files (default: `models`) |
 | `--withdraw` | Request a cash withdrawal of the specified dollar amount |
 
@@ -182,16 +200,97 @@ Requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` set in the environment (or sto
 
 ## File Reference
 
+### Core modules
+
 | File | Purpose |
 |------|---------|
-| `install_python.sh` | Linux/Fedora: create `.venv` and install packages |
-| `install_python.bat` | Windows: create `env` and install packages |
+| `models.py` | `StockNN` and `MasterNN` class definitions — single source of truth |
+| `universe.py` | 144-symbol trading universe (`INDUSTRIES`, `ALL_SYMBOLS`, `INDUSTRY_NAMES`) |
+| `fees.py` | Broker fee constants and `_sell_net()` helper |
+
+### Training
+
+| File | Purpose |
+|------|---------|
+| `training_v4.py` | **Recommended.** Parallel training: v2 per-slot loading + dynamic 2-thread industry pool |
+| `training_v2.py` | Single-threaded training — lower RAM requirement, identical logic to v4 |
+| `training_v3.py` | 7-thread parallel variant using an in-RAM model cache (requires ≥4 GB RAM) |
+
+### Data and tooling
+
+| File | Purpose |
+|------|---------|
 | `download_5y_data.py` | Download ~5 years of daily OHLCV data into `stock_data/` |
-| `training_v2.py` | Single-threaded evolutionary training loop |
-| `training_v3.py` | Parallel training variant (7 worker threads, in-RAM model cache) |
 | `inspect_trades.py` | Audit elite model trade decisions for a given day and industry |
+| `swap_symbols.py` | Replace ticker symbols across all source files via exact quoted-string match |
+
+### Production
+
+| File | Purpose |
+|------|---------|
 | `production_v2.py` | Daily trading cycle: fetch data, infer, submit orders, upkeep training |
-| `swap_symbols.py` | Replace ticker symbols across all source files |
+
+### Setup
+
+| File | Purpose |
+|------|---------|
+| `install_python.sh` | Linux/Fedora: create `.venv` and install all packages |
+| `install_python.bat` | Windows: create `env` and install all packages |
+
+---
+
+## Deployment (Docker / Kubernetes)
+
+A single-node Kubernetes deployment (tested with k3s) is provided under `k8s/`.
+
+### Build and push the Docker image
+
+```bash
+docker build -t jammane80/trading:latest .
+docker push jammane80/trading:latest
+```
+
+### Apply infrastructure manifests
+
+```bash
+# Namespace, persistent volumes and claims
+kubectl apply -f k8s/namespace.yaml
+kubectl apply -f k8s/pv-app-state.yaml   -f k8s/pvc-app-state.yaml
+kubectl apply -f k8s/pv-stock-data.yaml  -f k8s/pvc-stock-data.yaml
+kubectl apply -f k8s/pv-models-training.yaml -f k8s/pvc-models-training.yaml
+kubectl apply -f k8s/pv-models-prod.yaml -f k8s/pvc-models-prod.yaml
+```
+
+### Create the Alpaca credentials secret
+
+```bash
+# Copy the template, fill in real values, apply — never commit the filled file
+cp k8s/secret.yaml.template k8s/secret.yaml
+# edit k8s/secret.yaml
+kubectl apply -f k8s/secret.yaml
+```
+
+### Run a training job
+
+```bash
+kubectl apply -f k8s/job-training.yaml
+kubectl logs -n trading -f -l job-name=training-job
+```
+
+### Run a one-off data download
+
+```bash
+kubectl apply -f k8s/job-download.yaml
+```
+
+### Enable the daily production CronJob
+
+```bash
+kubectl apply -f k8s/cronjob-production.yaml
+```
+
+The CronJob schedule (`"15 20 * * 1-5"`) targets 4:15 pm ET (EDT, March–November).
+Adjust to `"15 21 * * 1-5"` for EST (November–March).
 
 ---
 

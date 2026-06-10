@@ -91,7 +91,6 @@ def update_owners_file(total_value, paper):
         except Exception as e:
             print(f"Error updating owners.json: {e}")
 
-# Compute cash allocation based on predicted performance
 def compute_alloc_from_predicted(predicted, industry_list):
     """
     Decode MasterNN output (1, 36) or (36,) into allocation and liquidation signals.

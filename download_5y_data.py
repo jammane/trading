@@ -106,4 +106,4 @@ else:
         print(f"   - {sym}: {count}/{expected_days} days")
 
 print("   You can now run initial training:")
-print("   python training_v2.py --output models")
+print("   python training_v4.py --output models")
