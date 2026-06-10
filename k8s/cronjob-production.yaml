@@ -21,7 +21,7 @@ spec:
           restartPolicy: Never
           containers:
             - name: trading
-              image: <dockerhub-username>/trading:latest
+              image: jammane80/trading:latest
               imagePullPolicy: Always
               command: ["python", "production_v2.py", "--paper", "--model-dir", "/app/models/prod"]
               envFrom:
