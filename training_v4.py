@@ -1,13 +1,15 @@
 """
 training_v4.py — Parallel evolutionary training: v2 per-slot on-demand loading +
-dynamic industry thread pool (ThreadPoolExecutor, max_workers=NUM_THREADS).
+dynamic industry process pool (ProcessPoolExecutor, max_workers=NUM_WORKERS).
 
 Each industry slot is loaded from disk, inferred, traded, and evicted before the
 next slot loads (v2 methodology — no persistent cache).  Industries are processed
-concurrently via a dynamic work queue: worker threads pull the next available
+concurrently via a dynamic work queue: worker processes pull the next available
 industry from the pool as soon as they finish their current one, keeping all
-available CPUs fully utilized without hard-coding industry-to-thread assignments.
-Master runs after all industries complete (sequential, single-threaded).
+available CPUs fully utilized without hard-coding industry-to-worker assignments.
+Using processes (not threads) sidesteps the Python GIL, enabling genuine parallel
+execution of the trade simulation loop.  Master runs after all industries complete
+(sequential, single-process).
 
 Usage:
     python training_v4.py --output models [--load-dir models] [--start-day N] [--stop-day N]
@@ -24,9 +26,9 @@ import random
 import shutil
 import statistics
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
-from threading import Lock
 
 import torch
 import torch.nn as nn
@@ -47,7 +49,7 @@ ELITE_POOL            = ELITE_COUNT + WAVG_COUNT   # 20 — all parent slots
 MUTATIONS_PER_PARENT  = 9           # each of the ELITE_POOL parents gets this many children
 # Layout: 0–16 direct elites | 17 w5 | 18 w10 | 19 w15 | 20–199 mutations (9 per parent)
 
-NUM_THREADS           = 2           # industry-level parallelism; raise to 4 on a 4-vCPU host
+NUM_WORKERS           = 2           # worker processes for industry parallelism; raise to 4 on a 4-vCPU host
 
 IND_STARTING_CASH     = 25_000.0    # per-industry portfolio starting capital
 MST_STARTING_CASH     = 300_000.0   # master starting capital (12 × IND_STARTING_CASH)
@@ -429,15 +431,18 @@ def sn(industry):
 _console_log_lines = []
 _console_log_path  = None   # set at startup by main()
 _CONSOLE_LOG_MAX   = 200
-_log_lock          = Lock()
 
 
 def log(msg):
-    """Timestamped, immediately-flushed console output — rolling 200-line file buffer. Thread-safe."""
+    """Timestamped, immediately-flushed console output — rolling 200-line file buffer.
+
+    File writes are suppressed in worker processes to avoid concurrent write conflicts;
+    workers print to stdout only (their output appears in the same terminal session).
+    """
     global _console_log_lines
     line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
-    with _log_lock:
-        print(line, flush=True)
+    print(line, flush=True)
+    if multiprocessing.current_process().name == 'MainProcess':
         _console_log_lines.append(line)
         if len(_console_log_lines) > _CONSOLE_LOG_MAX:
             _console_log_lines = _console_log_lines[-_CONSOLE_LOG_MAX:]
@@ -1811,6 +1816,29 @@ def trim_stock_data_files(all_symbols, stock_data_dir, keep_days=15):
         log(f"Trimmed {trimmed} stock data file(s) to the last {keep_days} days.")
 
 
+# ── Process-pool worker ────────────────────────────────────────────────────────
+
+def _run_industry_proc(ind, syms, output_dir, portfolio, history,
+                       day, actual_day, total_days, day_num, num_days,
+                       next_day, all_zero_streak, daily_sigma, freeze, seq_flags):
+    """Worker entrypoint for ProcessPoolExecutor — runs one industry and returns updated state.
+
+    Must be a module-level function (not a closure) so that multiprocessing can
+    pickle it for the worker subprocess.  Returns (ind, portfolio, history, result)
+    so the main process can reassign the mutated portfolio and history dicts.
+    """
+    result = step_industry(
+        ind, syms, output_dir, portfolio, history,
+        day, actual_day, total_days, day_num, num_days,
+        next_day=next_day,
+        all_zero_streak=all_zero_streak,
+        daily_sigma=daily_sigma,
+        freeze=freeze,
+        seq_flags=seq_flags,
+    )
+    return ind, portfolio, history, result
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -1879,7 +1907,7 @@ def main():
     log(f"Total trading days available: {total_days}")
     log(f"Training window: days {day_start} to {day_end} ({day_end - day_start} days)")
     log(f"Passes: {args.passes} | sigma: {args.sigma} | sigma-decay: {args.sigma_decay}")
-    log(f"Industry thread pool: NUM_THREADS={NUM_THREADS}")
+    log(f"Industry process pool: NUM_WORKERS={NUM_WORKERS}")
 
     csv_path    = os.path.join(args.output, 'training_log.csv')
     ind_names   = list(industries.keys())
@@ -1932,7 +1960,7 @@ def main():
 
         days_slice = all_days[day_start:day_end]
         num_days   = len(days_slice)
-        log(f"Starting training: {len(industries)} industries + master, {num_days} days, {NUM_THREADS} threads")
+        log(f"Starting training: {len(industries)} industries + master, {num_days} days, {NUM_WORKERS} workers")
 
         ind_streaks = {}   # {ind: consecutive all-zero-trade days}
 
@@ -1952,27 +1980,34 @@ def main():
 
             try:
                 # ── Parallel industry phase: dynamic work queue ───────────────
-                # Each future returns (ind, result) so that accumulation in the
-                # main thread is deterministic regardless of completion order.
-                # HardFlagError raised in any thread propagates via future.result(),
-                # exits the executor context (pending futures cancelled, running
-                # futures allowed to finish), and is caught by the outer handler.
-                def _run_industry(ind, syms):
-                    return ind, step_industry(
-                        ind, syms, args.output,
-                        ind_portfolios[ind], ind_histories[ind],
-                        day, actual_day, total_days, day_num, num_days,
-                        next_day=next_day,
-                        all_zero_streak=ind_streaks.get(ind, 0),
-                        daily_sigma=current_sigma if args.daily else None,
-                        freeze=args.master_only,
-                        seq_flags=seq_flags)
-
-                with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
-                    futures = {executor.submit(_run_industry, ind, syms): ind
-                               for ind, syms in industries.items()}
+                # Each future returns (ind, portfolio, history, result).
+                # Using ProcessPoolExecutor so each worker gets its own Python
+                # interpreter and GIL, enabling genuine parallel execution of
+                # the trade simulation loop.  Accumulation in the main process
+                # via as_completed is deterministic regardless of completion order.
+                # HardFlagError raised in any worker propagates via future.result(),
+                # exits the executor context (pending tasks cancelled, running
+                # tasks allowed to finish), and is caught by the outer handler.
+                with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
+                    futures = {
+                        executor.submit(
+                            _run_industry_proc,
+                            ind, syms, args.output,
+                            ind_portfolios[ind], ind_histories[ind],
+                            day, actual_day, total_days, day_num, num_days,
+                            next_day,
+                            ind_streaks.get(ind, 0),
+                            current_sigma if args.daily else None,
+                            args.master_only,
+                            seq_flags,
+                        ): ind
+                        for ind, syms in industries.items()
+                    }
                     for future in as_completed(futures):
-                        ind, result = future.result()
+                        ind, portfolio, history, result = future.result()
+                        # Reassign the worker's mutated copies back to main process.
+                        ind_portfolios[ind] = portfolio
+                        ind_histories[ind]  = history
                         if result is not None:
                             baseline, top_val, best_delta, top_hold, top_cash, new_streak = result
                             industry_top_scores[ind] = (baseline, top_val)
