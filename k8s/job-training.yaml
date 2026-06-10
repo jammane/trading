@@ -1,0 +1,56 @@
+# Manual trigger: kubectl apply -f k8s/job-training.yaml
+# To monitor:    kubectl logs -f -n trading -l job-name=training-job
+# To cancel:     kubectl delete -f k8s/job-training.yaml
+# NOTE: no activeDeadlineSeconds — training takes ~23 days.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: training-job
+  namespace: trading
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: trading
+          image: <dockerhub-username>/trading:latest
+          imagePullPolicy: Always
+          command:
+            - python
+            - training_v2.py
+            - --output
+            - /app/models/training
+            - --passes
+            - "5"
+            - --sigma
+            - "0.008"
+            - --master-sigma
+            - "0.006"
+            - --sigma-decay
+            - "1.0"
+            - --start-day
+            - "17"
+            - --stop-day
+            - "1255"
+            - --preserve-stock-data
+          resources:
+            requests:
+              memory: "600Mi"
+              cpu: "800m"
+            limits:
+              memory: "900Mi"
+              cpu: "1000m"
+          volumeMounts:
+            - name: stock-data
+              mountPath: /app/stock_data
+            - name: models-training
+              mountPath: /app/models/training
+      volumes:
+        - name: stock-data
+          persistentVolumeClaim:
+            claimName: pvc-stock-data
+        - name: models-training
+          persistentVolumeClaim:
+            claimName: pvc-models-training

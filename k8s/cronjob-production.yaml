@@ -1,0 +1,53 @@
+# Runs paper trading daily at 8:15pm UTC (4:15pm ET).
+# DST adjustment required twice yearly:
+#   EDT (Mar–Nov): "15 20 * * 1-5"  ← current
+#   EST (Nov–Mar): "15 21 * * 1-5"
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: production-cronjob
+  namespace: trading
+spec:
+  schedule: "15 20 * * 1-5"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: trading
+              image: <dockerhub-username>/trading:latest
+              imagePullPolicy: Always
+              command: ["python", "production_v2.py", "--paper", "--model-dir", "/app/models/prod"]
+              envFrom:
+                - secretRef:
+                    name: alpaca-credentials
+              resources:
+                requests:
+                  memory: "200Mi"
+                  cpu: "200m"
+                limits:
+                  memory: "500Mi"
+                  cpu: "600m"
+              volumeMounts:
+                - name: app-state
+                  mountPath: /app
+                - name: stock-data
+                  mountPath: /app/stock_data
+                - name: models-prod
+                  mountPath: /app/models/prod
+          volumes:
+            - name: app-state
+              persistentVolumeClaim:
+                claimName: pvc-app-state
+            - name: stock-data
+              persistentVolumeClaim:
+                claimName: pvc-stock-data
+            - name: models-prod
+              persistentVolumeClaim:
+                claimName: pvc-models-prod

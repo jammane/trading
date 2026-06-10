@@ -214,3 +214,6 @@ data_dump/
 owners/
 state.json
 training_log.csv
+
+# Kubernetes secrets — never commit real credentials
+k8s/secret.yaml
