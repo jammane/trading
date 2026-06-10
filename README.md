@@ -228,6 +228,7 @@ Requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` set in the environment (or sto
 | File | Purpose |
 |------|---------|
 | `install_python.sh` | Create `.venv` and install all packages (Fedora/Linux) |
+| `k8s/setup.sh` | First-time Kubernetes cluster setup: build image, apply manifests, create secret, optionally download data |
 
 ---
 
@@ -235,44 +236,26 @@ Requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` set in the environment (or sto
 
 A single-node Kubernetes deployment (tested with k3s) is provided under `k8s/`.
 
-### Build and push the Docker image
+### First-time cluster setup
+
+`k8s/setup.sh` handles all infrastructure steps end-to-end:
+
+1. Builds and pushes the Docker image
+2. Applies the namespace and all persistent-volume / PVC manifests
+3. Creates the Alpaca credentials secret (keys passed directly to `kubectl` — never written to disk)
+4. Optionally submits the stock-data download job
 
 ```bash
-docker build -t jammane80/trading:latest .
-docker push jammane80/trading:latest
+./k8s/setup.sh
 ```
 
-### Apply infrastructure manifests
-
-```bash
-# Namespace, persistent volumes and claims
-kubectl apply -f k8s/namespace.yaml
-kubectl apply -f k8s/pv-app-state.yaml   -f k8s/pvc-app-state.yaml
-kubectl apply -f k8s/pv-stock-data.yaml  -f k8s/pvc-stock-data.yaml
-kubectl apply -f k8s/pv-models-training.yaml -f k8s/pvc-models-training.yaml
-kubectl apply -f k8s/pv-models-prod.yaml -f k8s/pvc-models-prod.yaml
-```
-
-### Create the Alpaca credentials secret
-
-```bash
-# Copy the template, fill in real values, apply — never commit the filled file
-cp k8s/secret.yaml.template k8s/secret.yaml
-# edit k8s/secret.yaml
-kubectl apply -f k8s/secret.yaml
-```
+The script is idempotent — safe to re-run to rebuild the image, reconcile manifests, or rotate credentials.
 
 ### Run a training job
 
 ```bash
 kubectl apply -f k8s/job-training.yaml
 kubectl logs -n trading -f -l job-name=training-job
-```
-
-### Run a one-off data download
-
-```bash
-kubectl apply -f k8s/job-download.yaml
 ```
 
 ### Enable the daily production CronJob
