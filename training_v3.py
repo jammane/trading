@@ -962,7 +962,8 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
     if stop_prices_all is None:
         stop_prices_all = [{sym: 0.0 for sym in symbols} for _ in range(N_SLOTS)]
 
-    day_data = day['data']
+    day_data  = day['data']
+    fill_data = next_day['data'] if next_day is not None else day_data
     hist_lengths = [len(histories[sym]) for sym in symbols]
     num_past = min(hist_lengths) if hist_lengths else 0
 
@@ -1068,10 +1069,6 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
         port = portfolios[slot]
         out  = all_outputs[slot]   # (12, 4) all ReLU
         local_buys = local_sells = 0
-        for j, sym in enumerate(symbols):
-            if sym not in day_data:
-                continue
-        fill_data  = next_day['data'] if next_day is not None else day_data
         stop_prices = stop_prices_all[slot]
 
         # ── Open + low phase: partial sells, gap sell_all, stops, limit buys ───
