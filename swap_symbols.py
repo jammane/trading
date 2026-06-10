@@ -10,6 +10,13 @@ literals (e.g. 'OLDTICKER' → 'NEWTICKER'), so partial-match false positives
 
 Files edited:
     universe.py  (single source of truth for all ticker symbols)
+
+Note: run this script locally in the development working tree, not inside a
+running container.  Container source files are baked into the image layer at
+build time; edits made inside a container are discarded when the pod exits.
+After swapping symbols, re-download data for the new ticker, remove the old
+symbol's JSON from stock_data/, then rebuild and push the Docker image so the
+updated universe.py is included in the next training or production run.
 """
 
 import json
