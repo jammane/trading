@@ -13,7 +13,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: trading
-          image: <dockerhub-username>/trading:latest
+          image: jammane80/trading:latest
           imagePullPolicy: Always
           command: ["python", "download_5y_data.py"]
           resources:
