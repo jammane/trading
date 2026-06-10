@@ -1,0 +1,32 @@
+# Manual trigger: kubectl apply -f k8s/job-download.yaml
+# Run after symbol changes or on first-time setup to populate stock_data/.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: download-job
+  namespace: trading
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: trading
+          image: <dockerhub-username>/trading:latest
+          imagePullPolicy: Always
+          command: ["python", "download_5y_data.py"]
+          resources:
+            requests:
+              memory: "200Mi"
+              cpu: "100m"
+            limits:
+              memory: "600Mi"
+              cpu: "500m"
+          volumeMounts:
+            - name: stock-data
+              mountPath: /app/stock_data
+      volumes:
+        - name: stock-data
+          persistentVolumeClaim:
+            claimName: pvc-stock-data
