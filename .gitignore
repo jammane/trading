@@ -214,3 +214,4 @@ data_dump/
 owners/
 state.json
 training_log.csv
+elite_training/
