@@ -39,30 +39,53 @@ static constexpr int N_IND   = 12;
 static constexpr int IND_SYMS = 12;
 static constexpr int N_SYMS  = N_IND * IND_SYMS;   // 144
 
-static const char* const IND_NAMES[N_IND] = {
-    "tech_hardware","tech_software_ai","financials","consumer_discretionary",
-    "consumer_services","health_care","industrials","consumer_staples",
-    "energy","utilities","real_estate","materials"
-};
+// Runtime-loaded from universe.json (populated by load_universe_json in main)
+static std::string g_ind_names[N_IND];
+static std::string g_syms[N_IND][IND_SYMS];
+
+// Display-only abbreviations — not affected by symbol swaps
 static const char* const IND_SHORT[N_IND] = {
     "hardware ","software ","financial","discret  ","services ","health   ",
     "industrl ","staples  ","energy   ","utilitie ","land     ","materials"
 };
 
-static const char* const SYMS[N_IND][IND_SYMS] = {
-    {"NVDA","AMD","MU","SMCI","MRVL","ON","AMAT","LRCX","KLAC","TSM","SWKS","MPWR"},
-    {"PLTR","SNOW","DDOG","NET","CRWD","ZS","PANW","NOW","ADBE","CRM","FTNT","OKTA"},
-    {"XYZ","PYPL","AFRM","UPST","MELI","COIN","GS","SCHW","C","COF","BX","APO"},
-    {"TSLA","RCL","XPEV","LI","APTV","GM","LEA","WYNN","BKNG","ABNB","UBER","LYFT"},
-    {"NFLX","ROKU","SPOT","META","IAC","PINS","DASH","RBLX","TTWO","LYV","MTCH","WBD"},
-    {"MRNA","BNTX","IMVT","CRSP","ARWR","MYGN","NTRA","INMD","HIMS","BEAM","ACAD","BMRN"},
-    {"BA","GE","CAT","DE","DAL","UAL","XPO","LUV","ALK","GNRC","BTU","STLD"},
-    {"CELH","SFM","ELF","LULU","DECK","YETI","NKE","CROX","DKNG","PENN","MGM","CZR"},
-    {"FANG","DVN","OXY","APA","AR","EQT","RRC","SM","SLB","COP","EOG","VLO"},
-    {"ENPH","FSLR","SEDG","CWEN","VST","BE","BEP","DQ","CSIQ","JKS","HASI","NRG"},
-    {"DHI","LEN","PHM","TOL","MTH","KBH","BZH","TMHC","LGIH","CSGP","Z","SKY"},
-    {"NEM","AEM","FCX","SCCO","TECK","AA","SQM","WPM","AU","PAAS","GFI","CDE"}
-};
+// Load industry names and symbols from universe.json.
+// The JSON has exactly N_IND * (1 + IND_SYMS) quoted strings in insertion order:
+//   name0, sym[0][0..11], name1, sym[1][0..11], ...
+// This matches the order produced by Python's json.dump(INDUSTRIES, f, indent=2).
+static bool load_universe_json(const std::string& path) {
+    std::ifstream ifs(path);
+    if (!ifs) {
+        fprintf(stderr, "FATAL: cannot open %s\n", path.c_str());
+        fprintf(stderr, "       Run: python swap_symbols.py '{}' to generate it.\n");
+        return false;
+    }
+    std::string text((std::istreambuf_iterator<char>(ifs)), {});
+
+    std::vector<std::string> tokens;
+    for (size_t p = 0; p < text.size(); ) {
+        size_t a = text.find('"', p);
+        if (a == std::string::npos) break;
+        size_t b = text.find('"', a + 1);
+        if (b == std::string::npos) break;
+        tokens.push_back(text.substr(a + 1, b - a - 1));
+        p = b + 1;
+    }
+
+    const int expected = N_IND * (1 + IND_SYMS);   // 12 * 13 = 156
+    if ((int)tokens.size() != expected) {
+        fprintf(stderr, "FATAL: %s has %d quoted tokens, expected %d.\n",
+                path.c_str(), (int)tokens.size(), expected);
+        fprintf(stderr, "       Re-run: python swap_symbols.py '{}' to regenerate.\n");
+        return false;
+    }
+    for (int i = 0; i < N_IND; i++) {
+        g_ind_names[i] = tokens[i * (1 + IND_SYMS)];
+        for (int j = 0; j < IND_SYMS; j++)
+            g_syms[i][j] = tokens[i * (1 + IND_SYMS) + 1 + j];
+    }
+    return true;
+}
 
 // ── Training constants ─────────────────────────────────────────────────────────
 
@@ -647,8 +670,6 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     load_or_init_industry(models_dir, load_dir, ind_i, scratch.elite_buf);
     const OHLCV* day_sym  = day.sym[ind_i];
     const OHLCV* fill_sym = fill ? fill->sym[ind_i] : day_sym;
-    const char* const* symbols = SYMS[ind_i];
-
     // Compute num_past = minimum history length across symbols
     int num_past = HIST_WINDOW;
     for (int j = 0; j < IND_SYMS; j++)
@@ -1572,7 +1593,7 @@ static void update_hist_sym(SymHist& h, const OHLCV& d) {
 static void save_industry_elites(const std::string& dir, int ind_i,
                                   const float* elite_buf) {
     for (int slot = 0; slot < ELITE_POOL; slot++) {
-        std::string path = elite_path(dir, IND_NAMES[ind_i], slot);
+        std::string path = elite_path(dir, g_ind_names[ind_i].c_str(), slot);
         if (!save_bin(path, elite_buf + (size_t)slot * STOCKNN_PARAMS, STOCKNN_PARAMS))
             log_msg("WARNING: could not save " + path);
     }
@@ -1593,11 +1614,11 @@ static void load_or_init_industry(const std::string& dir, const std::string& loa
         float* e = elite_buf + (size_t)slot * STOCKNN_PARAMS;
         bool loaded = false;
         if (!load_dir.empty()) {
-            std::string p = elite_path(load_dir, IND_NAMES[ind_i], slot);
+            std::string p = elite_path(load_dir, g_ind_names[ind_i].c_str(), slot);
             loaded = load_bin(p, e, STOCKNN_PARAMS);
         }
         if (!loaded) {
-            std::string p = elite_path(dir, IND_NAMES[ind_i], slot);
+            std::string p = elite_path(dir, g_ind_names[ind_i].c_str(), slot);
             loaded = load_bin(p, e, STOCKNN_PARAMS);
         }
         if (!loaded) {
@@ -1638,7 +1659,7 @@ static std::vector<DayData> load_all_stock_data(const std::string& data_dir,
     int loaded = 0;
     for (int i = 0; i < N_IND; i++) {
         for (int j = 0; j < IND_SYMS; j++) {
-            std::string path = data_dir + "/" + SYMS[i][j] + ".json";
+            std::string path = data_dir + "/" + g_syms[i][j] + ".json";
             if (load_sym_data(path, sym_maps[i][j])) loaded++;
         }
     }
@@ -1776,6 +1797,8 @@ int main(int argc, char* argv[]) {
     if (output_dir.empty()) { print_usage(argv[0]); return 1; }
     if (master_sigma < 0.f) master_sigma = sigma;
 
+    if (!load_universe_json("universe.json")) return 1;
+
     // Disable OpenBLAS internal threading: N workers × M BLAS threads = N×M threads on N CPUs
     openblas_set_num_threads(1);
 
@@ -1807,7 +1830,7 @@ int main(int argc, char* argv[]) {
     FILE* csv = fopen(csv_path.c_str(), "w");
     if (csv) {
         fprintf(csv, "pass,day");
-        for (int i = 0; i < N_IND; i++) fprintf(csv, ",%s", IND_NAMES[i]);
+        for (int i = 0; i < N_IND; i++) fprintf(csv, ",%s", g_ind_names[i].c_str());
         fprintf(csv, ",flat_cos\n");
     }
 
