@@ -1039,7 +1039,6 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                 src_val[k]  = surviving[k].first;
             }
 
-            // Compute wavg weights before any reordering
             float w5_weights[5], w10_weights[10], w15_weights[15];
             int n5  = std::min(n_top, 5);
             int n10 = std::min(n_top, 10);
@@ -1048,12 +1047,8 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             normalize_weights(src_val, w10_weights, n10);
             normalize_weights(src_val, w15_weights, n15);
 
-            // Compute wavg weight vectors using scratch buffers
+            // Portfolio wavg uses original slot indices (portfolios[0..199] are all valid)
             Portfolio wp5{}, wp10{}, wp15{};
-            wavg_weights_flat(scratch.elite_buf, STOCKNN_PARAMS, src_rank, w5_weights,  n5,  scratch.wavg(0));
-            wavg_weights_flat(scratch.elite_buf, STOCKNN_PARAMS, src_rank, w10_weights, n10, scratch.wavg(1));
-            wavg_weights_flat(scratch.elite_buf, STOCKNN_PARAMS, src_rank, w15_weights, n15, scratch.wavg(2));
-
             const Portfolio* p5[5], *p10[10], *p15[15];
             for (int k = 0; k < n5;  k++) p5[k]  = &state.portfolios[src_rank[k]];
             for (int k = 0; k < n10; k++) p10[k] = &state.portfolios[src_rank[k]];
@@ -1062,18 +1057,33 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             wavg_portfolio(p10, w10_weights, n10, wp10);
             wavg_portfolio(p15, w15_weights, n15, wp15);
 
-            // Copy top elites into scratch.new_elites to avoid aliasing during reorder
+            // Copy/regenerate top-n_top into new_elites[0..n_top-1].
+            // src_rank[k] is a slot number (0-199): elites copy directly;
+            // mutations (slots 20-199) must be regenerated from parent + original seed.
             Portfolio new_ports[ELITE_POOL];
             for (int k = 0; k < n_top; k++) {
-                memcpy(scratch.new_elite(k), scratch.elite(src_rank[k]), STOCKNN_PARAMS * sizeof(float));
-                new_ports[k] = state.portfolios[src_rank[k]];
+                int slot = src_rank[k];
+                if (slot < ELITE_POOL) {
+                    memcpy(scratch.new_elite(k), scratch.elite(slot), STOCKNN_PARAMS * sizeof(float));
+                } else {
+                    int mut_i  = slot - ELITE_POOL;
+                    int parent = mut_i / MUTATIONS_PER_PARENT;
+                    memcpy(scratch.new_elite(k), scratch.elite(parent), STOCKNN_PARAMS * sizeof(float));
+                    apply_gaussian(scratch.new_elite(k), STOCKNN_PARAMS, sigma, mut_seeds[mut_i]);
+                }
+                new_ports[k] = state.portfolios[slot];
             }
-            // pad missing elite slots (if fewer than 17 survived) with best
             for (int k = n_top; k < ELITE_COUNT; k++) {
                 memcpy(scratch.new_elite(k), scratch.new_elite(0), STOCKNN_PARAMS * sizeof(float));
                 new_ports[k] = new_ports[0];
             }
-            // wavg slots
+
+            // Weight wavg uses new_elites[0..n-1] (consecutive, no OOB risk)
+            int seq[ELITE_COUNT]; for (int k = 0; k < ELITE_COUNT; k++) seq[k] = k;
+            wavg_weights_flat(scratch.new_elites, STOCKNN_PARAMS, seq, w5_weights,  n5,  scratch.wavg(0));
+            wavg_weights_flat(scratch.new_elites, STOCKNN_PARAMS, seq, w10_weights, n10, scratch.wavg(1));
+            wavg_weights_flat(scratch.new_elites, STOCKNN_PARAMS, seq, w15_weights, n15, scratch.wavg(2));
+
             memcpy(scratch.new_elite(ELITE_COUNT),     scratch.wavg(0), STOCKNN_PARAMS * sizeof(float));
             memcpy(scratch.new_elite(ELITE_COUNT + 1), scratch.wavg(1), STOCKNN_PARAMS * sizeof(float));
             memcpy(scratch.new_elite(ELITE_COUNT + 2), scratch.wavg(2), STOCKNN_PARAMS * sizeof(float));
@@ -1081,7 +1091,6 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             new_ports[ELITE_COUNT + 1] = wp10;
             new_ports[ELITE_COUNT + 2] = wp15;
 
-            // Write back to scratch.elite_buf and portfolios
             for (int k = 0; k < ELITE_POOL; k++) {
                 memcpy(scratch.elite(k), scratch.new_elite(k), STOCKNN_PARAMS * sizeof(float));
                 state.portfolios[k] = new_ports[k];
@@ -1460,10 +1469,7 @@ static float step_master(MasterState& state, MasterScratch& scratch,
 
         MasterPortfolio new_mports[ELITE_POOL];
 
-        wavg_weights_flat(scratch.elite_buf, MASTERNN_PARAMS, src_rank, w5_w,  n5,  scratch.wavg(0));
-        wavg_weights_flat(scratch.elite_buf, MASTERNN_PARAMS, src_rank, w10_w, n10, scratch.wavg(1));
-        wavg_weights_flat(scratch.elite_buf, MASTERNN_PARAMS, src_rank, w15_w, n15, scratch.wavg(2));
-
+        // Portfolio wavg from original slot positions (state.portfolios has 200 entries — valid)
         const MasterPortfolio* mp5[5], *mp10[10], *mp15[15];
         for (int k=0;k<n5;k++)  mp5[k]  = &state.portfolios[src_rank[k]];
         for (int k=0;k<n10;k++) mp10[k] = &state.portfolios[src_rank[k]];
@@ -1473,14 +1479,30 @@ static float step_master(MasterState& state, MasterScratch& scratch,
         wavg_mst_portfolio(mp10, w10_w, n10, wp10);
         wavg_mst_portfolio(mp15, w15_w, n15, wp15);
 
+        // Copy/regenerate into new_elites (mutations regenerated — elite_buf has only ELITE_POOL slots)
         for (int k = 0; k < n_top; k++) {
-            memcpy(scratch.new_elite(k), scratch.elite(src_rank[k]), MASTERNN_PARAMS * sizeof(float));
-            new_mports[k] = state.portfolios[src_rank[k]];
+            int slot = src_rank[k];
+            if (slot < ELITE_POOL) {
+                memcpy(scratch.new_elite(k), scratch.elite(slot), MASTERNN_PARAMS * sizeof(float));
+            } else {
+                int mut_i  = slot - ELITE_POOL;
+                int parent = mut_i / MUTATIONS_PER_PARENT;
+                memcpy(scratch.new_elite(k), scratch.elite(parent), MASTERNN_PARAMS * sizeof(float));
+                apply_gaussian(scratch.new_elite(k), MASTERNN_PARAMS, sigma, mast_mut_seeds[mut_i]);
+            }
+            new_mports[k] = state.portfolios[slot];
         }
         for (int k = n_top; k < ELITE_COUNT; k++) {
             memcpy(scratch.new_elite(k), scratch.new_elite(0), MASTERNN_PARAMS * sizeof(float));
             new_mports[k] = new_mports[0];
         }
+
+        // Weight wavg from new_elites[0..n-1] (consecutive indices, no OOB risk)
+        int seq[ELITE_COUNT]; for (int k = 0; k < ELITE_COUNT; k++) seq[k] = k;
+        wavg_weights_flat(scratch.new_elites, MASTERNN_PARAMS, seq, w5_w,  n5,  scratch.wavg(0));
+        wavg_weights_flat(scratch.new_elites, MASTERNN_PARAMS, seq, w10_w, n10, scratch.wavg(1));
+        wavg_weights_flat(scratch.new_elites, MASTERNN_PARAMS, seq, w15_w, n15, scratch.wavg(2));
+
         memcpy(scratch.new_elite(ELITE_COUNT),     scratch.wavg(0), MASTERNN_PARAMS * sizeof(float));
         memcpy(scratch.new_elite(ELITE_COUNT + 1), scratch.wavg(1), MASTERNN_PARAMS * sizeof(float));
         memcpy(scratch.new_elite(ELITE_COUNT + 2), scratch.wavg(2), MASTERNN_PARAMS * sizeof(float));
