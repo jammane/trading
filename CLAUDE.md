@@ -17,9 +17,8 @@ pip install keyring
 bash install_python.sh
 source .venv/bin/activate
 
-# Claude Code (Node.js >= 18 required)
-curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-apt-get install -y nodejs
+# Claude Code (Node.js 22 is in the Fedora repos directly)
+dnf install -y nodejs npm
 npm install -g @anthropic-ai/claude-code
 
 # Store Anthropic API key in kubectl (consistent with Alpaca credentials — never written to disk)
