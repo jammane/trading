@@ -27,6 +27,10 @@
 
 #include <cblas.h>
 
+// Force OpenBLAS single-threaded: multi-threaded BLAS with N worker threads causes
+// 2×N threads competing for N CPUs, multiplying overhead 2-3× per forward pass.
+extern "C" void openblas_set_num_threads(int);
+
 namespace fs = std::filesystem;
 
 // ── Universe ───────────────────────────────────────────────────────────────────
@@ -1718,7 +1722,7 @@ static void worker_fn(WorkerCtx* ctx) {
             return;
         }
         // Only pass load_dir on the first day of each pass to avoid re-seeding from stale checkpoint
-        const std::string& use_load = (ctx->day_num == 0) ? ctx->load_dir : std::string();
+        std::string use_load = (ctx->day_num == 0) ? ctx->load_dir : std::string();
         while (true) {
             int i = ctx->next_ind.fetch_add(1, std::memory_order_relaxed);
             if (i >= N_IND) break;
@@ -1771,6 +1775,9 @@ int main(int argc, char* argv[]) {
     }
     if (output_dir.empty()) { print_usage(argv[0]); return 1; }
     if (master_sigma < 0.f) master_sigma = sigma;
+
+    // Disable OpenBLAS internal threading: N workers × M BLAS threads = N×M threads on N CPUs
+    openblas_set_num_threads(1);
 
     fs::create_directories(output_dir);
     fs::create_directories("stock_data");
