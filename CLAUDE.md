@@ -77,7 +77,7 @@ python prepare_models.py --load-dir models/training --output models/training
 # After training, convert back to .pt before inspect_trades.py or production_v2.py:
 python convert_weights.py --models-dir models/training --output models/training
 ```
-~31 s/day on the droplet (vs ~180 s/day for Python v4). `convert_weights.py` is required
+~38 s/day on the droplet (vs ~180 s/day for Python v4). `convert_weights.py` is required
 after C++ training before using `inspect_trades.py` or `production_v2.py`.
 
 **Train (parallel, 7 threads — requires ≥4 GB RAM):**
