@@ -11,6 +11,32 @@ source .venv/bin/activate
 pip install keyring
 ```
 
+**Setup (DigitalOcean droplet — includes Claude Code for full test suite):**
+```bash
+# Python environment
+bash install_python.sh
+source .venv/bin/activate
+
+# Claude Code (Node.js >= 18 required)
+curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+apt-get install -y nodejs
+npm install -g @anthropic-ai/claude-code
+
+# Store Anthropic API key in kubectl (consistent with Alpaca credentials — never written to disk)
+kubectl create secret generic anthropic-credentials \
+    --namespace trading \
+    --from-literal=ANTHROPIC_API_KEY="sk-ant-..." \
+    --dry-run=client -o yaml | kubectl apply -f -
+
+# Export the key to the current shell before running claude
+export ANTHROPIC_API_KEY=$(kubectl get secret anthropic-credentials \
+    -n trading -o jsonpath='{.data.ANTHROPIC_API_KEY}' | base64 -d)
+
+claude
+```
+All 75 pytest tests (including `test_models.py`) run on the droplet where torch is available.
+The pre-commit hook runs the full suite automatically before every `git commit`.
+
 **Lint:**
 ```bash
 ruff check .
