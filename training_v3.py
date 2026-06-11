@@ -18,6 +18,7 @@ import json
 import math
 import os
 import random
+import shutil
 import statistics
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -2130,6 +2131,21 @@ def main():
                         f"{len(prior)}-day avg={mean_pred:.4f} (1σ={std_pred:.4f}) **")
 
             gc.collect()
+
+            # ── Incremental elite snapshot every 255 days and at pass end ──────
+            if (day_num + 1) % 255 == 0 or day_num == num_days - 1:
+                _inc_dir = 'models/incremental'
+                os.makedirs(_inc_dir, exist_ok=True)
+                for _ind in industries:
+                    for _slot in range(ELITE_POOL):
+                        _src = _model_path(_ind, args.output, _slot)
+                        if os.path.exists(_src):
+                            shutil.copy2(_src, _model_path(_ind, _inc_dir, _slot))
+                for _slot in range(ELITE_POOL):
+                    _src = _model_path('master', args.output, _slot)
+                    if os.path.exists(_src):
+                        shutil.copy2(_src, _model_path('master', _inc_dir, _slot))
+                log(f"[checkpoint] incremental elite snapshot saved → {_inc_dir}")
 
         # ── End-of-pass checkpoints ───────────────────────────────────────────
         for ind, syms in industries.items():

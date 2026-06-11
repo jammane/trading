@@ -11,6 +11,31 @@ source .venv/bin/activate
 pip install keyring
 ```
 
+**Setup (DigitalOcean droplet — includes Claude Code for full test suite):**
+```bash
+# Python environment
+bash install_python.sh
+source .venv/bin/activate
+
+# Claude Code (Node.js 22 is in the Fedora repos directly)
+dnf install -y nodejs npm
+npm install -g @anthropic-ai/claude-code
+
+# Store Anthropic API key in kubectl (consistent with Alpaca credentials — never written to disk)
+kubectl create secret generic anthropic-credentials \
+    --namespace trading \
+    --from-literal=ANTHROPIC_API_KEY="sk-ant-..." \
+    --dry-run=client -o yaml | kubectl apply -f -
+
+# Export the key to the current shell before running claude
+export ANTHROPIC_API_KEY=$(kubectl get secret anthropic-credentials \
+    -n trading -o jsonpath='{.data.ANTHROPIC_API_KEY}' | base64 -d)
+
+claude
+```
+All 75 pytest tests (including `test_models.py`) run on the droplet where torch is available.
+The pre-commit hook runs the full suite automatically before every `git commit`.
+
 **Lint:**
 ```bash
 ruff check .
@@ -34,12 +59,26 @@ python training_v2.py --output models --load-dir models          # resume from c
 python training_v2.py --output models --start-day 16 --stop-day 21 --passes 1 --preserve-stock-data  # short diagnostic run
 ```
 
-**Train (parallel, 2-process dynamic industry pool):**
+**Train (parallel, 2-process dynamic industry pool — DEPRECATED, use C++ binary):**
 ```bash
 python training_v4.py --output models
-python training_v4.py --output models --load-dir models          # resume from checkpoint
-python training_v4.py --output models --start-day 16 --stop-day 21 --passes 1 --preserve-stock-data  # short diagnostic run
 ```
+
+**Train (C++ binary — replaces training_v4.py, ~6× faster):**
+```bash
+# Seed once from existing Python models (or after any convert_weights.py run):
+python prepare_models.py --load-dir models/training --output models/training
+# Diagnostic run (defaults: start-day 17, stop-day 20, passes 1, output models/training):
+./build/training_v4_cpp --load-dir models/training
+# Full training run (canonical settings):
+./build/training_v4_cpp --load-dir models/training \
+  --passes 5 --sigma 0.008 --master-sigma 0.006 --sigma-decay 1.0 \
+  --start-day 17 --stop-day 1255
+# After training, convert back to .pt before inspect_trades.py or production_v2.py:
+python convert_weights.py --models-dir models/training --output models/training
+```
+~38 s/day on the droplet (vs ~180 s/day for Python v4). `convert_weights.py` is required
+after C++ training before using `inspect_trades.py` or `production_v2.py`.
 
 **Train (parallel, 7 threads — requires ≥4 GB RAM):**
 ```bash
@@ -62,7 +101,7 @@ python production_v2.py --model-dir models         # live (requires ALPACA_API_K
 ```bash
 ./swap_symbols.sh '{"OLDTICKER": "NEWTICKER"}'
 ```
-Runs all four steps: updates `universe.py`, removes stale `stock_data/` JSON, downloads new symbol data, and prompts to rebuild the Docker image.  Run locally — not inside a container.
+Runs all five steps: updates `universe.py` and regenerates `universe.json`, removes stale `stock_data/` JSON, downloads new symbol data, prompts to rebuild the Docker image, and prints optional model-cleanup commands for the droplet. The C++ binary reads `universe.json` at startup — no recompile needed after a symbol swap. Run locally — not inside a container.
 
 ## Shared modules
 
@@ -70,9 +109,12 @@ Runs all four steps: updates `universe.py`, removes stale `stock_data/` JSON, do
 |--------|----------|
 | `models.py` | `StockNN`, `MasterNN` — single source of truth for both model classes |
 | `universe.py` | `INDUSTRIES` dict, `ALL_SYMBOLS`, `INDUSTRY_NAMES` — 144-symbol universe |
+| `universe.json` | Auto-generated from `universe.py`; read by the C++ trainer at runtime |
 | `fees.py` | Fee constants (`BUY_FILL`, `SEC_FEE_RATE`, etc.) and `_sell_net()` helper |
+| `prepare_models.py` | `.pt` → `.bin` for C++ trainer (run before first C++ training) |
+| `convert_weights.py` | `.bin` → `.pt` + `_best.pt` for Python tools (run after C++ training) |
 
-All training scripts (`training_v2.py`, `training_v3.py`, `training_v4.py`), `production_v2.py`, and `inspect_trades.py` import from these modules. `download_5y_data.py` imports from `universe.py`. To add or change a ticker, edit `universe.py` only — or run `swap_symbols.sh` for the full guided workflow.
+All training scripts (`training_v2.py`, `training_v3.py`, `training_v4.py` [deprecated]), `production_v2.py`, and `inspect_trades.py` import from these modules. `download_5y_data.py` imports from `universe.py`. To add or change a ticker, run `swap_symbols.sh` — it updates both `universe.py` and `universe.json` together.
 
 ## Tests
 
@@ -101,7 +143,7 @@ Each industry maintains **200 model slots** on disk as `.pt` files. The slot lay
 
 Each training day: all 200 slots reset to slot 0's portfolio → infer → simulate fills → score as `delta × invested_pct` → select + mutate. The `invested_pct` multiplier penalises cash-heavy winners.
 
-`training_v4.py` (parallel) differs from `training_v2.py` (single-threaded) in: 2 worker *processes* (`ProcessPoolExecutor`) replacing the sequential industry loop, bypassing the Python GIL for genuine parallel execution of the trade simulation. Portfolio and history state is pickled to each worker and the mutated copies are returned and reassigned in the main process after each day. Expected speedup: ~40% (~3 min/day vs ~5 min/day) on a 2-vCPU host.
+`training_v4.py` is **deprecated** — superseded by `training_v4_cpp` which is ~6× faster and includes all features (`--daily`, `--promote`, `data_dump` diagnostics). Retained for reference only.
 
 `training_v3.py` (parallel) differs from `training_v2.py` in: 7 worker threads, in-RAM model cache (`_model_cache`), no slippage on limit fills, and slot-level portfolio JSON persisted alongside weights.
 
