@@ -37,6 +37,7 @@ def arr_to_state_dict(arr, layer_defs, model_class):
 
 
 def convert_industry(prefix, models_dir, output_dir, layer_defs, model_class, label):
+    import shutil
     converted = 0
     for slot in range(ELITE_POOL):
         src = os.path.join(models_dir, f'{prefix}_elite_{slot}.bin')
@@ -54,6 +55,12 @@ def convert_industry(prefix, models_dir, output_dir, layer_defs, model_class, la
         except Exception as e:
             print(f'  [{label}] slot {slot:2d}: ERROR — {e}')
     print(f'  [{label}] {converted}/{ELITE_POOL} elite slots converted')
+
+    # Slot 0 is the production model — copy to _best.pt for production_v2.py
+    slot0 = os.path.join(output_dir, f'{prefix}_model_0.pt')
+    if os.path.exists(slot0):
+        shutil.copy2(slot0, os.path.join(output_dir, f'{prefix}_best.pt'))
+        print(f'  [{label}] _best.pt written (copy of slot 0)')
 
 
 def main():

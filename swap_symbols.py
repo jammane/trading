@@ -9,7 +9,8 @@ literals (e.g. 'OLDTICKER' → 'NEWTICKER'), so partial-match false positives
 (e.g. 'C' inside 'CRWD') are impossible.
 
 Files edited:
-    universe.py  (single source of truth for all ticker symbols)
+    universe.py   (single source of truth for all ticker symbols)
+    universe.json (auto-generated from universe.py; read by the C++ trainer at runtime)
 
 Note: run this script locally in the development working tree, not inside a
 running container.  Container source files are baked into the image layer at
@@ -53,6 +54,22 @@ def swap_in_file(path: str, symbol_map: dict[str, str]) -> int:
     return replacements
 
 
+def export_universe_json(script_dir: str) -> None:
+    """Regenerate universe.json from the current universe.py (read by C++ trainer at runtime)."""
+    import importlib.util
+
+    path = os.path.join(script_dir, 'universe.py')
+    spec = importlib.util.spec_from_file_location('_universe_fresh', path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    data = {k: list(v) for k, v in mod.INDUSTRIES.items()}
+    dst = os.path.join(script_dir, 'universe.json')
+    with open(dst, 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f"  universe.json: regenerated ({len(data)} industries, "
+          f"{sum(len(v) for v in data.values())} symbols)")
+
+
 def main():
     """Parse the JSON symbol-map from argv[1] and apply it to all TARGET_FILES."""
     if len(sys.argv) != 2:
@@ -85,6 +102,8 @@ def main():
     else:
         print(f"\nDone. {total} total replacement{'s' if total > 1 else ''} made.")
         print("Remember to re-download data for new symbols and delete old JSON files from stock_data/.")
+
+    export_universe_json(script_dir)
 
 
 if __name__ == '__main__':

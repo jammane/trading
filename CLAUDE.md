@@ -41,6 +41,20 @@ python training_v4.py --output models --load-dir models          # resume from c
 python training_v4.py --output models --start-day 16 --stop-day 21 --passes 1 --preserve-stock-data  # short diagnostic run
 ```
 
+**Train (C++ binary — ~6× faster than training_v4.py):**
+```bash
+# Seed once from existing Python models (or after any convert_weights.py run):
+python prepare_models.py --load-dir models/training --output models/training
+# Full training run (canonical settings):
+./build/training_v4_cpp --output models/training --load-dir models/training \
+  --passes 5 --sigma 0.008 --master-sigma 0.006 --sigma-decay 1.0 \
+  --start-day 17 --stop-day 1255
+# After training, convert back to .pt before inspect_trades.py or production_v2.py:
+python convert_weights.py --models-dir models/training --output models/training
+```
+~31 s/day on the droplet (vs ~180 s/day for Python v4). `convert_weights.py` is required
+after C++ training before using `inspect_trades.py` or `production_v2.py`.
+
 **Train (parallel, 7 threads — requires ≥4 GB RAM):**
 ```bash
 python training_v3.py --output models
@@ -62,7 +76,7 @@ python production_v2.py --model-dir models         # live (requires ALPACA_API_K
 ```bash
 ./swap_symbols.sh '{"OLDTICKER": "NEWTICKER"}'
 ```
-Runs all four steps: updates `universe.py`, removes stale `stock_data/` JSON, downloads new symbol data, and prompts to rebuild the Docker image.  Run locally — not inside a container.
+Runs all five steps: updates `universe.py` and regenerates `universe.json`, removes stale `stock_data/` JSON, downloads new symbol data, prompts to rebuild the Docker image, and prints optional model-cleanup commands for the droplet. The C++ binary reads `universe.json` at startup — no recompile needed after a symbol swap. Run locally — not inside a container.
 
 ## Shared modules
 
@@ -70,9 +84,12 @@ Runs all four steps: updates `universe.py`, removes stale `stock_data/` JSON, do
 |--------|----------|
 | `models.py` | `StockNN`, `MasterNN` — single source of truth for both model classes |
 | `universe.py` | `INDUSTRIES` dict, `ALL_SYMBOLS`, `INDUSTRY_NAMES` — 144-symbol universe |
+| `universe.json` | Auto-generated from `universe.py`; read by the C++ trainer at runtime |
 | `fees.py` | Fee constants (`BUY_FILL`, `SEC_FEE_RATE`, etc.) and `_sell_net()` helper |
+| `prepare_models.py` | `.pt` → `.bin` for C++ trainer (run before first C++ training) |
+| `convert_weights.py` | `.bin` → `.pt` + `_best.pt` for Python tools (run after C++ training) |
 
-All training scripts (`training_v2.py`, `training_v3.py`, `training_v4.py`), `production_v2.py`, and `inspect_trades.py` import from these modules. `download_5y_data.py` imports from `universe.py`. To add or change a ticker, edit `universe.py` only — or run `swap_symbols.sh` for the full guided workflow.
+All training scripts (`training_v2.py`, `training_v3.py`, `training_v4.py`), `production_v2.py`, and `inspect_trades.py` import from these modules. `download_5y_data.py` imports from `universe.py`. To add or change a ticker, run `swap_symbols.sh` — it updates both `universe.py` and `universe.json` together.
 
 ## Tests
 
