@@ -95,6 +95,7 @@ static constexpr int   WAVG_COUNT          = 3;
 static constexpr int   ELITE_POOL          = 20;
 static constexpr int   MUTATIONS_PER_PARENT = 9;
 static constexpr int   HIST_WINDOW         = 15;
+static constexpr int   HIST_ELITE_DAYS     = 5;   // rolling days of elite pools kept
 
 static constexpr float IND_STARTING_CASH   = 25000.0f;
 static constexpr float MST_STARTING_CASH   = 300000.0f;
@@ -352,6 +353,8 @@ struct IndustryState {
     Portfolio portfolios[N_SLOTS];
     SymHist   hist[IND_SYMS];
     int       streak{0};
+    int       hist_ring_next{0};   // next write position in ring (0..HIST_ELITE_DAYS-1)
+    int       hist_ring_count{0};  // populated slots in ring (0..HIST_ELITE_DAYS)
     // elites removed — stored in per-worker WorkerScratch to avoid OOM
 };
 
@@ -360,6 +363,8 @@ struct MasterState {
     SymHist         sym_hist[N_SYMS];   // all 144 symbols, indexed [ind*12+sym]
     float           flat_cos_hist[15];
     int             flat_cos_len{0};
+    int             hist_ring_next{0};
+    int             hist_ring_count{0};
     // elites removed — stored in MasterScratch (heap-allocated in main)
 };
 
@@ -370,7 +375,8 @@ struct WorkerScratch {
     float*    new_elites;   // [ELITE_POOL * STOCKNN_PARAMS] — temp for selection reorder
     float*    wavg_buf;     // [3 * STOCKNN_PARAMS]
     float*    mut_buf;      // [STOCKNN_PARAMS]
-    float*    burst_buf{nullptr};  // [ELITE_COUNT * STOCKNN_PARAMS], allocated on demand
+    float*    burst_buf{nullptr};       // [ELITE_COUNT * STOCKNN_PARAMS], lazy-allocated
+    float*    hist_elite_buf{nullptr};  // [ELITE_POOL * STOCKNN_PARAMS], lazy-allocated
     uint64_t  mut_seeds[N_SLOTS - ELITE_POOL];
 
     WorkerScratch() {
@@ -383,15 +389,21 @@ struct WorkerScratch {
     ~WorkerScratch() {
         delete[] elite_buf; delete[] new_elites;
         delete[] wavg_buf;  delete[] mut_buf;
-        delete[] burst_buf;
+        delete[] burst_buf; delete[] hist_elite_buf;
     }
     float* elite(int i)     { return elite_buf  + (size_t)i * STOCKNN_PARAMS; }
     float* new_elite(int i) { return new_elites + (size_t)i * STOCKNN_PARAMS; }
     float* wavg(int i)      { return wavg_buf   + (size_t)i * STOCKNN_PARAMS; }
+    float* hist_elite(int i){ return hist_elite_buf + (size_t)i * STOCKNN_PARAMS; }
 
     float* ensure_burst_buf() {
         if (!burst_buf) burst_buf = new float[(size_t)ELITE_COUNT * STOCKNN_PARAMS]();
         return burst_buf;
+    }
+    float* ensure_hist_elite_buf() {
+        if (!hist_elite_buf)
+            hist_elite_buf = new float[(size_t)ELITE_POOL * STOCKNN_PARAMS]();
+        return hist_elite_buf;
     }
     float* burst(int i) { return burst_buf + (size_t)i * STOCKNN_PARAMS; }
 };
@@ -401,6 +413,7 @@ struct MasterScratch {
     float*    new_elites;
     float*    wavg_buf;
     float*    mut_buf;
+    float*    hist_elite_buf{nullptr};  // [ELITE_POOL * MASTERNN_PARAMS], lazy-allocated
     uint64_t  mut_seeds[N_SLOTS - ELITE_POOL];
 
     MasterScratch() {
@@ -413,10 +426,18 @@ struct MasterScratch {
     ~MasterScratch() {
         delete[] elite_buf; delete[] new_elites;
         delete[] wavg_buf;  delete[] mut_buf;
+        delete[] hist_elite_buf;
     }
-    float* elite(int i)     { return elite_buf  + (size_t)i * MASTERNN_PARAMS; }
-    float* new_elite(int i) { return new_elites + (size_t)i * MASTERNN_PARAMS; }
-    float* wavg(int i)      { return wavg_buf   + (size_t)i * MASTERNN_PARAMS; }
+    float* elite(int i)      { return elite_buf  + (size_t)i * MASTERNN_PARAMS; }
+    float* new_elite(int i)  { return new_elites + (size_t)i * MASTERNN_PARAMS; }
+    float* wavg(int i)       { return wavg_buf   + (size_t)i * MASTERNN_PARAMS; }
+    float* hist_elite(int i) { return hist_elite_buf + (size_t)i * MASTERNN_PARAMS; }
+
+    float* ensure_hist_elite_buf() {
+        if (!hist_elite_buf)
+            hist_elite_buf = new float[(size_t)ELITE_POOL * MASTERNN_PARAMS]();
+        return hist_elite_buf;
+    }
 };
 
 // ── Fee helpers ─────────────────────────────────────────────────────────────────
@@ -663,6 +684,9 @@ struct IndResult {
 static void load_or_init_industry(const std::string& dir, const std::string& load_dir,
                                    int ind_i, float* elite_buf);
 static void save_industry_elites(const std::string& dir, int ind_i, const float* elite_buf);
+static bool load_hist_ring_slot_ind(const std::string& models_dir, const char* ind_name,
+                                     int ring_slot, float* buf);
+static bool load_hist_ring_slot_mst(const std::string& models_dir, int ring_slot, float* buf);
 
 // ── write_dump_json ─────────────────────────────────────────────────────────────
 
@@ -850,6 +874,145 @@ static float simulate_ind_slot(
     }
 
     return compute_value_ind(port_out, day_sym, fill_sym);
+}
+
+// ── sim_ind_model: run one model's trade simulation from a fresh portfolio ──────
+// port: pre-initialized to baseline; modified in place. Returns final value.
+// seq_flags_ind: pointer to seq_flags[ind_i * IND_SYMS], length IND_SYMS.
+static float sim_ind_model(
+    const float* W,
+    const float* history_arr, const float* today_arr,
+    const OHLCV* day_sym, const OHLCV* fill_sym,
+    const bool* seq_flags_ind,
+    float* out48,
+    Portfolio& port)
+{
+    stock_forward(W, history_arr, today_arr, out48);
+
+    for (int j = 0; j < IND_SYMS; j++) {
+        if (!day_sym[j].valid) continue;
+        float buy_qty            = out48[4*j+0];
+        float buy_price_frac     = out48[4*j+1];
+        float sell_all_price_frac = out48[4*j+2];
+        float sell_qty           = out48[4*j+3];
+
+        float low_t  = day_sym[j].low;
+        float high_t = day_sym[j].high;
+        float span_t = std::max(high_t - low_t, 1e-9f);
+        float sell_all_price = low_t + sell_all_price_frac * span_t;
+        float buy_price      = low_t + buy_price_frac * span_t;
+        float stop_loss      = buy_price * 0.9f;
+
+        float nd_open = fill_sym[j].valid ? fill_sym[j].open  : day_sym[j].close;
+        float nd_low  = fill_sym[j].valid ? fill_sym[j].low   : day_sym[j].low;
+        float nd_high = fill_sym[j].valid ? fill_sym[j].high  : day_sym[j].high;
+        bool  low_first = seq_flags_ind[j];
+
+        if (sell_qty > 1e-6f && port.holdings[j] > 1e-6f) {
+            float amt = std::min(sell_qty, port.holdings[j]);
+            port.holdings[j] -= amt; port.cash += sell_net(amt, nd_open);
+        }
+        if (port.holdings[j] > 1e-6f && nd_open >= sell_all_price) {
+            float amt = port.holdings[j]; port.holdings[j] = 0.f;
+            port.cash += sell_net(amt, nd_open);
+        }
+        if (!low_first && port.holdings[j] > 1e-6f &&
+            nd_low < sell_all_price && sell_all_price < nd_high) {
+            float slipped = sell_all_price * (1.f - SLIPPAGE_RATE);
+            float amt = port.holdings[j]; port.holdings[j] = 0.f;
+            port.cash += sell_net(amt, slipped);
+        }
+        float stop_p = port.stop_prices[j];
+        if (stop_p > 0.f && port.holdings[j] > 1e-6f) {
+            if (nd_open <= stop_p) {
+                float amt = port.holdings[j]; port.holdings[j] = 0.f;
+                port.cash += sell_net(amt, nd_open);
+            } else if (nd_low <= stop_p) {
+                float slipped = stop_p * (1.f - SLIPPAGE_RATE);
+                float amt = port.holdings[j]; port.holdings[j] = 0.f;
+                port.cash += sell_net(amt, slipped);
+            }
+        }
+        if (buy_qty > 1e-6f && buy_price > 0.f) {
+            float fill_price = 0.f;
+            if (nd_open <= buy_price) fill_price = nd_open;
+            else if (nd_low < buy_price && buy_price < nd_high)
+                fill_price = buy_price * (1.f + SLIPPAGE_RATE);
+            if (fill_price > 0.f) {
+                float affordable = port.cash / fill_price;
+                float buy_amount = std::min(buy_qty, affordable);
+                if (buy_amount > 1e-6f) {
+                    float port_value = port.cash;
+                    for (int k = 0; k < IND_SYMS; k++) {
+                        float cp = fill_sym[k].valid ? fill_sym[k].close :
+                                   day_sym[k].valid  ? day_sym[k].close  : 0.f;
+                        port_value += port.holdings[k] * cp;
+                    }
+                    float cur_sym_val = port.holdings[j] * fill_price;
+                    float max_spend = std::max(0.f, MAX_SINGLE_STOCK_PCT * port_value - cur_sym_val);
+                    buy_amount = std::min(buy_amount, max_spend / fill_price);
+                }
+                if (buy_amount > 1e-6f) {
+                    port.holdings[j]    += buy_amount;
+                    port.cash           -= buy_amount * fill_price;
+                    port.stop_prices[j]  = stop_loss;
+                }
+            }
+        }
+    }
+    for (int j = 0; j < IND_SYMS; j++) {
+        if (!day_sym[j].valid) continue;
+        if (!seq_flags_ind[j]) continue;
+        float sell_all_price_frac = out48[4*j+2];
+        float span_t = std::max(day_sym[j].high - day_sym[j].low, 1e-9f);
+        float sell_all_price = day_sym[j].low + sell_all_price_frac * span_t;
+        float nd_low  = fill_sym[j].valid ? fill_sym[j].low  : day_sym[j].low;
+        float nd_high = fill_sym[j].valid ? fill_sym[j].high : day_sym[j].high;
+        if (port.holdings[j] > 1e-6f && nd_low < sell_all_price && sell_all_price < nd_high) {
+            float slipped = sell_all_price * (1.f - SLIPPAGE_RATE);
+            float amt = port.holdings[j]; port.holdings[j] = 0.f;
+            port.cash += sell_net(amt, slipped);
+        }
+    }
+    return compute_value_ind(port, day_sym, fill_sym);
+}
+
+// ── Hist ring helpers for industry ───────────────────────────────────────────────
+static void save_hist_ring_ind(const std::string& models_dir, const char* ind_name,
+                                IndustryState& state, const float* elite_buf) {
+    std::string dir = models_dir + "/hist_elite";
+    fs::create_directories(dir);
+    std::string path = dir + "/" + ind_name + "_hist_" +
+                       std::to_string(state.hist_ring_next) + ".bin";
+    if (!save_bin(path, elite_buf, (size_t)ELITE_POOL * STOCKNN_PARAMS))
+        log_msg("WARNING: could not save hist ring " + path);
+    state.hist_ring_next = (state.hist_ring_next + 1) % HIST_ELITE_DAYS;
+    if (state.hist_ring_count < HIST_ELITE_DAYS) state.hist_ring_count++;
+}
+
+static bool load_hist_ring_slot_ind(const std::string& models_dir, const char* ind_name,
+                                     int ring_slot, float* buf) {
+    std::string path = models_dir + "/hist_elite/" + ind_name + "_hist_" +
+                       std::to_string(ring_slot) + ".bin";
+    return load_bin(path, buf, (size_t)ELITE_POOL * STOCKNN_PARAMS);
+}
+
+// ── Hist ring helpers for master ─────────────────────────────────────────────────
+static void save_hist_ring_mst(const std::string& models_dir, MasterState& state,
+                                const float* elite_buf) {
+    std::string dir = models_dir + "/hist_elite";
+    fs::create_directories(dir);
+    std::string path = dir + "/master_hist_" + std::to_string(state.hist_ring_next) + ".bin";
+    if (!save_bin(path, elite_buf, (size_t)ELITE_POOL * MASTERNN_PARAMS))
+        log_msg("WARNING: could not save master hist ring " + path);
+    state.hist_ring_next = (state.hist_ring_next + 1) % HIST_ELITE_DAYS;
+    if (state.hist_ring_count < HIST_ELITE_DAYS) state.hist_ring_count++;
+}
+
+static bool load_hist_ring_slot_mst(const std::string& models_dir, int ring_slot, float* buf) {
+    std::string path = models_dir + "/hist_elite/master_hist_" +
+                       std::to_string(ring_slot) + ".bin";
+    return load_bin(path, buf, (size_t)ELITE_POOL * MASTERNN_PARAMS);
 }
 
 // ── run_daily_burst ─────────────────────────────────────────────────────────────
@@ -1445,6 +1608,52 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         }
     }
 
+    // ── Historical elite scoring ───────────────────────────────────────────────
+    struct HistCand {
+        float sel_score, slot_score;
+        int   ring_slot, elite_idx, age_offset;
+        Portfolio port;
+    };
+    std::vector<HistCand> hist_cands;
+    if (state.hist_ring_count > 0 && !all_inactive) {
+        scratch.ensure_hist_elite_buf();
+        float out48h[48];
+        float below_floor_thresh_h = baseline * 0.9f;
+        float survival_floor_h     = -(baseline * 0.1f);
+        for (int age = 0; age < state.hist_ring_count; age++) {
+            int ring_slot = (state.hist_ring_next - state.hist_ring_count + age +
+                             HIST_ELITE_DAYS * 2) % HIST_ELITE_DAYS;
+            if (!load_hist_ring_slot_ind(models_dir, g_ind_names[ind_i].c_str(),
+                                          ring_slot, scratch.hist_elite_buf))
+                continue;
+            for (int he = 0; he < ELITE_POOL; he++) {
+                Portfolio h_port;
+                h_port.cash = ref_cash;
+                for (int j = 0; j < IND_SYMS; j++) {
+                    h_port.holdings[j]    = ref_hold[j];
+                    h_port.stop_prices[j] = ref_stop[j];
+                }
+                float h_score = sim_ind_model(
+                    scratch.hist_elite_buf + (size_t)he * STOCKNN_PARAMS,
+                    history_arr, today_arr,
+                    day_sym, fill_sym,
+                    seq_flags + (size_t)ind_i * IND_SYMS,
+                    out48h, h_port);
+                if (h_score < below_floor_thresh_h) continue;
+                float raw_delta = h_score - baseline;
+                float hsel;
+                if (raw_delta > 0.f && h_score > 0.f) {
+                    float invested_pct = std::max(0.f, 1.f - h_port.cash / h_score);
+                    hsel = raw_delta * invested_pct;
+                } else {
+                    hsel = raw_delta;
+                }
+                if (hsel < survival_floor_h) continue;
+                hist_cands.push_back({hsel, h_score, ring_slot, he, age, h_port});
+            }
+        }
+    }
+
     // UNDER_INVEST flag: check elite candidates (ELITE_COUNT slots by sel_score rank)
     {
         // Build top-ELITE_COUNT candidate indices by sel_score
@@ -1497,7 +1706,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         float survival_floor = -(baseline * 0.1f);
         float below_floor_thresh = baseline * 0.9f;
 
-        // Build sorted surviving list
+        // Build sorted surviving list (regular slots + historical candidates)
         std::vector<std::pair<float,int>> surviving;
         for (int s = 0; s < N_SLOTS; s++) {
             if (inactive[s]) continue;
@@ -1513,13 +1722,15 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                 surviving.push_back({sel_scores[s], s});
             }
         }
+        // Historical candidates already filtered by floor in scoring block (negative IDs)
+        for (int h = 0; h < (int)hist_cands.size(); h++)
+            surviving.push_back({hist_cands[h].sel_score, -(h + 1)});
 
         if (!surviving.empty()) {
             std::sort(surviving.begin(), surviving.end(),
                       [](const auto& a, const auto& b){ return a.first > b.first; });
             int n_top = std::min((int)surviving.size(), ELITE_COUNT);
 
-            // Source ranks (indices into current state.elites[]) for top-17
             int   src_rank[ELITE_COUNT] = {};
             float src_val[ELITE_COUNT]  = {};
             for (int k = 0; k < n_top; k++) {
@@ -1535,31 +1746,48 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             normalize_weights(src_val, w10_weights, n10);
             normalize_weights(src_val, w15_weights, n15);
 
-            // Portfolio wavg uses original slot indices (portfolios[0..199] are all valid)
+            // Portfolio wavg — historical entries use their traded portfolio
             Portfolio wp5{}, wp10{}, wp15{};
             const Portfolio* p5[5], *p10[10], *p15[15];
-            for (int k = 0; k < n5;  k++) p5[k]  = &state.portfolios[src_rank[k]];
-            for (int k = 0; k < n10; k++) p10[k] = &state.portfolios[src_rank[k]];
-            for (int k = 0; k < n15; k++) p15[k] = &state.portfolios[src_rank[k]];
+            auto port_ptr = [&](int id) -> const Portfolio* {
+                return id < 0 ? &hist_cands[-(id+1)].port : &state.portfolios[id];
+            };
+            for (int k = 0; k < n5;  k++) p5[k]  = port_ptr(src_rank[k]);
+            for (int k = 0; k < n10; k++) p10[k] = port_ptr(src_rank[k]);
+            for (int k = 0; k < n15; k++) p15[k] = port_ptr(src_rank[k]);
             wavg_portfolio(p5,  w5_weights,  n5,  wp5);
             wavg_portfolio(p10, w10_weights, n10, wp10);
             wavg_portfolio(p15, w15_weights, n15, wp15);
 
-            // Copy/regenerate top-n_top into new_elites[0..n_top-1].
-            // src_rank[k] is a slot number (0-199): elites copy directly;
-            // mutations (slots 20-199) must be regenerated from parent + original seed.
+            // Copy/regenerate weights into new_elites; historical entries reload ring file
             Portfolio new_ports[ELITE_POOL];
             for (int k = 0; k < n_top; k++) {
-                int slot = src_rank[k];
-                if (slot < ELITE_POOL) {
-                    memcpy(scratch.new_elite(k), scratch.elite(slot), STOCKNN_PARAMS * sizeof(float));
+                int id = src_rank[k];
+                if (id < 0) {
+                    const auto& hc = hist_cands[-(id+1)];
+                    if (load_hist_ring_slot_ind(models_dir, g_ind_names[ind_i].c_str(),
+                                                hc.ring_slot, scratch.hist_elite_buf)) {
+                        memcpy(scratch.new_elite(k),
+                               scratch.hist_elite_buf + (size_t)hc.elite_idx * STOCKNN_PARAMS,
+                               STOCKNN_PARAMS * sizeof(float));
+                    } else {
+                        memcpy(scratch.new_elite(k), scratch.elite(0), STOCKNN_PARAMS * sizeof(float));
+                    }
+                    new_ports[k] = hc.port;
+                    log_msg(std::string("[") + IND_SHORT[ind_i] + "]   HIST ELITE re-entered: H" +
+                            std::to_string(hc.age_offset) + "." + std::to_string(hc.elite_idx) +
+                            " → slot " + std::to_string(k) +
+                            " (sel_score=" + std::to_string(hc.sel_score).substr(0,6) + ")");
+                } else if (id < ELITE_POOL) {
+                    memcpy(scratch.new_elite(k), scratch.elite(id), STOCKNN_PARAMS * sizeof(float));
+                    new_ports[k] = state.portfolios[id];
                 } else {
-                    int mut_i  = slot - ELITE_POOL;
+                    int mut_i  = id - ELITE_POOL;
                     int parent = mut_i / MUTATIONS_PER_PARENT;
                     memcpy(scratch.new_elite(k), scratch.elite(parent), STOCKNN_PARAMS * sizeof(float));
                     apply_gaussian(scratch.new_elite(k), STOCKNN_PARAMS, sigma, mut_seeds[mut_i]);
+                    new_ports[k] = state.portfolios[id];
                 }
-                new_ports[k] = state.portfolios[slot];
             }
             for (int k = n_top; k < ELITE_COUNT; k++) {
                 memcpy(scratch.new_elite(k), scratch.new_elite(0), STOCKNN_PARAMS * sizeof(float));
@@ -1594,14 +1822,19 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             std::string elite_display = "";
             for (int k = 0; k < std::min(n_top, 5); k++) {
                 if (k > 0) elite_display += ",";
-                int sl = src_rank[k];
-                if (sl < ELITE_COUNT) elite_display += std::to_string(sl) + ".0";
-                else if (sl < ELITE_POOL) {
+                int id = src_rank[k];
+                if (id < 0) {
+                    const auto& hc = hist_cands[-(id+1)];
+                    elite_display += "H" + std::to_string(hc.age_offset) + "." +
+                                     std::to_string(hc.elite_idx);
+                } else if (id < ELITE_COUNT) {
+                    elite_display += std::to_string(id) + ".0";
+                } else if (id < ELITE_POOL) {
                     const char* nm[] = {"w5","w10","w15"};
-                    elite_display += nm[sl - ELITE_COUNT];
+                    elite_display += nm[id - ELITE_COUNT];
                 } else {
-                    int p = (sl - ELITE_POOL) / MUTATIONS_PER_PARENT;
-                    int m = (sl - ELITE_POOL) % MUTATIONS_PER_PARENT + 1;
+                    int p = (id - ELITE_POOL) / MUTATIONS_PER_PARENT;
+                    int m = (id - ELITE_POOL) % MUTATIONS_PER_PARENT + 1;
                     elite_display += std::to_string(p) + "." + std::to_string(m);
                 }
             }
@@ -1643,8 +1876,10 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         top_hold += slot0_own.holdings[j] * price;
     }
 
-    // Save updated elites back to disk
+    // Save updated elites back to disk; append to hist ring for next day
     save_industry_elites(models_dir, ind_i, scratch.elite_buf);
+    if (!freeze)
+        save_hist_ring_ind(models_dir, g_ind_names[ind_i].c_str(), state, scratch.elite_buf);
 
     IndResult res;
     res.baseline   = baseline;
@@ -1663,7 +1898,7 @@ static float step_master(MasterState& state, MasterScratch& scratch,
                          const DayData& day, const DayData* fill,
                          const IndResult* ind_results,
                          int actual_day, int total_avail, int day_num, int num_days,
-                         float sigma) {
+                         float sigma, const std::string& models_dir) {
     const DayData& fd = fill ? *fill : day;
 
     // Resolve actual_perf[N_IND]
@@ -1907,6 +2142,37 @@ static float step_master(MasterState& state, MasterScratch& scratch,
         flat_cos = denom > 1e-9f ? dot / denom : 0.f;
     }
 
+    // ── Historical master elite scoring ──────────────────────────────────────
+    struct HistMstCand {
+        float pred_score;
+        int   ring_slot, elite_idx, age_offset;
+    };
+    std::vector<HistMstCand> hist_mst_cands;
+    if (state.hist_ring_count > 0 && have_deltas) {
+        scratch.ensure_hist_elite_buf();
+        float out36h[36];
+        for (int age = 0; age < state.hist_ring_count; age++) {
+            int ring_slot = (state.hist_ring_next - state.hist_ring_count + age +
+                             HIST_ELITE_DAYS * 2) % HIST_ELITE_DAYS;
+            if (!load_hist_ring_slot_mst(models_dir, ring_slot, scratch.hist_elite_buf))
+                continue;
+            for (int he = 0; he < ELITE_POOL; he++) {
+                master_forward(scratch.hist_elite_buf + (size_t)he * MASTERNN_PARAMS,
+                               hist_arr, today_arr, out36h);
+                float dotp=0, nap=0, nbp=0;
+                for (int i = 0; i < N_IND; i++) {
+                    dotp += out36h[i] * target_pct[i];
+                    nap  += out36h[i] * out36h[i];
+                    nbp  += target_pct[i] * target_pct[i];
+                }
+                float dp = sqrtf(nap) * sqrtf(nbp);
+                float hscore = dp > 1e-9f ? dotp / dp : 0.f;
+                hist_mst_cands.push_back({hscore, ring_slot, he, age});
+                if (hscore > best_pred) best_pred = hscore;
+            }
+        }
+    }
+
     log_msg(std::string("[master  ] Day ") + std::to_string(actual_day + 1) +
             "/" + std::to_string(total_avail) +
             " | pred=" + std::to_string(best_pred).substr(0,6) +
@@ -1926,19 +2192,28 @@ static float step_master(MasterState& state, MasterScratch& scratch,
 
     // Selection
     if (best_pred >= 0.50f) {
+        // Compute mean/variance over combined pool (regular + historical)
+        int total_n = N_SLOTS + (int)hist_mst_cands.size();
         float mean_ps = 0.f;
         for (int s = 0; s < N_SLOTS; s++) mean_ps += pred_scores[s];
-        mean_ps /= N_SLOTS;
+        for (auto& hc : hist_mst_cands) mean_ps += hc.pred_score;
+        mean_ps /= total_n;
         float var_ps = 0.f;
         for (int s = 0; s < N_SLOTS; s++) {
             float d = pred_scores[s] - mean_ps; var_ps += d * d;
         }
-        float pool_floor = mean_ps - sqrtf(var_ps / N_SLOTS);
+        for (auto& hc : hist_mst_cands) {
+            float d = hc.pred_score - mean_ps; var_ps += d * d;
+        }
+        float pool_floor = mean_ps - sqrtf(var_ps / total_n);
 
         std::vector<std::pair<float,int>> surviving;
         for (int s = 0; s < N_SLOTS; s++)
             if (pred_scores[s] >= pool_floor)
                 surviving.push_back({pred_scores[s], s});
+        for (int h = 0; h < (int)hist_mst_cands.size(); h++)
+            if (hist_mst_cands[h].pred_score >= pool_floor)
+                surviving.push_back({hist_mst_cands[h].pred_score, -(h + 1)});
         if (surviving.empty()) surviving.push_back({pred_scores[0], 0});
 
         std::sort(surviving.begin(), surviving.end(),
@@ -1964,28 +2239,46 @@ static float step_master(MasterState& state, MasterScratch& scratch,
 
         MasterPortfolio new_mports[ELITE_POOL];
 
-        // Portfolio wavg from original slot positions (state.portfolios has 200 entries — valid)
+        // Portfolio wavg — historical entries use slot0 as placeholder
+        auto mst_port_ptr = [&](int id) -> const MasterPortfolio* {
+            return id < 0 ? &state.portfolios[0] : &state.portfolios[id];
+        };
         const MasterPortfolio* mp5[5], *mp10[10], *mp15[15];
-        for (int k=0;k<n5;k++)  mp5[k]  = &state.portfolios[src_rank[k]];
-        for (int k=0;k<n10;k++) mp10[k] = &state.portfolios[src_rank[k]];
-        for (int k=0;k<n15;k++) mp15[k] = &state.portfolios[src_rank[k]];
+        for (int k=0;k<n5;k++)  mp5[k]  = mst_port_ptr(src_rank[k]);
+        for (int k=0;k<n10;k++) mp10[k] = mst_port_ptr(src_rank[k]);
+        for (int k=0;k<n15;k++) mp15[k] = mst_port_ptr(src_rank[k]);
         MasterPortfolio wp5={}, wp10={}, wp15={};
         wavg_mst_portfolio(mp5,  w5_w,  n5,  wp5);
         wavg_mst_portfolio(mp10, w10_w, n10, wp10);
         wavg_mst_portfolio(mp15, w15_w, n15, wp15);
 
-        // Copy/regenerate into new_elites (mutations regenerated — elite_buf has only ELITE_POOL slots)
+        // Copy/regenerate into new_elites; historical entries reload ring file
         for (int k = 0; k < n_top; k++) {
-            int slot = src_rank[k];
-            if (slot < ELITE_POOL) {
-                memcpy(scratch.new_elite(k), scratch.elite(slot), MASTERNN_PARAMS * sizeof(float));
+            int id = src_rank[k];
+            if (id < 0) {
+                const auto& hc = hist_mst_cands[-(id+1)];
+                if (load_hist_ring_slot_mst(models_dir, hc.ring_slot, scratch.hist_elite_buf)) {
+                    memcpy(scratch.new_elite(k),
+                           scratch.hist_elite_buf + (size_t)hc.elite_idx * MASTERNN_PARAMS,
+                           MASTERNN_PARAMS * sizeof(float));
+                } else {
+                    memcpy(scratch.new_elite(k), scratch.elite(0), MASTERNN_PARAMS * sizeof(float));
+                }
+                new_mports[k] = state.portfolios[0];
+                log_msg(std::string("[master  ] HIST ELITE re-entered: H") +
+                        std::to_string(hc.age_offset) + "." + std::to_string(hc.elite_idx) +
+                        " → slot " + std::to_string(k) +
+                        " (pred_score=" + std::to_string(hc.pred_score).substr(0,6) + ")");
+            } else if (id < ELITE_POOL) {
+                memcpy(scratch.new_elite(k), scratch.elite(id), MASTERNN_PARAMS * sizeof(float));
+                new_mports[k] = state.portfolios[id];
             } else {
-                int mut_i  = slot - ELITE_POOL;
+                int mut_i  = id - ELITE_POOL;
                 int parent = mut_i / MUTATIONS_PER_PARENT;
                 memcpy(scratch.new_elite(k), scratch.elite(parent), MASTERNN_PARAMS * sizeof(float));
                 apply_gaussian(scratch.new_elite(k), MASTERNN_PARAMS, sigma, mast_mut_seeds[mut_i]);
+                new_mports[k] = state.portfolios[id];
             }
-            new_mports[k] = state.portfolios[slot];
         }
         for (int k = n_top; k < ELITE_COUNT; k++) {
             memcpy(scratch.new_elite(k), scratch.new_elite(0), MASTERNN_PARAMS * sizeof(float));
@@ -2026,6 +2319,9 @@ static float step_master(MasterState& state, MasterScratch& scratch,
     }
 
     state.portfolios[0] = slot0_own;
+
+    // Append current elite pool to master hist ring (scratch.elite_buf already up to date)
+    save_hist_ring_mst(models_dir, state, scratch.elite_buf);
 
     // Update flat_cos history
     if (state.flat_cos_len < 15) {
@@ -2317,6 +2613,7 @@ int main(int argc, char* argv[]) {
     fs::create_directories("stock_data");
     const std::string incremental_dir = "models/incremental";
     fs::create_directories(incremental_dir);
+    fs::create_directories(output_dir + "/hist_elite");
 
     // Load stock data
     std::vector<std::string> dates;
@@ -2376,7 +2673,9 @@ int main(int argc, char* argv[]) {
                 ind_states[i].portfolios[0].holdings[j]    = 0.f;
                 ind_states[i].portfolios[0].stop_prices[j] = 0.f;
             }
-            ind_states[i].streak = 0;
+            ind_states[i].streak         = 0;
+            ind_states[i].hist_ring_next  = 0;
+            ind_states[i].hist_ring_count = 0;
             for (int s = 1; s < N_SLOTS; s++) ind_states[i].portfolios[s] = ind_states[i].portfolios[0];
         }
         // Load master elites once at pass start (no per-day reload needed for master)
@@ -2384,7 +2683,9 @@ int main(int argc, char* argv[]) {
         mst->portfolios[0].cash = MST_STARTING_CASH;
         for (int i = 0; i < N_IND; i++) mst->portfolios[0].holdings[i] = 0.f;
         for (int s = 1; s < N_SLOTS; s++) mst->portfolios[s] = mst->portfolios[0];
-        mst->flat_cos_len = 0;
+        mst->flat_cos_len     = 0;
+        mst->hist_ring_next   = 0;
+        mst->hist_ring_count  = 0;
 
         // Clear histories
         for (int i = 0; i < N_IND; i++)
@@ -2446,7 +2747,7 @@ int main(int argc, char* argv[]) {
             // Master step
             float flat_cos = step_master(*mst, *mst_scratch, *day_ptr, fill_ptr, results,
                                          actual_day, total_days, day_num, num_days,
-                                         cur_mst_sigma);
+                                         cur_mst_sigma, output_dir);
 
             // Log CSV row
             if (csv) write_csv_row(csv, pass, actual_day, results, flat_cos);
