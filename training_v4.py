@@ -2246,21 +2246,20 @@ def main():
 
             gc.collect()
 
-            # ── 255-day elite snapshot (one trading year) ─────────────────────
-            if (day_num + 1) % 255 == 0:
-                _elite_base = os.path.join(
-                    os.path.dirname(os.path.normpath(args.output)), 'elite_training')
-                _snap_dir = os.path.join(
-                    _elite_base, f'pass{pass_num + 1}_day{actual_day + 1}')
-                os.makedirs(_snap_dir, exist_ok=True)
+            # ── Incremental elite snapshot every 255 days and at pass end ──────
+            if (day_num + 1) % 255 == 0 or day_num == num_days - 1:
+                _inc_dir = 'models/incremental'
+                os.makedirs(_inc_dir, exist_ok=True)
                 for _ind in industries:
-                    _src = os.path.join(args.output, f'{_ind}_model_0.pt')
+                    for _slot in range(ELITE_POOL):
+                        _src = _model_path(_ind, args.output, _slot)
+                        if os.path.exists(_src):
+                            shutil.copy2(_src, _model_path(_ind, _inc_dir, _slot))
+                for _slot in range(ELITE_POOL):
+                    _src = _model_path('master', args.output, _slot)
                     if os.path.exists(_src):
-                        shutil.copy2(_src, os.path.join(_snap_dir, f'{_ind}_model_0.pt'))
-                _src = os.path.join(args.output, 'master_model_0.pt')
-                if os.path.exists(_src):
-                    shutil.copy2(_src, os.path.join(_snap_dir, 'master_model_0.pt'))
-                log(f"[checkpoint] 255-day elite snapshot saved → {_snap_dir}")
+                        shutil.copy2(_src, _model_path('master', _inc_dir, _slot))
+                log(f"[checkpoint] incremental elite snapshot saved → {_inc_dir}")
 
         executor.shutdown(wait=True)
 

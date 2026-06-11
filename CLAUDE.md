@@ -70,8 +70,10 @@ python training_v4.py --output models --start-day 16 --stop-day 21 --passes 1 --
 ```bash
 # Seed once from existing Python models (or after any convert_weights.py run):
 python prepare_models.py --load-dir models/training --output models/training
+# Diagnostic run (defaults: start-day 17, stop-day 20, passes 1, output models/training):
+./build/training_v4_cpp --load-dir models/training
 # Full training run (canonical settings):
-./build/training_v4_cpp --output models/training --load-dir models/training \
+./build/training_v4_cpp --load-dir models/training \
   --passes 5 --sigma 0.008 --master-sigma 0.006 --sigma-decay 1.0 \
   --start-day 17 --stop-day 1255
 # After training, convert back to .pt before inspect_trades.py or production_v2.py:
