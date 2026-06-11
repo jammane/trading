@@ -1,19 +1,21 @@
 """
-training_v4.py — Parallel evolutionary training: v2 per-slot on-demand loading +
-dynamic industry process pool (ProcessPoolExecutor, max_workers=NUM_WORKERS).
+DEPRECATED: training_v4.py is superseded by the C++ trainer (training_v4_cpp).
 
-Each industry slot is loaded from disk, inferred, traded, and evicted before the
-next slot loads (v2 methodology — no persistent cache).  Industries are processed
-concurrently via a dynamic work queue: worker processes pull the next available
-industry from the pool as soon as they finish their current one, keeping all
-available CPUs fully utilized without hard-coding industry-to-worker assignments.
-Using processes (not threads) sidesteps the Python GIL, enabling genuine parallel
-execution of the trade simulation loop.  Master runs after all industries complete
-(sequential, single-process).
+The C++ binary is ~6× faster and now includes all features previously unique to this
+file: --daily burst refinement, --promote, HARD/SOFT/UNDER_INVEST data_dump diagnostics,
+incremental snapshots, and --master-only mode.
 
-Usage:
-    python training_v4.py --output models [--load-dir models] [--start-day N] [--stop-day N]
-                          [--passes N] [--sigma 0.01] [--daily] [--promote uat,prod]
+Use the C++ trainer instead:
+    ./build/training_v4_cpp                              # diagnostic (days 17-20, defaults)
+    ./build/training_v4_cpp --load-dir models/training   # resume from checkpoint
+    ./build/training_v4_cpp --load-dir models/training \\
+      --passes 5 --sigma 0.008 --master-sigma 0.006 \\
+      --sigma-decay 1.0 --start-day 17 --stop-day 1255   # full training run
+    ./build/training_v4_cpp --daily                      # with burst refinement
+    ./build/training_v4_cpp --promote uat,prod           # promote after training
+
+See CLAUDE.md for full usage. This file is retained for reference only and will be
+removed in a future commit.
 """
 
 import argparse
@@ -2246,21 +2248,20 @@ def main():
 
             gc.collect()
 
-            # ── 255-day elite snapshot (one trading year) ─────────────────────
-            if (day_num + 1) % 255 == 0:
-                _elite_base = os.path.join(
-                    os.path.dirname(os.path.normpath(args.output)), 'elite_training')
-                _snap_dir = os.path.join(
-                    _elite_base, f'pass{pass_num + 1}_day{actual_day + 1}')
-                os.makedirs(_snap_dir, exist_ok=True)
+            # ── Incremental elite snapshot every 255 days and at pass end ──────
+            if (day_num + 1) % 255 == 0 or day_num == num_days - 1:
+                _inc_dir = 'models/incremental'
+                os.makedirs(_inc_dir, exist_ok=True)
                 for _ind in industries:
-                    _src = os.path.join(args.output, f'{_ind}_model_0.pt')
+                    for _slot in range(ELITE_POOL):
+                        _src = _model_path(_ind, args.output, _slot)
+                        if os.path.exists(_src):
+                            shutil.copy2(_src, _model_path(_ind, _inc_dir, _slot))
+                for _slot in range(ELITE_POOL):
+                    _src = _model_path('master', args.output, _slot)
                     if os.path.exists(_src):
-                        shutil.copy2(_src, os.path.join(_snap_dir, f'{_ind}_model_0.pt'))
-                _src = os.path.join(args.output, 'master_model_0.pt')
-                if os.path.exists(_src):
-                    shutil.copy2(_src, os.path.join(_snap_dir, 'master_model_0.pt'))
-                log(f"[checkpoint] 255-day elite snapshot saved → {_snap_dir}")
+                        shutil.copy2(_src, _model_path('master', _inc_dir, _slot))
+                log(f"[checkpoint] incremental elite snapshot saved → {_inc_dir}")
 
         executor.shutdown(wait=True)
 

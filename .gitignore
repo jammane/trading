@@ -216,5 +216,13 @@ state.json
 training_log.csv
 elite_training/
 
+# C++ build artifacts
+training_v4_cpp
+*.bin
+
 # Kubernetes secrets — never commit real credentials
 k8s/secret.yaml
+
+# Local developer workflow scripts — machine-specific, not committed
+tmux_start.sh
+tmux_cont.sh
