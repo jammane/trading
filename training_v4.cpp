@@ -324,8 +324,8 @@ struct SymHist {
 struct IndustryState {
     Portfolio portfolios[N_SLOTS];
     SymHist   hist[IND_SYMS];
-    float     elites[ELITE_POOL][STOCKNN_PARAMS];
     int       streak{0};
+    // elites removed — stored in per-worker WorkerScratch to avoid OOM
 };
 
 struct MasterState {
@@ -333,7 +333,55 @@ struct MasterState {
     SymHist         sym_hist[N_SYMS];   // all 144 symbols, indexed [ind*12+sym]
     float           flat_cos_hist[15];
     int             flat_cos_len{0};
-    float           elites[ELITE_POOL][MASTERNN_PARAMS];
+    // elites removed — stored in MasterScratch (heap-allocated in main)
+};
+
+// ── Per-worker scratch (heap-allocated once per thread, ~162 MB total) ──────────
+
+struct WorkerScratch {
+    float*    elite_buf;    // [ELITE_POOL * STOCKNN_PARAMS] — loaded from disk per industry
+    float*    new_elites;   // [ELITE_POOL * STOCKNN_PARAMS] — temp for selection reorder
+    float*    wavg_buf;     // [3 * STOCKNN_PARAMS]
+    float*    mut_buf;      // [STOCKNN_PARAMS]
+    uint64_t  mut_seeds[N_SLOTS - ELITE_POOL];
+
+    WorkerScratch() {
+        size_t ep = (size_t)ELITE_POOL * STOCKNN_PARAMS;
+        elite_buf  = new float[ep]();
+        new_elites = new float[ep]();
+        wavg_buf   = new float[3 * STOCKNN_PARAMS]();
+        mut_buf    = new float[STOCKNN_PARAMS]();
+    }
+    ~WorkerScratch() {
+        delete[] elite_buf; delete[] new_elites;
+        delete[] wavg_buf;  delete[] mut_buf;
+    }
+    float* elite(int i)     { return elite_buf  + (size_t)i * STOCKNN_PARAMS; }
+    float* new_elite(int i) { return new_elites + (size_t)i * STOCKNN_PARAMS; }
+    float* wavg(int i)      { return wavg_buf   + (size_t)i * STOCKNN_PARAMS; }
+};
+
+struct MasterScratch {
+    float*    elite_buf;
+    float*    new_elites;
+    float*    wavg_buf;
+    float*    mut_buf;
+    uint64_t  mut_seeds[N_SLOTS - ELITE_POOL];
+
+    MasterScratch() {
+        size_t ep = (size_t)ELITE_POOL * MASTERNN_PARAMS;
+        elite_buf  = new float[ep]();
+        new_elites = new float[ep]();
+        wavg_buf   = new float[3 * MASTERNN_PARAMS]();
+        mut_buf    = new float[MASTERNN_PARAMS]();
+    }
+    ~MasterScratch() {
+        delete[] elite_buf; delete[] new_elites;
+        delete[] wavg_buf;  delete[] mut_buf;
+    }
+    float* elite(int i)     { return elite_buf  + (size_t)i * MASTERNN_PARAMS; }
+    float* new_elite(int i) { return new_elites + (size_t)i * MASTERNN_PARAMS; }
+    float* wavg(int i)      { return wavg_buf   + (size_t)i * MASTERNN_PARAMS; }
 };
 
 // ── Fee helpers ─────────────────────────────────────────────────────────────────
@@ -536,26 +584,15 @@ static void normalize_weights(const float* vals, float* out, int n) {
     for (int i = 0; i < n; i++) out[i] = std::max(0.f, vals[i]) / total;
 }
 
-// Weighted average of elites into dst. src_ranks[] indexes into state.elites[].
-static void wavg_weights(const float elites[][STOCKNN_PARAMS],
-                         const int* src_ranks, const float* weights, int n,
-                         float* dst, int n_params) {
+// Weighted average of elites (flat layout: elite i at elite_buf + i*n_params).
+static void wavg_weights_flat(const float* elite_buf, int n_params,
+                               const int* src_ranks, const float* weights, int n,
+                               float* dst) {
     memset(dst, 0, n_params * sizeof(float));
     for (int k = 0; k < n; k++) {
-        const float* src = elites[src_ranks[k]];
+        const float* src = elite_buf + (size_t)src_ranks[k] * n_params;
         float w = weights[k];
         for (int j = 0; j < n_params; j++) dst[j] += src[j] * w;
-    }
-}
-
-static void wavg_weights_m(const float elites[][MASTERNN_PARAMS],
-                           const int* src_ranks, const float* weights, int n,
-                           float* dst) {
-    memset(dst, 0, MASTERNN_PARAMS * sizeof(float));
-    for (int k = 0; k < n; k++) {
-        const float* src = elites[src_ranks[k]];
-        float w = weights[k];
-        for (int j = 0; j < MASTERNN_PARAMS; j++) dst[j] += src[j] * w;
     }
 }
 
@@ -590,10 +627,15 @@ struct IndResult {
 // ── step_industry ───────────────────────────────────────────────────────────────
 
 static IndResult step_industry(int ind_i, IndustryState& state,
+                               WorkerScratch& scratch,
+                               const std::string& models_dir,
+                               const std::string& load_dir,
                                const DayData& day, const DayData* fill,
                                int actual_day, int total_avail,
                                int day_num, int num_days,
                                float sigma, bool freeze, const bool* seq_flags) {
+    // Load this industry's elites from disk (or random init on first day)
+    load_or_init_industry(models_dir, load_dir, ind_i, scratch.elite_buf);
     const OHLCV* day_sym  = day.sym[ind_i];
     const OHLCV* fill_sym = fill ? fill->sym[ind_i] : day_sym;
     const char* const* symbols = SYMS[ind_i];
@@ -739,9 +781,9 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     int   trade_count[N_SLOTS] = {};
     float buy_exec = 0.f, sell_exec = 0.f;
 
-    // Thread-local scratch for one mutation's weights
-    static thread_local float mut_buf[STOCKNN_PARAMS];
-    static thread_local uint64_t mut_seeds[N_SLOTS - ELITE_POOL];
+    // Use per-worker scratch buffers (no thread-local statics)
+    float*    mut_buf   = scratch.mut_buf;
+    uint64_t* mut_seeds = scratch.mut_seeds;
 
     // Assign mutation seeds at start of day
     {
@@ -758,11 +800,11 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         // Select weights
         const float* W;
         if (slot < ELITE_POOL) {
-            W = state.elites[slot];
+            W = scratch.elite(slot);
         } else {
             int mut_i  = slot - ELITE_POOL;
             int parent = mut_i / MUTATIONS_PER_PARENT;
-            memcpy(mut_buf, state.elites[parent], STOCKNN_PARAMS * sizeof(float));
+            memcpy(mut_buf, scratch.elite(parent), STOCKNN_PARAMS * sizeof(float));
             apply_gaussian(mut_buf, STOCKNN_PARAMS, sigma, mut_seeds[mut_i]);
             W = mut_buf;
         }
@@ -1001,12 +1043,11 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             normalize_weights(src_val, w10_weights, n10);
             normalize_weights(src_val, w15_weights, n15);
 
-            // Temp buffers for wavg weights + portfolios
-            static thread_local float wavg_w[3][STOCKNN_PARAMS];
+            // Compute wavg weight vectors using scratch buffers
             Portfolio wp5{}, wp10{}, wp15{};
-            wavg_weights(state.elites, src_rank, w5_weights,  n5,  wavg_w[0], STOCKNN_PARAMS);
-            wavg_weights(state.elites, src_rank, w10_weights, n10, wavg_w[1], STOCKNN_PARAMS);
-            wavg_weights(state.elites, src_rank, w15_weights, n15, wavg_w[2], STOCKNN_PARAMS);
+            wavg_weights_flat(scratch.elite_buf, STOCKNN_PARAMS, src_rank, w5_weights,  n5,  scratch.wavg(0));
+            wavg_weights_flat(scratch.elite_buf, STOCKNN_PARAMS, src_rank, w10_weights, n10, scratch.wavg(1));
+            wavg_weights_flat(scratch.elite_buf, STOCKNN_PARAMS, src_rank, w15_weights, n15, scratch.wavg(2));
 
             const Portfolio* p5[5], *p10[10], *p15[15];
             for (int k = 0; k < n5;  k++) p5[k]  = &state.portfolios[src_rank[k]];
@@ -1016,29 +1057,28 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             wavg_portfolio(p10, w10_weights, n10, wp10);
             wavg_portfolio(p15, w15_weights, n15, wp15);
 
-            // Copy top elites into temp to avoid aliasing during reorder
-            static thread_local float new_elites[ELITE_POOL][STOCKNN_PARAMS];
+            // Copy top elites into scratch.new_elites to avoid aliasing during reorder
             Portfolio new_ports[ELITE_POOL];
             for (int k = 0; k < n_top; k++) {
-                memcpy(new_elites[k], state.elites[src_rank[k]], STOCKNN_PARAMS * sizeof(float));
+                memcpy(scratch.new_elite(k), scratch.elite(src_rank[k]), STOCKNN_PARAMS * sizeof(float));
                 new_ports[k] = state.portfolios[src_rank[k]];
             }
             // pad missing elite slots (if fewer than 17 survived) with best
             for (int k = n_top; k < ELITE_COUNT; k++) {
-                memcpy(new_elites[k], new_elites[0], STOCKNN_PARAMS * sizeof(float));
+                memcpy(scratch.new_elite(k), scratch.new_elite(0), STOCKNN_PARAMS * sizeof(float));
                 new_ports[k] = new_ports[0];
             }
             // wavg slots
-            memcpy(new_elites[ELITE_COUNT],     wavg_w[0], STOCKNN_PARAMS * sizeof(float));
-            memcpy(new_elites[ELITE_COUNT + 1], wavg_w[1], STOCKNN_PARAMS * sizeof(float));
-            memcpy(new_elites[ELITE_COUNT + 2], wavg_w[2], STOCKNN_PARAMS * sizeof(float));
+            memcpy(scratch.new_elite(ELITE_COUNT),     scratch.wavg(0), STOCKNN_PARAMS * sizeof(float));
+            memcpy(scratch.new_elite(ELITE_COUNT + 1), scratch.wavg(1), STOCKNN_PARAMS * sizeof(float));
+            memcpy(scratch.new_elite(ELITE_COUNT + 2), scratch.wavg(2), STOCKNN_PARAMS * sizeof(float));
             new_ports[ELITE_COUNT]     = wp5;
             new_ports[ELITE_COUNT + 1] = wp10;
             new_ports[ELITE_COUNT + 2] = wp15;
 
-            // Write back to state
+            // Write back to scratch.elite_buf and portfolios
             for (int k = 0; k < ELITE_POOL; k++) {
-                memcpy(state.elites[k], new_elites[k], STOCKNN_PARAMS * sizeof(float));
+                memcpy(scratch.elite(k), scratch.new_elite(k), STOCKNN_PARAMS * sizeof(float));
                 state.portfolios[k] = new_ports[k];
             }
 
@@ -1071,12 +1111,11 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         if (all_inactive && new_streak >= 2) {
             int half = ELITE_COUNT / 2;
             PCG32 div_rng; div_rng.seed((uint64_t)actual_day * 99991ULL + ind_i);
-            static thread_local float rand_w[STOCKNN_PARAMS];
             for (int k = half; k < ELITE_COUNT; k++) {
-                // blend top half with random: 0.5 * elite + 0.5 * random
-                init_stock_weights(rand_w, div_rng);
+                // blend top half with random: 0.5 * elite + 0.5 * random (reuse mut_buf)
+                init_stock_weights(scratch.mut_buf, div_rng);
                 for (int p = 0; p < STOCKNN_PARAMS; p++)
-                    state.elites[k][p] = 0.5f * state.elites[k - half][p] + 0.5f * rand_w[p];
+                    scratch.elite(k)[p] = 0.5f * scratch.elite(k - half)[p] + 0.5f * scratch.mut_buf[p];
                 state.portfolios[k] = state.portfolios[k - half];
             }
             new_streak = 0;
@@ -1095,6 +1134,9 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         top_hold += slot0_own.holdings[j] * price;
     }
 
+    // Save updated elites back to disk
+    save_industry_elites(models_dir, ind_i, scratch.elite_buf);
+
     IndResult res;
     res.baseline   = baseline;
     res.slot0_score = slot_scores[0];
@@ -1108,7 +1150,8 @@ static IndResult step_industry(int ind_i, IndustryState& state,
 
 // ── step_master ─────────────────────────────────────────────────────────────────
 
-static float step_master(MasterState& state, const DayData& day, const DayData* fill,
+static float step_master(MasterState& state, MasterScratch& scratch,
+                         const DayData& day, const DayData* fill,
                          const IndResult* ind_results,
                          int actual_day, int total_avail, int day_num, int num_days,
                          float sigma) {
@@ -1234,12 +1277,12 @@ static float step_master(MasterState& state, const DayData& day, const DayData* 
         for (int i = 0; i < N_IND; i++) state.portfolios[s].holdings[i] = ref_hold[i];
     }
 
-    // Inference + trade loop
+    // Inference + trade loop — use per-master scratch (no thread-local statics)
     float pred_scores[N_SLOTS] = {};
     float slot_preds[N_SLOTS][N_IND] = {};
     float out36[36];
-    static thread_local float mast_mut_buf[MASTERNN_PARAMS];
-    static thread_local uint64_t mast_mut_seeds[N_SLOTS - ELITE_POOL];
+    float*    mast_mut_buf  = scratch.mut_buf;
+    uint64_t* mast_mut_seeds = scratch.mut_seeds;
     {
         PCG32 seed_rng; seed_rng.seed((uint64_t)actual_day * 777017ULL + 99999ULL);
         for (int i = 0; i < N_SLOTS - ELITE_POOL; i++)
@@ -1251,11 +1294,11 @@ static float step_master(MasterState& state, const DayData& day, const DayData* 
     for (int slot = 0; slot < N_SLOTS; slot++) {
         const float* W;
         if (slot < ELITE_POOL) {
-            W = state.elites[slot];
+            W = scratch.elite(slot);
         } else {
             int mut_i  = slot - ELITE_POOL;
             int parent = mut_i / MUTATIONS_PER_PARENT;
-            memcpy(mast_mut_buf, state.elites[parent], MASTERNN_PARAMS * sizeof(float));
+            memcpy(mast_mut_buf, scratch.elite(parent), MASTERNN_PARAMS * sizeof(float));
             apply_gaussian(mast_mut_buf, MASTERNN_PARAMS, sigma, mast_mut_seeds[mut_i]);
             W = mast_mut_buf;
         }
@@ -1410,13 +1453,11 @@ static float step_master(MasterState& state, const DayData& day, const DayData* 
         normalize_weights(src_val, w10_w, n10);
         normalize_weights(src_val, w15_w, n15);
 
-        static thread_local float new_melites[ELITE_POOL][MASTERNN_PARAMS];
-        static thread_local float mwavg[3][MASTERNN_PARAMS];
         MasterPortfolio new_mports[ELITE_POOL];
 
-        wavg_weights_m(state.elites, src_rank, w5_w,  n5,  mwavg[0]);
-        wavg_weights_m(state.elites, src_rank, w10_w, n10, mwavg[1]);
-        wavg_weights_m(state.elites, src_rank, w15_w, n15, mwavg[2]);
+        wavg_weights_flat(scratch.elite_buf, MASTERNN_PARAMS, src_rank, w5_w,  n5,  scratch.wavg(0));
+        wavg_weights_flat(scratch.elite_buf, MASTERNN_PARAMS, src_rank, w10_w, n10, scratch.wavg(1));
+        wavg_weights_flat(scratch.elite_buf, MASTERNN_PARAMS, src_rank, w15_w, n15, scratch.wavg(2));
 
         const MasterPortfolio* mp5[5], *mp10[10], *mp15[15];
         for (int k=0;k<n5;k++)  mp5[k]  = &state.portfolios[src_rank[k]];
@@ -1428,22 +1469,22 @@ static float step_master(MasterState& state, const DayData& day, const DayData* 
         wavg_mst_portfolio(mp15, w15_w, n15, wp15);
 
         for (int k = 0; k < n_top; k++) {
-            memcpy(new_melites[k], state.elites[src_rank[k]], MASTERNN_PARAMS * sizeof(float));
+            memcpy(scratch.new_elite(k), scratch.elite(src_rank[k]), MASTERNN_PARAMS * sizeof(float));
             new_mports[k] = state.portfolios[src_rank[k]];
         }
         for (int k = n_top; k < ELITE_COUNT; k++) {
-            memcpy(new_melites[k], new_melites[0], MASTERNN_PARAMS * sizeof(float));
+            memcpy(scratch.new_elite(k), scratch.new_elite(0), MASTERNN_PARAMS * sizeof(float));
             new_mports[k] = new_mports[0];
         }
-        memcpy(new_melites[ELITE_COUNT],     mwavg[0], MASTERNN_PARAMS * sizeof(float));
-        memcpy(new_melites[ELITE_COUNT + 1], mwavg[1], MASTERNN_PARAMS * sizeof(float));
-        memcpy(new_melites[ELITE_COUNT + 2], mwavg[2], MASTERNN_PARAMS * sizeof(float));
+        memcpy(scratch.new_elite(ELITE_COUNT),     scratch.wavg(0), MASTERNN_PARAMS * sizeof(float));
+        memcpy(scratch.new_elite(ELITE_COUNT + 1), scratch.wavg(1), MASTERNN_PARAMS * sizeof(float));
+        memcpy(scratch.new_elite(ELITE_COUNT + 2), scratch.wavg(2), MASTERNN_PARAMS * sizeof(float));
         new_mports[ELITE_COUNT]   = wp5;
         new_mports[ELITE_COUNT+1] = wp10;
         new_mports[ELITE_COUNT+2] = wp15;
 
         for (int k = 0; k < ELITE_POOL; k++) {
-            memcpy(state.elites[k], new_melites[k], MASTERNN_PARAMS * sizeof(float));
+            memcpy(scratch.elite(k), scratch.new_elite(k), MASTERNN_PARAMS * sizeof(float));
             state.portfolios[k] = new_mports[k];
         }
         for (int mut_i = 0; mut_i < N_SLOTS - ELITE_POOL; mut_i++)
@@ -1454,11 +1495,10 @@ static float step_master(MasterState& state, const DayData& day, const DayData* 
         log_msg(std::string("[master  ] best_pred=") + std::to_string(best_pred).substr(0,6) +
                 " below floor — injecting diversity");
         PCG32 div_rng; div_rng.seed((uint64_t)actual_day * 55555ULL + 77777ULL);
-        static float mst_rand_w[MASTERNN_PARAMS];  // heap-sized; master runs in main thread
         for (int k = half; k < ELITE_COUNT; k++) {
-            init_master_weights(mst_rand_w, div_rng);
+            init_master_weights(scratch.mut_buf, div_rng);
             for (int p = 0; p < MASTERNN_PARAMS; p++)
-                state.elites[k][p] = 0.5f * state.elites[k - half][p] + 0.5f * mst_rand_w[p];
+                scratch.elite(k)[p] = 0.5f * scratch.elite(k - half)[p] + 0.5f * scratch.mut_buf[p];
             state.portfolios[k] = state.portfolios[k - half];
         }
     }
@@ -1499,61 +1539,61 @@ static void update_hist_sym(SymHist& h, const OHLCV& d) {
 // ── Model persistence ──────────────────────────────────────────────────────────
 
 static void save_industry_elites(const std::string& dir, int ind_i,
-                                  const float elites[][STOCKNN_PARAMS]) {
+                                  const float* elite_buf) {
     for (int slot = 0; slot < ELITE_POOL; slot++) {
         std::string path = elite_path(dir, IND_NAMES[ind_i], slot);
-        if (!save_bin(path, elites[slot], STOCKNN_PARAMS))
+        if (!save_bin(path, elite_buf + (size_t)slot * STOCKNN_PARAMS, STOCKNN_PARAMS))
             log_msg("WARNING: could not save " + path);
     }
 }
 
-static void save_master_elites(const std::string& dir,
-                                const float elites[][MASTERNN_PARAMS]) {
+static void save_master_elites(const std::string& dir, const float* elite_buf) {
     for (int slot = 0; slot < ELITE_POOL; slot++) {
         std::string path = elite_path(dir, "master", slot);
-        if (!save_bin(path, elites[slot], MASTERNN_PARAMS))
+        if (!save_bin(path, elite_buf + (size_t)slot * MASTERNN_PARAMS, MASTERNN_PARAMS))
             log_msg("WARNING: could not save " + path);
     }
 }
 
 static void load_or_init_industry(const std::string& dir, const std::string& load_dir,
-                                   int ind_i, float elites[][STOCKNN_PARAMS]) {
+                                   int ind_i, float* elite_buf) {
     PCG32 rng; rng.seed((uint64_t)ind_i * 987654321ULL + 123456789ULL);
     for (int slot = 0; slot < ELITE_POOL; slot++) {
-        // Try load_dir first, then dir
+        float* e = elite_buf + (size_t)slot * STOCKNN_PARAMS;
         bool loaded = false;
         if (!load_dir.empty()) {
             std::string p = elite_path(load_dir, IND_NAMES[ind_i], slot);
-            loaded = load_bin(p, elites[slot], STOCKNN_PARAMS);
+            loaded = load_bin(p, e, STOCKNN_PARAMS);
         }
         if (!loaded) {
             std::string p = elite_path(dir, IND_NAMES[ind_i], slot);
-            loaded = load_bin(p, elites[slot], STOCKNN_PARAMS);
+            loaded = load_bin(p, e, STOCKNN_PARAMS);
         }
         if (!loaded) {
             log_msg(std::string("[") + IND_SHORT[ind_i] + "]   Slot " +
                     std::to_string(slot) + ": random init");
-            init_stock_weights(elites[slot], rng);
+            init_stock_weights(e, rng);
         }
     }
 }
 
 static void load_or_init_master(const std::string& dir, const std::string& load_dir,
-                                 float elites[][MASTERNN_PARAMS]) {
+                                 float* elite_buf) {
     PCG32 rng; rng.seed(0xDEADBEEFCAFEBABEULL);
     for (int slot = 0; slot < ELITE_POOL; slot++) {
+        float* e = elite_buf + (size_t)slot * MASTERNN_PARAMS;
         bool loaded = false;
         if (!load_dir.empty()) {
             std::string p = elite_path(load_dir, "master", slot);
-            loaded = load_bin(p, elites[slot], MASTERNN_PARAMS);
+            loaded = load_bin(p, e, MASTERNN_PARAMS);
         }
         if (!loaded) {
             std::string p = elite_path(dir, "master", slot);
-            loaded = load_bin(p, elites[slot], MASTERNN_PARAMS);
+            loaded = load_bin(p, e, MASTERNN_PARAMS);
         }
         if (!loaded) {
             log_msg("[master  ]   Slot " + std::to_string(slot) + ": random init");
-            init_master_weights(elites[slot], rng);
+            init_master_weights(e, rng);
         }
     }
 }
@@ -1631,6 +1671,8 @@ struct WorkerCtx {
     const DayData*      fill_ptr;
     IndResult*          results;
     const bool*         seq_flags;
+    std::string         models_dir;
+    std::string         load_dir;   // only used on day_num == 0
     int                 actual_day, total_avail, day_num, num_days;
     float               sigma;
     bool                freeze, master_only;
@@ -1641,17 +1683,21 @@ struct WorkerCtx {
 };
 
 static void worker_fn(WorkerCtx* ctx) {
+    WorkerScratch scratch;  // ~162 MB heap, allocated once per worker thread
     while (true) {
         ctx->work_ready.acquire();
         if (ctx->shutdown.load(std::memory_order_relaxed)) {
             ctx->work_done.release();
             return;
         }
+        // Only pass load_dir on the first day of each pass to avoid re-seeding from stale checkpoint
+        const std::string& use_load = (ctx->day_num == 0) ? ctx->load_dir : std::string();
         while (true) {
             int i = ctx->next_ind.fetch_add(1, std::memory_order_relaxed);
             if (i >= N_IND) break;
             if (!ctx->master_only)
-                ctx->results[i] = step_industry(i, ctx->ind_states[i],
+                ctx->results[i] = step_industry(i, ctx->ind_states[i], scratch,
+                                                 ctx->models_dir, use_load,
                                                  *ctx->day_ptr, ctx->fill_ptr,
                                                  ctx->actual_day, ctx->total_avail,
                                                  ctx->day_num, ctx->num_days,
@@ -1717,9 +1763,10 @@ int main(int argc, char* argv[]) {
             "  Training: days " + std::to_string(day_start) +
             "–" + std::to_string(day_end));
 
-    // Allocate state on heap (too large for stack)
-    auto ind_states = std::make_unique<IndustryState[]>(N_IND);
-    auto mst        = std::make_unique<MasterState>();
+    // Allocate state on heap (small now — elites removed)
+    auto ind_states  = std::make_unique<IndustryState[]>(N_IND);
+    auto mst         = std::make_unique<MasterState>();
+    auto mst_scratch = std::make_unique<MasterScratch>();  // ~162 MB for master elites
 
     // Open CSV log
     std::string csv_path = output_dir + "/training_log.csv";
@@ -1733,7 +1780,9 @@ int main(int argc, char* argv[]) {
     // Threading setup
     num_workers = std::max(1, std::min(num_workers, N_IND));
     WorkerCtx wctx;
-    wctx.ind_states = ind_states.get();
+    wctx.ind_states  = ind_states.get();
+    wctx.models_dir  = output_dir;
+    wctx.load_dir    = load_dir;
 
     std::vector<std::thread> workers;
     for (int w = 0; w < num_workers; w++)
@@ -1749,19 +1798,18 @@ int main(int argc, char* argv[]) {
                 " | sigma=" + std::to_string(cur_sigma).substr(0,8) +
                 " | master_sigma=" + std::to_string(cur_mst_sigma).substr(0,8) + " =====");
 
-        // Load / init models
+        // Init portfolios; industry elites are loaded per-day inside step_industry
         for (int i = 0; i < N_IND; i++) {
-            load_or_init_industry(output_dir, load_dir, i, ind_states[i].elites);
             ind_states[i].portfolios[0].cash = IND_STARTING_CASH;
             for (int j = 0; j < IND_SYMS; j++) {
                 ind_states[i].portfolios[0].holdings[j]    = 0.f;
                 ind_states[i].portfolios[0].stop_prices[j] = 0.f;
             }
             ind_states[i].streak = 0;
-            // Initialize mutation portfolios
             for (int s = 1; s < N_SLOTS; s++) ind_states[i].portfolios[s] = ind_states[i].portfolios[0];
         }
-        load_or_init_master(output_dir, load_dir, mst->elites);
+        // Load master elites once at pass start (no per-day reload needed for master)
+        load_or_init_master(output_dir, load_dir, mst_scratch->elite_buf);
         mst->portfolios[0].cash = MST_STARTING_CASH;
         for (int i = 0; i < N_IND; i++) mst->portfolios[0].holdings[i] = 0.f;
         for (int s = 1; s < N_SLOTS; s++) mst->portfolios[s] = mst->portfolios[0];
@@ -1822,27 +1870,23 @@ int main(int argc, char* argv[]) {
             }
 
             // Master step
-            float flat_cos = step_master(*mst, *day_ptr, fill_ptr, results,
+            float flat_cos = step_master(*mst, *mst_scratch, *day_ptr, fill_ptr, results,
                                          actual_day, total_days, day_num, num_days,
                                          cur_mst_sigma);
 
             // Log CSV row
             if (csv) write_csv_row(csv, pass, actual_day, results, flat_cos);
 
-            // Periodic save (every 50 days and at end)
+            // Periodic master save (industry elites already saved inside step_industry each day)
             if (day_num % 50 == 49 || day_num == num_days - 1) {
-                log_msg("Saving elites to " + output_dir + " ...");
-                for (int i = 0; i < N_IND; i++)
-                    save_industry_elites(output_dir, i, ind_states[i].elites);
-                save_master_elites(output_dir, mst->elites);
+                log_msg("Saving master elites to " + output_dir + " ...");
+                save_master_elites(output_dir, mst_scratch->elite_buf);
             }
         }
 
-        // Save after each pass
-        log_msg("Pass " + std::to_string(pass+1) + " complete — saving elites");
-        for (int i = 0; i < N_IND; i++)
-            save_industry_elites(output_dir, i, ind_states[i].elites);
-        save_master_elites(output_dir, mst->elites);
+        // Save master after each pass (industry elites already saved)
+        log_msg("Pass " + std::to_string(pass+1) + " complete — saving master elites");
+        save_master_elites(output_dir, mst_scratch->elite_buf);
     }
 
     // Shutdown workers
