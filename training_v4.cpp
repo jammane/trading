@@ -624,6 +624,11 @@ struct IndResult {
     int   new_streak;
 };
 
+// ── Forward declarations (needed because step_industry calls load/save defined later) ──
+static void load_or_init_industry(const std::string& dir, const std::string& load_dir,
+                                   int ind_i, float* elite_buf);
+static void save_industry_elites(const std::string& dir, int ind_i, const float* elite_buf);
+
 // ── step_industry ───────────────────────────────────────────────────────────────
 
 static IndResult step_industry(int ind_i, IndustryState& state,
