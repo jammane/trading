@@ -20,7 +20,7 @@ import os
 import random
 import shutil
 import statistics
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from threading import Lock
@@ -303,6 +303,7 @@ ELITE_COUNT          = 17
 WAVG_COUNT           = 3
 ELITE_POOL           = ELITE_COUNT + WAVG_COUNT   # 20
 MUTATIONS_PER_PARENT = 9
+HIST_ELITE_DAYS      = 5           # rolling days of elite pools kept for re-entry
 IND_STARTING_CASH    = 25_000.0
 MST_STARTING_CASH    = 300_000.0
 MAX_SINGLE_STOCK_PCT = 0.60
@@ -669,6 +670,30 @@ def _normalize_weights(values):
     return [v / total for v in clipped]
 
 
+def _wavg_from_model_objects(models, values, model_class):
+    """Weighted average from pre-loaded model objects — avoids extra disk I/O."""
+    weights   = _normalize_weights(values)
+    avg_state = None
+    int_state = {}
+    with torch.no_grad():
+        for m, w in zip(models, weights):
+            state = m.state_dict()
+            if avg_state is None:
+                avg_state = {k: v.clone().float() * w
+                             for k, v in state.items() if torch.is_floating_point(v)}
+                int_state = {k: v.clone()
+                             for k, v in state.items() if not torch.is_floating_point(v)}
+            else:
+                for k, v in state.items():
+                    if torch.is_floating_point(v) and k in avg_state:
+                        avg_state[k] = avg_state[k] + v.float() * w
+    if avg_state is None:
+        return model_class()
+    result = model_class()
+    result.load_state_dict({**avg_state, **int_state})
+    return result
+
+
 def compute_weighted_avg_model(prefix, directory, slots, values, model_class):
     """
     Build a weighted-average model from the given slots.
@@ -798,12 +823,18 @@ def selection_and_mutation(
     inactive_slots=None,  # set of slot indices excluded from elite candidacy (zero-trade filter)
     actual_day=None, total_avail=None,
     sigma=None,
+    hist_state_dicts=None,  # {virtual_slot<0: state_dict} — historical elite weights
+    hist_ports=None,         # {virtual_slot<0: port_dict}  — historical elite portfolios
+    hist_elite_deque=None,   # deque to append today's elite snapshot to
 ):
     """
     Keeps top ELITE_COUNT direct elites (slots 0..16), plus three weighted-average
     keepers (w5/w10/w15 at slots 17/18/19 = ELITE_COUNT..ELITE_COUNT+2).
     Fills slots ELITE_POOL..N_SLOTS-1 (180 slots) with 9 mutations per parent,
     assigned deterministically: parent = (slot - ELITE_POOL) // MUTATIONS_PER_PARENT.
+
+    Historical elites (negative virtual slot IDs) may appear in scores and compete for
+    direct-elite slots 0–16. Mutation still draws only from freshly-selected slots 0–19.
     """
     if inactive_slots is None:
         inactive_slots = set()
@@ -820,45 +851,78 @@ def selection_and_mutation(
     elite_slots = [s for s, _ in top_elite]
     elite_vals  = [v for _, v in top_elite]
 
-    # Collect elite models/portfolios first (avoid read-after-write if slots swap)
-    elite_models = []
-    elite_ports  = []
-    for old_slot, _ in top_elite:
-        m = (_model_cache[prefix][old_slot]
-             if prefix in _model_cache
-             else load_slot_model(prefix, directory, old_slot, model_class))
-        elite_models.append(m)
-        if hasattr(portfolios, 'reset_all_to'):
+    # Collect elite models/portfolios — historical entries from state_dicts, others from cache/disk
+    elite_models  = []
+    elite_ports   = []
+    hist_reentries = []
+    for rank, (old_slot, _) in enumerate(top_elite):
+        if old_slot < 0 and hist_state_dicts and old_slot in hist_state_dicts:
+            m = model_class()
+            m.load_state_dict(hist_state_dicts[old_slot])
+            elite_models.append(m)
+            day_off  = (-old_slot - 1) // ELITE_POOL
+            slot_off = (-old_slot - 1) % ELITE_POOL
+            hist_reentries.append((rank, day_off, slot_off, elite_vals[rank]))
+        else:
+            m = (_model_cache[prefix][old_slot]
+                 if prefix in _model_cache
+                 else load_slot_model(prefix, directory, old_slot, model_class))
+            elite_models.append(m)
+
+        if old_slot < 0 and hist_ports and old_slot in hist_ports:
+            elite_ports.append(hist_ports[old_slot])
+        elif hasattr(portfolios, 'reset_all_to'):
             elite_ports.append((float(portfolios.cash[old_slot]),
                                 portfolios.holdings[old_slot].copy()))
         else:
             elite_ports.append(copy.deepcopy(portfolios[old_slot]))
+
+    # Compute wavg from already-loaded models (handles historical entries; avoids double disk I/O)
+    def _wavg_n(n):
+        k    = min(n, len(elite_models))
+        mods = elite_models[:k]
+        vals = elite_vals[:k]
+        pts  = elite_ports[:k]
+        # Normalise ports to plain dicts for compute_weighted_avg_portfolio
+        def _to_dict(p):
+            if isinstance(p, tuple):  # PortfolioArray form: (cash, holdings_array)
+                return p
+            return p
+        wm = _wavg_from_model_objects(mods, vals, model_class)
+        wp = compute_weighted_avg_portfolio(
+            [p if isinstance(p, dict) else {'cash': p[0], 'holdings': {}} for p in pts],
+            vals)
+        return wm, wp
+
+    w5_model,  w5_port  = _wavg_n(5)
+    w10_model, w10_port = _wavg_n(10)
+    w15_model, w15_port = _wavg_n(15)
+
+    # Snapshot today's elite pool for tomorrow's historical buffer (models already in memory)
+    if hist_elite_deque is not None:
+        snapshot = [copy.deepcopy(m.state_dict()) for m in elite_models]
+        snapshot.append(copy.deepcopy(w5_model.state_dict()))
+        snapshot.append(copy.deepcopy(w10_model.state_dict()))
+        snapshot.append(copy.deepcopy(w15_model.state_dict()))
+        hist_elite_deque.append(snapshot)
 
     # Copy direct elites to slots 0..ELITE_COUNT-1
     for new_slot, (model, port) in enumerate(zip(elite_models, elite_ports)):
         if prefix in _model_cache:
             _model_cache[prefix][new_slot] = model
         save_slot_model(prefix, directory, new_slot, model)
-        if hasattr(portfolios, 'reset_all_to'):
+        if isinstance(port, tuple):   # PortfolioArray form
             portfolios.cash[new_slot]        = port[0]
             portfolios.holdings[new_slot, :] = port[1]
+        elif hasattr(portfolios, 'reset_all_to'):
+            portfolios.cash[new_slot]        = port.get('cash', IND_STARTING_CASH)
         else:
             portfolios[new_slot] = port
 
-    # Weighted averages: w5 (top-5), w10 (top-10), w15 (top-15) at slots 17/18/19
-    wavg_configs = [
-        (ELITE_COUNT,     min(5,  len(surviving))),
-        (ELITE_COUNT + 1, min(10, len(surviving))),
-        (ELITE_COUNT + 2, min(15, len(surviving))),
-    ]
-    for wavg_slot, k in wavg_configs:
-        top_k       = surviving[:k]
-        top_k_slots = [s for s, _ in top_k]
-        top_k_vals  = [v for _, v in top_k]
-        wm          = compute_weighted_avg_model(prefix, directory, top_k_slots, top_k_vals, model_class)
-        _dicts      = ([portfolios[s].to_dict() for s in top_k_slots]
-                       if hasattr(portfolios[0], 'to_dict') else [portfolios[s] for s in top_k_slots])
-        wp          = compute_weighted_avg_portfolio(_dicts, top_k_vals)
+    # Write wavg slots 17–19
+    for wavg_slot, wm, wp in [(ELITE_COUNT, w5_model, w5_port),
+                               (ELITE_COUNT + 1, w10_model, w10_port),
+                               (ELITE_COUNT + 2, w15_model, w15_port)]:
         if prefix in _model_cache:
             _model_cache[prefix][wavg_slot] = wm
         save_slot_model(prefix, directory, wavg_slot, wm)
@@ -885,13 +949,19 @@ def selection_and_mutation(
             else:
                 portfolios[child_slot] = copy.deepcopy(portfolios[parent_slot])
 
-    elite_display = [_fmt_slot(s) for s in range(len(top_elite))]
+    if hist_reentries:
+        for rank, day_off, slot_off, score in hist_reentries:
+            log(f"[{sn(prefix)}]   HIST ELITE re-entered: H{day_off}.{slot_off} → slot {rank} "
+                f"(sel_score={score:.2f})")
+
+    elite_display = [_fmt_slot(s) if s >= 0 else f"H{(-s-1)//ELITE_POOL}.{(-s-1)%ELITE_POOL}"
+                     for s in elite_slots]
     log(f"[{sn(prefix)}]   Selection done | elite={elite_display} | "
         f"top score=${max(elite_vals):.2f} | mutations={N_SLOTS - ELITE_POOL}")
 
     # Seed dominance check: if 13+ of 17 direct elites are original seed slots (<ELITE_POOL),
     # inject diversity by replacing bottom half of elites with halfway blends from top half.
-    seed_elite_count = sum(1 for s in elite_slots if s < ELITE_POOL)
+    seed_elite_count = sum(1 for s in elite_slots if s >= 0 and s < ELITE_POOL)
     if seed_elite_count >= ELITE_COUNT - 4:
         day_tag = f" Day {actual_day + 1}/{total_avail}" if actual_day is not None else ""
         log(f"[{sn(prefix)}]{day_tag}   Seed dominance ({seed_elite_count}/{ELITE_COUNT} elites are seeds) — injecting diversity")
@@ -899,6 +969,8 @@ def selection_and_mutation(
         inject_slots = elite_slots[half:]
         source_slots = elite_slots[:half]
         for inject_slot, source_slot in zip(inject_slots, source_slots):
+            if source_slot < 0:
+                continue  # historical entries don't get diversity-injected back into themselves
             elite  = load_slot_model(prefix, directory, source_slot, model_class)
             blend  = blend_model_halfway(elite, model_class)
             if prefix in _model_cache:
@@ -947,7 +1019,7 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
                   day, actual_day, total_avail, day_num, total_days,
                   stop_prices_all=None,
                   next_day=None, all_zero_streak=0, daily_sigma=None,
-                  freeze=False, seq_flags=None):
+                  freeze=False, seq_flags=None, hist_elite_buf=None):
     """
     Process a single trading day for one industry.
     Orders are placed using today's model predictions but filled against
@@ -1173,6 +1245,38 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
             sell_exec_count       += ls
             slot_trade_count[slot] = lb + ls
 
+    # ── Step 2b: score historical elites (last HIST_ELITE_DAYS days' pools) ──
+    # Historical models run from the same reset state as regular slots.
+    # Competitive scorers can re-enter the elite pool via selection below.
+    hist_vslot_scores = []
+    hist_vslot_models = {}
+    hist_vslot_ports  = {}
+    if hist_elite_buf:
+        ref_hold_dict = {symbols[i]: float(baseline_hold[i]) for i in range(len(symbols))}
+        ref_stop_dict = dict(stop_prices_all[0]) if stop_prices_all else {sym: 0.0 for sym in symbols}
+        state_vec_ref = [baseline_cash] + [ref_hold_dict.get(sym, 0.0) for sym in symbols]
+        today_t_ref   = torch.tensor(today_shared + state_vec_ref, dtype=torch.float32).unsqueeze(0)
+        for day_offset, snapshot in enumerate(hist_elite_buf):
+            for slot_idx, sd in enumerate(snapshot):
+                vslot = -(day_offset * ELITE_POOL + slot_idx + 1)
+                h_model = StockNN()
+                h_model.load_state_dict(sd)
+                h_model.eval()
+                h_score, h_port = _simulate_one_model(
+                    h_model, baseline_cash, ref_hold_dict, ref_stop_dict,
+                    symbols, day_data, fill_data, history_t_shared, today_t_ref,
+                    seq_flags=seq_flags)
+                del h_model
+                raw_delta = h_score - baseline_score
+                if raw_delta > 0:
+                    invested_pct = max(0.0, 1.0 - h_port['cash'] / h_score)
+                    sel_score = raw_delta * invested_pct
+                else:
+                    sel_score = raw_delta
+                hist_vslot_scores.append((vslot, sel_score))
+                hist_vslot_models[vslot] = sd
+                hist_vslot_ports[vslot]  = h_port
+
     # ── Step 3: update the shared market-history window ──────────────────────
     for sym in symbols:
         if sym in day_data:
@@ -1276,10 +1380,13 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
     if not freeze:
         selection_and_mutation(
             industry, output_dir, StockNN,
-            sel_scores, portfolios,
+            sel_scores + hist_vslot_scores, portfolios,
             survival_floor=-(baseline_score * 0.1),
             inactive_slots=inactive_slots | below_floor,
             actual_day=actual_day, total_avail=total_avail,
+            hist_state_dicts=hist_vslot_models or None,
+            hist_ports=hist_vslot_ports or None,
+            hist_elite_deque=hist_elite_buf,
         )  # sigma threaded via mutate() default — v3 keeps monkey-patch approach
 
     # ── Diversity injection if all-zero streak hits 2 ────────────────────────
@@ -1432,7 +1539,8 @@ def compute_master_liquidation(
 def step_master(output_dir, portfolios, histories, industries,
                 day, actual_day, total_avail, day_num, total_days,
                 flat_cos_history=None,
-                industry_top_scores=None, ind_capital_state=None, sigma=None):
+                industry_top_scores=None, ind_capital_state=None, sigma=None,
+                hist_elite_buf=None):
     """
     Process a single trading day for the master model.
 
@@ -1655,6 +1763,29 @@ def step_master(output_dir, portfolios, histories, industries,
 
     del all_master_models
 
+    # ── Step 2b: historical elite master forward passes ───────────────────────
+    # Collect alloc predictions from historical models; scoring deferred to Step 4
+    # once target_pct is built.  Uses slot-0 portfolio state as reference input.
+    hist_mst_vslot_preds = {}
+    hist_mst_state_dicts = {}
+    if hist_elite_buf:
+        ref_cash_norm = portfolios.cash[0] / max(pool, 1.0)
+        ref_hold_vals = [float(portfolios.holdings[0][j]) * ind_price.get(ind, 0.0)
+                         for j, ind in enumerate(industry_list)]
+        ref_state_vec = [ref_cash_norm] + ref_hold_vals
+        hist_today_t  = torch.tensor(mst_today_shared + ref_state_vec,
+                                     dtype=torch.float32).unsqueeze(0)
+        for day_offset, snapshot in enumerate(hist_elite_buf):
+            for slot_idx, sd in enumerate(snapshot):
+                vslot   = -(day_offset * ELITE_POOL + slot_idx + 1)
+                h_model = MasterNN(); h_model.load_state_dict(sd); h_model.eval()
+                with torch.inference_mode():
+                    out = h_model(mst_history_t, hist_today_t)
+                del h_model
+                h_alloc, _, _ = compute_alloc_from_predicted(out.squeeze(), industry_list)
+                hist_mst_vslot_preds[vslot] = h_alloc
+                hist_mst_state_dicts[vslot] = sd
+
     # ── Step 3: update shared symbol history ─────────────────────────────────
     for sym in all_symbols:
         if sym in day_data:
@@ -1691,6 +1822,11 @@ def step_master(output_dir, portfolios, histories, industries,
         slot_preds  = {s: master_allocs[s][0] for s in range(N_SLOTS)}
         pred_scores = [(s, _cos_sim(slot_preds[s], target_pct, industry_list))
                        for s in range(N_SLOTS)]
+        if hist_mst_vslot_preds:
+            pred_scores = pred_scores + [
+                (vs, _cos_sim(alloc, target_pct, industry_list))
+                for vs, alloc in hist_mst_vslot_preds.items()
+            ]
         best_pred   = max(v for _, v in pred_scores)
         flat_cos    = _cos_sim(flat_alloc, target_pct, industry_list)
     else:
@@ -1723,6 +1859,8 @@ def step_master(output_dir, portfolios, histories, industries,
         mean_ps    = sum(pred_vals) / len(pred_vals)
         std_ps     = (sum((v - mean_ps) ** 2 for v in pred_vals) / len(pred_vals)) ** 0.5
         pool_floor = mean_ps - std_ps
+        hist_mst_ports = {vs: copy.deepcopy(portfolios[0])
+                          for vs in hist_mst_state_dicts} if hist_mst_state_dicts else None
         selection_and_mutation(
             'master', output_dir, MasterNN,
             pred_scores, portfolios,
@@ -1730,6 +1868,9 @@ def step_master(output_dir, portfolios, histories, industries,
             inactive_slots=set(),
             actual_day=actual_day, total_avail=total_avail,
             sigma=sigma,
+            hist_state_dicts=hist_mst_state_dicts or None,
+            hist_ports=hist_mst_ports,
+            hist_elite_deque=hist_elite_buf,
         )
     else:
         half = ELITE_COUNT // 2
@@ -2049,14 +2190,17 @@ def main():
         ind_portfolios   = {}
         ind_histories    = {}
         ind_stop_prices  = {}
+        ind_hist_elites  = {}
         for ind, syms in industries.items():
             log(f"[{sn(ind)}] ===== PASS {pass_num+1} BEGIN | days {day_start}–{day_end} of {total_days} =====")
             ind_portfolios[ind], ind_histories[ind], ind_stop_prices[ind] = init_industry(
                 ind, syms, args.output, args.load_dir, all_days, day_start)
+            ind_hist_elites[ind] = deque(maxlen=HIST_ELITE_DAYS)
 
         log(f"[master] ===== PASS {pass_num+1} BEGIN | days {day_start}–{day_end} of {total_days} =====")
         mst_portfolios, mst_histories = init_master(
             args.output, args.load_dir, industries, all_days, day_start)
+        mst_hist_elites = deque(maxlen=HIST_ELITE_DAYS)
 
         days_slice = all_days[day_start:day_end]
         num_days   = len(days_slice)
@@ -2084,7 +2228,8 @@ def main():
                                        all_zero_streak=ind_streaks.get(ind, 0),
                                        daily_sigma=current_sigma if args.daily else None,
                                        freeze=args.master_only,
-                                       seq_flags=seq_flags)
+                                       seq_flags=seq_flags,
+                                       hist_elite_buf=ind_hist_elites[ind])
                 if result is not None:
                     baseline, top_val, best_delta, top_hold, top_cash, new_streak = result
                     industry_top_scores[ind] = (baseline, top_val)
@@ -2102,7 +2247,8 @@ def main():
                 flat_cos_history=mst_flat_cos_history,
                 industry_top_scores=industry_top_scores,
                 ind_capital_state=ind_capital_state,
-                sigma=current_master_sigma)
+                sigma=current_master_sigma,
+                hist_elite_buf=mst_hist_elites)
             invalidate_cache('master')
 
             # Append one row to the training CSV

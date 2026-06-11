@@ -143,6 +143,8 @@ Each industry maintains **200 model slots** on disk as `.pt` files. The slot lay
 
 Each training day: all 200 slots reset to slot 0's portfolio → infer → simulate fills → score as `delta × invested_pct` → select + mutate. The `invested_pct` multiplier penalises cash-heavy winners.
 
+**Historical elite buffer (`HIST_ELITE_DAYS = 5`):** At the end of each day's selection, the winning elite pool (20 models) is saved to a rolling 5-day buffer. The next day, these historical models are scored from fresh reset portfolios alongside the regular 200 slots. Historical models that re-crack the top 17 re-enter the active pool and receive fresh mutations. This gives consistently strong models more than one chance — a model that keeps appearing in the top 20 accumulates new children each time. Historical elites are **excluded** from 255-day checkpoints and end-of-pass saves. Python trainers keep the buffer in RAM; the C++ trainer uses a disk-based ring buffer in `<output_dir>/hist_elite/` (≈4.8 GB total for 12 industries + master at 5 days × 70 MB/slot).
+
 `training_v4.py` is **deprecated** — superseded by `training_v4_cpp` which is ~6× faster and includes all features (`--daily`, `--promote`, `data_dump` diagnostics). Retained for reference only.
 
 `training_v3.py` (parallel) differs from `training_v2.py` in: 7 worker threads, in-RAM model cache (`_model_cache`), no slippage on limit fills, and slot-level portfolio JSON persisted alongside weights.
@@ -170,6 +172,7 @@ A `PostToolUse` hook in `.claude/settings.json` auto-updates `CHANGELOG.md` and 
 | `N_SLOTS` | 200 | Total model slots per pool |
 | `ELITE_COUNT` | 17 | Direct elite slots |
 | `ELITE_POOL` | 20 | Elites + weighted-average slots |
+| `HIST_ELITE_DAYS` | 5 | Rolling days of past elite pools kept for re-entry |
 | `IND_STARTING_CASH` | $25,000 | Per-industry starting capital |
 | `MST_STARTING_CASH` | $300,000 | Master starting capital |
 | `MAX_SINGLE_STOCK_PCT` | 0.60 | Max fraction of industry cash in one stock |
