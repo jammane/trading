@@ -149,9 +149,9 @@ Requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` set in the environment (or sto
 
 ### `training_v4.py` / `training_v2.py`
 
-`training_v4.py` (parallel, 2-thread dynamic industry pool — recommended) and `training_v2.py`
-(single-threaded) share identical CLI flags. The thread count in v4 is a source-level constant
-(`NUM_THREADS = 2`) rather than a CLI argument.
+`training_v4.py` (parallel, 2-process dynamic industry pool) and `training_v2.py`
+(single-process) share identical CLI flags. The process count in v4 is a source-level constant
+(`NUM_WORKERS = 2`) rather than a CLI argument.
 
 | Flag | Default | Description |
 |------|---------|-------------|

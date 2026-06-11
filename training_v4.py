@@ -32,6 +32,7 @@ import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from datetime import datetime
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -53,6 +54,10 @@ MUTATIONS_PER_PARENT  = 9           # each of the ELITE_POOL parents gets this m
 
 NUM_WORKERS           = 2           # worker processes for industry parallelism; raise to 4 on a 4-vCPU host
 DAY_TIMEOUT_SECS      = 420         # 7 min wall-clock limit per training day; v2 baseline ~5 min — exit if exceeded
+
+N_IND                 = len(INDUSTRIES)  # 12 industry sectors
+IND_SYMS              = 12               # symbols per industry (all sectors have exactly 12)
+HIST_WINDOW           = 15               # rolling history window length
 
 IND_STARTING_CASH     = 25_000.0    # per-industry portfolio starting capital
 MST_STARTING_CASH     = 300_000.0   # master starting capital (12 × IND_STARTING_CASH)
@@ -1847,19 +1852,89 @@ def _dump_day_timeout(actual_day, total_days, elapsed, completed_inds, hung_inds
     return path
 
 
+# ── numpy IPC helpers ──────────────────────────────────────────────────────────
+# Portfolio layout per slot: [cash, holdings[sym0..N-1], stop_prices[sym0..N-1]]
+# History layout: (IND_SYMS, HIST_WINDOW, 10) — oldest entries first, zero-padded.
+#
+# Per-industry files are used instead of shared memmaps to avoid concurrent-
+# write conflicts on copy-on-write filesystems (btrfs, ZFS).  Each worker
+# reads and writes only its own industry's files; main reads portfolio files
+# after all workers complete.
+
+_PORT_COLS = 1 + IND_SYMS * 2   # 25: cash + 12 holdings + 12 stop_prices
+
+
+def _ipc_paths(ipc_dir, ind_idx):
+    """Return (port_path, hist_path, lens_path) for one industry index."""
+    base = os.path.join(ipc_dir, f'_ipc_{ind_idx}')
+    return f'{base}_port.npy', f'{base}_hist.npy', f'{base}_lens.npy'
+
+
+def portfolio_to_arr(portfolios, syms):
+    """Flatten list-of-dicts to ndarray (N_SLOTS, _PORT_COLS)."""
+    arr = np.empty((N_SLOTS, _PORT_COLS), dtype=np.float64)
+    for s, p in enumerate(portfolios):
+        arr[s, 0] = p['cash']
+        for i, sym in enumerate(syms):
+            arr[s, 1 + i]            = p['holdings'].get(sym, 0.0)
+            arr[s, 1 + IND_SYMS + i] = p['stop_prices'].get(sym, 0.0)
+    return arr
+
+
+def arr_to_portfolio(arr, syms):
+    """Rebuild list-of-dicts from ndarray (N_SLOTS, _PORT_COLS)."""
+    portfolios = []
+    for s in range(N_SLOTS):
+        portfolios.append({
+            'cash':        float(arr[s, 0]),
+            'holdings':    {sym: float(arr[s, 1 + i])            for i, sym in enumerate(syms)},
+            'stop_prices': {sym: float(arr[s, 1 + IND_SYMS + i]) for i, sym in enumerate(syms)},
+        })
+    return portfolios
+
+
+def history_to_arr(histories, syms):
+    """Pack history dict into ndarray (IND_SYMS, HIST_WINDOW, 10) and lengths (IND_SYMS,)."""
+    data = np.zeros((IND_SYMS, HIST_WINDOW, 10), dtype=np.float64)
+    lens = np.zeros(IND_SYMS, dtype=np.int32)
+    for i, sym in enumerate(syms):
+        entries = histories.get(sym, [])
+        n = len(entries)
+        lens[i] = n
+        if n:
+            data[i, :n] = entries   # oldest first
+    return data, lens
+
+
+def arr_to_history(hist_arr, lens_arr, syms):
+    """Reconstruct history dict from ndarray and lengths arrays.  Returns Python floats."""
+    histories = {}
+    for i, sym in enumerate(syms):
+        n = int(lens_arr[i])
+        histories[sym] = [[float(x) for x in hist_arr[i, j]] for j in range(n)]
+    return histories
+
+
 # ── Process-pool worker ────────────────────────────────────────────────────────
 
-def _run_industry_proc(ind, syms, output_dir, portfolio, history,
+def _run_industry_proc(ind, syms, output_dir,
+                       ipc_dir, ind_idx,
                        day, actual_day, total_days, day_num, num_days,
                        next_day, all_zero_streak, daily_sigma, freeze, seq_flags):
-    """Worker entrypoint for ProcessPoolExecutor — runs one industry and returns updated state.
+    """Worker entrypoint for ProcessPoolExecutor — reads/writes state via per-industry files.
 
     Must be a module-level function (not a closure) so that multiprocessing can
-    pickle it for the worker subprocess.  Returns (ind, portfolio, history, result)
-    so the main process can reassign the mutated portfolio and history dicts.
+    pickle it.  Portfolio and history are exchanged via per-industry numpy binary
+    files; each worker reads and writes only its own index, so there are no
+    concurrent-write conflicts regardless of the underlying filesystem.
     """
+    port_path, hist_path, lens_path = _ipc_paths(ipc_dir, ind_idx)
+
+    portfolios = arr_to_portfolio(np.load(port_path), syms)
+    history    = arr_to_history(np.load(hist_path), np.load(lens_path), syms)
+
     result = step_industry(
-        ind, syms, output_dir, portfolio, history,
+        ind, syms, output_dir, portfolios, history,
         day, actual_day, total_days, day_num, num_days,
         next_day=next_day,
         all_zero_streak=all_zero_streak,
@@ -1867,7 +1942,10 @@ def _run_industry_proc(ind, syms, output_dir, portfolio, history,
         freeze=freeze,
         seq_flags=seq_flags,
     )
-    return ind, portfolio, history, result
+
+    np.save(port_path, portfolio_to_arr(portfolios, syms))
+
+    return ind, result
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -1995,6 +2073,14 @@ def main():
 
         ind_streaks = {}   # {ind: consecutive all-zero-trade days}
 
+        # Per-industry IPC files — written by main before each day's workers start;
+        # each worker reads its own 3 files and writes back only the portfolio file.
+        # Using per-industry files (not a single shared file) avoids concurrent-
+        # write conflicts on copy-on-write filesystems (btrfs).
+        _ipc_dir   = args.output
+        ind_list   = list(industries.keys())
+        ind_to_idx = {ind: i for i, ind in enumerate(ind_list)}
+
         # The executor is created once per pass and kept alive for all days.
         # Workers are forked here — before step_master() ever runs in the main
         # process.  Forking after step_master() would inherit PyTorch's
@@ -2021,20 +2107,27 @@ def main():
             completed_inds = []
 
             try:
+                # ── Write state to per-industry files before launching workers ─
+                # Workers read their 3 files (portfolio, history, lens) and write
+                # back only the portfolio file.  No pickle round-trip for large data.
+                for _ind, _syms in industries.items():
+                    _idx = ind_to_idx[_ind]
+                    _pp, _hp, _lp = _ipc_paths(_ipc_dir, _idx)
+                    np.save(_pp, portfolio_to_arr(ind_portfolios[_ind], _syms))
+                    _h_arr, _lens = history_to_arr(ind_histories[_ind], _syms)
+                    np.save(_hp, _h_arr)
+                    np.save(_lp, _lens)
+
                 # ── Parallel industry phase: dynamic work queue ───────────────
-                # Each future returns (ind, portfolio, history, result).
-                # Using ProcessPoolExecutor so each worker gets its own Python
-                # interpreter and GIL, enabling genuine parallel execution of
-                # the trade simulation loop.  Accumulation in the main process
-                # via as_completed is deterministic regardless of completion order.
+                # Each future returns (ind, result) — portfolio and history are
+                # exchanged via per-industry numpy files, not pickle.
                 # HardFlagError raised in any worker propagates via future.result()
-                # and is caught by the outer handler; hard_flag_hit then breaks
-                # the day loop and the executor is shut down cleanly.
+                # and is caught by the outer handler.
                 futures = {
                     executor.submit(
                         _run_industry_proc,
                         ind, syms, args.output,
-                        ind_portfolios[ind], ind_histories[ind],
+                        _ipc_dir, ind_to_idx[ind],
                         day, actual_day, total_days, day_num, num_days,
                         next_day,
                         ind_streaks.get(ind, 0),
@@ -2045,11 +2138,8 @@ def main():
                     for ind, syms in industries.items()
                 }
                 for future in as_completed(futures, timeout=DAY_TIMEOUT_SECS):
-                    ind, portfolio, history, result = future.result()
+                    ind, result = future.result()
                     completed_inds.append(ind)
-                    # Reassign the worker's mutated copies back to main process.
-                    ind_portfolios[ind] = portfolio
-                    ind_histories[ind]  = history
                     if result is not None:
                         baseline, top_val, best_delta, top_hold, top_cash, new_streak = result
                         industry_top_scores[ind] = (baseline, top_val)
@@ -2073,6 +2163,24 @@ def main():
                     else:
                         ind_best_deltas[ind]   = 0.0
                         ind_capital_state[ind] = (0.0, 0.0)
+
+                # ── Read updated portfolios from per-industry files ───────────
+                for _ind, _syms in industries.items():
+                    _pp, _, _ = _ipc_paths(_ipc_dir, ind_to_idx[_ind])
+                    ind_portfolios[_ind] = arr_to_portfolio(np.load(_pp), _syms)
+
+                # ── Append today's OHLCV to histories in main process ─────────
+                # Workers discarded their local history updates; main is canonical.
+                for _ind, _syms in industries.items():
+                    for _sym in _syms:
+                        _d = day['data'].get(_sym)
+                        if _d:
+                            _raw    = [_d['open'], _d['close'], _d['high'], _d['low'], _d['volume']]
+                            _prev   = ind_histories[_ind][_sym][-1][:5] if ind_histories[_ind][_sym] else None
+                            _deltas = [r - p for r, p in zip(_raw, _prev)] if _prev else [0.0] * 5
+                            ind_histories[_ind][_sym].append(_raw + _deltas)
+                            if len(ind_histories[_ind][_sym]) > HIST_WINDOW:
+                                ind_histories[_ind][_sym].pop(0)
 
                 master_best_delta, master_flat_cos, master_slot0_pred = step_master(
                     args.output, mst_portfolios, mst_histories, industries,
