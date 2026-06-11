@@ -1,19 +1,21 @@
 """
-training_v4.py — Parallel evolutionary training: v2 per-slot on-demand loading +
-dynamic industry process pool (ProcessPoolExecutor, max_workers=NUM_WORKERS).
+DEPRECATED: training_v4.py is superseded by the C++ trainer (training_v4_cpp).
 
-Each industry slot is loaded from disk, inferred, traded, and evicted before the
-next slot loads (v2 methodology — no persistent cache).  Industries are processed
-concurrently via a dynamic work queue: worker processes pull the next available
-industry from the pool as soon as they finish their current one, keeping all
-available CPUs fully utilized without hard-coding industry-to-worker assignments.
-Using processes (not threads) sidesteps the Python GIL, enabling genuine parallel
-execution of the trade simulation loop.  Master runs after all industries complete
-(sequential, single-process).
+The C++ binary is ~6× faster and now includes all features previously unique to this
+file: --daily burst refinement, --promote, HARD/SOFT/UNDER_INVEST data_dump diagnostics,
+incremental snapshots, and --master-only mode.
 
-Usage:
-    python training_v4.py --output models [--load-dir models] [--start-day N] [--stop-day N]
-                          [--passes N] [--sigma 0.01] [--daily] [--promote uat,prod]
+Use the C++ trainer instead:
+    ./build/training_v4_cpp                              # diagnostic (days 17-20, defaults)
+    ./build/training_v4_cpp --load-dir models/training   # resume from checkpoint
+    ./build/training_v4_cpp --load-dir models/training \\
+      --passes 5 --sigma 0.008 --master-sigma 0.006 \\
+      --sigma-decay 1.0 --start-day 17 --stop-day 1255   # full training run
+    ./build/training_v4_cpp --daily                      # with burst refinement
+    ./build/training_v4_cpp --promote uat,prod           # promote after training
+
+See CLAUDE.md for full usage. This file is retained for reference only and will be
+removed in a future commit.
 """
 
 import argparse

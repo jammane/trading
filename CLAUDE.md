@@ -59,14 +59,12 @@ python training_v2.py --output models --load-dir models          # resume from c
 python training_v2.py --output models --start-day 16 --stop-day 21 --passes 1 --preserve-stock-data  # short diagnostic run
 ```
 
-**Train (parallel, 2-process dynamic industry pool):**
+**Train (parallel, 2-process dynamic industry pool — DEPRECATED, use C++ binary):**
 ```bash
 python training_v4.py --output models
-python training_v4.py --output models --load-dir models          # resume from checkpoint
-python training_v4.py --output models --start-day 16 --stop-day 21 --passes 1 --preserve-stock-data  # short diagnostic run
 ```
 
-**Train (C++ binary — ~6× faster than training_v4.py):**
+**Train (C++ binary — replaces training_v4.py, ~6× faster):**
 ```bash
 # Seed once from existing Python models (or after any convert_weights.py run):
 python prepare_models.py --load-dir models/training --output models/training
@@ -116,7 +114,7 @@ Runs all five steps: updates `universe.py` and regenerates `universe.json`, remo
 | `prepare_models.py` | `.pt` → `.bin` for C++ trainer (run before first C++ training) |
 | `convert_weights.py` | `.bin` → `.pt` + `_best.pt` for Python tools (run after C++ training) |
 
-All training scripts (`training_v2.py`, `training_v3.py`, `training_v4.py`), `production_v2.py`, and `inspect_trades.py` import from these modules. `download_5y_data.py` imports from `universe.py`. To add or change a ticker, run `swap_symbols.sh` — it updates both `universe.py` and `universe.json` together.
+All training scripts (`training_v2.py`, `training_v3.py`, `training_v4.py` [deprecated]), `production_v2.py`, and `inspect_trades.py` import from these modules. `download_5y_data.py` imports from `universe.py`. To add or change a ticker, run `swap_symbols.sh` — it updates both `universe.py` and `universe.json` together.
 
 ## Tests
 
@@ -145,7 +143,7 @@ Each industry maintains **200 model slots** on disk as `.pt` files. The slot lay
 
 Each training day: all 200 slots reset to slot 0's portfolio → infer → simulate fills → score as `delta × invested_pct` → select + mutate. The `invested_pct` multiplier penalises cash-heavy winners.
 
-`training_v4.py` (parallel) differs from `training_v2.py` (single-threaded) in: 2 worker *processes* (`ProcessPoolExecutor`) replacing the sequential industry loop, bypassing the Python GIL for genuine parallel execution of the trade simulation. Portfolio and history state is pickled to each worker and the mutated copies are returned and reassigned in the main process after each day. Expected speedup: ~40% (~3 min/day vs ~5 min/day) on a 2-vCPU host.
+`training_v4.py` is **deprecated** — superseded by `training_v4_cpp` which is ~6× faster and includes all features (`--daily`, `--promote`, `data_dump` diagnostics). Retained for reference only.
 
 `training_v3.py` (parallel) differs from `training_v2.py` in: 7 worker threads, in-RAM model cache (`_model_cache`), no slippage on limit fills, and slot-level portfolio JSON persisted alongside weights.
 
