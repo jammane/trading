@@ -35,15 +35,11 @@ STOCK_LAYER_DEFS = [
 ]
 
 MASTER_LAYER_DEFS = [
-    ('fc_seed',  120,  61),
-    *[(f'fc_inject.{i}', 125 + 5 * i, 181 + 5 * i) for i in range(14)],
-    ('fc_today', 300, 419),
-    ('fc_flat1', 300, 300),
-    ('fc_flat2', 300, 300),
-    ('fc_fc1',   234, 300),
-    ('fc_fc2',   168, 234),
-    ('fc_fc3',   102, 168),
-    ('fc_out',    36, 102),
+    ('fc1',    444, 444),
+    ('fc2',    444, 444),
+    ('fc3',    312, 444),
+    ('fc4',    180, 312),
+    ('fc_out',  48, 180),
 ]
 
 ELITE_POOL = 20

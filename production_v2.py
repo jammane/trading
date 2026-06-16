@@ -18,6 +18,7 @@ import random
 from datetime import datetime
 
 import keyring
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -91,62 +92,27 @@ def update_owners_file(total_value, paper):
         except Exception as e:
             print(f"Error updating owners.json: {e}")
 
-def compute_alloc_from_predicted(predicted, industry_list):
-    """
-    Decode MasterNN output (1, 36) or (36,) into allocation and liquidation signals.
+def _master_state_path(model_dir):
+    return os.path.join(model_dir, 'master_state.json')
 
-    predicted: tensor
-      [:12]  softmax allocation weights (sum to 1)
-      [12:24] sigmoid liquidation depth   (0=hold, 1=liquidate to floor)
-      [24:36] sigmoid liquidation trigger (0=skip, 1=execute)
+def _load_master_state(model_dir, industry_list):
+    """Load persisted ind_value_history and zero_counts. Returns defaults on missing/corrupt."""
+    path = _master_state_path(model_dir)
+    try:
+        with open(path) as f:
+            state = json.load(f)
+        hist  = state.get('ind_value_history', {ind: [] for ind in industry_list})
+        zcnt  = state.get('zero_counts',       {ind: 0  for ind in industry_list})
+        return hist, zcnt
+    except Exception:
+        return {ind: [] for ind in industry_list}, {ind: 0 for ind in industry_list}
 
-    Returns:
-      alloc_prop:  {ind: fraction}  40% cap, 2% floor enforced
-      liq_depth:   {ind: float}     0-1
-      liq_trigger: {ind: float}     0-1
-    """
-    n     = len(industry_list)
-    floor = 0.02
-    cap   = 0.40
-
-    # Flatten to 1D if needed
-    p = predicted.squeeze()
-    vals     = p.tolist() if hasattr(p, 'tolist') else list(p)
-    weights  = vals[:12]   if len(vals) >= 12 else vals + [1.0/n]*(12-len(vals))
-    depths   = vals[12:24] if len(vals) >= 24 else [0.5]*12
-    triggers = vals[24:36] if len(vals) >= 36 else [0.5]*12
-
-    # Hybrid allocation: top industry gets full cap; rest filled proportionally.
-    w_map   = dict(zip(industry_list, weights))
-    top_ind = max(w_map, key=w_map.get)
-
-    alloc_prop          = {ind: floor for ind in industry_list}
-    alloc_prop[top_ind] = cap
-
-    others  = [ind for ind in industry_list if ind != top_ind]
-    premium = 1.0 - cap - floor * len(others)
-
-    if premium > 1e-9 and others:
-        uncapped = others[:]
-        while premium > 1e-9 and uncapped:
-            tw = sum(w_map[ind] for ind in uncapped)
-            if tw <= 0:
-                break
-            proposed     = {ind: alloc_prop[ind] + premium * w_map[ind] / tw for ind in uncapped}
-            newly_capped = [ind for ind in uncapped if proposed[ind] >= cap]
-            if not newly_capped:
-                for ind in uncapped:
-                    alloc_prop[ind] = proposed[ind]
-                break
-            for ind in newly_capped:
-                alloc_prop[ind] = cap
-                uncapped.remove(ind)
-            premium = 1.0 - sum(alloc_prop.values())
-
-    liq_depth   = {ind: depths[i]   for i, ind in enumerate(industry_list)}
-    liq_trigger = {ind: triggers[i] for i, ind in enumerate(industry_list)}
-
-    return alloc_prop, liq_depth, liq_trigger
+def _save_master_state(model_dir, ind_value_history, zero_counts):
+    try:
+        with open(_master_state_path(model_dir), 'w') as f:
+            json.dump({'ind_value_history': ind_value_history, 'zero_counts': zero_counts}, f)
+    except Exception as e:
+        print(f"Warning: could not save master state: {e}")
 
 def load_weighted_model(model_class, model_dir, prefix):
     """
@@ -186,56 +152,30 @@ def train_industry_one_day_prod(industry, symbols, yesterday_data, primed_portfo
         return None
 
 
-def _flat_cos_history_path(model_dir):
-    """Return the path to the rolling flat_cos history JSON file for the master model."""
-    return os.path.join(model_dir, 'master_flat_cos_history.json')
-
-def _load_flat_cos_history(model_dir):
-    """Load up to 15 recent flat_cos values from disk; returns [] on any failure."""
-    path = _flat_cos_history_path(model_dir)
-    try:
-        with open(path) as f:
-            return json.load(f).get('history', [])[-15:]
-    except Exception:
-        return []
-
-def _save_flat_cos_history(model_dir, history):
-    """Persist the last 15 flat_cos values to disk, silently ignoring write errors."""
-    try:
-        with open(_flat_cos_history_path(model_dir), 'w') as f:
-            json.dump({'history': list(history)[-15:]}, f)
-    except Exception as e:
-        print(f"Warning: could not save flat_cos history: {e}")
-
-
-def train_master_one_day_prod(yesterday_data, industries, primed_portfolio, model_dir,
-                               industry_top_scores=None):
+def train_master_one_day_prod(industries, primed_portfolio, model_dir,
+                               ind_value_history, industry_top_scores=None):
     """
     Upkeep training for the master model.
-    yesterday_data: OHLCV for the prediction day.  industry_top_scores come from
-                    train_industry_one_day_prod calls (today's actual top-slot values).
+    ind_value_history: already updated for today (today's values appended by caller).
+    industry_top_scores: {ind: (baseline_v, top_v)} from today's industry runs.
     """
     from training_v2 import train_master_one_day
     try:
-        fc_history = _load_flat_cos_history(model_dir)
-        flat_cos   = train_master_one_day(yesterday_data, industries, primed_portfolio, model_dir,
-                                          industry_top_scores=industry_top_scores,
-                                          flat_cos_history=fc_history)
-        if flat_cos is not None:
-            fc_history.append(flat_cos)
-            _save_flat_cos_history(model_dir, fc_history)
+        train_master_one_day(industries, primed_portfolio, model_dir,
+                             ind_value_history,
+                             industry_top_scores=industry_top_scores)
     except Exception as e:
         print(f"Error training master: {e}")
 
 
-def build_primed_portfolios(trading_client, industries, allocations):
+def build_primed_portfolios(trading_client, industries, allocations, zero_counts=None):
     """
     Fetch real Alpaca account state and build per-industry primed portfolios
     plus a master primed portfolio for single-day retraining.
 
     Returns:
         ind_primed:    {industry: {'cash': float, 'holdings': {sym: float}}}
-        master_primed: {'cash': float, 'holdings': {ind: float}}
+        master_primed: {'cash': float, 'holdings': {ind: float}, 'zero_counts': {ind: int}}
     """
     try:
         account    = trading_client.get_account()
@@ -244,7 +184,6 @@ def build_primed_portfolios(trading_client, industries, allocations):
         print(f"Error fetching Alpaca account: {e}")
         total_cash = 0.0
 
-    # Fetch current positions from Alpaca
     alpaca_qty = {}
     try:
         positions = trading_client.get_all_positions()
@@ -253,7 +192,6 @@ def build_primed_portfolios(trading_client, industries, allocations):
     except Exception as e:
         print(f"Error fetching Alpaca positions: {e}")
 
-    # Each industry gets 40% of cash + its actual symbol holdings
     ind_primed = {}
     for ind, syms in industries.items():
         ind_primed[ind] = {
@@ -261,15 +199,13 @@ def build_primed_portfolios(trading_client, industries, allocations):
             'holdings': {sym: alpaca_qty.get(sym, 0.0) for sym in syms},
         }
 
-    # Master gets remaining cash (after industry allocations) + industry allocation units
-    # Represent each industry holding as the dollar value allocated to it
-    master_holdings = {}
-    for ind in industries:
-        master_holdings[ind] = allocations.get(ind, 0.0)   # dollar amount allocated
+    master_holdings = {ind: allocations.get(ind, 0.0) for ind in industries}
+    industry_list   = list(industries.keys())
 
     master_primed = {
-        'cash':     total_cash * (1.0 - 0.40),   # cash not deployed to industries
-        'holdings': master_holdings,
+        'cash':        total_cash * (1.0 - 0.40),
+        'holdings':    master_holdings,
+        'zero_counts': {ind: (zero_counts or {}).get(ind, 0) for ind in industry_list},
     }
 
     return ind_primed, master_primed
@@ -412,116 +348,35 @@ def compute_industry_current_values(industries, holdings, histories):
     return ind_values
 
 
-def run_master_allocation(master_model, industries, histories, holdings,
-                          total_cash, total_account_value):
+def run_master_allocation(master_model, industries, ind_value_history, zero_counts, total_cash):
     """
-    Run master inference using new 229-feature input.
-    Returns (allocations, alloc_prop, liq_depth, liq_trigger).
-
-    allocations:   {ind: dollar_amount} cash to deploy
-    alloc_prop:    {ind: fraction}
-    liq_depth:     {ind: 0-1} how deeply to liquidate (0=to target, 1=to floor)
-    liq_trigger:   {ind: 0-1} whether to liquidate (>0.5 = yes)
+    Run master inference to get tier classification and capital allocation.
+    Mutates zero_counts in place.
+    Returns (allocations, tier_map).
+      allocations: {ind: dollar_amount}
+      tier_map:    {ind: 0-3}
     """
+    from training_v2 import build_master_features, decode_master_tiers, tiers_to_alloc
     industry_list = list(industries.keys())
-    n_ind         = len(industry_list)
-    alloc_prop    = {ind: 1.0 / n_ind for ind in industry_list}
-    liq_depth     = {ind: 0.0 for ind in industry_list}
-    liq_trigger   = {ind: 0.0 for ind in industry_list}
+    tier_map      = {ind: 0 for ind in industry_list}
 
     if master_model is not None:
         try:
-            # Per-industry rolling stats
-            ind_stats = {}
-            all_syms  = [sym for syms in industries.values() for sym in syms]
-            num_past  = min(len(histories.get(sym, [])) for sym in all_syms) if all_syms else 0
-
-            for ind, ind_syms in industries.items():
-                mean_deltas = []
-                for t in range(15):
-                    dl = [histories[sym][-(t+1)][5:] for sym in ind_syms
-                          if len(histories.get(sym,[])) > t]
-                    if dl:
-                        mean_deltas.append([sum(col)/len(col) for col in zip(*dl)])
-                    else:
-                        mean_deltas.append([0.0]*5)
-                vals   = [d[0] for d in mean_deltas]
-                mean_v = sum(vals)/len(vals) if vals else 0.0
-                std_v  = (sum((v-mean_v)**2 for v in vals)/len(vals))**0.5 if vals else 0.0
-                mean_5d = sum(vals[:5])/5 if len(vals) >= 5 else mean_v
-                ind_stats[ind] = {
-                    'volatility': std_v / abs(mean_v) if abs(mean_v) > 1e-9 else 0.0,
-                    'momentum':   mean_5d / mean_v    if abs(mean_v) > 1e-9 else 1.0,
-                    'mean_deltas': mean_deltas,
-                }
-
-            all_mean_per_day = []
-            for t in range(15):
-                day_means = [ind_stats[ind]['mean_deltas'][t][0] for ind in industry_list]
-                all_mean_per_day.append(sum(day_means)/len(day_means) if day_means else 0.0)
-
-            # history_t: (1,15,60) — mean OHLCV per industry, oldest first
-            history_rows = []
-            for t in range(14, -1, -1):
-                row = []
-                for ind in industry_list:
-                    dl = [histories[sym][-(t+1)][:5] for sym in industries[ind]
-                          if len(histories.get(sym, [])) > t]
-                    if dl:
-                        row += [sum(col)/len(col) for col in zip(*dl)]
-                    else:
-                        row += [0.0] * 5
-                history_rows.append(row)
-            history_t = torch.tensor(history_rows, dtype=torch.float32).unsqueeze(0)  # (1,15,60)
-
-            # today_t: (1,229) — today's delta aggregates per industry + state
-            today_ind_data = {}
-            for ind in industry_list:
-                dl = []
-                for sym in industries[ind]:
-                    h = histories.get(sym, [])
-                    if len(h) >= 2:
-                        raw_t = h[-1][:5]
-                        prev  = h[-2][:5]
-                        dl.append([raw_t[i] - prev[i] for i in range(5)])
-                    elif len(h) == 1:
-                        dl.append([0.0] * 5)
-                if dl:
-                    tr   = list(zip(*dl))
-                    aggs = []
-                    for tp in tr: aggs += [max(tp), min(tp), sum(tp)/len(tp)]
-                    ind_mean_today = sum(row[1] for row in dl) / len(dl)
-                else:
-                    aggs = [0.0] * 15; ind_mean_today = 0.0
-                today_ind_data[ind] = (aggs, ind_mean_today)
-
-            all_mean_today = (sum(v[1] for v in today_ind_data.values()) / len(today_ind_data)
-                              if today_ind_data else 0.0)
-            cash_norm = total_cash / max(total_account_value, 1.0)
-            hold_vals = []
-            for ind, ind_syms in industries.items():
-                hv = sum(holdings.get(sym, 0.0) * (histories[sym][-1][1] if histories.get(sym) else 0.0)
-                         for sym in ind_syms)
-                hold_vals.append(hv)
-            state_vec = [cash_norm] + hold_vals
-
-            today_row = []
-            for ind in industry_list:
-                st = ind_stats[ind]; aggs, ind_mean_today = today_ind_data[ind]
-                corr = ind_mean_today / all_mean_today if abs(all_mean_today) > 1e-9 else 1.0
-                today_row += aggs + [st['volatility'], st['momentum'], corr]
-            today_row += state_vec
-            today_t = torch.tensor(today_row, dtype=torch.float32).unsqueeze(0)  # (1,229)
-
+            today_t = build_master_features(ind_value_history, industry_list)
             with torch.no_grad():
-                out = master_model(history_t, today_t)
-            alloc_prop, liq_depth, liq_trigger = compute_alloc_from_predicted(
-                out.squeeze(), industry_list)
+                out = master_model(today_t)
+            tier_map = decode_master_tiers(out, industry_list)
         except Exception as e:
             print(f"Error running master model: {e}")
 
-    allocations = {ind: alloc_prop[ind] * total_cash for ind in industry_list}
-    return allocations, alloc_prop, liq_depth, liq_trigger
+    for ind in industry_list:
+        if tier_map[ind] == 0:
+            zero_counts[ind] = zero_counts.get(ind, 0) + 1
+        else:
+            zero_counts[ind] = 0
+
+    allocations = tiers_to_alloc(tier_map, industry_list, total_cash)
+    return allocations, tier_map
 
 
 def compute_liquidation_orders(industries, ind_current_values, alloc_prop,
@@ -703,37 +558,26 @@ def main():
         print(f"Intraday sequence: {n_low_first} low-first, {n_high_first} high-first "
               f"({len(intraday_data)} symbols with 1-min data)")
 
-        # ── Master: predict allocations + liquidation signals ──────────────
+        # ── Master: predict tier allocations ──────────────────────────────
         all_symbols_flat  = [sym for syms in industries.values() for sym in syms]
-        total_account_val = cash + sum(
-            holdings.get(sym, 0.0) * (histories[sym][-1][1] if histories.get(sym) else 0.0)
-            for sym in all_symbols_flat
-        )
+        industry_list     = list(industries.keys())
+        ind_value_history, zero_counts = _load_master_state(args.model_dir, industry_list)
         master = load_weighted_model(MasterNN, args.model_dir, 'master')
-        allocations, alloc_prop, liq_depth, liq_trigger = run_master_allocation(
-            master, industries, histories, holdings, cash, total_account_val)
+        allocations, tier_map = run_master_allocation(
+            master, industries, ind_value_history, zero_counts, cash)
 
-        # Build per-industry liquidation orders from master's trigger + depth signals
-        floor_value = total_account_val * 0.02
+        # Liquidate industries with 3+ consecutive tier-0 predictions
         ind_current_values = compute_industry_current_values(industries, holdings, histories)
         liquidation_orders = {}
         for ind in industries:
-            if liq_trigger.get(ind, 0.0) <= 0.5:
-                continue
-            hold_v = ind_current_values.get(ind, (0.0, 0.0))[0]
-            if hold_v <= floor_value:
-                continue
-            target_v      = alloc_prop.get(ind, 0.0) * cash
-            depth         = liq_depth.get(ind, 0.0)
-            effective_tgt = target_v + (1.0 - depth) * max(0.0, hold_v - target_v)
-            effective_tgt = max(effective_tgt, floor_value)
-            liq_amt       = max(0.0, min(hold_v - effective_tgt, hold_v - floor_value))
-            if liq_amt > 1e-6:
-                liquidation_orders[ind] = liq_amt
+            if zero_counts.get(ind, 0) >= 3:
+                hold_v = ind_current_values.get(ind, (0.0, 0.0))[0]
+                if hold_v > 1e-6:
+                    liquidation_orders[ind] = hold_v
 
         if liquidation_orders:
             liq_str = ', '.join(f"{ind}=${v:.2f}" for ind, v in liquidation_orders.items())
-            print(f"Master liquidation orders: {liq_str}")
+            print(f"Master liquidation orders (3x tier-0): {liq_str}")
 
         orders = []
 
@@ -741,7 +585,7 @@ def main():
         active_industries = set()
         inactive_log      = []
         for ind, syms in industries.items():
-            ind_capital  = total_account_val * alloc_prop.get(ind, 0.0)
+            ind_capital  = allocations.get(ind, 0.0)
             prices_today = {s: day_data.get(s, {}).get('close', 0.0) for s in syms if day_data.get(s, {}).get('close', 0.0) > 0}
             if not prices_today:
                 continue
@@ -977,7 +821,8 @@ def main():
         # Retrain models using real Alpaca state as portfolio seed.
         # yesterday_data = model-input features (day N); day_data = fill prices (day N+1).
         # This matches the offline training's day-N-predict / day-N+1-fill pattern.
-        ind_primed, master_primed = build_primed_portfolios(trading_client, industries, allocations)
+        ind_primed, master_primed = build_primed_portfolios(
+            trading_client, industries, allocations, zero_counts)
         industry_top_scores = {}
         for industry, symbols in industries.items():
             if any(os.path.exists(f"{args.model_dir}/{industry}_model_{i}.pt") for i in range(10)):
@@ -986,8 +831,16 @@ def main():
                     today_data=day_data, seq_flags=seq_flags)
                 if result is not None:
                     industry_top_scores[industry] = result
+
+        # Append today's industry values and persist master state for next day
+        for ind in industry_list:
+            if ind in industry_top_scores:
+                ind_value_history[ind].append(industry_top_scores[ind][1])
+        _save_master_state(args.model_dir, ind_value_history, zero_counts)
+
         if any(os.path.exists(f"{args.model_dir}/master_model_{i}.pt") for i in range(10)):
-            train_master_one_day_prod(yesterday_data, industries, master_primed, args.model_dir,
+            train_master_one_day_prod(industries, master_primed, args.model_dir,
+                                      ind_value_history,
                                       industry_top_scores=industry_top_scores)
 
         # Submit orders to Alpaca if requested

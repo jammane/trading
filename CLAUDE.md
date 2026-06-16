@@ -56,17 +56,17 @@ python download_5y_data.py
 ```bash
 python training_v2.py --output models
 python training_v2.py --output models --load-dir models          # resume from checkpoint
-python training_v2.py --output models --start-day 16 --stop-day 21 --passes 1 --preserve-stock-data  # short diagnostic run
+python training_v2.py --output models --start-day 16 --stop-day 35 --passes 1 --preserve-stock-data --no-save-master  # short diagnostic run
 ```
 
 **Train (parallel, 2-process dynamic industry pool):**
 ```bash
 python training_v4.py --output models
 python training_v4.py --output models --load-dir models          # resume from checkpoint
-python training_v4.py --output models --start-day 16 --stop-day 21 --passes 1 --preserve-stock-data  # short diagnostic run
+python training_v4.py --output models --start-day 16 --stop-day 35 --passes 1 --preserve-stock-data --no-save-master  # short diagnostic run
 ```
 
-**Train (C++ binary — ~6× faster than training_v4.py):**
+**Train (C++ binary — ~6× faster than training_v4.py for industries; use Python for master):**
 ```bash
 # Seed once from existing Python models (or after any convert_weights.py run):
 python prepare_models.py --load-dir models/training --output models/training
@@ -76,6 +76,9 @@ python prepare_models.py --load-dir models/training --output models/training
   --start-day 17 --stop-day 1255
 # After training, convert back to .pt before inspect_trades.py or production_v2.py:
 python convert_weights.py --models-dir models/training --output models/training
+# On master-tier-reclass branch: C++ master is deferred; use Python --master-only instead:
+python training_v4.py --output models/training --load-dir models/training \
+  --master-only --passes 5 --start-day 17 --stop-day 1255
 ```
 ~31 s/day on the droplet (vs ~180 s/day for Python v4). `convert_weights.py` is required
 after C++ training before using `inspect_trades.py` or `production_v2.py`.

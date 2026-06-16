@@ -68,52 +68,36 @@ class StockNN(nn.Module):
 
 class MasterNN(nn.Module):
     """
-    FC injection architecture — no LSTM.
+    Flat FC architecture — no injection chain, no history tensor.
 
-    history: (1, 15, 61)  — 15 days oldest→newest,
-               avg of 5 delta features × 12 industries + flat_cos for that day
-    today:   (1, 229)     — current day full features:
-               (max/min/avg of 5 deltas)×12 (180) + vol×12 (12)
-               + momentum×12 (12) + correlation×12 (12) + state (13) = 229
+    today: (1, 444) — explicit temporal features:
+             delta at 18 lookback days × 12 industries    (216)
+             2nd-order poly coefs, 5-day window × 12      ( 36)
+             3rd-order poly coefs × 4 windows × 12        (192)
+             Total: 444
 
-    Seed   (day 15):  61              → FC → 120
-    Inject (×14):     (181+5i)+61     → FC → 125+5i  (grows 120→190)
-    Today:            190+229=419     → FC → 300
-    Flat:             300             → FC → 300  (×2)
-    Funnel:           300→234→168→102→36
+    FC1:    444 → 444  ReLU  (wide)
+    FC2:    444 → 444  ReLU  (wide)
+    FC3:    444 → 312  ReLU  (taper, step=132)
+    FC4:    312 → 180  ReLU  (taper)
+    fc_out: 180 →  48        (taper = output)
 
-    Output (1,36):
-      [:12]   Softmax  → allocation weights (sum to 1)
-      [12:24] Sigmoid  → liquidation depth per industry (0=hold, 1=liquidate to floor)
-      [24:36] Sigmoid  → liquidation trigger per industry (>0.5 = execute)
+    Output (1, 48): raw logits, reshape to (12, 4).
+      Per-industry softmax over dim=1 → argmax → tier ∈ {0,1,2,3}
+      0 = expected net loss; 1/2/3 = positive-return terciles (low→high)
     """
 
     def __init__(self):
         super().__init__()
-        self.fc_seed   = nn.Linear(61,  120)
-        self.fc_inject = nn.ModuleList([
-            nn.Linear(181 + 5 * i, 125 + 5 * i) for i in range(14)
-        ])
-        self.fc_today  = nn.Linear(419, 300)
-        self.fc_flat1  = nn.Linear(300, 300)
-        self.fc_flat2  = nn.Linear(300, 300)
-        self.fc_fc1    = nn.Linear(300, 234)
-        self.fc_fc2    = nn.Linear(234, 168)
-        self.fc_fc3    = nn.Linear(168, 102)
-        self.fc_out    = nn.Linear(102,  36)
+        self.fc1    = nn.Linear(444, 444)
+        self.fc2    = nn.Linear(444, 444)
+        self.fc3    = nn.Linear(444, 312)
+        self.fc4    = nn.Linear(312, 180)
+        self.fc_out = nn.Linear(180,  48)
 
-    def forward(self, history, today):
-        x = F.relu(self.fc_seed(history[:, 0, :]))
-        for i, layer in enumerate(self.fc_inject):
-            x = F.relu(layer(torch.cat([x, history[:, i + 1, :]], dim=1)))
-        x   = F.relu(self.fc_today(torch.cat([x, today], dim=1)))
-        x   = F.relu(self.fc_flat1(x))
-        x   = F.relu(self.fc_flat2(x))
-        x   = F.relu(self.fc_fc1(x))
-        x   = F.relu(self.fc_fc2(x))
-        x   = F.relu(self.fc_fc3(x))
-        out = self.fc_out(x)
-        alloc   = F.softmax(out[:, :12],  dim=-1)
-        depth   = torch.sigmoid(out[:, 12:24])
-        trigger = torch.sigmoid(out[:, 24:36])
-        return torch.cat([alloc, depth, trigger], dim=-1)
+    def forward(self, today):
+        x = F.relu(self.fc1(today))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        x = F.relu(self.fc4(x))
+        return self.fc_out(x)   # (1, 48) raw logits
