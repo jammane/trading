@@ -59,29 +59,26 @@ python training_v2.py --output models --load-dir models          # resume from c
 python training_v2.py --output models --start-day 16 --stop-day 35 --passes 1 --preserve-stock-data --no-save-master  # short diagnostic run
 ```
 
-**Train (parallel, 2-process dynamic industry pool):**
-```bash
-python training_v4.py --output models
-python training_v4.py --output models --load-dir models          # resume from checkpoint
-python training_v4.py --output models --start-day 16 --stop-day 35 --passes 1 --preserve-stock-data --no-save-master  # short diagnostic run
-```
-
-**Train (C++ binary — ~6× faster than training_v4.py for industries; use Python for master):**
+**Train (C++ binary — canonical; handles both industries and master):**
 ```bash
 # Seed once from existing Python models (or after any convert_weights.py run):
 python prepare_models.py --load-dir models/training --output models/training
-# Full training run (canonical settings):
+# Full training run (canonical settings — industries + master):
 ./build/training_v4_cpp --output models/training --load-dir models/training \
   --passes 5 --sigma 0.008 --master-sigma 0.006 --sigma-decay 1.0 \
   --start-day 17 --stop-day 1255
+# Retrain master only (freeze industries, use their slot-0 perf for ind_val_hist):
+./build/training_v4_cpp --output models/training --load-dir models/training \
+  --master-only --passes 5 --start-day 17 --stop-day 1255
+# Short diagnostic (verifies master fires at day 30+):
+./build/training_v4_cpp --output /root/diag --load-dir /root/diag \
+  --start-day 16 --stop-day 35 --passes 1 --preserve-stock-data
 # After training, convert back to .pt before inspect_trades.py or production_v2.py:
 python convert_weights.py --models-dir models/training --output models/training
-# On master-tier-reclass branch: C++ master is deferred; use Python --master-only instead:
-python training_v4.py --output models/training --load-dir models/training \
-  --master-only --passes 5 --start-day 17 --stop-day 1255
 ```
-~31 s/day on the droplet (vs ~180 s/day for Python v4). `convert_weights.py` is required
-after C++ training before using `inspect_trades.py` or `production_v2.py`.
+Master trains via tier-classification (444 features, FN/FP penalties) starting at day 30.
+`convert_weights.py` is required after C++ training before using `inspect_trades.py` or `production_v2.py`.
+Note: existing master `.bin` files are incompatible after the architecture change — regenerate with `prepare_models.py`.
 
 **Train (parallel, 7 threads — requires ≥4 GB RAM):**
 ```bash
@@ -117,7 +114,7 @@ Runs all five steps: updates `universe.py` and regenerates `universe.json`, remo
 | `prepare_models.py` | `.pt` → `.bin` for C++ trainer (run before first C++ training) |
 | `convert_weights.py` | `.bin` → `.pt` + `_best.pt` for Python tools (run after C++ training) |
 
-All training scripts (`training_v2.py`, `training_v3.py`, `training_v4.py`), `production_v2.py`, and `inspect_trades.py` import from these modules. `download_5y_data.py` imports from `universe.py`. To add or change a ticker, run `swap_symbols.sh` — it updates both `universe.py` and `universe.json` together.
+All training scripts (`training_v2.py`, `training_v3.py`), `production_v2.py`, and `inspect_trades.py` import from these modules. (`training_v4.py` was deleted — superseded by `training_v4_cpp` for all training.) `download_5y_data.py` imports from `universe.py`. To add or change a ticker, run `swap_symbols.sh` — it updates both `universe.py` and `universe.json` together.
 
 ## Tests
 
@@ -146,7 +143,7 @@ Each industry maintains **200 model slots** on disk as `.pt` files. The slot lay
 
 Each training day: all 200 slots reset to slot 0's portfolio → infer → simulate fills → score as `delta × invested_pct` → select + mutate. The `invested_pct` multiplier penalises cash-heavy winners.
 
-`training_v4.py` (parallel) differs from `training_v2.py` (single-threaded) in: 2 worker *processes* (`ProcessPoolExecutor`) replacing the sequential industry loop, bypassing the Python GIL for genuine parallel execution of the trade simulation. Portfolio and history state is pickled to each worker and the mutated copies are returned and reassigned in the main process after each day. Expected speedup: ~40% (~3 min/day vs ~5 min/day) on a 2-vCPU host.
+`training_v4_cpp` (C++ binary) is the canonical trainer — handles both industry and master training with ~6× speedup over Python. Master training uses tier-classification (444 features: 18 delta lookbacks + polynomial regression over per-industry portfolio value history; FN/FP penalty scoring; 3-consecutive-zero liquidation). Master only activates at `actual_day >= 30`.
 
 `training_v3.py` (parallel) differs from `training_v2.py` in: 7 worker threads, in-RAM model cache (`_model_cache`), no slippage on limit fills, and slot-level portfolio JSON persisted alongside weights.
 
