@@ -2022,7 +2022,13 @@ def main():
         # threads that own them, causing a futex deadlock on every day after
         # the first.  Keeping workers alive across days also eliminates
         # per-day fork overhead.
-        executor = ProcessPoolExecutor(max_workers=NUM_WORKERS)
+        # Python 3.12 spawns workers lazily (on first submit), so fork happens
+        # after PyTorch's thread pool is initialized — causing a futex deadlock.
+        # 'spawn' starts fresh worker processes that re-import torch cleanly.
+        executor = ProcessPoolExecutor(
+            max_workers=NUM_WORKERS,
+            mp_context=__import__('multiprocessing').get_context('spawn'),
+        )
         hard_flag_hit = False
         for day_num, day in enumerate(days_slice):
             if hard_flag_hit:
