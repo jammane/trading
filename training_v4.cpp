@@ -105,15 +105,20 @@ static constexpr float FINRA_TAF_PER_SHARE = 0.000166f;
 static constexpr float FINRA_TAF_MAX       = 8.30f;
 static constexpr float SLIPPAGE_RATE       = 0.001f;
 
-static constexpr int   STOCKNN_PARAMS = 921625;
-static constexpr int   MASTERNN_PARAMS = 923560;
+static constexpr int   STOCKNN_PARAMS  = 921625;
+// New flat 5-layer MasterNN: 444→444→444→312→180→48
+// fc1: 444×444+444=197580  fc2: +197580=395160  fc3: 444×312+312=138840→534000
+// fc4: 312×180+180=56340→590340  fc_out: 180×48+48=8688→599028
+static constexpr int   MASTERNN_PARAMS = 599028;
+static constexpr int   MASTER_START_DAY = 30;
+static constexpr float FN_PENALTY      = 0.006f;
+static constexpr float FP_PENALTY      = 0.004f;
+static constexpr float TIER_WEIGHTS[4] = {0.f, 1.f, 1.5f, 2.25f};
 
 // ── Layer dimensions ───────────────────────────────────────────────────────────
 
 static constexpr int STOCK_INJ_IN [14] = {180,185,190,195,200,205,210,215,220,225,230,235,240,245};
 static constexpr int STOCK_INJ_OUT[14] = {125,130,135,140,145,150,155,160,165,170,175,180,185,190};
-static constexpr int MAST_INJ_IN  [14] = {181,186,191,196,201,206,211,216,221,226,231,236,241,246};
-static constexpr int MAST_INJ_OUT [14] = {125,130,135,140,145,150,155,160,165,170,175,180,185,190};
 
 // Float offsets into the flat weight array for StockNN
 static constexpr int STOCK_SEED_W  = 0;
@@ -141,31 +146,18 @@ static constexpr int STOCK_FC3_B   = 916138;
 static constexpr int STOCK_OUT_W   = 916249;
 static constexpr int STOCK_OUT_B   = 921577;
 
-// Float offsets into the flat weight array for MasterNN
-static constexpr int MAST_SEED_W  = 0;
-static constexpr int MAST_SEED_B  = 7320;
-static constexpr int MAST_INJ_W[14] = {
-     7440, 30190, 54500, 80420,108000,137290,168340,201200,
-    235920,272550,311140,351740,394400,439170
-};
-static constexpr int MAST_INJ_B[14] = {
-    30065, 54370, 80285,107860,137145,168190,201045,235760,
-    272385,310970,351565,394220,438985,485910
-};
-static constexpr int MAST_TODAY_W = 486100;
-static constexpr int MAST_TODAY_B = 611800;
-static constexpr int MAST_FLAT1_W = 612100;
-static constexpr int MAST_FLAT1_B = 702100;
-static constexpr int MAST_FLAT2_W = 702400;
-static constexpr int MAST_FLAT2_B = 792400;
-static constexpr int MAST_FC1_W   = 792700;
-static constexpr int MAST_FC1_B   = 862900;
-static constexpr int MAST_FC2_W   = 863134;
-static constexpr int MAST_FC2_B   = 902446;
-static constexpr int MAST_FC3_W   = 902614;
-static constexpr int MAST_FC3_B   = 919750;
-static constexpr int MAST_OUT_W   = 919852;
-static constexpr int MAST_OUT_B   = 923524;
+// Float offsets into the flat weight array for MasterNN (5-layer flat FC)
+static constexpr int MAST_FC1_W   = 0;
+static constexpr int MAST_FC1_B   = 197136;   // 444*444
+static constexpr int MAST_FC2_W   = 197580;   // +444
+static constexpr int MAST_FC2_B   = 394716;   // +444*444
+static constexpr int MAST_FC3_W   = 395160;   // +444
+static constexpr int MAST_FC3_B   = 533688;   // +444*312
+static constexpr int MAST_FC4_W   = 534000;   // +312
+static constexpr int MAST_FC4_B   = 590160;   // +312*180
+static constexpr int MAST_OUT_W   = 590340;   // +180
+static constexpr int MAST_OUT_B   = 598980;   // +180*48
+// Verify: 598980+48 = 599028 = MASTERNN_PARAMS
 
 // ── PCG32 fast RNG ─────────────────────────────────────────────────────────────
 
@@ -260,53 +252,15 @@ static void stock_forward(const float* W, const float* hist15x60,
     }
 }
 
-// MasterNN forward — weights[] is MASTERNN_PARAMS floats.
-// hist15x61 is [15][61], today229 is [229].
-// Output out36: [0..11] softmax alloc, [12..23] sigmoid depth, [24..35] sigmoid trigger.
-static void master_forward(const float* W, const float* hist15x61,
-                           const float* today229, float* out36) {
-    float x[300], y[300], cat[430], fc1[234], fc2[168], fc3[102];
-
-    // Seed: hist[0][61] → 120
-    sgemv_relu(W + MAST_SEED_W, W + MAST_SEED_B, hist15x61, x, 120, 61);
-
-    // Inject layers i=0..13
-    int xsz = 120;
-    for (int i = 0; i < 14; i++) {
-        int in_sz  = MAST_INJ_IN[i];
-        int out_sz = MAST_INJ_OUT[i];
-        memcpy(cat, x, xsz * sizeof(float));
-        memcpy(cat + xsz, hist15x61 + (i + 1) * 61, 61 * sizeof(float));
-        sgemv_relu(W + MAST_INJ_W[i], W + MAST_INJ_B[i], cat, y, out_sz, in_sz);
-        memcpy(x, y, out_sz * sizeof(float));
-        xsz = out_sz;
-    }
-
-    // Today: cat(x[190], today[229]) = 419 → 300
-    memcpy(cat, x, 190 * sizeof(float));
-    memcpy(cat + 190, today229, 229 * sizeof(float));
-    sgemv_relu(W + MAST_TODAY_W, W + MAST_TODAY_B, cat, x, 300, 419);
-
-    // Flat
-    sgemv_relu(W + MAST_FLAT1_W, W + MAST_FLAT1_B, x, y, 300, 300);
-    sgemv_relu(W + MAST_FLAT2_W, W + MAST_FLAT2_B, y, x, 300, 300);
-
-    // Funnel
-    sgemv_relu(W + MAST_FC1_W, W + MAST_FC1_B, x,   fc1, 234, 300);
-    sgemv_relu(W + MAST_FC2_W, W + MAST_FC2_B, fc1, fc2, 168, 234);
-    sgemv_relu(W + MAST_FC3_W, W + MAST_FC3_B, fc2, fc3, 102, 168);
-
-    // Output
-    sgemv_only(W + MAST_OUT_W, W + MAST_OUT_B, fc3, out36, 36, 102);
-
-    // Softmax for alloc[0..11]
-    float mx = *std::max_element(out36, out36 + 12);
-    float sm = 0.f;
-    for (int i = 0; i < 12; i++) { out36[i] = expf(out36[i] - mx); sm += out36[i]; }
-    for (int i = 0; i < 12; i++) out36[i] /= sm;
-
-    // Sigmoid for depth[12..23] and trigger[24..35]
-    for (int i = 12; i < 36; i++) out36[i] = sigmoidf(out36[i]);
+// MasterNN forward — weights[] is MASTERNN_PARAMS floats, today444 is (1,444) flat vector.
+// Output out48: raw logits [12][4]; caller decodes tier via argmax over each group of 4.
+static void master_forward(const float* W, const float* today444, float* out48) {
+    float h1[444], h2[444], h3[312], h4[180];
+    sgemv_relu(W + MAST_FC1_W, W + MAST_FC1_B, today444, h1, 444, 444);
+    sgemv_relu(W + MAST_FC2_W, W + MAST_FC2_B, h1,       h2, 444, 444);
+    sgemv_relu(W + MAST_FC3_W, W + MAST_FC3_B, h2,       h3, 312, 444);
+    sgemv_relu(W + MAST_FC4_W, W + MAST_FC4_B, h3,       h4, 180, 312);
+    sgemv_only(W + MAST_OUT_W, W + MAST_OUT_B, h4,    out48,  48, 180);
 }
 
 // ── Data structures ─────────────────────────────────────────────────────────────
@@ -355,11 +309,17 @@ struct IndustryState {
     // elites removed — stored in per-worker WorkerScratch to avoid OOM
 };
 
+// IND_HIST_CAP: maximum entries in ind_val_hist rolling buffer.
+// Need up to lookback 91 days of history (delta at t=90 needs hist[90] and hist[91]).
+static constexpr int IND_HIST_CAP = 92;
+
 struct MasterState {
     MasterPortfolio portfolios[N_SLOTS];
-    SymHist         sym_hist[N_SYMS];   // all 144 symbols, indexed [ind*12+sym]
-    float           flat_cos_hist[15];
-    int             flat_cos_len{0};
+    // Per-industry rolling value history: oldest-first, length ind_hist_count (≤ IND_HIST_CAP)
+    float           ind_val_hist[N_IND][IND_HIST_CAP];
+    int             ind_hist_count{0};
+    // Consecutive tier-0 counter per slot per industry; slot 0 persists across days
+    int             zero_counts[N_SLOTS][N_IND];
     // elites removed — stored in MasterScratch (heap-allocated in main)
 };
 
@@ -484,22 +444,11 @@ static void init_stock_weights(float* W, PCG32& rng) {
 }
 
 static void init_master_weights(float* W, PCG32& rng) {
-    kaiming_init(W + MAST_SEED_W, 120, 61, rng);
-    for (int i = 0; i < 14; i++) {
-        int in_sz = MAST_INJ_IN[i], out_sz = MAST_INJ_OUT[i];
-        float bound = 1.0f / sqrtf((float)in_sz);
-        for (int k = 0; k < out_sz * in_sz; k++)
-            W[MAST_INJ_W[i] + k] = (rng.next_float() * 2.f - 1.f) * bound;
-        for (int k = 0; k < out_sz; k++)
-            W[MAST_INJ_B[i] + k] = (rng.next_float() * 2.f - 1.f) * bound;
-    }
-    kaiming_init(W + MAST_TODAY_W, 300, 419, rng);
-    kaiming_init(W + MAST_FLAT1_W, 300, 300, rng);
-    kaiming_init(W + MAST_FLAT2_W, 300, 300, rng);
-    kaiming_init(W + MAST_FC1_W,   234, 300, rng);
-    kaiming_init(W + MAST_FC2_W,   168, 234, rng);
-    kaiming_init(W + MAST_FC3_W,   102, 168, rng);
-    kaiming_init(W + MAST_OUT_W,    36, 102, rng);
+    kaiming_init(W + MAST_FC1_W, 444, 444, rng);
+    kaiming_init(W + MAST_FC2_W, 444, 444, rng);
+    kaiming_init(W + MAST_FC3_W, 312, 444, rng);
+    kaiming_init(W + MAST_FC4_W, 180, 312, rng);
+    kaiming_init(W + MAST_OUT_W,  48, 180, rng);
 }
 
 // ── Model file I/O ──────────────────────────────────────────────────────────────
@@ -1187,140 +1136,168 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     return res;
 }
 
+// ── Master feature construction helpers ─────────────────────────────────────────
+
+// Solve 3×3 augmented system A[3][4] in-place; result in x[3].
+static void gauss_solve3(float A[3][4], float x[3]) {
+    for (int col = 0; col < 3; col++) {
+        int piv = col;
+        for (int r = col+1; r < 3; r++)
+            if (fabsf(A[r][col]) > fabsf(A[piv][col])) piv = r;
+        if (piv != col) for (int j = 0; j < 4; j++) { float t=A[col][j]; A[col][j]=A[piv][j]; A[piv][j]=t; }
+        if (fabsf(A[col][col]) < 1e-12f) continue;
+        for (int r = col+1; r < 3; r++) {
+            float f = A[r][col] / A[col][col];
+            for (int j = col; j < 4; j++) A[r][j] -= f * A[col][j];
+        }
+    }
+    for (int i = 2; i >= 0; i--) {
+        x[i] = A[i][3];
+        for (int j = i+1; j < 3; j++) x[i] -= A[i][j] * x[j];
+        x[i] = fabsf(A[i][i]) > 1e-12f ? x[i] / A[i][i] : 0.f;
+    }
+}
+
+// Solve 4×4 augmented system A[4][5] in-place; result in x[4].
+static void gauss_solve4(float A[4][5], float x[4]) {
+    for (int col = 0; col < 4; col++) {
+        int piv = col;
+        for (int r = col+1; r < 4; r++)
+            if (fabsf(A[r][col]) > fabsf(A[piv][col])) piv = r;
+        if (piv != col) for (int j = 0; j < 5; j++) { float t=A[col][j]; A[col][j]=A[piv][j]; A[piv][j]=t; }
+        if (fabsf(A[col][col]) < 1e-12f) continue;
+        for (int r = col+1; r < 4; r++) {
+            float f = A[r][col] / A[col][col];
+            for (int j = col; j < 5; j++) A[r][j] -= f * A[col][j];
+        }
+    }
+    for (int i = 3; i >= 0; i--) {
+        x[i] = A[i][4];
+        for (int j = i+1; j < 4; j++) x[i] -= A[i][j] * x[j];
+        x[i] = fabsf(A[i][i]) > 1e-12f ? x[i] / A[i][i] : 0.f;
+    }
+}
+
+// Degree-2 polyfit via normal equations; coefs[3] = {a2, a1, a0} (highest power first).
+// x = linspace(0,1,n); n must be ≥ 1.
+static void polyfit2(const float* y, int n, float coefs[3]) {
+    float A[3][4] = {};
+    for (int i = 0; i < n; i++) {
+        float xi = (n > 1) ? (float)i / (float)(n-1) : 0.f;
+        float v[3] = {xi*xi, xi, 1.f};
+        for (int r = 0; r < 3; r++) {
+            for (int c = 0; c < 3; c++) A[r][c] += v[r] * v[c];
+            A[r][3] += v[r] * y[i];
+        }
+    }
+    gauss_solve3(A, coefs);
+}
+
+// Degree-3 polyfit; coefs[4] = {a3, a2, a1, a0}.
+static void polyfit3(const float* y, int n, float coefs[4]) {
+    float A[4][5] = {};
+    for (int i = 0; i < n; i++) {
+        float xi = (n > 1) ? (float)i / (float)(n-1) : 0.f;
+        float v[4] = {xi*xi*xi, xi*xi, xi, 1.f};
+        for (int r = 0; r < 4; r++) {
+            for (int c = 0; c < 4; c++) A[r][c] += v[r] * v[c];
+            A[r][4] += v[r] * y[i];
+        }
+    }
+    gauss_solve4(A, coefs);
+}
+
+// hist_at: clamp-to-oldest accessor into a rolling oldest-first buffer.
+// hist[0..hist_count-1]; k=0 → newest, k=hist_count-1 → oldest.
+static inline float hist_at(const float* hist, int hist_count, int k) {
+    int idx = hist_count - 1 - k;
+    return idx < 0 ? hist[0] : hist[idx];
+}
+
+// Fill window[0..win-1] with oldest-first values ending at newest, left-padding with oldest.
+static void fill_window(const float* hist, int hist_count, int win, float* window) {
+    for (int j = 0; j < win; j++) {
+        int src = (hist_count - win) + j;
+        window[j] = (src <= 0) ? hist[0] : hist[src];
+    }
+}
+
+// Build 444-feature vector for master from per-industry value history.
+// out444 layout per industry (37 features × 12 = 444):
+//   [0..17]   18 delta lookbacks at LOOKBACKS days
+//   [18..20]  3 poly-2 coefs over 5-day window
+//   [21..36]  16 poly-3 coefs over 4 windows (10,30,60,90 days)
+static void build_master_features(const float ind_val_hist[][IND_HIST_CAP],
+                                   int hist_count, float* out444) {
+    static constexpr int LOOKBACKS[18] = {1,2,3,4,5,6,7,8,9,10,15,20,25,30,40,50,60,90};
+    static constexpr int POLY3_WINS[4] = {10,30,60,90};
+    memset(out444, 0, 444 * sizeof(float));
+
+    for (int i = 0; i < N_IND; i++) {
+        const float* h = ind_val_hist[i];
+        float* feat = out444 + i * 37;
+
+        // 18 delta lookbacks
+        for (int lt = 0; lt < 18; lt++) {
+            int t  = LOOKBACKS[lt];
+            float vt  = hist_at(h, hist_count, t);
+            float vt1 = hist_at(h, hist_count, t + 1);
+            float denom = fabsf(vt1) > 1e-9f ? vt1 : (vt1 >= 0.f ? 1e-9f : -1e-9f);
+            feat[lt] = (vt - vt1) / fabsf(denom);
+        }
+
+        // poly-2 over 5-day window
+        float win5[5];
+        fill_window(h, hist_count, 5, win5);
+        polyfit2(win5, 5, feat + 18);
+
+        // poly-3 over 4 windows (10,30,60,90)
+        float polywin[90];
+        for (int wi = 0; wi < 4; wi++) {
+            int W = POLY3_WINS[wi];
+            fill_window(h, hist_count, W, polywin);
+            polyfit3(polywin, W, feat + 21 + wi * 4);
+        }
+    }
+}
+
 // ── step_master ─────────────────────────────────────────────────────────────────
 
 static float step_master(MasterState& state, MasterScratch& scratch,
-                         const DayData& day, const DayData* fill,
                          const IndResult* ind_results,
-                         int actual_day, int total_avail, int day_num, int num_days,
+                         int actual_day, int total_avail,
                          float sigma) {
-    const DayData& fd = fill ? *fill : day;
+    // Gate: must have 30+ days of actual market data before master can train.
+    if (actual_day < MASTER_START_DAY) return 0.f;
 
-    // Resolve actual_perf[N_IND]
+    // Compute actual_perf[N_IND] from slot-0 industry results
     float actual_perf[N_IND] = {};
     for (int i = 0; i < N_IND; i++) {
         if (ind_results[i].baseline > 0.f)
             actual_perf[i] = ind_results[i].slot0_score / ind_results[i].baseline - 1.f;
     }
 
-    // Pre-compute ind_stats: mean_deltas[15][5] per industry
-    // mean_deltas[t][k]: t=0 most recent, t=14 oldest; k=0..4 delta channel
-    float ind_mean_deltas[N_IND][15][5] = {};
-    float ind_volatility[N_IND] = {};
-    float ind_momentum[N_IND]   = {};
+    // Build 444-feature vector (same for all slots — features independent of portfolio state)
+    float today444[444];
+    build_master_features(state.ind_val_hist, state.ind_hist_count, today444);
 
-    for (int i = 0; i < N_IND; i++) {
-        for (int t = 0; t < 15; t++) {
-            float sum[5] = {}; int cnt = 0;
-            for (int j = 0; j < IND_SYMS; j++) {
-                const SymHist& h = state.sym_hist[i * IND_SYMS + j];
-                if (h.len > t) {
-                    const float* d = h.get(h.len - 1 - t).data;  // t steps back from newest
-                    for (int k = 0; k < 5; k++) sum[k] += d[5 + k];
-                    cnt++;
-                }
-            }
-            if (cnt > 0) for (int k = 0; k < 5; k++) ind_mean_deltas[i][t][k] = sum[k] / cnt;
-        }
-        // volatility and momentum from mean_deltas[*][0] (delta close)
-        float vals[15]; int vlen = 0;
-        for (int t = 0; t < 15; t++) vals[vlen++] = ind_mean_deltas[i][t][0];
-        float mean_v = 0.f;
-        for (int t = 0; t < vlen; t++) mean_v += vals[t];
-        mean_v /= vlen > 0 ? vlen : 1;
-        float var_v = 0.f;
-        for (int t = 0; t < vlen; t++) { float dv = vals[t] - mean_v; var_v += dv*dv; }
-        float std_v = vlen > 0 ? sqrtf(var_v / vlen) : 0.f;
-        float abs_mean = fabsf(mean_v);
-        ind_volatility[i] = abs_mean > 1e-9f ? std_v / abs_mean : 0.f;
-        float mean5 = 0.f;
-        for (int t = 0; t < std::min(vlen, 5); t++) mean5 += vals[t];
-        mean5 /= std::min(vlen, 5) > 0 ? std::min(vlen, 5) : 1;
-        ind_momentum[i] = abs_mean > 1e-9f ? mean5 / mean_v : 1.f;
-    }
-
-    // flat_cos_hist padded to 15
-    float fc_padded[15] = {};
-    int fc_start = 15 - state.flat_cos_len;
-    memcpy(fc_padded + fc_start, state.flat_cos_hist, state.flat_cos_len * sizeof(float));
-
-    // Build master history: hist15x61, row 0 = oldest
-    float hist_arr[15 * 61] = {};
-    for (int row = 0; row < 15; row++) {
-        // row 0 = oldest (t=14 in mean_deltas), row 14 = newest (t=0)
-        int t = 14 - row;
-        for (int i = 0; i < N_IND; i++)
-            for (int k = 0; k < 5; k++)
-                hist_arr[row * 61 + i * 5 + k] = ind_mean_deltas[i][t][k];
-        hist_arr[row * 61 + 60] = fc_padded[row];
-    }
-
-    // Compute today_ind_data: delta aggs and ind_mean_today per industry
-    float today_ind_aggs[N_IND][15] = {};
-    float today_ind_mean[N_IND]     = {};
-
-    for (int i = 0; i < N_IND; i++) {
-        float dl[IND_SYMS][5] = {};
-        for (int j = 0; j < IND_SYMS; j++) {
-            int si = i * IND_SYMS + j;
-            const OHLCV& d = day.sym[i][j];
-            float raw_t[5] = {d.valid?d.open:0, d.valid?d.close:0,
-                              d.valid?d.high:0, d.valid?d.low:0, d.valid?d.volume:0};
-            const HistEntry* prev = state.sym_hist[si].newest();
-            for (int k = 0; k < 5; k++) dl[j][k] = prev ? raw_t[k] - prev->data[k] : 0.f;
-        }
-        float sum_delta_close = 0.f;
-        for (int k = 0; k < 5; k++) {
-            float mx = dl[0][k], mn = dl[0][k], sm = 0.f;
-            for (int j = 0; j < IND_SYMS; j++) {
-                if (dl[j][k] > mx) mx = dl[j][k];
-                if (dl[j][k] < mn) mn = dl[j][k];
-                sm += dl[j][k];
-            }
-            today_ind_aggs[i][k * 3 + 0] = mx;
-            today_ind_aggs[i][k * 3 + 1] = mn;
-            today_ind_aggs[i][k * 3 + 2] = sm / IND_SYMS;
-        }
-        // ind_mean_today = mean delta_close across symbols
-        for (int j = 0; j < IND_SYMS; j++) sum_delta_close += dl[j][1];
-        today_ind_mean[i] = sum_delta_close / IND_SYMS;
-    }
-    float all_mean_today = 0.f;
-    for (int i = 0; i < N_IND; i++) all_mean_today += today_ind_mean[i];
-    all_mean_today /= N_IND;
-
-    // Build today_arr [229]
-    float today_arr[229] = {};
-    for (int i = 0; i < N_IND; i++) {
-        int base = i * 18;
-        for (int k = 0; k < 15; k++) today_arr[base + k] = today_ind_aggs[i][k];
-        today_arr[base + 15] = ind_volatility[i];
-        today_arr[base + 16] = ind_momentum[i];
-        float corr = fabsf(all_mean_today) > 1e-9f ? today_ind_mean[i] / all_mean_today : 1.f;
-        today_arr[base + 17] = corr;
-    }
-    // State: [cash_norm, holdings[12]]
+    // Snapshot slot-0's portfolio as baseline
     float ref_cash = state.portfolios[0].cash;
     float ref_hold[N_IND];
     for (int i = 0; i < N_IND; i++) ref_hold[i] = state.portfolios[0].holdings[i];
-    today_arr[216] = ref_cash / std::max(MST_STARTING_CASH, 1.f);
-    for (int i = 0; i < N_IND; i++) today_arr[217 + i] = ref_hold[i] * IND_UNIT_PRICE;
-
-    // Baseline
     float baseline = ref_cash;
     for (int i = 0; i < N_IND; i++) baseline += ref_hold[i] * IND_UNIT_PRICE;
 
-    // Reset all portfolios
+    // Reset all portfolios to slot-0's state; zero_counts for slots 1+ inherit slot 0's counts
     for (int s = 0; s < N_SLOTS; s++) {
         state.portfolios[s].cash = ref_cash;
         for (int i = 0; i < N_IND; i++) state.portfolios[s].holdings[i] = ref_hold[i];
     }
+    for (int s = 1; s < N_SLOTS; s++)
+        memcpy(state.zero_counts[s], state.zero_counts[0], N_IND * sizeof(int));
 
-    // Inference + trade loop — use per-master scratch (no thread-local statics)
-    float pred_scores[N_SLOTS] = {};
-    float slot_preds[N_SLOTS][N_IND] = {};
-    float out36[36];
-    float*    mast_mut_buf  = scratch.mut_buf;
+    // Pregenerate mutation seeds
+    float*    mast_mut_buf   = scratch.mut_buf;
     uint64_t* mast_mut_seeds = scratch.mut_seeds;
     {
         PCG32 seed_rng; seed_rng.seed((uint64_t)actual_day * 777017ULL + 99999ULL);
@@ -1328,7 +1305,9 @@ static float step_master(MasterState& state, MasterScratch& scratch,
             mast_mut_seeds[i] = ((uint64_t)seed_rng.next() << 32) | seed_rng.next();
     }
 
-    float floor_value = MST_STARTING_CASH * 0.02f;
+    float pred_scores[N_SLOTS] = {};
+    int   slot_tiers[N_SLOTS][N_IND] = {};
+    float out48[48];
 
     for (int slot = 0; slot < N_SLOTS; slot++) {
         const float* W;
@@ -1342,106 +1321,121 @@ static float step_master(MasterState& state, MasterScratch& scratch,
             W = mast_mut_buf;
         }
 
-        master_forward(W, hist_arr, today_arr, out36);
-        for (int i = 0; i < N_IND; i++) slot_preds[slot][i] = out36[i];
+        master_forward(W, today444, out48);
+
+        // Decode tiers: argmax over each group of 4 logits
+        int tier[N_IND];
+        for (int i = 0; i < N_IND; i++) {
+            const float* lg = out48 + i * 4;
+            int best = 0;
+            for (int k = 1; k < 4; k++) if (lg[k] > lg[best]) best = k;
+            tier[i] = best;
+            slot_tiers[slot][i] = best;
+        }
+
+        // Update consecutive-zero counts for this slot
+        for (int i = 0; i < N_IND; i++) {
+            if (tier[i] == 0) state.zero_counts[slot][i]++;
+            else              state.zero_counts[slot][i] = 0;
+        }
 
         MasterPortfolio& port = state.portfolios[slot];
 
-        // Liquidation: sorted ascending by alloc weight
-        int sorted_inds[N_IND];
-        for (int i = 0; i < N_IND; i++) sorted_inds[i] = i;
-        std::sort(sorted_inds, sorted_inds + N_IND,
-                  [&out36](int a, int b){ return out36[a] < out36[b]; });
-
-        for (int si = 0; si < N_IND; si++) {
-            int i = sorted_inds[si];
-            float price = IND_UNIT_PRICE;
-            if (out36[12 + i] <= 0.5f) continue;  // liq_trigger
-            float cur_hold_v = port.holdings[i] * price;
-            if (cur_hold_v <= floor_value) continue;
-            float target_hold_v = out36[i] * MST_STARTING_CASH;
-            float depth = out36[12 + i];
-            float eff_tgt = target_hold_v + (1.f - depth) * std::max(0.f, cur_hold_v - target_hold_v);
-            eff_tgt = std::max(eff_tgt, floor_value);
-            float liq_v = std::max(0.f, std::min(cur_hold_v - eff_tgt, cur_hold_v - floor_value));
-            float liq_units = liq_v / price;
-            if (liq_units > 1e-9f) {
-                port.holdings[i] -= liq_units;
-                port.cash        += sell_net(liq_units, price);
-            }
-        }
-
-        // Deployment
+        // Liquidate industries with 3+ consecutive tier-0 predictions
         for (int i = 0; i < N_IND; i++) {
-            float price = IND_UNIT_PRICE;
-            float cur_hold_v = port.holdings[i] * price;
-            float target_hold_v = out36[i] * MST_STARTING_CASH;
-            float diff = target_hold_v - cur_hold_v;
-            if (diff <= 1e-6f) continue;
-            float affordable = std::min(diff, port.cash);
-            float units = affordable / price;
-            if (units > 1e-9f) {
-                port.holdings[i] += units;
-                port.cash        -= units * price;
+            if (state.zero_counts[slot][i] >= 3 && port.holdings[i] > 1e-9f) {
+                port.cash        += sell_net(port.holdings[i], IND_UNIT_PRICE);
+                port.holdings[i]  = 0.f;
             }
         }
 
-        // Apply daily returns
+        // Compute tier-based allocation: tiers_to_alloc
+        int positives[N_IND]; int n_pos = 0;
+        for (int i = 0; i < N_IND; i++) if (tier[i] > 0) positives[n_pos++] = i;
+
+        float alloc[N_IND] = {};
+        if (n_pos > 0) {
+            // Sort ascending by predicted tier so that re-assignment is stable
+            std::sort(positives, positives + n_pos,
+                      [&tier](int a, int b){ return tier[a] < tier[b]; });
+
+            int base = n_pos / 3, rem = n_pos % 3;
+            int n3 = base;
+            int n2 = base + (rem >= 2 ? 1 : 0);
+
+            int assigned[N_IND] = {};
+            for (int rank = 0; rank < n_pos; rank++) {
+                int ind = positives[rank];
+                if      (rank < n3)       assigned[ind] = 1;
+                else if (rank < n3 + n2)  assigned[ind] = 2;
+                else                      assigned[ind] = 3;
+            }
+
+            float total_w = 0.f;
+            for (int k = 0; k < n_pos; k++)
+                total_w += TIER_WEIGHTS[assigned[positives[k]]];
+
+            float pool = port.cash;
+            for (int i = 0; i < N_IND; i++) pool += port.holdings[i] * IND_UNIT_PRICE;
+
+            if (total_w > 0.f)
+                for (int k = 0; k < n_pos; k++) {
+                    int ind = positives[k];
+                    alloc[ind] = TIER_WEIGHTS[assigned[ind]] / total_w * pool;
+                }
+        }
+
+        // Apply allocation: liquidate first, then buy
+        for (int i = 0; i < N_IND; i++) {
+            float cur_v = port.holdings[i] * IND_UNIT_PRICE;
+            float tgt_v = alloc[i];
+            if (cur_v > tgt_v + 1e-6f) {
+                float units = (cur_v - tgt_v) / IND_UNIT_PRICE;
+                port.holdings[i] -= units;
+                port.cash        += sell_net(units, IND_UNIT_PRICE);
+            }
+        }
+        for (int i = 0; i < N_IND; i++) {
+            float cur_v = port.holdings[i] * IND_UNIT_PRICE;
+            float tgt_v = alloc[i];
+            if (tgt_v > cur_v + 1e-6f) {
+                float diff = std::min(tgt_v - cur_v, port.cash);
+                float units = diff / IND_UNIT_PRICE;
+                port.holdings[i] += units;
+                port.cash        -= units * IND_UNIT_PRICE;
+            }
+        }
+
+        // Apply daily industry returns
         for (int i = 0; i < N_IND; i++)
             port.holdings[i] *= (1.f + actual_perf[i]);
-    }
 
-    // Compute target_pct from ind_results
-    float raw_deltas[N_IND] = {};
-    bool have_deltas = false;
-    for (int i = 0; i < N_IND; i++) {
-        if (ind_results[i].baseline > 0.f) {
-            raw_deltas[i] = ind_results[i].slot0_score - ind_results[i].baseline;
-            have_deltas = true;
-        }
-    }
-
-    float target_pct[N_IND] = {};
-    float flat_cos = 0.f;
-    float best_pred = 0.f;
-
-    if (have_deltas) {
-        float min_d = *std::min_element(raw_deltas, raw_deltas + N_IND);
-        float total = 0.f;
-        float shifted[N_IND];
-        for (int i = 0; i < N_IND; i++) { shifted[i] = raw_deltas[i] - min_d + 1e-9f; total += shifted[i]; }
-        for (int i = 0; i < N_IND; i++) target_pct[i] = shifted[i] / total;
-
-        // Compute pred scores
-        for (int s = 0; s < N_SLOTS; s++) {
-            float dot=0, na=0, nb=0;
-            for (int i = 0; i < N_IND; i++) {
-                dot += slot_preds[s][i] * target_pct[i];
-                na  += slot_preds[s][i] * slot_preds[s][i];
-                nb  += target_pct[i]    * target_pct[i];
-            }
-            float denom = sqrtf(na) * sqrtf(nb);
-            pred_scores[s] = denom > 1e-9f ? dot / denom : 0.f;
-            if (pred_scores[s] > best_pred) best_pred = pred_scores[s];
-        }
-
-        // flat_cos: uniform alloc vs target_pct
-        float flat_alloc = 1.f / N_IND;
-        float dot=0, na=0, nb=0;
+        // Score with FN/FP penalties
+        float port_val = port.cash;
+        for (int i = 0; i < N_IND; i++) port_val += port.holdings[i] * IND_UNIT_PRICE;
+        int fn_cnt = 0, fp_cnt = 0;
         for (int i = 0; i < N_IND; i++) {
-            dot += flat_alloc * target_pct[i];
-            na  += flat_alloc * flat_alloc;
-            nb  += target_pct[i] * target_pct[i];
+            if (actual_perf[i] <  0.f && tier[i] >  0) fn_cnt++;
+            if (actual_perf[i] >= 0.f && tier[i] == 0) fp_cnt++;
         }
-        float denom = sqrtf(na) * sqrtf(nb);
-        flat_cos = denom > 1e-9f ? dot / denom : 0.f;
+        pred_scores[slot] = port_val * (1.f - FN_PENALTY * fn_cnt - FP_PENALTY * fp_cnt);
     }
+
+    // Log tier distribution for slot-0
+    int tier_counts[4] = {};
+    for (int i = 0; i < N_IND; i++) tier_counts[slot_tiers[0][i]]++;
+    float prod_val = state.portfolios[0].cash;
+    for (int i = 0; i < N_IND; i++) prod_val += state.portfolios[0].holdings[i] * IND_UNIT_PRICE;
+    float best_score = *std::max_element(pred_scores, pred_scores + N_SLOTS);
 
     log_msg(std::string("[master  ] Day ") + std::to_string(actual_day + 1) +
             "/" + std::to_string(total_avail) +
-            " | pred=" + std::to_string(best_pred).substr(0,6) +
-            " flat=" + std::to_string(flat_cos).substr(0,6) +
-            " | prod=$" + std::to_string((int)baseline));
+            " | best=$" + std::to_string((int)best_score) +
+            " prod=$"   + std::to_string((int)prod_val) +
+            " | t0="    + std::to_string(tier_counts[0]) +
+            " t1="      + std::to_string(tier_counts[1]) +
+            " t2="      + std::to_string(tier_counts[2]) +
+            " t3="      + std::to_string(tier_counts[3]));
 
     // Floor reset
     if (baseline < MST_STARTING_CASH * 0.9f) {
@@ -1449,20 +1443,22 @@ static float step_master(MasterState& state, MasterScratch& scratch,
             state.portfolios[s].cash = MST_STARTING_CASH;
             for (int i = 0; i < N_IND; i++) state.portfolios[s].holdings[i] = 0.f;
         }
-        return flat_cos;
+        memset(state.zero_counts, 0, sizeof(state.zero_counts));
+        return 0.f;
     }
 
+    // Snapshot slot-0's own portfolio and zero_counts before selection mutates them
     MasterPortfolio slot0_own = state.portfolios[0];
+    int slot0_zc[N_IND];
+    memcpy(slot0_zc, state.zero_counts[0], N_IND * sizeof(int));
 
-    // Selection
-    if (best_pred >= 0.50f) {
+    // Selection gate: did any slot beat baseline (i.e. doing nothing)?
+    if (best_score > baseline) {
         float mean_ps = 0.f;
         for (int s = 0; s < N_SLOTS; s++) mean_ps += pred_scores[s];
         mean_ps /= N_SLOTS;
         float var_ps = 0.f;
-        for (int s = 0; s < N_SLOTS; s++) {
-            float d = pred_scores[s] - mean_ps; var_ps += d * d;
-        }
+        for (int s = 0; s < N_SLOTS; s++) { float d = pred_scores[s]-mean_ps; var_ps += d*d; }
         float pool_floor = mean_ps - sqrtf(var_ps / N_SLOTS);
 
         std::vector<std::pair<float,int>> surviving;
@@ -1477,14 +1473,8 @@ static float step_master(MasterState& state, MasterScratch& scratch,
 
         int   src_rank[ELITE_COUNT] = {};
         float src_val[ELITE_COUNT]  = {};
-        for (int k = 0; k < n_top; k++) {
-            src_rank[k] = surviving[k].second;
-            src_val[k]  = surviving[k].first;
-        }
-        for (int k = n_top; k < ELITE_COUNT; k++) {
-            src_rank[k] = src_rank[0];
-            src_val[k]  = src_val[0];
-        }
+        for (int k = 0; k < n_top; k++) { src_rank[k] = surviving[k].second; src_val[k] = surviving[k].first; }
+        for (int k = n_top; k < ELITE_COUNT; k++) { src_rank[k] = src_rank[0]; src_val[k] = src_val[0]; }
 
         float w5_w[5], w10_w[10], w15_w[15];
         int n5 = std::min(n_top,5), n10 = std::min(n_top,10), n15 = std::min(n_top,15);
@@ -1492,9 +1482,10 @@ static float step_master(MasterState& state, MasterScratch& scratch,
         normalize_weights(src_val, w10_w, n10);
         normalize_weights(src_val, w15_w, n15);
 
-        MasterPortfolio new_mports[ELITE_POOL];
+        // New slot-0's zero_counts come from the best-scoring slot
+        memcpy(slot0_zc, state.zero_counts[src_rank[0]], N_IND * sizeof(int));
 
-        // Portfolio wavg from original slot positions (state.portfolios has 200 entries — valid)
+        MasterPortfolio new_mports[ELITE_POOL];
         const MasterPortfolio* mp5[5], *mp10[10], *mp15[15];
         for (int k=0;k<n5;k++)  mp5[k]  = &state.portfolios[src_rank[k]];
         for (int k=0;k<n10;k++) mp10[k] = &state.portfolios[src_rank[k]];
@@ -1504,7 +1495,6 @@ static float step_master(MasterState& state, MasterScratch& scratch,
         wavg_mst_portfolio(mp10, w10_w, n10, wp10);
         wavg_mst_portfolio(mp15, w15_w, n15, wp15);
 
-        // Copy/regenerate into new_elites (mutations regenerated — elite_buf has only ELITE_POOL slots)
         for (int k = 0; k < n_top; k++) {
             int slot = src_rank[k];
             if (slot < ELITE_POOL) {
@@ -1522,7 +1512,6 @@ static float step_master(MasterState& state, MasterScratch& scratch,
             new_mports[k] = new_mports[0];
         }
 
-        // Weight wavg from new_elites[0..n-1] (consecutive indices, no OOB risk)
         int seq[ELITE_COUNT]; for (int k = 0; k < ELITE_COUNT; k++) seq[k] = k;
         wavg_weights_flat(scratch.new_elites, MASTERNN_PARAMS, seq, w5_w,  n5,  scratch.wavg(0));
         wavg_weights_flat(scratch.new_elites, MASTERNN_PARAMS, seq, w10_w, n10, scratch.wavg(1));
@@ -1542,30 +1531,22 @@ static float step_master(MasterState& state, MasterScratch& scratch,
         for (int mut_i = 0; mut_i < N_SLOTS - ELITE_POOL; mut_i++)
             state.portfolios[ELITE_POOL + mut_i] = state.portfolios[mut_i / MUTATIONS_PER_PARENT];
     } else {
-        // Diversity injection
         int half = ELITE_COUNT / 2;
-        log_msg(std::string("[master  ] best_pred=") + std::to_string(best_pred).substr(0,6) +
-                " below floor — injecting diversity");
+        log_msg("[master  ] best_score <= baseline — injecting diversity");
         PCG32 div_rng; div_rng.seed((uint64_t)actual_day * 55555ULL + 77777ULL);
         for (int k = half; k < ELITE_COUNT; k++) {
             init_master_weights(scratch.mut_buf, div_rng);
             for (int p = 0; p < MASTERNN_PARAMS; p++)
-                scratch.elite(k)[p] = 0.5f * scratch.elite(k - half)[p] + 0.5f * scratch.mut_buf[p];
+                scratch.elite(k)[p] = 0.5f * scratch.elite(k-half)[p] + 0.5f * scratch.mut_buf[p];
             state.portfolios[k] = state.portfolios[k - half];
         }
     }
 
+    // Restore slot-0's own portfolio and propagate its zero_counts to the new best
     state.portfolios[0] = slot0_own;
+    memcpy(state.zero_counts[0], slot0_zc, N_IND * sizeof(int));
 
-    // Update flat_cos history
-    if (state.flat_cos_len < 15) {
-        state.flat_cos_hist[state.flat_cos_len++] = flat_cos;
-    } else {
-        memmove(state.flat_cos_hist, state.flat_cos_hist + 1, 14 * sizeof(float));
-        state.flat_cos_hist[14] = flat_cos;
-    }
-
-    return flat_cos;
+    return best_score;
 }
 
 // ── History update (main thread after workers finish) ────────────────────────────
@@ -1689,29 +1670,25 @@ static std::vector<DayData> load_all_stock_data(const std::string& data_dir,
 
 // ── Pre-load history warmup ─────────────────────────────────────────────────────
 
-static void warmup_history(IndustryState* ind_states, MasterState& mst,
+static void warmup_history(IndustryState* ind_states,
                             const std::vector<DayData>& all_days, int day_start) {
     if (day_start <= 0) return;
     int start = std::max(0, day_start - HIST_WINDOW);
-    for (int d = start; d < day_start; d++) {
-        for (int i = 0; i < N_IND; i++) {
-            for (int j = 0; j < IND_SYMS; j++) {
+    for (int d = start; d < day_start; d++)
+        for (int i = 0; i < N_IND; i++)
+            for (int j = 0; j < IND_SYMS; j++)
                 update_hist_sym(ind_states[i].hist[j], all_days[d].sym[i][j]);
-                update_hist_sym(mst.sym_hist[i * IND_SYMS + j], all_days[d].sym[i][j]);
-            }
-        }
-    }
     log_msg("Warmup: pre-loaded " + std::to_string(day_start - start) + " days of history");
 }
 
 // ── CSV logging ────────────────────────────────────────────────────────────────
 
 static void write_csv_row(FILE* csv, int pass_num, int actual_day,
-                           const IndResult* res, float flat_cos) {
+                           const IndResult* res, float master_val) {
     fprintf(csv, "%d,%d", pass_num + 1, actual_day + 1);
     for (int i = 0; i < N_IND; i++)
         fprintf(csv, ",%+10.2f", res[i].best_delta);
-    fprintf(csv, ",%+.4f\n", flat_cos);
+    fprintf(csv, ",%+.2f\n", master_val);
     fflush(csv);
 }
 
@@ -1747,17 +1724,15 @@ static void worker_fn(WorkerCtx* ctx) {
         while (true) {
             int i = ctx->next_ind.fetch_add(1, std::memory_order_relaxed);
             if (i >= N_IND) break;
-            if (!ctx->master_only)
-                ctx->results[i] = step_industry(i, ctx->ind_states[i], scratch,
-                                                 ctx->models_dir, use_load,
-                                                 *ctx->day_ptr, ctx->fill_ptr,
-                                                 ctx->actual_day, ctx->total_avail,
-                                                 ctx->day_num, ctx->num_days,
-                                                 ctx->sigma, ctx->freeze, ctx->seq_flags);
-            else
-                ctx->results[i] = {ctx->ind_states[i].portfolios[0].cash,
-                                   ctx->ind_states[i].portfolios[0].cash,
-                                   0.f, 0.f, 0.f, 0};
+            // In master_only mode, run industry with freeze=true so master gets real
+            // performance data for ind_val_hist without mutating industry models.
+            bool freeze = ctx->freeze || ctx->master_only;
+            ctx->results[i] = step_industry(i, ctx->ind_states[i], scratch,
+                                             ctx->models_dir, use_load,
+                                             *ctx->day_ptr, ctx->fill_ptr,
+                                             ctx->actual_day, ctx->total_avail,
+                                             ctx->day_num, ctx->num_days,
+                                             ctx->sigma, freeze, ctx->seq_flags);
         }
         ctx->work_done.release();
     }
@@ -1831,7 +1806,7 @@ int main(int argc, char* argv[]) {
     if (csv) {
         fprintf(csv, "pass,day");
         for (int i = 0; i < N_IND; i++) fprintf(csv, ",%s", g_ind_names[i].c_str());
-        fprintf(csv, ",flat_cos\n");
+        fprintf(csv, ",master_val\n");
     }
 
     // Threading setup
@@ -1870,16 +1845,17 @@ int main(int argc, char* argv[]) {
         mst->portfolios[0].cash = MST_STARTING_CASH;
         for (int i = 0; i < N_IND; i++) mst->portfolios[0].holdings[i] = 0.f;
         for (int s = 1; s < N_SLOTS; s++) mst->portfolios[s] = mst->portfolios[0];
-        mst->flat_cos_len = 0;
+        memset(mst->ind_val_hist, 0, sizeof(mst->ind_val_hist));
+        mst->ind_hist_count = 0;
+        memset(mst->zero_counts, 0, sizeof(mst->zero_counts));
 
-        // Clear histories
+        // Clear industry OHLCV histories
         for (int i = 0; i < N_IND; i++)
             for (int j = 0; j < IND_SYMS; j++)
                 ind_states[i].hist[j] = SymHist{};
-        for (int si = 0; si < N_SYMS; si++) mst->sym_hist[si] = SymHist{};
 
         // Warmup history
-        warmup_history(ind_states.get(), *mst, all_days, day_start);
+        warmup_history(ind_states.get(), all_days, day_start);
 
         int num_days = day_end - day_start;
         IndResult results[N_IND] = {};
@@ -1918,21 +1894,30 @@ int main(int argc, char* argv[]) {
             // Wait for all workers to finish
             for (int w = 0; w < num_workers; w++) wctx.work_done.acquire();
 
-            // Update histories (main thread is canonical, matching Python design)
-            for (int i = 0; i < N_IND; i++) {
-                for (int j = 0; j < IND_SYMS; j++) {
+            // Update industry OHLCV histories (main thread is canonical)
+            for (int i = 0; i < N_IND; i++)
+                for (int j = 0; j < IND_SYMS; j++)
                     update_hist_sym(ind_states[i].hist[j], day_ptr->sym[i][j]);
-                    update_hist_sym(mst->sym_hist[i * IND_SYMS + j], day_ptr->sym[i][j]);
+
+            // Run master step (uses ind_val_hist from days BEFORE today, then we append today)
+            float master_val = step_master(*mst, *mst_scratch, results,
+                                           actual_day, total_days, cur_mst_sigma);
+
+            // Append today's best-slot industry values to rolling ind_val_hist buffer
+            for (int i = 0; i < N_IND; i++) {
+                float today_v = results[i].baseline + results[i].best_delta;
+                if (mst->ind_hist_count < IND_HIST_CAP) {
+                    mst->ind_val_hist[i][mst->ind_hist_count] = today_v;
+                } else {
+                    memmove(mst->ind_val_hist[i], mst->ind_val_hist[i] + 1,
+                            (IND_HIST_CAP - 1) * sizeof(float));
+                    mst->ind_val_hist[i][IND_HIST_CAP - 1] = today_v;
                 }
             }
-
-            // Master step
-            float flat_cos = step_master(*mst, *mst_scratch, *day_ptr, fill_ptr, results,
-                                         actual_day, total_days, day_num, num_days,
-                                         cur_mst_sigma);
+            if (mst->ind_hist_count < IND_HIST_CAP) mst->ind_hist_count++;
 
             // Log CSV row
-            if (csv) write_csv_row(csv, pass, actual_day, results, flat_cos);
+            if (csv) write_csv_row(csv, pass, actual_day, results, master_val);
 
             // Periodic master save (industry elites already saved inside step_industry each day)
             if (day_num % 50 == 49 || day_num == num_days - 1) {
