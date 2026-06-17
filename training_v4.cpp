@@ -111,9 +111,8 @@ static constexpr int   STOCKNN_PARAMS  = 921625;
 // fc4: 312×180+180=56340→590340  fc_out: 180×48+48=8688→599028
 static constexpr int   MASTERNN_PARAMS = 599028;
 static constexpr int   MASTER_START_DAY = 30;
-static constexpr float FN_PENALTY      = 0.006f;
-static constexpr float FP_PENALTY      = 0.004f;
 static constexpr float TIER_WEIGHTS[4] = {0.f, 1.f, 1.5f, 2.25f};
+static constexpr float NULL_DENOM      = 1.f + 1.5f + 2.25f;  // 4.75
 
 // ── Layer dimensions ───────────────────────────────────────────────────────────
 
@@ -1305,7 +1304,36 @@ static float step_master(MasterState& state, MasterScratch& scratch,
             mast_mut_seeds[i] = ((uint64_t)seed_rng.next() << 32) | seed_rng.next();
     }
 
+    // Compute optimal tiers retroactively from actual_perf (for points scoring)
+    // Negatives → tier 0; positives sorted ascending, split bottom-up into thirds.
+    // n_pos==1: opt=3; n_pos==2: lower=2,higher=3; n_pos>=3: bottom-up formula.
+    int opt_tier[N_IND] = {};
+    {
+        int pos_idx[N_IND]; int n_pos_opt = 0;
+        for (int i = 0; i < N_IND; i++)
+            if (actual_perf[i] >= 0.f) pos_idx[n_pos_opt++] = i;
+        std::sort(pos_idx, pos_idx + n_pos_opt,
+                  [&actual_perf](int a, int b){ return actual_perf[a] < actual_perf[b]; });
+        if (n_pos_opt == 1) {
+            opt_tier[pos_idx[0]] = 3;
+        } else if (n_pos_opt == 2) {
+            opt_tier[pos_idx[0]] = 2;
+            opt_tier[pos_idx[1]] = 3;
+        } else {
+            int base = n_pos_opt / 3, rem = n_pos_opt % 3;
+            int n1 = base + (rem >= 1 ? 1 : 0);
+            int n2 = base + (rem >= 2 ? 1 : 0);
+            for (int rank = 0; rank < n_pos_opt; rank++) {
+                int ind = pos_idx[rank];
+                if      (rank < n1)        opt_tier[ind] = 1;
+                else if (rank < n1 + n2)   opt_tier[ind] = 2;
+                else                        opt_tier[ind] = 3;
+            }
+        }
+    }
+
     float pred_scores[N_SLOTS] = {};
+    float port_vals[N_SLOTS]   = {};
     int   slot_tiers[N_SLOTS][N_IND] = {};
     float out48[48];
 
@@ -1349,40 +1377,46 @@ static float step_master(MasterState& state, MasterScratch& scratch,
             }
         }
 
-        // Compute tier-based allocation: tiers_to_alloc
+        // Compute tier-based allocation (bottom-up, null-padded for n_pos < 3)
         int positives[N_IND]; int n_pos = 0;
         for (int i = 0; i < N_IND; i++) if (tier[i] > 0) positives[n_pos++] = i;
 
         float alloc[N_IND] = {};
         if (n_pos > 0) {
-            // Sort ascending by predicted tier so that re-assignment is stable
             std::sort(positives, positives + n_pos,
                       [&tier](int a, int b){ return tier[a] < tier[b]; });
-
-            int base = n_pos / 3, rem = n_pos % 3;
-            int n3 = base;
-            int n2 = base + (rem >= 2 ? 1 : 0);
-
-            int assigned[N_IND] = {};
-            for (int rank = 0; rank < n_pos; rank++) {
-                int ind = positives[rank];
-                if      (rank < n3)       assigned[ind] = 1;
-                else if (rank < n3 + n2)  assigned[ind] = 2;
-                else                      assigned[ind] = 3;
-            }
-
-            float total_w = 0.f;
-            for (int k = 0; k < n_pos; k++)
-                total_w += TIER_WEIGHTS[assigned[positives[k]]];
 
             float pool = port.cash;
             for (int i = 0; i < N_IND; i++) pool += port.holdings[i] * IND_UNIT_PRICE;
 
-            if (total_w > 0.f)
-                for (int k = 0; k < n_pos; k++) {
-                    int ind = positives[k];
-                    alloc[ind] = TIER_WEIGHTS[assigned[ind]] / total_w * pool;
+            if (n_pos == 1) {
+                alloc[positives[0]] = TIER_WEIGHTS[3] / NULL_DENOM * pool;
+            } else if (n_pos == 2) {
+                alloc[positives[0]] = TIER_WEIGHTS[2] / NULL_DENOM * pool;
+                alloc[positives[1]] = TIER_WEIGHTS[3] / NULL_DENOM * pool;
+            } else {
+                int base = n_pos / 3, rem = n_pos % 3;
+                int n1 = base + (rem >= 1 ? 1 : 0);
+                int n2 = base + (rem >= 2 ? 1 : 0);
+
+                int assigned[N_IND] = {};
+                for (int rank = 0; rank < n_pos; rank++) {
+                    int ind = positives[rank];
+                    if      (rank < n1)        assigned[ind] = 1;
+                    else if (rank < n1 + n2)   assigned[ind] = 2;
+                    else                        assigned[ind] = 3;
                 }
+
+                float total_w = 0.f;
+                for (int k = 0; k < n_pos; k++)
+                    total_w += TIER_WEIGHTS[assigned[positives[k]]];
+
+                if (total_w > 0.f)
+                    for (int k = 0; k < n_pos; k++) {
+                        int ind = positives[k];
+                        alloc[ind] = TIER_WEIGHTS[assigned[ind]] / total_w * pool;
+                    }
+            }
         }
 
         // Apply allocation: liquidate first, then buy
@@ -1410,32 +1444,45 @@ static float step_master(MasterState& state, MasterScratch& scratch,
         for (int i = 0; i < N_IND; i++)
             port.holdings[i] *= (1.f + actual_perf[i]);
 
-        // Score with FN/FP penalties
+        // Score via points table against retroactive optimal tiers
         float port_val = port.cash;
         for (int i = 0; i < N_IND; i++) port_val += port.holdings[i] * IND_UNIT_PRICE;
-        int fn_cnt = 0, fp_cnt = 0;
+        port_vals[slot] = port_val;
+        float pts = 0.f;
         for (int i = 0; i < N_IND; i++) {
-            if (actual_perf[i] <  0.f && tier[i] >  0) fn_cnt++;
-            if (actual_perf[i] >= 0.f && tier[i] == 0) fp_cnt++;
+            int pred = tier[i], opt = opt_tier[i];
+            if (opt == 0) {
+                if (pred > 0) pts += -2.f - 0.25f * pred;
+            } else if (pred == 0) {
+                pts -= (float)opt;
+            } else if (pred <= opt) {
+                pts += (float)pred;
+            } else {
+                pts += (float)opt - 0.25f * (float)(pred - opt);
+            }
         }
-        pred_scores[slot] = port_val * (1.f - FN_PENALTY * fn_cnt - FP_PENALTY * fp_cnt);
+        pred_scores[slot] = pts * 1e9f + port_val;
     }
 
     // Log tier distribution for slot-0
     int tier_counts[4] = {};
     for (int i = 0; i < N_IND; i++) tier_counts[slot_tiers[0][i]]++;
-    float prod_val = state.portfolios[0].cash;
-    for (int i = 0; i < N_IND; i++) prod_val += state.portfolios[0].holdings[i] * IND_UNIT_PRICE;
-    float best_score = *std::max_element(pred_scores, pred_scores + N_SLOTS);
+    int best_slot_idx = (int)(std::max_element(pred_scores, pred_scores + N_SLOTS) - pred_scores);
+    float best_score  = pred_scores[best_slot_idx];
+    float best_pts_v  = (best_score - port_vals[best_slot_idx]) / 1e9f;
+    float slot0_pts_v = (pred_scores[0] - port_vals[0]) / 1e9f;
 
+    auto fmt_pts = [](float v) -> std::string {
+        char buf[32]; snprintf(buf, sizeof(buf), "%+.2f", v); return buf;
+    };
     log_msg(std::string("[master  ] Day ") + std::to_string(actual_day + 1) +
             "/" + std::to_string(total_avail) +
-            " | best=$" + std::to_string((int)best_score) +
-            " prod=$"   + std::to_string((int)prod_val) +
-            " | t0="    + std::to_string(tier_counts[0]) +
-            " t1="      + std::to_string(tier_counts[1]) +
-            " t2="      + std::to_string(tier_counts[2]) +
-            " t3="      + std::to_string(tier_counts[3]));
+            " | best_pts=" + fmt_pts(best_pts_v) +
+            " slot0_pts=" + fmt_pts(slot0_pts_v) +
+            " | t0=" + std::to_string(tier_counts[0]) +
+            " t1="   + std::to_string(tier_counts[1]) +
+            " t2="   + std::to_string(tier_counts[2]) +
+            " t3="   + std::to_string(tier_counts[3]));
 
     // Floor reset
     if (baseline < MST_STARTING_CASH * 0.9f) {
@@ -1452,8 +1499,8 @@ static float step_master(MasterState& state, MasterScratch& scratch,
     int slot0_zc[N_IND];
     memcpy(slot0_zc, state.zero_counts[0], N_IND * sizeof(int));
 
-    // Selection gate: did any slot beat baseline (i.e. doing nothing)?
-    if (best_score > baseline) {
+    // Selection gate: run selection if any slot scored non-negative points today.
+    if (best_pts_v >= 0.f) {
         float mean_ps = 0.f;
         for (int s = 0; s < N_SLOTS; s++) mean_ps += pred_scores[s];
         mean_ps /= N_SLOTS;
@@ -1532,7 +1579,7 @@ static float step_master(MasterState& state, MasterScratch& scratch,
             state.portfolios[ELITE_POOL + mut_i] = state.portfolios[mut_i / MUTATIONS_PER_PARENT];
     } else {
         int half = ELITE_COUNT / 2;
-        log_msg("[master  ] best_score <= baseline — injecting diversity");
+        log_msg("[master  ] best_pts=" + fmt_pts(best_pts_v) + " < 0 — injecting diversity");
         PCG32 div_rng; div_rng.seed((uint64_t)actual_day * 55555ULL + 77777ULL);
         for (int k = half; k < ELITE_COUNT; k++) {
             init_master_weights(scratch.mut_buf, div_rng);
@@ -1546,7 +1593,7 @@ static float step_master(MasterState& state, MasterScratch& scratch,
     state.portfolios[0] = slot0_own;
     memcpy(state.zero_counts[0], slot0_zc, N_IND * sizeof(int));
 
-    return best_score;
+    return best_pts_v;
 }
 
 // ── History update (main thread after workers finish) ────────────────────────────
@@ -1806,7 +1853,7 @@ int main(int argc, char* argv[]) {
     if (csv) {
         fprintf(csv, "pass,day");
         for (int i = 0; i < N_IND; i++) fprintf(csv, ",%s", g_ind_names[i].c_str());
-        fprintf(csv, ",master_val\n");
+        fprintf(csv, ",master_best_pts\n");
     }
 
     // Threading setup

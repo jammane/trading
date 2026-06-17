@@ -49,9 +49,8 @@ MAX_SINGLE_STOCK_PCT  = 0.60        # no single stock may exceed 60% of portfoli
 MASTER_LOOKBACKS     = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30, 40, 50, 60, 90]
 MASTER_POLY3_WINDOWS = [10, 30, 60, 90]
 MASTER_START_DAY     = 30
-FN_PENALTY           = 0.006   # predicted positive, was negative (active loss — heavier)
-FP_PENALTY           = 0.004   # predicted tier-0, was positive (missed gain — lighter)
 TIER_WEIGHTS         = {1: 1.0, 2: 1.5, 3: 2.25}
+_NULL_DENOM          = TIER_WEIGHTS[1] + TIER_WEIGHTS[2] + TIER_WEIGHTS[3]  # 4.75
 
 
 class HardFlagError(Exception):
@@ -509,21 +508,63 @@ def decode_master_tiers(out_logits, industry_list):
 def tiers_to_alloc(tier_map, industry_list, available_cash):
     positives = sorted([ind for ind in industry_list if tier_map[ind] > 0],
                        key=lambda ind: tier_map[ind])
-    N = len(positives)
-    if N == 0:
-        return {ind: 0.0 for ind in industry_list}
-    base = N // 3; rem = N % 3
-    n3 = base; n2 = base + (1 if rem >= 2 else 0)
-    tier_assignments = {}
-    for rank, ind in enumerate(positives):
-        if rank < n3:       tier_assignments[ind] = 1
-        elif rank < n3+n2:  tier_assignments[ind] = 2
-        else:               tier_assignments[ind] = 3
-    total_w = sum(TIER_WEIGHTS[tier_assignments[ind]] for ind in positives)
+    n_pos = len(positives)
     alloc = {ind: 0.0 for ind in industry_list}
-    for ind in positives:
-        alloc[ind] = (TIER_WEIGHTS[tier_assignments[ind]] / total_w) * available_cash
+    if n_pos == 0:
+        return alloc
+    if n_pos == 1:
+        alloc[positives[0]] = (TIER_WEIGHTS[3] / _NULL_DENOM) * available_cash
+    elif n_pos == 2:
+        alloc[positives[0]] = (TIER_WEIGHTS[2] / _NULL_DENOM) * available_cash
+        alloc[positives[1]] = (TIER_WEIGHTS[3] / _NULL_DENOM) * available_cash
+    else:
+        base = n_pos // 3; rem = n_pos % 3
+        n1 = base + (1 if rem >= 1 else 0)
+        n2 = base + (1 if rem >= 2 else 0)
+        tier_assignments = {}
+        for rank, ind in enumerate(positives):
+            if rank < n1:          tier_assignments[ind] = 1
+            elif rank < n1 + n2:   tier_assignments[ind] = 2
+            else:                  tier_assignments[ind] = 3
+        total_w = sum(TIER_WEIGHTS[tier_assignments[ind]] for ind in positives)
+        for ind in positives:
+            alloc[ind] = (TIER_WEIGHTS[tier_assignments[ind]] / total_w) * available_cash
     return alloc
+
+
+def _optimal_tiers(actual_perf, industry_list):
+    positives = sorted(
+        [ind for ind in industry_list if actual_perf.get(ind, 0.0) >= 0],
+        key=lambda ind: actual_perf.get(ind, 0.0)
+    )
+    n_pos = len(positives)
+    opt = {ind: 0 for ind in industry_list}
+    if n_pos == 1:
+        opt[positives[0]] = 3
+    elif n_pos == 2:
+        opt[positives[0]] = 2
+        opt[positives[1]] = 3
+    elif n_pos >= 3:
+        base = n_pos // 3; rem = n_pos % 3
+        n1 = base + (1 if rem >= 1 else 0)
+        n2 = base + (1 if rem >= 2 else 0)
+        for rank, ind in enumerate(positives):
+            if rank < n1:          opt[ind] = 1
+            elif rank < n1 + n2:   opt[ind] = 2
+            else:                  opt[ind] = 3
+    return opt
+
+
+def _master_points(pred, opt):
+    if opt == 0:
+        if pred == 0:
+            return 0.0
+        return -2.0 - 0.25 * pred
+    if pred == 0:
+        return -float(opt)
+    if pred <= opt:
+        return float(pred)
+    return float(opt) - 0.25 * (pred - opt)
 
 
 def compute_alloc_from_predicted(predicted, industry_list):
@@ -1457,26 +1498,25 @@ def step_master(output_dir, portfolios, ind_value_history, industries,
         for ind in industry_list:
             port['holdings'][ind] *= (1.0 + actual_perf.get(ind, 0.0))
 
+    opt_tiers  = _optimal_tiers(actual_perf, industry_list)
+    slot_pts   = []
     pred_scores = []
     for slot in range(N_SLOTS):
-        port_val   = _port_val(portfolios[slot])
-        tier_map   = slot_tier_maps[slot]
-        false_negs = sum(1 for ind in industry_list
-                         if actual_perf.get(ind, 0.0) < 0 and tier_map[ind] > 0)
-        false_pos  = sum(1 for ind in industry_list
-                         if actual_perf.get(ind, 0.0) >= 0 and tier_map[ind] == 0)
-        adj = port_val * (1.0 - FN_PENALTY * false_negs - FP_PENALTY * false_pos)
-        pred_scores.append((slot, adj))
+        port_val = _port_val(portfolios[slot])
+        tier_map = slot_tier_maps[slot]
+        pts = sum(_master_points(tier_map[ind], opt_tiers[ind]) for ind in industry_list)
+        slot_pts.append(pts)
+        pred_scores.append((slot, pts * 1e9 + port_val))
 
-    best_adj   = max(v for _, v in pred_scores)
-    slot0_val  = _port_val(portfolios[0])
-    slot0_adj  = pred_scores[0][1]
+    best_pts  = max(slot_pts)
+    slot0_val = _port_val(portfolios[0])
+    slot0_pts = slot_pts[0]
 
     s0_tiers    = slot_tier_maps.get(0, {})
     tier_counts = [sum(1 for ind in industry_list if s0_tiers.get(ind) == t) for t in range(4)]
 
     log(f"[master] Day {actual_day + 1}/{total_avail} | "
-        f"best=${best_adj:.0f} prod=${baseline_score:.0f} | "
+        f"best_pts={best_pts:+.2f} slot0_pts={slot0_pts:+.2f} | "
         f"tiers(0/1/2/3)={tier_counts[0]}/{tier_counts[1]}/{tier_counts[2]}/{tier_counts[3]} | "
         f"shares(buy/sell)={buy_exec_count:.0f}/{sell_exec_count:.0f}")
 
@@ -1491,12 +1531,12 @@ def step_master(output_dir, portfolios, ind_value_history, industries,
                 'holdings':    {ind: 0.0 for ind in industry_list},
                 'zero_counts': {ind: 0   for ind in industry_list},
             }
-        return best_adj, slot0_val, slot0_adj
+        return best_pts, slot0_val, slot0_pts
 
     slot0_own_port = copy.deepcopy(portfolios[0])
 
     if not no_save_master:
-        if best_adj > baseline_score:
+        if best_pts >= 0.0:
             score_vals = [v for _, v in pred_scores]
             mean_ps    = sum(score_vals) / len(score_vals)
             std_ps     = (sum((v - mean_ps) ** 2 for v in score_vals) / len(score_vals)) ** 0.5
@@ -1511,7 +1551,7 @@ def step_master(output_dir, portfolios, ind_value_history, industries,
         else:
             half = ELITE_COUNT // 2
             log(f"[master] Day {actual_day + 1}/{total_avail}   "
-                f"best={best_adj:.0f} <= baseline={baseline_score:.0f} — "
+                f"best_pts={best_pts:.2f} < 0 — "
                 f"injecting diversity into bottom {ELITE_COUNT - half} elite slots")
             for inject_rank in range(half, ELITE_COUNT):
                 source_rank = inject_rank - half
@@ -1522,7 +1562,7 @@ def step_master(output_dir, portfolios, ind_value_history, industries,
                 del elite, blend
 
     portfolios[0] = slot0_own_port
-    return best_adj, slot0_val, slot0_adj
+    return best_pts, slot0_val, slot0_pts
 
 
 # ── Single-day wrappers (called from production_v2.py) ────────────────────────
@@ -1589,7 +1629,7 @@ def train_master_one_day(industries, primed_portfolio, model_dir,
     """
     Production upkeep wrapper — one evolution step for the master model.
     ind_value_history must already contain today's values before calling.
-    Returns (best_adj, slot0_val) from step_master, or (None, None) if skipped.
+    Returns (best_pts, slot0_val) from step_master, or (None, None) if skipped.
     """
     industry_list = list(industries.keys())
     portfolios = [copy.deepcopy(primed_portfolio) for _ in range(N_SLOTS)]
@@ -1602,8 +1642,8 @@ def train_master_one_day(industries, primed_portfolio, model_dir,
                          actual_day=MASTER_START_DAY, total_avail=1,
                          day_num=0, total_days=1,
                          industry_top_scores=industry_top_scores)
-    best_adj, slot0_val, _ = result
-    return best_adj, slot0_val
+    best_pts, slot0_val, _ = result
+    return best_pts, slot0_val
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────
@@ -1761,7 +1801,7 @@ def main():
 
     csv_path    = os.path.join(args.output, 'training_log.csv')
     ind_names   = list(industries.keys())
-    csv_headers = ['pass', 'day'] + ind_names + ['master_best_adj', 'master_slot0_val']
+    csv_headers = ['pass', 'day'] + ind_names + ['master_best_pts', 'master_slot0_val']
     with open(csv_path, 'w') as csv_f:
         csv_f.write(','.join(csv_headers) + '\n')
     log(f"Training log: {csv_path}")
@@ -1865,7 +1905,7 @@ def main():
                     _top_val = industry_top_scores.get(_ind, (IND_STARTING_CASH, IND_STARTING_CASH))[1]
                     mst_ind_value_history[_ind].append(_top_val)
 
-                master_best_adj, master_slot0_val, _ = step_master(
+                master_best_pts, master_slot0_val, _ = step_master(
                     args.output, mst_portfolios, mst_ind_value_history, industries,
                     actual_day, total_avail=(day_end - day_start), day_num=day_num, total_days=num_days,
                     industry_top_scores=industry_top_scores,
@@ -1880,7 +1920,7 @@ def main():
 
             row  = [f"{pass_num + 1:<2}", f"{actual_day + 1:<4}"]
             row += [_fmt(ind_best_deltas.get(ind, 0.0)) for ind in ind_names]
-            _mba = master_best_adj  if master_best_adj  is not None else 0.0
+            _mba = master_best_pts  if master_best_pts  is not None else 0.0
             _ms0 = master_slot0_val if master_slot0_val is not None else 0.0
             row += [f"{_mba:+.2f}", f"{_ms0:+.2f}"]
             with open(csv_path, 'a') as csv_f:
