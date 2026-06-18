@@ -597,6 +597,11 @@ struct IndResult {
     float baseline, slot0_score, best_delta;
     float top_hold, top_cash;
     int   new_streak;
+    float elite_max_val, elite_min_val, elite_mean_val;
+};
+
+struct MasterResult {
+    float best_pts, elite_max_pts, elite_min_pts, elite_mean_pts, ideal_pts;
 };
 
 // ── Forward declarations (needed because step_industry calls load/save defined later) ──
@@ -921,6 +926,13 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     float best_delta  = best_score - baseline;
     float worst_delta = *std::min_element(slot_scores, slot_scores + N_SLOTS) - baseline;
 
+    // Elite stats (slots 0..ELITE_COUNT-1 portfolio values)
+    float elite_max_val = *std::max_element(slot_scores, slot_scores + ELITE_COUNT);
+    float elite_min_val = *std::min_element(slot_scores, slot_scores + ELITE_COUNT);
+    float elite_mean_val = 0.f;
+    for (int s = 0; s < ELITE_COUNT; s++) elite_mean_val += slot_scores[s];
+    elite_mean_val /= ELITE_COUNT;
+
     log_msg(std::string("[") + IND_SHORT[ind_i] + "] Day " +
             std::to_string(actual_day + 1) + "/" + std::to_string(total_avail) +
             " | best Δ" + (best_delta >= 0 ? "+" : "") + std::to_string((int)best_delta) +
@@ -941,7 +953,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                 state.portfolios[s].stop_prices[j] = 0.f;
             }
         }
-        return {baseline, baseline, 0.f, 0.f, 0.f, 0};
+        return {baseline, baseline, 0.f, 0.f, 0.f, 0, 0.f, 0.f, 0.f};
     }
 
     // Zero-trade inaction filter
@@ -1125,13 +1137,16 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     save_industry_elites(models_dir, ind_i, scratch.elite_buf);
 
     IndResult res;
-    res.baseline   = baseline;
-    res.slot0_score = slot_scores[0];
-    res.best_delta = best_delta;
-    res.top_hold   = top_hold;
-    res.top_cash   = slot0_own.cash;
-    res.new_streak = new_streak;
-    state.streak   = new_streak;
+    res.baseline      = baseline;
+    res.slot0_score   = slot_scores[0];
+    res.best_delta    = best_delta;
+    res.top_hold      = top_hold;
+    res.top_cash      = slot0_own.cash;
+    res.new_streak    = new_streak;
+    res.elite_max_val = elite_max_val;
+    res.elite_min_val = elite_min_val;
+    res.elite_mean_val= elite_mean_val;
+    state.streak      = new_streak;
     return res;
 }
 
@@ -1262,12 +1277,12 @@ static void build_master_features(const float ind_val_hist[][IND_HIST_CAP],
 
 // ── step_master ─────────────────────────────────────────────────────────────────
 
-static float step_master(MasterState& state, MasterScratch& scratch,
-                         const IndResult* ind_results,
-                         int actual_day, int total_avail,
-                         float sigma) {
+static MasterResult step_master(MasterState& state, MasterScratch& scratch,
+                                const IndResult* ind_results,
+                                int actual_day, int total_avail,
+                                float sigma) {
     // Gate: must have 30+ days of actual market data before master can train.
-    if (actual_day < MASTER_START_DAY) return 0.f;
+    if (actual_day < MASTER_START_DAY) return {0.f, 0.f, 0.f, 0.f, 0.f};
 
     // Compute actual_perf[N_IND] from slot-0 industry results
     float actual_perf[N_IND] = {};
@@ -1331,6 +1346,9 @@ static float step_master(MasterState& state, MasterScratch& scratch,
             }
         }
     }
+
+    float ideal_pts = 0.f;
+    for (int i = 0; i < N_IND; i++) ideal_pts += (float)opt_tier[i];
 
     float pred_scores[N_SLOTS] = {};
     float port_vals[N_SLOTS]   = {};
@@ -1491,7 +1509,7 @@ static float step_master(MasterState& state, MasterScratch& scratch,
             for (int i = 0; i < N_IND; i++) state.portfolios[s].holdings[i] = 0.f;
         }
         memset(state.zero_counts, 0, sizeof(state.zero_counts));
-        return 0.f;
+        return {0.f, 0.f, 0.f, 0.f, 0.f};
     }
 
     // Snapshot slot-0's own portfolio and zero_counts before selection mutates them
@@ -1593,7 +1611,17 @@ static float step_master(MasterState& state, MasterScratch& scratch,
     state.portfolios[0] = slot0_own;
     memcpy(state.zero_counts[0], slot0_zc, N_IND * sizeof(int));
 
-    return best_pts_v;
+    // Elite pts stats (slots 0..ELITE_COUNT-1)
+    float elite_max_pts = -1e9f, elite_min_pts = 1e9f, elite_mean_pts = 0.f;
+    for (int s = 0; s < ELITE_COUNT; s++) {
+        float p = (pred_scores[s] - port_vals[s]) / 1e9f;
+        if (p > elite_max_pts) elite_max_pts = p;
+        if (p < elite_min_pts) elite_min_pts = p;
+        elite_mean_pts += p;
+    }
+    elite_mean_pts /= ELITE_COUNT;
+
+    return {best_pts_v, elite_max_pts, elite_min_pts, elite_mean_pts, ideal_pts};
 }
 
 // ── History update (main thread after workers finish) ────────────────────────────
@@ -1731,11 +1759,13 @@ static void warmup_history(IndustryState* ind_states,
 // ── CSV logging ────────────────────────────────────────────────────────────────
 
 static void write_csv_row(FILE* csv, int pass_num, int actual_day,
-                           const IndResult* res, float master_val) {
+                           const IndResult* res, const MasterResult& mst) {
     fprintf(csv, "%d,%d", pass_num + 1, actual_day + 1);
     for (int i = 0; i < N_IND; i++)
-        fprintf(csv, ",%+10.2f", res[i].best_delta);
-    fprintf(csv, ",%+.2f\n", master_val);
+        fprintf(csv, ",%+10.2f,%+10.2f,%+10.2f",
+                res[i].elite_max_val, res[i].elite_min_val, res[i].elite_mean_val);
+    fprintf(csv, ",%+.2f,%+.2f,%+.2f,%+.2f\n",
+            mst.elite_max_pts, mst.elite_min_pts, mst.elite_mean_pts, mst.ideal_pts);
     fflush(csv);
 }
 
@@ -1852,8 +1882,10 @@ int main(int argc, char* argv[]) {
     FILE* csv = fopen(csv_path.c_str(), "w");
     if (csv) {
         fprintf(csv, "pass,day");
-        for (int i = 0; i < N_IND; i++) fprintf(csv, ",%s", g_ind_names[i].c_str());
-        fprintf(csv, ",master_best_pts\n");
+        for (int i = 0; i < N_IND; i++)
+            fprintf(csv, ",%s_elite_max,%s_elite_min,%s_elite_mean",
+                    g_ind_names[i].c_str(), g_ind_names[i].c_str(), g_ind_names[i].c_str());
+        fprintf(csv, ",master_elite_max_pts,master_elite_min_pts,master_elite_mean_pts,master_ideal_pts\n");
     }
 
     // Threading setup
@@ -1947,8 +1979,8 @@ int main(int argc, char* argv[]) {
                     update_hist_sym(ind_states[i].hist[j], day_ptr->sym[i][j]);
 
             // Run master step (uses ind_val_hist from days BEFORE today, then we append today)
-            float master_val = step_master(*mst, *mst_scratch, results,
-                                           actual_day, total_days, cur_mst_sigma);
+            MasterResult master_res = step_master(*mst, *mst_scratch, results,
+                                                   actual_day, total_days, cur_mst_sigma);
 
             // Append today's best-slot industry values to rolling ind_val_hist buffer
             for (int i = 0; i < N_IND; i++) {
@@ -1964,7 +1996,7 @@ int main(int argc, char* argv[]) {
             if (mst->ind_hist_count < IND_HIST_CAP) mst->ind_hist_count++;
 
             // Log CSV row
-            if (csv) write_csv_row(csv, pass, actual_day, results, master_val);
+            if (csv) write_csv_row(csv, pass, actual_day, results, master_res);
 
             // Periodic master save (industry elites already saved inside step_industry each day)
             if (day_num % 50 == 49 || day_num == num_days - 1) {

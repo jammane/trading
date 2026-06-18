@@ -1292,6 +1292,13 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
     worst_score    = float(vals_end.min())
     best_delta     = best_score  - baseline_score
     worst_delta    = worst_score - baseline_score
+
+    # Elite portfolio value stats (slots 0..ELITE_COUNT-1)
+    _elite_arr     = vals_end[:ELITE_COUNT]
+    elite_max_val  = float(_elite_arr.max())
+    elite_min_val  = float(_elite_arr.min())
+    elite_mean_val = float(_elite_arr.mean())
+
     survival_floor = IND_STARTING_CASH * 0.9
     ranked_idx_end = np.argsort(vals_end)[::-1]
     ranked_scores  = [(int(ranked_idx_end[i]), float(vals_end[ranked_idx_end[i]])) for i in range(N_SLOTS)]
@@ -1310,7 +1317,7 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
         portfolios.holdings[:] = 0.0
         for sp in stop_prices_all:
             sp.clear()
-        return baseline_score, baseline_score, 0.0, 0.0, 0.0   # no signal this day
+        return baseline_score, baseline_score, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0   # no signal this day
 
     # ── Zero-trade inaction filter ────────────────────────────────────────────
     inactive_slots  = set()
@@ -1436,7 +1443,7 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
         for sym in symbols if sym in day_data and day_data[sym]['close'] > 0
     )
     top_cash_value = portfolios[0]['cash']
-    return baseline_score, slot0_score, best_delta, top_holdings_value, top_cash_value, new_streak
+    return baseline_score, slot0_score, best_delta, top_holdings_value, top_cash_value, new_streak, elite_max_val, elite_min_val, elite_mean_val
 
 
 # ── Master training ────────────────────────────────────────────────────────────
@@ -1526,7 +1533,7 @@ def step_master(output_dir, portfolios, ind_value_history, industries,
     Returns (best_adj_score, prod_val, slot0_adj_score) in dollars, or (None,None,None).
     """
     if actual_day < MASTER_START_DAY:
-        return None, None, None
+        return None, None, None, None, None, None, None
 
     industry_list = list(industries.keys())
 
@@ -1612,6 +1619,7 @@ def step_master(output_dir, portfolios, ind_value_history, industries,
             port['holdings'][ind] *= (1.0 + actual_perf.get(ind, 0.0))
 
     opt_tiers  = _optimal_tiers(actual_perf, industry_list)
+    ideal_pts  = sum(opt_tiers.values())
     slot_pts   = []
     pred_scores = []
     for slot in range(N_SLOTS):
@@ -1624,6 +1632,12 @@ def step_master(output_dir, portfolios, ind_value_history, industries,
     best_pts  = max(slot_pts)
     slot0_val = _port_val(portfolios[0])
     slot0_pts = slot_pts[0]
+
+    # Elite pts stats (slots 0..ELITE_COUNT-1)
+    elite_pts      = slot_pts[:ELITE_COUNT]
+    elite_max_pts  = max(elite_pts)
+    elite_min_pts  = min(elite_pts)
+    elite_mean_pts = sum(elite_pts) / len(elite_pts)
 
     s0_tiers    = slot_tier_maps.get(0, {})
     tier_counts = [sum(1 for ind in industry_list if s0_tiers.get(ind) == t) for t in range(4)]
@@ -1644,7 +1658,7 @@ def step_master(output_dir, portfolios, ind_value_history, industries,
                 'holdings':    {ind: 0.0 for ind in industry_list},
                 'zero_counts': {ind: 0   for ind in industry_list},
             }
-        return best_pts, slot0_val, slot0_pts
+        return best_pts, slot0_val, slot0_pts, elite_max_pts, elite_min_pts, elite_mean_pts, ideal_pts
 
     slot0_own_port = copy.deepcopy(portfolios[0])
 
@@ -1675,7 +1689,7 @@ def step_master(output_dir, portfolios, ind_value_history, industries,
                 del elite, blend
 
     portfolios[0] = slot0_own_port
-    return best_pts, slot0_val, slot0_pts
+    return best_pts, slot0_val, slot0_pts, elite_max_pts, elite_min_pts, elite_mean_pts, ideal_pts
 
 
 # ── Single-day training wrappers (called from production_v2.py) ───────────────
@@ -1753,7 +1767,7 @@ def train_master_one_day(industries, primed_portfolio, model_dir,
                          actual_day=MASTER_START_DAY, total_avail=1,
                          day_num=0, total_days=1,
                          industry_top_scores=industry_top_scores)
-    best_pts, slot0_val, _ = result
+    best_pts, slot0_val, *_ = result
     return best_pts, slot0_val
 
 
@@ -1919,7 +1933,8 @@ def main():
     # ── Initialise training CSV (overwrite on each script execution) ──────────
     csv_path    = os.path.join(args.output, 'training_log.csv')
     ind_names   = list(industries.keys())
-    csv_headers = ['pass', 'day'] + ind_names + ['master_best_pts', 'master_slot0_val']
+    _ind_stat_cols = [f"{n}_{s}" for n in ind_names for s in ("elite_max", "elite_min", "elite_mean")]
+    csv_headers = ['pass', 'day'] + _ind_stat_cols + ['master_elite_max_pts', 'master_elite_min_pts', 'master_elite_mean_pts', 'master_ideal_pts']
     with open(csv_path, 'w') as csv_f:
         csv_f.write(','.join(csv_headers) + '\n')
     log(f"Training log: {csv_path}")
@@ -1970,6 +1985,7 @@ def main():
             actual_day          = day_start + day_num
             industry_top_scores = {}
             ind_best_deltas     = {}
+            ind_elite_stats     = {}
 
             # Per-symbol intraday sequence for this day: True=low-first, False=high-first (~50/50)
             seq_flags = {sym: (random.random() < 0.5)
@@ -1987,14 +2003,17 @@ def main():
                                        freeze=args.master_only,
                                        seq_flags=seq_flags)
                 if result is not None:
-                    baseline, top_val, best_delta, top_hold, top_cash, new_streak = result
+                    baseline, top_val, best_delta, top_hold, top_cash, new_streak, \
+                        e_max, e_min, e_mean = result
                     industry_top_scores[ind] = (baseline, top_val)
                     ind_best_deltas[ind]     = top_val - baseline
                     ind_capital_state[ind]   = (top_hold, top_cash)
+                    ind_elite_stats[ind]     = (e_max, e_min, e_mean)
                     ind_streaks[ind]         = new_streak
                 else:
                     ind_best_deltas[ind]     = 0.0
                     ind_capital_state[ind]   = (0.0, 0.0)
+                    ind_elite_stats[ind]     = (0.0, 0.0, 0.0)
                 invalidate_cache(ind)
 
             # Append today's industry values to master history before step_master
@@ -2002,7 +2021,9 @@ def main():
                 _top_val = industry_top_scores.get(_ind, (IND_STARTING_CASH, IND_STARTING_CASH))[1]
                 mst_ind_value_history[_ind].append(_top_val)
 
-            master_best_pts, master_slot0_val, _ = step_master(
+            master_best_pts, master_slot0_val, _, \
+                master_elite_max_pts, master_elite_min_pts, master_elite_mean_pts, \
+                master_ideal_pts = step_master(
                 args.output, mst_portfolios, mst_ind_value_history, industries,
                 actual_day, total_avail=(day_end - day_start), day_num=day_num, total_days=num_days,
                 industry_top_scores=industry_top_scores,
@@ -2012,10 +2033,14 @@ def main():
 
             # Append one row to the training CSV
             row  = [f"{pass_num + 1:<7}", f"{actual_day + 1:<4}"]
-            row += [_fmt(ind_best_deltas.get(ind, 0.0)) for ind in ind_names]
-            _mba = master_best_pts  if master_best_pts  is not None else 0.0
-            _ms0 = master_slot0_val if master_slot0_val is not None else 0.0
-            row += [f"{_mba:+.2f}", f"{_ms0:+.2f}"]
+            for ind in ind_names:
+                e_max, e_min, e_mean = ind_elite_stats.get(ind, (0.0, 0.0, 0.0))
+                row += [f"{e_max:+10.2f}", f"{e_min:+10.2f}", f"{e_mean:+10.2f}"]
+            _mmx  = master_elite_max_pts  if master_elite_max_pts  is not None else 0.0
+            _mmn  = master_elite_min_pts  if master_elite_min_pts  is not None else 0.0
+            _mmn2 = master_elite_mean_pts if master_elite_mean_pts is not None else 0.0
+            _mid  = master_ideal_pts      if master_ideal_pts      is not None else 0.0
+            row += [f"{_mmx:+.2f}", f"{_mmn:+.2f}", f"{_mmn2:+.2f}", f"{_mid:+.2f}"]
             with open(csv_path, 'a') as csv_f:
                 csv_f.write(','.join(row) + '\n')
 
