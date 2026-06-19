@@ -52,6 +52,11 @@ MASTER_START_DAY     = 30
 TIER_WEIGHTS         = {1: 1.0, 2: 1.5, 3: 2.25}
 _NULL_DENOM          = TIER_WEIGHTS[1] + TIER_WEIGHTS[2] + TIER_WEIGHTS[3]  # 4.75
 
+HIST_DAYS    = 5
+HIST_PER_DAY = 10
+HIST_ELITE   = 7   # top-7 direct elite slots saved per day
+HIST_WAVG    = 3   # wavg slots (17,18,19) saved per day
+
 
 class HardFlagError(Exception):
     """Raised when a HARD-flagged day's gain exceeds the configured threshold."""
@@ -632,6 +637,27 @@ def _meta_path(prefix, directory):
     """Return the top10_meta.json path for a given prefix and directory."""
     return os.path.join(directory, f"{prefix}_top10_meta.json")
 
+def _hist_model_path(industry, directory, day_slot, pos):
+    return os.path.join(directory, f"{industry}_hist_{day_slot}_{pos}.pt")
+
+def _hist_meta_path(industry, directory):
+    return os.path.join(directory, f"{industry}_hist_meta.json")
+
+def _load_hist_meta(industry, directory):
+    path = _hist_meta_path(industry, directory)
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                meta = json.load(f)
+            return max(0, min(meta.get('head', 0), HIST_DAYS - 1)), max(0, min(meta.get('count', 0), HIST_DAYS))
+        except Exception:
+            pass
+    return 0, 0
+
+def _save_hist_meta(industry, directory, head, count):
+    with open(_hist_meta_path(industry, directory), 'w') as f:
+        json.dump({'head': head, 'count': count}, f)
+
 
 def save_slot_model(prefix, directory, slot, model):
     """Save model weights to disk for the given slot, logging on failure."""
@@ -926,8 +952,9 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
     num_past     = min(hist_lengths) if hist_lengths else 0
 
     if day_num % 10 == 0 or day_num == total_days - 1:
-        log(f"[{sn(industry)}] Day {actual_day + 1}/{total_avail} — running 100 models "
-            f"(history={num_past}/15 days warm) ...")
+        n_hist_warm = (0 if day_num == 0 else _load_hist_meta(industry, output_dir)[1]) * HIST_PER_DAY
+        log(f"[{sn(industry)}] Day {actual_day + 1}/{total_avail} — running {N_SLOTS} models "
+            f"+ {n_hist_warm} history (ohlcv={num_past}/15 days warm) ...")
 
     # ── Step 1: reset all slots to slot 0's portfolio (level playing field) ─────
     # Every slot starts each day from model 0.0's current cash + holdings.
@@ -938,6 +965,12 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
     # Valuation uses fill_data prices: fills execute at next-day prices so both
     # baseline and post-trade scoring must use the same day.
     val_data = fill_data  # next_day['data'] if available, else day_data
+
+    # Load or reset per-industry history meta
+    if day_num == 0:
+        hist_head, hist_count = 0, 0
+    else:
+        hist_head, hist_count = _load_hist_meta(industry, output_dir)
 
     ref_cash  = portfolios[0]['cash']
     ref_hold  = {sym: portfolios[0]['holdings'].get(sym, 0.0) for sym in symbols}
@@ -1162,6 +1195,29 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
     best_delta    = best_score  - baseline_score
     worst_delta   = worst_score - baseline_score
 
+    # ── Score history candidates ───────────────────────────────────────────────
+    # Each history candidate is a model from a previous day's elite pool.
+    # We re-simulate from slot 0's starting state so scores are comparable.
+    n_hist      = hist_count * HIST_PER_DAY
+    hist_scored = []  # list of (h_index, score, port)
+    for h in range(n_hist):
+        day_slot = h // HIST_PER_DAY
+        pos      = h % HIST_PER_DAY
+        hpath    = _hist_model_path(industry, output_dir, day_slot, pos)
+        if not os.path.exists(hpath):
+            continue
+        try:
+            hmodel = StockNN()
+            hmodel.load_state_dict(torch.load(hpath, weights_only=True))
+            hscore, hport = _simulate_one_model(
+                hmodel, ref_cash, ref_hold, ref_stop,
+                symbols, day_data, fill_data, history_t, today_t,
+                seq_flags=seq_flags)
+            del hmodel
+            hist_scored.append((h, hscore, hport))
+        except Exception as e:
+            log(f"[{sn(industry)}] WARNING: failed to load history {day_slot}.{pos}: {e}")
+
     # Elite portfolio value stats (slots 0..ELITE_COUNT-1)
     elite_vals     = [v for s, v in scores if s < ELITE_COUNT]
     elite_max_val  = max(elite_vals)
@@ -1253,6 +1309,24 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
         else:
             sel_scores.append((s, raw_delta))
 
+    # Append history candidates as virtual slots N_SLOTS..N_SLOTS+n_hist-1.
+    # Copy each history .pt to its virtual slot path so selection_and_mutation
+    # can load it by slot index without modification.
+    hist_below_floor = set()
+    for h, hscore, hport in hist_scored:
+        vslot     = N_SLOTS + h
+        raw_delta = hscore - baseline_score
+        if raw_delta > 0:
+            invested_pct = max(0.0, 1.0 - hport['cash'] / hscore) if hscore > 0 else 0.0
+            sel_scores.append((vslot, raw_delta * invested_pct))
+        else:
+            sel_scores.append((vslot, raw_delta))
+        portfolios.append(hport)  # portfolios[vslot]
+        hpath = _hist_model_path(industry, output_dir, h // HIST_PER_DAY, h % HIST_PER_DAY)
+        shutil.copy2(hpath, _model_path(industry, output_dir, vslot))
+        if hscore < survival_floor:
+            hist_below_floor.add(vslot)
+
     # ── Under-investment soft flag: only fires if an elite candidate is affected ──
     # Suppressed when fill day closed down (close < open for majority of symbols):
     # holding cash was rational on a declining fill day, not a model deficiency.
@@ -1261,7 +1335,7 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
         if sym in fill_data
         and fill_data[sym].get('close', 0.0) < fill_data[sym].get('open', 0.0)
     ) > len(symbols) / 2
-    excluded         = inactive_slots | below_floor
+    excluded         = inactive_slots | below_floor | hist_below_floor
     elite_candidates = set(
         [s for s, _ in sorted(sel_scores, key=lambda x: x[1], reverse=True)
          if s not in excluded][:ELITE_COUNT]
@@ -1293,9 +1367,18 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
             industry, output_dir, StockNN,
             sel_scores, portfolios,
             survival_floor=-(baseline_score * 0.1),
-            inactive_slots=inactive_slots | below_floor,
+            inactive_slots=inactive_slots | below_floor | hist_below_floor,
             actual_day=actual_day, total_avail=total_avail,
         )
+
+    # Remove virtual slot files and trim extended portfolios list.
+    for h, _, _ in hist_scored:
+        vpath = _model_path(industry, output_dir, N_SLOTS + h)
+        try:
+            os.remove(vpath)
+        except FileNotFoundError:
+            pass
+    del portfolios[N_SLOTS:]
 
     # ── Diversity injection if all-zero streak ≥ 2 ───────────────────────────
     # After selection, slots 0–16 = top 17 elites, 17–19 = weighted averages.
@@ -1328,6 +1411,26 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
                 day_data, fill_data, history_t, today_t,
                 portfolios, actual_day, total_avail,
                 seq_flags=seq_flags)
+
+    # ── History push ──────────────────────────────────────────────────────────
+    # Save the day's top-7 direct elites + 3 wavg blends into the circular
+    # history buffer so they can compete as re-selection candidates tomorrow.
+    if not freeze:
+        hd = hist_head
+        for k in range(HIST_ELITE):
+            src = _model_path(industry, output_dir, k)
+            dst = _hist_model_path(industry, output_dir, hd, k)
+            if os.path.exists(src):
+                shutil.copy2(src, dst)
+        for k in range(HIST_WAVG):
+            src = _model_path(industry, output_dir, ELITE_COUNT + k)
+            dst = _hist_model_path(industry, output_dir, hd, HIST_ELITE + k)
+            if os.path.exists(src):
+                shutil.copy2(src, dst)
+        hist_head  = (hist_head + 1) % HIST_DAYS
+        if hist_count < HIST_DAYS:
+            hist_count += 1
+        _save_hist_meta(industry, output_dir, hist_head, hist_count)
 
     # Restore slot 0's own portfolio so the next day's baseline carries forward
     # this model's actual result, not the winner's cherry-picked result.
