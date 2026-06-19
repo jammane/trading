@@ -71,12 +71,14 @@ python prepare_models.py --load-dir models/training --output models/training
 ./build/training_v4_cpp --output models/training --load-dir models/training \
   --master-only --passes 5 --start-day 17 --stop-day 1255
 # Short diagnostic (verifies history accumulates at day 5+, CSV has elite columns):
-./build/training_v4_cpp --output /tmp/diag --load-dir /tmp/diag \
+mkdir -p /root/diag_logs
+./build/training_v4_cpp --output /root/diag_logs --load-dir /root/diag_logs \
   --start-day 16 --stop-day 37 --passes 1 --preserve-stock-data --no-save
 # After training, convert back to .pt before inspect_trades.py or production_v2.py:
 python convert_weights.py --models-dir models/training --output models/training
 ```
-`--no-save` suppresses all model writes (industry elites, history, master) — use for diagnostic runs to avoid filling /tmp (a 978 MB tmpfs on the droplet) with .bin files.
+`--no-save` suppresses all model writes (industry elites, history, master).
+Always use real disk paths (`models/training`, `logs/`, `/root/diag_logs`) — never `/tmp` which is a 978 MB RAM-backed tmpfs on the droplet. Training and production can run concurrently; both write to real disk only.
 Master trains via tier-classification (444 features, FN/FP penalties) starting at day 30.
 `convert_weights.py` is required after C++ training before using `inspect_trades.py` or `production_v2.py`.
 Note: existing master `.bin` files are incompatible after the architecture change — regenerate with `prepare_models.py`.
