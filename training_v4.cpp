@@ -120,6 +120,8 @@ static constexpr int HIST_PER_DAY = 10;
 static constexpr int HIST_ELITE   = 7;   // top-7 direct elite slots saved per day
 static constexpr int HIST_WAVG    = 3;   // wavg slots (17,18,19) saved per day
 
+static bool g_no_save = false;  // --no-save: skip all model writes (diagnostic mode)
+
 // ── Layer dimensions ───────────────────────────────────────────────────────────
 
 static constexpr int STOCK_INJ_IN [14] = {180,185,190,195,200,205,210,215,220,225,230,235,240,245};
@@ -1314,8 +1316,10 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     }
 
     // Save updated elites and history back to disk
-    save_industry_elites(models_dir, ind_i, scratch.elite_buf);
-    save_ind_history(models_dir, ind_i, scratch);
+    if (!g_no_save) {
+        save_industry_elites(models_dir, ind_i, scratch.elite_buf);
+        save_ind_history(models_dir, ind_i, scratch);
+    }
 
     IndResult res;
     res.baseline      = baseline;
@@ -2029,7 +2033,7 @@ static void print_usage(const char* prog) {
     fprintf(stderr,
         "Usage: %s --output DIR [--load-dir DIR] [--start-day N] [--stop-day N]\n"
         "          [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F]\n"
-        "          [--workers N] [--master-only] [--preserve-stock-data]\n", prog);
+        "          [--workers N] [--master-only] [--preserve-stock-data] [--no-save]\n", prog);
 }
 
 int main(int argc, char* argv[]) {
@@ -2052,6 +2056,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--workers"  && a+1<argc) { num_workers=atoi(argv[++a]);}
         else if (arg == "--master-only") master_only = true;
         else if (arg == "--preserve-stock-data") preserve_stock = true;
+        else if (arg == "--no-save") g_no_save = true;
         else if (arg == "--help" || arg == "-h") { print_usage(argv[0]); return 0; }
     }
     if (output_dir.empty()) { print_usage(argv[0]); return 1; }
@@ -2207,15 +2212,17 @@ int main(int argc, char* argv[]) {
             if (csv) write_csv_row(csv, pass, actual_day, results, master_res);
 
             // Periodic master save (industry elites already saved inside step_industry each day)
-            if (day_num % 50 == 49 || day_num == num_days - 1) {
+            if (!g_no_save && (day_num % 50 == 49 || day_num == num_days - 1)) {
                 log_msg("Saving master elites to " + output_dir + " ...");
                 save_master_elites(output_dir, mst_scratch->elite_buf);
             }
         }
 
         // Save master after each pass (industry elites already saved)
-        log_msg("Pass " + std::to_string(pass+1) + " complete — saving master elites");
-        save_master_elites(output_dir, mst_scratch->elite_buf);
+        if (!g_no_save) {
+            log_msg("Pass " + std::to_string(pass+1) + " complete — saving master elites");
+            save_master_elites(output_dir, mst_scratch->elite_buf);
+        }
     }
 
     // Shutdown workers

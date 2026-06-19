@@ -70,12 +70,13 @@ python prepare_models.py --load-dir models/training --output models/training
 # Retrain master only (freeze industries, use their slot-0 perf for ind_val_hist):
 ./build/training_v4_cpp --output models/training --load-dir models/training \
   --master-only --passes 5 --start-day 17 --stop-day 1255
-# Short diagnostic (verifies master fires at day 30+):
-./build/training_v4_cpp --output /root/diag --load-dir /root/diag \
-  --start-day 16 --stop-day 35 --passes 1 --preserve-stock-data
+# Short diagnostic (verifies history accumulates at day 5+, CSV has elite columns):
+./build/training_v4_cpp --output /tmp/diag --load-dir /tmp/diag \
+  --start-day 16 --stop-day 37 --passes 1 --preserve-stock-data --no-save
 # After training, convert back to .pt before inspect_trades.py or production_v2.py:
 python convert_weights.py --models-dir models/training --output models/training
 ```
+`--no-save` suppresses all model writes (industry elites, history, master) — use for diagnostic runs to avoid filling /tmp (a 978 MB tmpfs on the droplet) with .bin files.
 Master trains via tier-classification (444 features, FN/FP penalties) starting at day 30.
 `convert_weights.py` is required after C++ training before using `inspect_trades.py` or `production_v2.py`.
 Note: existing master `.bin` files are incompatible after the architecture change — regenerate with `prepare_models.py`.
