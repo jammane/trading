@@ -348,9 +348,9 @@ struct WorkerScratch {
         wavg_buf   = new float[3 * STOCKNN_PARAMS]();
         mut_buf    = new float[STOCKNN_PARAMS]();
         hist_buf   = new float[hist]();
-        mlock(elite_buf,  ep   * sizeof(float));
-        mlock(new_elites, ep   * sizeof(float));
-        mlock(hist_buf,   hist * sizeof(float));
+        // Pin only elite_buf (hot inference read path) — 70 MB per worker.
+        // new_elites and hist_buf are write-heavy/sequential; swap-friendly.
+        mlock(elite_buf, ep * sizeof(float));
     }
     ~WorkerScratch() {
         delete[] elite_buf; delete[] new_elites;
@@ -376,8 +376,7 @@ struct MasterScratch {
         new_elites = new float[ep]();
         wavg_buf   = new float[3 * MASTERNN_PARAMS]();
         mut_buf    = new float[MASTERNN_PARAMS]();
-        mlock(elite_buf,  ep * sizeof(float));
-        mlock(new_elites, ep * sizeof(float));
+        // Master runs sequentially (not concurrent with workers); not mlock'd.
     }
     ~MasterScratch() {
         delete[] elite_buf; delete[] new_elites;
