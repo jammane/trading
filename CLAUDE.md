@@ -32,6 +32,19 @@ export ANTHROPIC_API_KEY=$(kubectl get secret anthropic-credentials \
     -n trading -o jsonpath='{.data.ANTHROPIC_API_KEY}' | base64 -d)
 
 claude
+
+# Store Alpaca credentials per account+mode (paper and live keys are separate Alpaca accounts)
+kubectl create secret generic alpaca-credentials-acct0-paper \
+    --namespace trading \
+    --from-literal=ALPACA_API_KEY="PK..." \
+    --from-literal=ALPACA_SECRET_KEY="..." \
+    --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl create secret generic alpaca-credentials-acct0-prod \
+    --namespace trading \
+    --from-literal=ALPACA_API_KEY="AK..." \
+    --from-literal=ALPACA_SECRET_KEY="..." \
+    --dry-run=client -o yaml | kubectl apply -f -
 ```
 All 75 pytest tests (including `test_models.py`) run on the droplet where torch is available.
 The pre-commit hook runs the full suite automatically before every `git commit`.
@@ -56,29 +69,32 @@ python download_5y_data.py
 ```bash
 python training_v2.py --output models
 python training_v2.py --output models --load-dir models          # resume from checkpoint
-python training_v2.py --output models --start-day 16 --stop-day 21 --passes 1 --preserve-stock-data  # short diagnostic run
+python training_v2.py --output models --start-day 16 --stop-day 35 --passes 1 --preserve-stock-data --no-save-master  # short diagnostic run
 ```
 
-**Train (parallel, 2-process dynamic industry pool — DEPRECATED, use C++ binary):**
-```bash
-python training_v4.py --output models
-```
-
-**Train (C++ binary — replaces training_v4.py, ~6× faster):**
+**Train (C++ binary — canonical; handles both industries and master):**
 ```bash
 # Seed once from existing Python models (or after any convert_weights.py run):
 python prepare_models.py --load-dir models/training --output models/training
-# Diagnostic run (defaults: start-day 17, stop-day 20, passes 1, output models/training):
-./build/training_v4_cpp --load-dir models/training
-# Full training run (canonical settings):
-./build/training_v4_cpp --load-dir models/training \
+# Full training run (canonical settings — industries + master):
+./build/training_v4_cpp --output models/training --load-dir models/training \
   --passes 5 --sigma 0.008 --master-sigma 0.006 --sigma-decay 1.0 \
   --start-day 17 --stop-day 1255
+# Retrain master only (freeze industries, use their slot-0 perf for ind_val_hist):
+./build/training_v4_cpp --output models/training --load-dir models/training \
+  --master-only --passes 5 --start-day 17 --stop-day 1255
+# Short diagnostic (verifies history accumulates at day 5+, CSV has elite columns):
+mkdir -p /root/diag_logs
+./build/training_v4_cpp --output /root/diag_logs --load-dir /root/diag_logs \
+  --start-day 16 --stop-day 37 --passes 1 --preserve-stock-data --no-save
 # After training, convert back to .pt before inspect_trades.py or production_v2.py:
 python convert_weights.py --models-dir models/training --output models/training
 ```
-~63 s/day on the droplet (vs ~180 s/day for Python v4). `convert_weights.py` is required
-after C++ training before using `inspect_trades.py` or `production_v2.py`.
+`--no-save` suppresses all model writes (industry elites, history, master).
+Always use real disk paths (`models/training`, `logs/`, `/root/diag_logs`) — never `/tmp` which is a 978 MB RAM-backed tmpfs on the droplet. Training and production can run concurrently; both write to real disk only.
+Master trains via tier-classification (444 features, FN/FP penalties) starting at day 30.
+`convert_weights.py` is required after C++ training before using `inspect_trades.py` or `production_v2.py`.
+Note: existing master `.bin` files are incompatible after the architecture change — regenerate with `prepare_models.py`.
 
 **Train (parallel, 7 threads — requires ≥4 GB RAM):**
 ```bash
@@ -91,17 +107,60 @@ python inspect_trades.py --industry energy --date 2024-01-10 --models-dir ./mode
 python inspect_trades.py --industry energy --day-index 17 --models-dir ./models --top-n 5
 ```
 
-**Paper / live trading:**
-```bash
-python production_v2.py --paper --model-dir models
-python production_v2.py --model-dir models         # live (requires ALPACA_API_KEY / ALPACA_SECRET_KEY)
+**Paper / live trading (per-account isolation):**
+
+Each Alpaca account gets its own directory tree: `models/acct#/[training|paper|prod]`.
+`--model-dir` points to the account+mode subdirectory; all per-run files (`state.json`,
+`owners.json`, `master_state.json`, `*.pt`) live there.
+
+Current account is `acct0`. Up to 5 accounts planned; additional accounts will likely
+require a droplet upgrade.
+
+**Scheduling convention (user is US Eastern Time, EDT=UTC-4, EST=UTC-5):**
+- Market close: 4:00 PM ET
+- acct0 paper: 1h05m after close = 5:05 PM ET (21:05 UTC EDT / 22:05 UTC EST)
+- acct0 prod:  30 min after paper = 5:35 PM ET
+- acct1 paper: acct0 paper + 1h = 6:05 PM ET
+- acct1 prod:  30 min after acct1 paper = 6:35 PM ET
+- (each additional account adds 1 hour to paper time, prod is always 30 min after paper)
+- **Cron times shift by 1 hour in November (EDT→EST) and March (EST→EDT)**
+
 ```
+# crontab on droplet (times in UTC, summer/EDT)
+5 21 * * 1-5  cd /root/trading && export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d) && export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d) && source .venv/bin/activate && python production_v2.py --paper --model-dir models/acct0/paper >> logs/acct0_paper.log 2>&1
+35 21 * * 1-5 cd /root/trading && export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d) && export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d) && source .venv/bin/activate && python production_v2.py --model-dir models/acct0/prod >> logs/acct0_prod.log 2>&1
+# acct1 (future): 5 22 paper, 35 22 prod
+# acct2 (future): 5 23 paper, 35 23 prod
+```
+
+```bash
+# Manual run (paper)
+export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d)
+export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d)
+python production_v2.py --paper --model-dir models/acct0/paper
+
+# Manual run (live, future)
+export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d)
+export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d)
+python production_v2.py --model-dir models/acct0/prod
+```
+
+Training output (`training_v4_cpp`) writes to `models/acct#/training`; after training run
+`convert_weights.py` targeting that directory, then copy `_best.pt` files to `.../prod`.
+
+Note: the current training run on the droplet writes to `models/training` (pre-acct structure).
+Once it completes, migrate: `mv models/training models/acct0/training` on the droplet.
 
 **Replace ticker symbols (full guided workflow):**
 ```bash
 ./swap_symbols.sh '{"OLDTICKER": "NEWTICKER"}'
 ```
 Runs all five steps: updates `universe.py` and regenerates `universe.json`, removes stale `stock_data/` JSON, downloads new symbol data, prompts to rebuild the Docker image, and prints optional model-cleanup commands for the droplet. The C++ binary reads `universe.json` at startup — no recompile needed after a symbol swap. Run locally — not inside a container.
+
+**Symbol swap thresholds (checked ~monthly — expect 1-2 swaps/month):**
+- **$15 watch floor** — symbol goes into `universe_watchlist.json` `"watch"` section with a candidate. Do NOT download candidate data yet. Do NOT run `swap_symbols.sh`.
+- **$10 swap floor** (or defunct/halted ticker) — perform the swap: run `swap_symbols.sh`, which downloads candidate data. The removed symbol's open positions are auto-liquidated via market order on the next `production_v2.py` run (orphaned-position logic). Update the watchlist accordingly.
+- **5-day new-symbol hold** — after any swap, `production_v2.py` automatically detects the new symbol (compares universe to `state['known_symbols']`) and applies a 5-run hold: paper/prod orders are suppressed for that symbol for 5 trading days. Training (regular C++ and daily upkeep) still runs on the new symbol immediately so the model starts adapting.
 
 ## Shared modules
 
@@ -114,7 +173,7 @@ Runs all five steps: updates `universe.py` and regenerates `universe.json`, remo
 | `prepare_models.py` | `.pt` → `.bin` for C++ trainer (run before first C++ training) |
 | `convert_weights.py` | `.bin` → `.pt` + `_best.pt` for Python tools (run after C++ training) |
 
-All training scripts (`training_v2.py`, `training_v3.py`, `training_v4.py` [deprecated]), `production_v2.py`, and `inspect_trades.py` import from these modules. `download_5y_data.py` imports from `universe.py`. To add or change a ticker, run `swap_symbols.sh` — it updates both `universe.py` and `universe.json` together.
+All training scripts (`training_v2.py`, `training_v3.py`), `production_v2.py`, and `inspect_trades.py` import from these modules. (`training_v4.py` was deleted — superseded by `training_v4_cpp` for all training.) `download_5y_data.py` imports from `universe.py`. To add or change a ticker, run `swap_symbols.sh` — it updates both `universe.py` and `universe.json` together.
 
 ## Tests
 
@@ -143,11 +202,19 @@ Each industry maintains **200 model slots** on disk as `.pt` files. The slot lay
 
 Each training day: all 200 slots reset to slot 0's portfolio → infer → simulate fills → score as `delta × invested_pct` → select + mutate. The `invested_pct` multiplier penalises cash-heavy winners.
 
-**Historical elite buffer (`HIST_ELITE_DAYS = 5`):** At the end of each day's selection, the winning elite pool (20 models) is saved to a rolling 5-day buffer. The next day, these historical models are scored from fresh reset portfolios alongside the regular 200 slots. Historical models that re-crack the top 17 re-enter the active pool and receive fresh mutations. This gives consistently strong models more than one chance — a model that keeps appearing in the top 20 accumulates new children each time. Historical elites are **excluded** from 255-day checkpoints and end-of-pass saves. Python trainers keep the buffer in RAM; the C++ trainer uses a disk-based ring buffer in `<output_dir>/hist_elite/` (≈4.8 GB total for 12 industries + master at 5 days × 70 MB/slot).
+**5-day elite history:** After each selection step, the top-7 direct elites (slots 0–6) plus 3 wavg blends (slots 17–19) are saved into a 5-day circular buffer per industry. On each subsequent day these 10×N historical models are re-scored from scratch (same fill simulation, same reference portfolio) and made eligible for re-selection as direct elites — but NOT used as mutation parents unless they win a direct-elite slot. History resets at pass boundaries. Per-industry constants: `HIST_DAYS=5`, `HIST_PER_DAY=10`, `HIST_ELITE=7`, `HIST_WAVG=3`.
 
-`training_v4.py` is **deprecated** — superseded by `training_v4_cpp` which is ~6× faster and includes all features (`--daily`, `--promote`, `data_dump` diagnostics). Retained for reference only.
+History files per industry:
+- **C++**: `{ind}_hist.bin` — 2 ints (head, count) + `HIST_DAYS × HIST_PER_DAY × STOCKNN_PARAMS` floats
+- **Python**: `{ind}_hist_{day_slot}_{pos}.pt` (up to 50 files) + `{ind}_hist_meta.json` `{"head": 0, "count": 0}`
 
-`training_v3.py` (parallel) differs from `training_v2.py` in: 7 worker threads, in-RAM model cache (`_model_cache`), no slippage on limit fills, and slot-level portfolio JSON persisted alongside weights.
+**`mlock()`**: All hot model weight buffers in the C++ trainer are pinned in RAM via `mlock()` to prevent swap thrashing during inference. Pinned: `elite_buf`, `new_elites`, and `hist_buf` per worker (~315 MB/worker × 2 = 630 MB) plus MasterScratch buffers (~90 MB). Total locked ≈ 720 MB. `mlock()` failure is non-fatal (falls back to swappable). Not applicable to Python trainers.
+
+**Swap file (droplet):** `/swapfile` (2 GB, btrfs-compatible via `chattr +C` + `dd`) is active on the DigitalOcean droplet alongside `/dev/zram0` (1.9 GB), giving ~3.9 GB total swap. To recreate after a rebuild: `truncate -s 0 /swapfile && chattr +C /swapfile && dd if=/dev/zero of=/swapfile bs=1M count=2048 && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /etc/fstab`.
+
+`training_v4_cpp` (C++ binary) is the canonical trainer — handles both industry and master training with ~6× speedup over Python. Master training uses tier-classification (444 features: 18 delta lookbacks + polynomial regression over per-industry portfolio value history; FN/FP penalty scoring; 3-consecutive-zero liquidation). Master only activates at `actual_day >= 30`.
+
+`training_v3.py` (parallel) differs from `training_v2.py` in: 7 worker threads, in-RAM model cache (`_model_cache`), no slippage on limit fills, and slot-level portfolio JSON persisted alongside weights. History candidates in v3 cause the model cache to be invalidated before `selection_and_mutation` (so virtual slot files load from disk); the cache is repopulated on the next day's `load_all_models` call.
 
 ### Fill simulation
 
@@ -159,7 +226,9 @@ When an elite holds ≥50% cash (industry) or ≥80% cash (master), an `UNDER_IN
 
 ### Production cycle
 
-`production_v2.py` runs once per trading day: fetch data from yfinance → run MasterNN to rebalance capital → run StockNN per active industry → submit limit/stop orders to Alpaca → perform one upkeep evolution step on yesterday's data. Alpaca credentials are read from `keyring` or environment variables.
+`production_v2.py` runs once per trading day: fetch data from yfinance → run MasterNN to rebalance capital → run StockNN per active industry → submit limit/stop orders to Alpaca → perform one upkeep evolution step on yesterday's data. Alpaca credentials are read from `keyring` or environment variables (`ALPACA_API_KEY` / `ALPACA_SECRET_KEY`). All per-account state files (`state.json`, `owners.json`, `master_state.json`) live under `--model-dir`, enabling multiple accounts to run independently with different `--model-dir` paths and credentials.
+
+`--paper` routes all API calls to Alpaca's paper trading endpoint — orders are submitted and portfolio state is read from the paper account, giving real paper trading history without risking real money. Omit `--paper` for live trading.
 
 ### Changelog hook
 
@@ -172,10 +241,13 @@ A `PostToolUse` hook in `.claude/settings.json` auto-updates `CHANGELOG.md` and 
 | `N_SLOTS` | 200 | Total model slots per pool |
 | `ELITE_COUNT` | 17 | Direct elite slots |
 | `ELITE_POOL` | 20 | Elites + weighted-average slots |
-| `HIST_ELITE_DAYS` | 5 | Rolling days of past elite pools kept for re-entry |
 | `IND_STARTING_CASH` | $25,000 | Per-industry starting capital |
 | `MST_STARTING_CASH` | $300,000 | Master starting capital |
 | `MAX_SINGLE_STOCK_PCT` | 0.60 | Max fraction of industry cash in one stock |
+| `HIST_DAYS` | 5 | Days of elite history kept per industry |
+| `HIST_PER_DAY` | 10 | Models saved per day (HIST_ELITE + HIST_WAVG) |
+| `HIST_ELITE` | 7 | Direct elite slots saved to history each day |
+| `HIST_WAVG` | 3 | Wavg blend slots saved to history each day |
 
 ## Ignored directories
 

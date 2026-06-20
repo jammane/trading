@@ -26,6 +26,7 @@
 #include <vector>
 
 #include <cblas.h>
+#include <sys/mman.h>
 
 // Force OpenBLAS single-threaded: multi-threaded BLAS with N worker threads causes
 // 2×N threads competing for N CPUs, multiplying overhead 2-3× per forward pass.
@@ -95,7 +96,6 @@ static constexpr int   WAVG_COUNT          = 3;
 static constexpr int   ELITE_POOL          = 20;
 static constexpr int   MUTATIONS_PER_PARENT = 9;
 static constexpr int   HIST_WINDOW         = 15;
-static constexpr int   HIST_ELITE_DAYS     = 5;   // rolling days of elite pools kept
 
 static constexpr float IND_STARTING_CASH   = 25000.0f;
 static constexpr float MST_STARTING_CASH   = 300000.0f;
@@ -106,15 +106,26 @@ static constexpr float FINRA_TAF_PER_SHARE = 0.000166f;
 static constexpr float FINRA_TAF_MAX       = 8.30f;
 static constexpr float SLIPPAGE_RATE       = 0.001f;
 
-static constexpr int   STOCKNN_PARAMS = 921625;
-static constexpr int   MASTERNN_PARAMS = 923560;
+static constexpr int   STOCKNN_PARAMS  = 921625;
+// New flat 5-layer MasterNN: 444→444→444→312→180→48
+// fc1: 444×444+444=197580  fc2: +197580=395160  fc3: 444×312+312=138840→534000
+// fc4: 312×180+180=56340→590340  fc_out: 180×48+48=8688→599028
+static constexpr int   MASTERNN_PARAMS = 599028;
+static constexpr int   MASTER_START_DAY = 30;
+static constexpr float TIER_WEIGHTS[4] = {0.f, 1.f, 1.5f, 2.25f};
+static constexpr float NULL_DENOM      = 1.f + 1.5f + 2.25f;  // 4.75
+
+static constexpr int HIST_DAYS    = 5;
+static constexpr int HIST_PER_DAY = 10;
+static constexpr int HIST_ELITE   = 7;   // top-7 direct elite slots saved per day
+static constexpr int HIST_WAVG    = 3;   // wavg slots (17,18,19) saved per day
+
+static bool g_no_save = false;  // --no-save: skip all model writes (diagnostic mode)
 
 // ── Layer dimensions ───────────────────────────────────────────────────────────
 
 static constexpr int STOCK_INJ_IN [14] = {180,185,190,195,200,205,210,215,220,225,230,235,240,245};
 static constexpr int STOCK_INJ_OUT[14] = {125,130,135,140,145,150,155,160,165,170,175,180,185,190};
-static constexpr int MAST_INJ_IN  [14] = {181,186,191,196,201,206,211,216,221,226,231,236,241,246};
-static constexpr int MAST_INJ_OUT [14] = {125,130,135,140,145,150,155,160,165,170,175,180,185,190};
 
 // Float offsets into the flat weight array for StockNN
 static constexpr int STOCK_SEED_W  = 0;
@@ -142,31 +153,18 @@ static constexpr int STOCK_FC3_B   = 916138;
 static constexpr int STOCK_OUT_W   = 916249;
 static constexpr int STOCK_OUT_B   = 921577;
 
-// Float offsets into the flat weight array for MasterNN
-static constexpr int MAST_SEED_W  = 0;
-static constexpr int MAST_SEED_B  = 7320;
-static constexpr int MAST_INJ_W[14] = {
-     7440, 30190, 54500, 80420,108000,137290,168340,201200,
-    235920,272550,311140,351740,394400,439170
-};
-static constexpr int MAST_INJ_B[14] = {
-    30065, 54370, 80285,107860,137145,168190,201045,235760,
-    272385,310970,351565,394220,438985,485910
-};
-static constexpr int MAST_TODAY_W = 486100;
-static constexpr int MAST_TODAY_B = 611800;
-static constexpr int MAST_FLAT1_W = 612100;
-static constexpr int MAST_FLAT1_B = 702100;
-static constexpr int MAST_FLAT2_W = 702400;
-static constexpr int MAST_FLAT2_B = 792400;
-static constexpr int MAST_FC1_W   = 792700;
-static constexpr int MAST_FC1_B   = 862900;
-static constexpr int MAST_FC2_W   = 863134;
-static constexpr int MAST_FC2_B   = 902446;
-static constexpr int MAST_FC3_W   = 902614;
-static constexpr int MAST_FC3_B   = 919750;
-static constexpr int MAST_OUT_W   = 919852;
-static constexpr int MAST_OUT_B   = 923524;
+// Float offsets into the flat weight array for MasterNN (5-layer flat FC)
+static constexpr int MAST_FC1_W   = 0;
+static constexpr int MAST_FC1_B   = 197136;   // 444*444
+static constexpr int MAST_FC2_W   = 197580;   // +444
+static constexpr int MAST_FC2_B   = 394716;   // +444*444
+static constexpr int MAST_FC3_W   = 395160;   // +444
+static constexpr int MAST_FC3_B   = 533688;   // +444*312
+static constexpr int MAST_FC4_W   = 534000;   // +312
+static constexpr int MAST_FC4_B   = 590160;   // +312*180
+static constexpr int MAST_OUT_W   = 590340;   // +180
+static constexpr int MAST_OUT_B   = 598980;   // +180*48
+// Verify: 598980+48 = 599028 = MASTERNN_PARAMS
 
 // ── PCG32 fast RNG ─────────────────────────────────────────────────────────────
 
@@ -261,53 +259,15 @@ static void stock_forward(const float* W, const float* hist15x60,
     }
 }
 
-// MasterNN forward — weights[] is MASTERNN_PARAMS floats.
-// hist15x61 is [15][61], today229 is [229].
-// Output out36: [0..11] softmax alloc, [12..23] sigmoid depth, [24..35] sigmoid trigger.
-static void master_forward(const float* W, const float* hist15x61,
-                           const float* today229, float* out36) {
-    float x[300], y[300], cat[430], fc1[234], fc2[168], fc3[102];
-
-    // Seed: hist[0][61] → 120
-    sgemv_relu(W + MAST_SEED_W, W + MAST_SEED_B, hist15x61, x, 120, 61);
-
-    // Inject layers i=0..13
-    int xsz = 120;
-    for (int i = 0; i < 14; i++) {
-        int in_sz  = MAST_INJ_IN[i];
-        int out_sz = MAST_INJ_OUT[i];
-        memcpy(cat, x, xsz * sizeof(float));
-        memcpy(cat + xsz, hist15x61 + (i + 1) * 61, 61 * sizeof(float));
-        sgemv_relu(W + MAST_INJ_W[i], W + MAST_INJ_B[i], cat, y, out_sz, in_sz);
-        memcpy(x, y, out_sz * sizeof(float));
-        xsz = out_sz;
-    }
-
-    // Today: cat(x[190], today[229]) = 419 → 300
-    memcpy(cat, x, 190 * sizeof(float));
-    memcpy(cat + 190, today229, 229 * sizeof(float));
-    sgemv_relu(W + MAST_TODAY_W, W + MAST_TODAY_B, cat, x, 300, 419);
-
-    // Flat
-    sgemv_relu(W + MAST_FLAT1_W, W + MAST_FLAT1_B, x, y, 300, 300);
-    sgemv_relu(W + MAST_FLAT2_W, W + MAST_FLAT2_B, y, x, 300, 300);
-
-    // Funnel
-    sgemv_relu(W + MAST_FC1_W, W + MAST_FC1_B, x,   fc1, 234, 300);
-    sgemv_relu(W + MAST_FC2_W, W + MAST_FC2_B, fc1, fc2, 168, 234);
-    sgemv_relu(W + MAST_FC3_W, W + MAST_FC3_B, fc2, fc3, 102, 168);
-
-    // Output
-    sgemv_only(W + MAST_OUT_W, W + MAST_OUT_B, fc3, out36, 36, 102);
-
-    // Softmax for alloc[0..11]
-    float mx = *std::max_element(out36, out36 + 12);
-    float sm = 0.f;
-    for (int i = 0; i < 12; i++) { out36[i] = expf(out36[i] - mx); sm += out36[i]; }
-    for (int i = 0; i < 12; i++) out36[i] /= sm;
-
-    // Sigmoid for depth[12..23] and trigger[24..35]
-    for (int i = 12; i < 36; i++) out36[i] = sigmoidf(out36[i]);
+// MasterNN forward — weights[] is MASTERNN_PARAMS floats, today444 is (1,444) flat vector.
+// Output out48: raw logits [12][4]; caller decodes tier via argmax over each group of 4.
+static void master_forward(const float* W, const float* today444, float* out48) {
+    float h1[444], h2[444], h3[312], h4[180];
+    sgemv_relu(W + MAST_FC1_W, W + MAST_FC1_B, today444, h1, 444, 444);
+    sgemv_relu(W + MAST_FC2_W, W + MAST_FC2_B, h1,       h2, 444, 444);
+    sgemv_relu(W + MAST_FC3_W, W + MAST_FC3_B, h2,       h3, 312, 444);
+    sgemv_relu(W + MAST_FC4_W, W + MAST_FC4_B, h3,       h4, 180, 312);
+    sgemv_only(W + MAST_OUT_W, W + MAST_OUT_B, h4,    out48,  48, 180);
 }
 
 // ── Data structures ─────────────────────────────────────────────────────────────
@@ -353,18 +313,20 @@ struct IndustryState {
     Portfolio portfolios[N_SLOTS];
     SymHist   hist[IND_SYMS];
     int       streak{0};
-    int       hist_ring_next{0};   // next write position in ring (0..HIST_ELITE_DAYS-1)
-    int       hist_ring_count{0};  // populated slots in ring (0..HIST_ELITE_DAYS)
     // elites removed — stored in per-worker WorkerScratch to avoid OOM
 };
 
+// IND_HIST_CAP: maximum entries in ind_val_hist rolling buffer.
+// Need up to lookback 91 days of history (delta at t=90 needs hist[90] and hist[91]).
+static constexpr int IND_HIST_CAP = 92;
+
 struct MasterState {
     MasterPortfolio portfolios[N_SLOTS];
-    SymHist         sym_hist[N_SYMS];   // all 144 symbols, indexed [ind*12+sym]
-    float           flat_cos_hist[15];
-    int             flat_cos_len{0};
-    int             hist_ring_next{0};
-    int             hist_ring_count{0};
+    // Per-industry rolling value history: oldest-first, length ind_hist_count (≤ IND_HIST_CAP)
+    float           ind_val_hist[N_IND][IND_HIST_CAP];
+    int             ind_hist_count{0};
+    // Consecutive tier-0 counter per slot per industry; slot 0 persists across days
+    int             zero_counts[N_SLOTS][N_IND];
     // elites removed — stored in MasterScratch (heap-allocated in main)
 };
 
@@ -375,37 +337,32 @@ struct WorkerScratch {
     float*    new_elites;   // [ELITE_POOL * STOCKNN_PARAMS] — temp for selection reorder
     float*    wavg_buf;     // [3 * STOCKNN_PARAMS]
     float*    mut_buf;      // [STOCKNN_PARAMS]
-    float*    burst_buf{nullptr};       // [ELITE_COUNT * STOCKNN_PARAMS], lazy-allocated
-    float*    hist_elite_buf{nullptr};  // [ELITE_POOL * STOCKNN_PARAMS], lazy-allocated
+    float*    hist_buf;     // [HIST_DAYS * HIST_PER_DAY * STOCKNN_PARAMS] — per-industry history (disk-backed)
+    int       hist_head{0}; // circular write index into hist_buf, 0..HIST_DAYS-1
+    int       hist_count{0};// days of valid history populated, 0..HIST_DAYS
     uint64_t  mut_seeds[N_SLOTS - ELITE_POOL];
 
     WorkerScratch() {
-        size_t ep = (size_t)ELITE_POOL * STOCKNN_PARAMS;
+        size_t ep   = (size_t)ELITE_POOL * STOCKNN_PARAMS;
+        size_t hist = (size_t)HIST_DAYS * HIST_PER_DAY * STOCKNN_PARAMS;
         elite_buf  = new float[ep]();
         new_elites = new float[ep]();
         wavg_buf   = new float[3 * STOCKNN_PARAMS]();
         mut_buf    = new float[STOCKNN_PARAMS]();
+        hist_buf   = new float[hist]();
+        // Pin only elite_buf (hot inference read path) — 70 MB per worker.
+        // new_elites and hist_buf are write-heavy/sequential; swap-friendly.
+        mlock(elite_buf, ep * sizeof(float));
     }
     ~WorkerScratch() {
         delete[] elite_buf; delete[] new_elites;
         delete[] wavg_buf;  delete[] mut_buf;
-        delete[] burst_buf; delete[] hist_elite_buf;
+        delete[] hist_buf;
     }
-    float* elite(int i)     { return elite_buf  + (size_t)i * STOCKNN_PARAMS; }
-    float* new_elite(int i) { return new_elites + (size_t)i * STOCKNN_PARAMS; }
-    float* wavg(int i)      { return wavg_buf   + (size_t)i * STOCKNN_PARAMS; }
-    float* hist_elite(int i){ return hist_elite_buf + (size_t)i * STOCKNN_PARAMS; }
-
-    float* ensure_burst_buf() {
-        if (!burst_buf) burst_buf = new float[(size_t)ELITE_COUNT * STOCKNN_PARAMS]();
-        return burst_buf;
-    }
-    float* ensure_hist_elite_buf() {
-        if (!hist_elite_buf)
-            hist_elite_buf = new float[(size_t)ELITE_POOL * STOCKNN_PARAMS]();
-        return hist_elite_buf;
-    }
-    float* burst(int i) { return burst_buf + (size_t)i * STOCKNN_PARAMS; }
+    float* elite(int i)      { return elite_buf  + (size_t)i * STOCKNN_PARAMS; }
+    float* new_elite(int i)  { return new_elites + (size_t)i * STOCKNN_PARAMS; }
+    float* wavg(int i)       { return wavg_buf   + (size_t)i * STOCKNN_PARAMS; }
+    float* hist(int d, int p){ return hist_buf + ((size_t)d * HIST_PER_DAY + p) * STOCKNN_PARAMS; }
 };
 
 struct MasterScratch {
@@ -413,7 +370,6 @@ struct MasterScratch {
     float*    new_elites;
     float*    wavg_buf;
     float*    mut_buf;
-    float*    hist_elite_buf{nullptr};  // [ELITE_POOL * MASTERNN_PARAMS], lazy-allocated
     uint64_t  mut_seeds[N_SLOTS - ELITE_POOL];
 
     MasterScratch() {
@@ -422,22 +378,15 @@ struct MasterScratch {
         new_elites = new float[ep]();
         wavg_buf   = new float[3 * MASTERNN_PARAMS]();
         mut_buf    = new float[MASTERNN_PARAMS]();
+        // Master runs sequentially (not concurrent with workers); not mlock'd.
     }
     ~MasterScratch() {
         delete[] elite_buf; delete[] new_elites;
         delete[] wavg_buf;  delete[] mut_buf;
-        delete[] hist_elite_buf;
     }
-    float* elite(int i)      { return elite_buf  + (size_t)i * MASTERNN_PARAMS; }
-    float* new_elite(int i)  { return new_elites + (size_t)i * MASTERNN_PARAMS; }
-    float* wavg(int i)       { return wavg_buf   + (size_t)i * MASTERNN_PARAMS; }
-    float* hist_elite(int i) { return hist_elite_buf + (size_t)i * MASTERNN_PARAMS; }
-
-    float* ensure_hist_elite_buf() {
-        if (!hist_elite_buf)
-            hist_elite_buf = new float[(size_t)ELITE_POOL * MASTERNN_PARAMS]();
-        return hist_elite_buf;
-    }
+    float* elite(int i)     { return elite_buf  + (size_t)i * MASTERNN_PARAMS; }
+    float* new_elite(int i) { return new_elites + (size_t)i * MASTERNN_PARAMS; }
+    float* wavg(int i)      { return wavg_buf   + (size_t)i * MASTERNN_PARAMS; }
 };
 
 // ── Fee helpers ─────────────────────────────────────────────────────────────────
@@ -513,22 +462,11 @@ static void init_stock_weights(float* W, PCG32& rng) {
 }
 
 static void init_master_weights(float* W, PCG32& rng) {
-    kaiming_init(W + MAST_SEED_W, 120, 61, rng);
-    for (int i = 0; i < 14; i++) {
-        int in_sz = MAST_INJ_IN[i], out_sz = MAST_INJ_OUT[i];
-        float bound = 1.0f / sqrtf((float)in_sz);
-        for (int k = 0; k < out_sz * in_sz; k++)
-            W[MAST_INJ_W[i] + k] = (rng.next_float() * 2.f - 1.f) * bound;
-        for (int k = 0; k < out_sz; k++)
-            W[MAST_INJ_B[i] + k] = (rng.next_float() * 2.f - 1.f) * bound;
-    }
-    kaiming_init(W + MAST_TODAY_W, 300, 419, rng);
-    kaiming_init(W + MAST_FLAT1_W, 300, 300, rng);
-    kaiming_init(W + MAST_FLAT2_W, 300, 300, rng);
-    kaiming_init(W + MAST_FC1_W,   234, 300, rng);
-    kaiming_init(W + MAST_FC2_W,   168, 234, rng);
-    kaiming_init(W + MAST_FC3_W,   102, 168, rng);
-    kaiming_init(W + MAST_OUT_W,    36, 102, rng);
+    kaiming_init(W + MAST_FC1_W, 444, 444, rng);
+    kaiming_init(W + MAST_FC2_W, 444, 444, rng);
+    kaiming_init(W + MAST_FC3_W, 312, 444, rng);
+    kaiming_init(W + MAST_FC4_W, 180, 312, rng);
+    kaiming_init(W + MAST_OUT_W,  48, 180, rng);
 }
 
 // ── Model file I/O ──────────────────────────────────────────────────────────────
@@ -678,546 +616,19 @@ struct IndResult {
     float baseline, slot0_score, best_delta;
     float top_hold, top_cash;
     int   new_streak;
+    float elite_max_val, elite_min_val, elite_mean_val;
+};
+
+struct MasterResult {
+    float best_pts, elite_max_pts, elite_min_pts, elite_mean_pts, ideal_pts;
 };
 
 // ── Forward declarations (needed because step_industry calls load/save defined later) ──
 static void load_or_init_industry(const std::string& dir, const std::string& load_dir,
                                    int ind_i, float* elite_buf);
 static void save_industry_elites(const std::string& dir, int ind_i, const float* elite_buf);
-static bool load_hist_ring_slot_ind(const std::string& models_dir, const char* ind_name,
-                                     int ring_slot, float* buf);
-static bool load_hist_ring_slot_mst(const std::string& models_dir, int ring_slot, float* buf);
-
-// ── write_dump_json ─────────────────────────────────────────────────────────────
-
-static void write_dump_json(
-    int ind_i, int actual_day,
-    const char* flag_type,
-    float baseline, float best_delta, float pct_gain,
-    const float* slot_scores,   // N_SLOTS values
-    const OHLCV* day_sym, const OHLCV* fill_sym)
-{
-    std::string dir = "data_dump/day_" + std::to_string(actual_day + 1);
-    fs::create_directories(dir);
-
-    std::string path = dir + "/" + g_ind_names[ind_i] + "_" + flag_type + ".json";
-    FILE* f = fopen(path.c_str(), "w");
-    if (!f) return;
-
-    fprintf(f, "{\n");
-    fprintf(f, "  \"industry\": \"%s\",\n", g_ind_names[ind_i].c_str());
-    fprintf(f, "  \"day\": %d,\n", actual_day + 1);
-    fprintf(f, "  \"flag\": \"%s\",\n", flag_type);
-    fprintf(f, "  \"baseline\": %.4f,\n", (double)baseline);
-    fprintf(f, "  \"best_delta\": %.4f,\n", (double)best_delta);
-    fprintf(f, "  \"pct_gain\": %.4f,\n", (double)pct_gain);
-
-    // scores: sorted descending
-    std::vector<std::pair<float,int>> scored(N_SLOTS);
-    for (int s = 0; s < N_SLOTS; s++) scored[s] = {slot_scores[s], s};
-    std::sort(scored.begin(), scored.end(), [](const auto& a, const auto& b){ return a.first > b.first; });
-
-    fprintf(f, "  \"scores\": [");
-    for (int s = 0; s < N_SLOTS; s++) {
-        if (s > 0) fprintf(f, ", ");
-        fprintf(f, "[%d, %.4f]", scored[s].second, (double)scored[s].first);
-    }
-    fprintf(f, "],\n");
-
-    // day_data
-    fprintf(f, "  \"day_data\": {");
-    for (int j = 0; j < IND_SYMS; j++) {
-        if (j > 0) fprintf(f, ", ");
-        const OHLCV& o = day_sym[j];
-        fprintf(f, "\"%s\": {\"open\":%.4f,\"close\":%.4f,\"high\":%.4f,\"low\":%.4f,\"volume\":%.2f}",
-                g_syms[ind_i][j].c_str(),
-                (double)o.open, (double)o.close, (double)o.high, (double)o.low, (double)o.volume);
-    }
-    fprintf(f, "},\n");
-
-    // fill_data
-    fprintf(f, "  \"fill_data\": {");
-    for (int j = 0; j < IND_SYMS; j++) {
-        if (j > 0) fprintf(f, ", ");
-        const OHLCV& o = (fill_sym && fill_sym[j].valid) ? fill_sym[j] : day_sym[j];
-        fprintf(f, "\"%s\": {\"open\":%.4f,\"close\":%.4f,\"high\":%.4f,\"low\":%.4f,\"volume\":%.2f}",
-                g_syms[ind_i][j].c_str(),
-                (double)o.open, (double)o.close, (double)o.high, (double)o.low, (double)o.volume);
-    }
-    fprintf(f, "}\n");
-
-    fprintf(f, "}\n");
-    fclose(f);
-}
-
-// ── simulate_ind_slot ───────────────────────────────────────────────────────────
-// Runs one model through Phase 1 + Phase 2 trade simulation for one day.
-// port_out must be pre-initialized with the starting portfolio state before calling.
-
-static float simulate_ind_slot(
-    const float* W, Portfolio& port_out,
-    const OHLCV* day_sym, const OHLCV* fill_sym,
-    const float* history_arr, const float* today_arr,
-    const bool* seq_flags, int ind_i)
-{
-    float out48[48];
-    stock_forward(W, history_arr, today_arr, out48);
-
-    // ── Phase 1: partial sells, gap sell_all, high-first sell_all, stops, buys ─
-    for (int j = 0; j < IND_SYMS; j++) {
-        if (!day_sym[j].valid) continue;
-        float buy_qty             = out48[4*j+0];
-        float buy_price_frac      = out48[4*j+1];
-        float sell_all_price_frac = out48[4*j+2];
-        float sell_qty            = out48[4*j+3];
-
-        float low_t  = day_sym[j].low;
-        float high_t = day_sym[j].high;
-        float span_t = std::max(high_t - low_t, 1e-9f);
-        float sell_all_price = low_t + sell_all_price_frac * span_t;
-        float buy_price      = low_t + buy_price_frac * span_t;
-        float stop_loss      = buy_price * 0.9f;
-
-        float nd_open = fill_sym[j].valid ? fill_sym[j].open  : day_sym[j].close;
-        float nd_low  = fill_sym[j].valid ? fill_sym[j].low   : day_sym[j].low;
-        float nd_high = fill_sym[j].valid ? fill_sym[j].high  : day_sym[j].high;
-
-        bool low_first = seq_flags[ind_i * IND_SYMS + j];
-
-        // Partial sell at open
-        if (sell_qty > 1e-6f && port_out.holdings[j] > 1e-6f) {
-            float amt = std::min(sell_qty, port_out.holdings[j]);
-            port_out.holdings[j] -= amt;
-            port_out.cash        += sell_net(amt, nd_open);
-        }
-
-        // Gap-up sell_all at open
-        if (port_out.holdings[j] > 1e-6f && nd_open >= sell_all_price) {
-            float amt = port_out.holdings[j];
-            port_out.holdings[j] = 0.f;
-            port_out.cash        += sell_net(amt, nd_open);
-        }
-
-        // High-first: intraday sell_all fires before buy
-        if (!low_first && port_out.holdings[j] > 1e-6f &&
-            nd_low < sell_all_price && sell_all_price < nd_high) {
-            float slipped = sell_all_price * (1.f - SLIPPAGE_RATE);
-            float amt = port_out.holdings[j];
-            port_out.holdings[j] = 0.f;
-            port_out.cash        += sell_net(amt, slipped);
-        }
-
-        // Stop loss
-        float stop_p = port_out.stop_prices[j];
-        if (stop_p > 0.f && port_out.holdings[j] > 1e-6f) {
-            if (nd_open <= stop_p) {
-                float amt = port_out.holdings[j];
-                port_out.holdings[j] = 0.f;
-                port_out.cash        += sell_net(amt, nd_open);
-            } else if (nd_low <= stop_p) {
-                float slipped = stop_p * (1.f - SLIPPAGE_RATE);
-                float amt = port_out.holdings[j];
-                port_out.holdings[j] = 0.f;
-                port_out.cash        += sell_net(amt, slipped);
-            }
-        }
-
-        // Limit buy
-        if (buy_qty > 1e-6f && buy_price > 0.f) {
-            float fill_price = 0.f;
-            if (nd_open <= buy_price)
-                fill_price = nd_open;
-            else if (nd_low < buy_price && buy_price < nd_high)
-                fill_price = buy_price * (1.f + SLIPPAGE_RATE);
-
-            if (fill_price > 0.f) {
-                float affordable = port_out.cash / fill_price;
-                float buy_amount = std::min(buy_qty, affordable);
-                if (buy_amount > 1e-6f) {
-                    float port_value = port_out.cash;
-                    for (int k = 0; k < IND_SYMS; k++) {
-                        float cp = fill_sym[k].valid ? fill_sym[k].close :
-                                   day_sym[k].valid  ? day_sym[k].close  : 0.f;
-                        port_value += port_out.holdings[k] * cp;
-                    }
-                    float cur_sym_val = port_out.holdings[j] * fill_price;
-                    float max_spend   = std::max(0.f, MAX_SINGLE_STOCK_PCT * port_value - cur_sym_val);
-                    buy_amount = std::min(buy_amount, max_spend / fill_price);
-                }
-                if (buy_amount > 1e-6f) {
-                    port_out.holdings[j]    += buy_amount;
-                    port_out.cash           -= buy_amount * fill_price;
-                    port_out.stop_prices[j]  = stop_loss;
-                }
-            }
-        }
-    }
-
-    // ── Phase 2: low-first intraday sell_all ──────────────────────────────
-    for (int j = 0; j < IND_SYMS; j++) {
-        if (!day_sym[j].valid) continue;
-        if (!seq_flags[ind_i * IND_SYMS + j]) continue;  // high-first: skip
-
-        float sell_all_price_frac = out48[4*j+2];
-        float span_t = std::max(day_sym[j].high - day_sym[j].low, 1e-9f);
-        float sell_all_price = day_sym[j].low + sell_all_price_frac * span_t;
-
-        float nd_low  = fill_sym[j].valid ? fill_sym[j].low  : day_sym[j].low;
-        float nd_high = fill_sym[j].valid ? fill_sym[j].high : day_sym[j].high;
-
-        if (port_out.holdings[j] > 1e-6f && nd_low < sell_all_price && sell_all_price < nd_high) {
-            float slipped = sell_all_price * (1.f - SLIPPAGE_RATE);
-            float amt = port_out.holdings[j];
-            port_out.holdings[j] = 0.f;
-            port_out.cash        += sell_net(amt, slipped);
-        }
-    }
-
-    return compute_value_ind(port_out, day_sym, fill_sym);
-}
-
-// ── sim_ind_model: run one model's trade simulation from a fresh portfolio ──────
-// port: pre-initialized to baseline; modified in place. Returns final value.
-// seq_flags_ind: pointer to seq_flags[ind_i * IND_SYMS], length IND_SYMS.
-static float sim_ind_model(
-    const float* W,
-    const float* history_arr, const float* today_arr,
-    const OHLCV* day_sym, const OHLCV* fill_sym,
-    const bool* seq_flags_ind,
-    float* out48,
-    Portfolio& port)
-{
-    stock_forward(W, history_arr, today_arr, out48);
-
-    for (int j = 0; j < IND_SYMS; j++) {
-        if (!day_sym[j].valid) continue;
-        float buy_qty            = out48[4*j+0];
-        float buy_price_frac     = out48[4*j+1];
-        float sell_all_price_frac = out48[4*j+2];
-        float sell_qty           = out48[4*j+3];
-
-        float low_t  = day_sym[j].low;
-        float high_t = day_sym[j].high;
-        float span_t = std::max(high_t - low_t, 1e-9f);
-        float sell_all_price = low_t + sell_all_price_frac * span_t;
-        float buy_price      = low_t + buy_price_frac * span_t;
-        float stop_loss      = buy_price * 0.9f;
-
-        float nd_open = fill_sym[j].valid ? fill_sym[j].open  : day_sym[j].close;
-        float nd_low  = fill_sym[j].valid ? fill_sym[j].low   : day_sym[j].low;
-        float nd_high = fill_sym[j].valid ? fill_sym[j].high  : day_sym[j].high;
-        bool  low_first = seq_flags_ind[j];
-
-        if (sell_qty > 1e-6f && port.holdings[j] > 1e-6f) {
-            float amt = std::min(sell_qty, port.holdings[j]);
-            port.holdings[j] -= amt; port.cash += sell_net(amt, nd_open);
-        }
-        if (port.holdings[j] > 1e-6f && nd_open >= sell_all_price) {
-            float amt = port.holdings[j]; port.holdings[j] = 0.f;
-            port.cash += sell_net(amt, nd_open);
-        }
-        if (!low_first && port.holdings[j] > 1e-6f &&
-            nd_low < sell_all_price && sell_all_price < nd_high) {
-            float slipped = sell_all_price * (1.f - SLIPPAGE_RATE);
-            float amt = port.holdings[j]; port.holdings[j] = 0.f;
-            port.cash += sell_net(amt, slipped);
-        }
-        float stop_p = port.stop_prices[j];
-        if (stop_p > 0.f && port.holdings[j] > 1e-6f) {
-            if (nd_open <= stop_p) {
-                float amt = port.holdings[j]; port.holdings[j] = 0.f;
-                port.cash += sell_net(amt, nd_open);
-            } else if (nd_low <= stop_p) {
-                float slipped = stop_p * (1.f - SLIPPAGE_RATE);
-                float amt = port.holdings[j]; port.holdings[j] = 0.f;
-                port.cash += sell_net(amt, slipped);
-            }
-        }
-        if (buy_qty > 1e-6f && buy_price > 0.f) {
-            float fill_price = 0.f;
-            if (nd_open <= buy_price) fill_price = nd_open;
-            else if (nd_low < buy_price && buy_price < nd_high)
-                fill_price = buy_price * (1.f + SLIPPAGE_RATE);
-            if (fill_price > 0.f) {
-                float affordable = port.cash / fill_price;
-                float buy_amount = std::min(buy_qty, affordable);
-                if (buy_amount > 1e-6f) {
-                    float port_value = port.cash;
-                    for (int k = 0; k < IND_SYMS; k++) {
-                        float cp = fill_sym[k].valid ? fill_sym[k].close :
-                                   day_sym[k].valid  ? day_sym[k].close  : 0.f;
-                        port_value += port.holdings[k] * cp;
-                    }
-                    float cur_sym_val = port.holdings[j] * fill_price;
-                    float max_spend = std::max(0.f, MAX_SINGLE_STOCK_PCT * port_value - cur_sym_val);
-                    buy_amount = std::min(buy_amount, max_spend / fill_price);
-                }
-                if (buy_amount > 1e-6f) {
-                    port.holdings[j]    += buy_amount;
-                    port.cash           -= buy_amount * fill_price;
-                    port.stop_prices[j]  = stop_loss;
-                }
-            }
-        }
-    }
-    for (int j = 0; j < IND_SYMS; j++) {
-        if (!day_sym[j].valid) continue;
-        if (!seq_flags_ind[j]) continue;
-        float sell_all_price_frac = out48[4*j+2];
-        float span_t = std::max(day_sym[j].high - day_sym[j].low, 1e-9f);
-        float sell_all_price = day_sym[j].low + sell_all_price_frac * span_t;
-        float nd_low  = fill_sym[j].valid ? fill_sym[j].low  : day_sym[j].low;
-        float nd_high = fill_sym[j].valid ? fill_sym[j].high : day_sym[j].high;
-        if (port.holdings[j] > 1e-6f && nd_low < sell_all_price && sell_all_price < nd_high) {
-            float slipped = sell_all_price * (1.f - SLIPPAGE_RATE);
-            float amt = port.holdings[j]; port.holdings[j] = 0.f;
-            port.cash += sell_net(amt, slipped);
-        }
-    }
-    return compute_value_ind(port, day_sym, fill_sym);
-}
-
-// ── Hist ring helpers for industry ───────────────────────────────────────────────
-static void save_hist_ring_ind(const std::string& models_dir, const char* ind_name,
-                                IndustryState& state, const float* elite_buf) {
-    std::string dir = models_dir + "/hist_elite";
-    fs::create_directories(dir);
-    std::string path = dir + "/" + ind_name + "_hist_" +
-                       std::to_string(state.hist_ring_next) + ".bin";
-    if (!save_bin(path, elite_buf, (size_t)ELITE_POOL * STOCKNN_PARAMS))
-        log_msg("WARNING: could not save hist ring " + path);
-    state.hist_ring_next = (state.hist_ring_next + 1) % HIST_ELITE_DAYS;
-    if (state.hist_ring_count < HIST_ELITE_DAYS) state.hist_ring_count++;
-}
-
-static bool load_hist_ring_slot_ind(const std::string& models_dir, const char* ind_name,
-                                     int ring_slot, float* buf) {
-    std::string path = models_dir + "/hist_elite/" + ind_name + "_hist_" +
-                       std::to_string(ring_slot) + ".bin";
-    return load_bin(path, buf, (size_t)ELITE_POOL * STOCKNN_PARAMS);
-}
-
-// ── Hist ring helpers for master ─────────────────────────────────────────────────
-static void save_hist_ring_mst(const std::string& models_dir, MasterState& state,
-                                const float* elite_buf) {
-    std::string dir = models_dir + "/hist_elite";
-    fs::create_directories(dir);
-    std::string path = dir + "/master_hist_" + std::to_string(state.hist_ring_next) + ".bin";
-    if (!save_bin(path, elite_buf, (size_t)ELITE_POOL * MASTERNN_PARAMS))
-        log_msg("WARNING: could not save master hist ring " + path);
-    state.hist_ring_next = (state.hist_ring_next + 1) % HIST_ELITE_DAYS;
-    if (state.hist_ring_count < HIST_ELITE_DAYS) state.hist_ring_count++;
-}
-
-static bool load_hist_ring_slot_mst(const std::string& models_dir, int ring_slot, float* buf) {
-    std::string path = models_dir + "/hist_elite/master_hist_" +
-                       std::to_string(ring_slot) + ".bin";
-    return load_bin(path, buf, (size_t)ELITE_POOL * MASTERNN_PARAMS);
-}
-
-// ── run_daily_burst ─────────────────────────────────────────────────────────────
-
-static void run_daily_burst(
-    int ind_i, IndustryState& state, WorkerScratch& scratch,
-    const OHLCV* day_sym, const OHLCV* fill_sym,
-    float ref_cash, const float* ref_hold, const float* ref_stop,
-    const float* history_arr, const float* today_arr,
-    const bool* seq_flags,
-    const std::string& models_dir,
-    int actual_day, int total_avail,
-    float daily_sigma)
-{
-    scratch.ensure_burst_buf();
-
-    float best_before = compute_value_ind(state.portfolios[0], day_sym, fill_sym);
-
-    for (int burst_num = 0; burst_num < 4; burst_num++) {
-        float burst_sigma = daily_sigma / (float)(1 << (burst_num + 1));
-
-        // Score current ELITE_COUNT elites
-        float cur_scores[ELITE_COUNT];
-        Portfolio cur_ports[ELITE_COUNT];
-        for (int k = 0; k < ELITE_COUNT; k++) {
-            cur_ports[k].cash = ref_cash;
-            for (int j = 0; j < IND_SYMS; j++) {
-                cur_ports[k].holdings[j]    = ref_hold[j];
-                cur_ports[k].stop_prices[j] = ref_stop[j];
-            }
-            cur_scores[k] = simulate_ind_slot(scratch.elite(k), cur_ports[k],
-                                               day_sym, fill_sym,
-                                               history_arr, today_arr,
-                                               seq_flags, ind_i);
-        }
-
-        // Generate ELITE_POOL * 10 burst candidates, track top-ELITE_COUNT
-        float burst_scores[ELITE_COUNT];
-        Portfolio burst_ports[ELITE_COUNT];
-        int burst_used = 0;
-        float burst_min = -1e30f;
-        int burst_min_idx = 0;
-
-        PCG32 brng;
-        brng.seed((uint64_t)actual_day * 77777ULL + (uint64_t)ind_i * 333ULL + (uint64_t)burst_num);
-
-        for (int p = 0; p < ELITE_POOL; p++) {
-            for (int m = 0; m < 10; m++) {
-                memcpy(scratch.mut_buf, scratch.elite(p), STOCKNN_PARAMS * sizeof(float));
-                uint64_t seed = ((uint64_t)brng.next() << 32) | brng.next();
-                apply_gaussian(scratch.mut_buf, STOCKNN_PARAMS, burst_sigma, seed);
-
-                Portfolio port;
-                port.cash = ref_cash;
-                for (int j = 0; j < IND_SYMS; j++) {
-                    port.holdings[j]    = ref_hold[j];
-                    port.stop_prices[j] = ref_stop[j];
-                }
-                float sc = simulate_ind_slot(scratch.mut_buf, port,
-                                             day_sym, fill_sym,
-                                             history_arr, today_arr,
-                                             seq_flags, ind_i);
-
-                if (burst_used < ELITE_COUNT) {
-                    memcpy(scratch.burst(burst_used), scratch.mut_buf, STOCKNN_PARAMS * sizeof(float));
-                    burst_scores[burst_used] = sc;
-                    burst_ports[burst_used]  = port;
-                    if (burst_used == 0 || sc < burst_min) {
-                        burst_min     = sc;
-                        burst_min_idx = burst_used;
-                    }
-                    burst_used++;
-                } else if (sc > burst_min) {
-                    memcpy(scratch.burst(burst_min_idx), scratch.mut_buf, STOCKNN_PARAMS * sizeof(float));
-                    burst_scores[burst_min_idx] = sc;
-                    burst_ports[burst_min_idx]  = port;
-                    // recompute burst_min
-                    burst_min = burst_scores[0];
-                    burst_min_idx = 0;
-                    for (int k = 1; k < ELITE_COUNT; k++) {
-                        if (burst_scores[k] < burst_min) {
-                            burst_min     = burst_scores[k];
-                            burst_min_idx = k;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Merge: combined pool of ELITE_COUNT current + ELITE_COUNT burst = 34 total
-        // Pick best ELITE_COUNT (17), capping burst replacements at 2
-        // Build combined indexed list
-        struct Candidate {
-            float score;
-            bool  is_burst;
-            int   idx;
-        };
-        Candidate combined[ELITE_COUNT * 2];
-        for (int k = 0; k < ELITE_COUNT; k++) {
-            combined[k]               = {cur_scores[k],   false, k};
-            combined[ELITE_COUNT + k] = {burst_scores[k], true,  k};
-        }
-        std::sort(combined, combined + ELITE_COUNT * 2,
-                  [](const Candidate& a, const Candidate& b){ return a.score > b.score; });
-
-        int picked_burst = 0;
-        int winner_idxs[ELITE_COUNT];
-        bool winner_is_burst[ELITE_COUNT];
-        int  winner_count = 0;
-
-        for (int k = 0; k < ELITE_COUNT * 2 && winner_count < ELITE_COUNT; k++) {
-            if (combined[k].is_burst) {
-                if (picked_burst >= 2) continue;
-                picked_burst++;
-            }
-            winner_idxs[winner_count]    = combined[k].idx;
-            winner_is_burst[winner_count] = combined[k].is_burst;
-            winner_count++;
-        }
-        // Fill remaining if cap prevented enough burst
-        for (int k = 0; k < ELITE_COUNT * 2 && winner_count < ELITE_COUNT; k++) {
-            if (!combined[k].is_burst) {
-                // check not already picked
-                bool already = false;
-                for (int w = 0; w < winner_count; w++)
-                    if (!winner_is_burst[w] && winner_idxs[w] == combined[k].idx) { already = true; break; }
-                if (!already) {
-                    winner_idxs[winner_count]    = combined[k].idx;
-                    winner_is_burst[winner_count] = false;
-                    winner_count++;
-                }
-            }
-        }
-
-        // Build winner scores for wavg normalization
-        float winner_scores[ELITE_COUNT];
-        for (int k = 0; k < winner_count; k++) {
-            winner_scores[k] = winner_is_burst[k] ? burst_scores[winner_idxs[k]]
-                                                   : cur_scores[winner_idxs[k]];
-        }
-        for (int k = winner_count; k < ELITE_COUNT; k++) winner_scores[k] = winner_scores[0];
-
-        // Copy winners into new_elites and update portfolios
-        for (int k = 0; k < winner_count; k++) {
-            if (winner_is_burst[k])
-                memcpy(scratch.new_elite(k), scratch.burst(winner_idxs[k]), STOCKNN_PARAMS * sizeof(float));
-            else
-                memcpy(scratch.new_elite(k), scratch.elite(winner_idxs[k]), STOCKNN_PARAMS * sizeof(float));
-            state.portfolios[k] = winner_is_burst[k] ? burst_ports[winner_idxs[k]]
-                                                      : cur_ports[winner_idxs[k]];
-        }
-        for (int k = winner_count; k < ELITE_COUNT; k++) {
-            memcpy(scratch.new_elite(k), scratch.new_elite(0), STOCKNN_PARAMS * sizeof(float));
-            state.portfolios[k] = state.portfolios[0];
-        }
-
-        // Recompute wavg slots
-        int n5  = std::min(ELITE_COUNT, 5);
-        int n10 = std::min(ELITE_COUNT, 10);
-        int n15 = std::min(ELITE_COUNT, 15);
-        float w5_weights[5], w10_weights[10], w15_weights[15];
-        normalize_weights(winner_scores, w5_weights,  n5);
-        normalize_weights(winner_scores, w10_weights, n10);
-        normalize_weights(winner_scores, w15_weights, n15);
-
-        int seq[ELITE_COUNT]; for (int k = 0; k < ELITE_COUNT; k++) seq[k] = k;
-        wavg_weights_flat(scratch.new_elites, STOCKNN_PARAMS, seq, w5_weights,  n5,  scratch.wavg(0));
-        wavg_weights_flat(scratch.new_elites, STOCKNN_PARAMS, seq, w10_weights, n10, scratch.wavg(1));
-        wavg_weights_flat(scratch.new_elites, STOCKNN_PARAMS, seq, w15_weights, n15, scratch.wavg(2));
-
-        memcpy(scratch.new_elite(ELITE_COUNT),     scratch.wavg(0), STOCKNN_PARAMS * sizeof(float));
-        memcpy(scratch.new_elite(ELITE_COUNT + 1), scratch.wavg(1), STOCKNN_PARAMS * sizeof(float));
-        memcpy(scratch.new_elite(ELITE_COUNT + 2), scratch.wavg(2), STOCKNN_PARAMS * sizeof(float));
-
-        // Wavg portfolios: use winner_count current portfolios
-        Portfolio wp5{}, wp10{}, wp15{};
-        const Portfolio* p5[5], *p10[10], *p15[15];
-        for (int k = 0; k < n5;  k++) p5[k]  = &state.portfolios[k];
-        for (int k = 0; k < n10; k++) p10[k] = &state.portfolios[k];
-        for (int k = 0; k < n15; k++) p15[k] = &state.portfolios[k];
-        wavg_portfolio(p5,  w5_weights,  n5,  wp5);
-        wavg_portfolio(p10, w10_weights, n10, wp10);
-        wavg_portfolio(p15, w15_weights, n15, wp15);
-        state.portfolios[ELITE_COUNT]     = wp5;
-        state.portfolios[ELITE_COUNT + 1] = wp10;
-        state.portfolios[ELITE_COUNT + 2] = wp15;
-
-        // Commit new_elites → elite_buf for ELITE_POOL slots
-        for (int k = 0; k < ELITE_POOL; k++)
-            memcpy(scratch.elite(k), scratch.new_elite(k), STOCKNN_PARAMS * sizeof(float));
-
-        // Save elites to models_dir
-        save_industry_elites(models_dir, ind_i, scratch.elite_buf);
-
-        float best_after = compute_value_ind(state.portfolios[0], day_sym, fill_sym);
-        log_msg(std::string("[") + IND_SHORT[ind_i] + "] Day " +
-                std::to_string(actual_day + 1) + "/" + std::to_string(total_avail) +
-                " burst#" + std::to_string(burst_num) +
-                " sigma=" + std::to_string(burst_sigma).substr(0, 7) +
-                " | best $" + std::to_string((int)best_before) +
-                " → $" + std::to_string((int)best_after) +
-                (best_after > best_before ? " [improved]" : ""));
-        best_before = best_after;
-    }
-}
+static void load_ind_history(const std::string& dir, int ind_i, WorkerScratch& scratch);
+static void save_ind_history(const std::string& dir, int ind_i, const WorkerScratch& scratch);
 
 // ── step_industry ───────────────────────────────────────────────────────────────
 
@@ -1228,10 +639,16 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                                const DayData& day, const DayData* fill,
                                int actual_day, int total_avail,
                                int day_num, int num_days,
-                               float sigma, bool freeze, const bool* seq_flags,
-                               float daily_sigma = -1.f) {
+                               float sigma, bool freeze, const bool* seq_flags) {
     // Load this industry's elites from disk (or random init on first day)
     load_or_init_industry(models_dir, load_dir, ind_i, scratch.elite_buf);
+    // Load per-industry elite history (or reset at pass start)
+    if (day_num == 0) {
+        scratch.hist_head  = 0;
+        scratch.hist_count = 0;
+    } else {
+        load_ind_history(models_dir, ind_i, scratch);
+    }
     const OHLCV* day_sym  = day.sym[ind_i];
     const OHLCV* fill_sym = fill ? fill->sym[ind_i] : day_sym;
     // Compute num_past = minimum history length across symbols
@@ -1242,7 +659,8 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     if (day_num % 10 == 0 || day_num == num_days - 1)
         log_msg(std::string("[") + IND_SHORT[ind_i] + "] Day " +
                 std::to_string(actual_day + 1) + "/" + std::to_string(total_avail) +
-                " — running 200 models (history=" + std::to_string(num_past) + "/15 days warm)");
+                " — running 200 models + " + std::to_string(scratch.hist_count * HIST_PER_DAY) +
+                " history (ohlcv_hist=" + std::to_string(num_past) + "/15 days warm)");
 
     // ── Baseline: slot 0 valued at fill prices with no trading ──────────────
     float ref_cash = state.portfolios[0].cash;
@@ -1532,28 +950,133 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         sell_exec += local_sell;
     }
 
+    // ── Score history models ─────────────────────────────────────────────────
+    Portfolio hist_ports[HIST_DAYS * HIST_PER_DAY] = {};
+    float hist_scores[HIST_DAYS * HIST_PER_DAY] = {};
+    int n_hist = scratch.hist_count * HIST_PER_DAY;
+    for (int h = 0; h < n_hist; h++) {
+        Portfolio& port = hist_ports[h];
+        port.cash = ref_cash;
+        for (int j = 0; j < IND_SYMS; j++) {
+            port.holdings[j]    = ref_hold[j];
+            port.stop_prices[j] = ref_stop[j];
+        }
+        const float* W = scratch.hist(h / HIST_PER_DAY, h % HIST_PER_DAY);
+        stock_forward(W, history_arr, today_arr, out48);
+        float local_buy = 0.f, local_sell = 0.f;
+        // ── Phase 1: partial sells, gap sell_all, high-first sell_all, stops, buys ─
+        for (int j = 0; j < IND_SYMS; j++) {
+            if (!day_sym[j].valid) continue;
+            float buy_qty             = out48[4*j+0];
+            float buy_price_frac      = out48[4*j+1];
+            float sell_all_price_frac = out48[4*j+2];
+            float sell_qty            = out48[4*j+3];
+            float low_t  = day_sym[j].low;
+            float high_t = day_sym[j].high;
+            float span_t = std::max(high_t - low_t, 1e-9f);
+            float sell_all_price = low_t + sell_all_price_frac * span_t;
+            float buy_price      = low_t + buy_price_frac * span_t;
+            float stop_loss      = buy_price * 0.9f;
+            float nd_open = fill_sym[j].valid ? fill_sym[j].open  : day_sym[j].close;
+            float nd_low  = fill_sym[j].valid ? fill_sym[j].low   : day_sym[j].low;
+            float nd_high = fill_sym[j].valid ? fill_sym[j].high  : day_sym[j].high;
+            bool low_first = seq_flags[ind_i * IND_SYMS + j];
+            if (sell_qty > 1e-6f && port.holdings[j] > 1e-6f) {
+                float amt = std::min(sell_qty, port.holdings[j]);
+                port.holdings[j] -= amt;
+                port.cash        += sell_net(amt, nd_open);
+                local_sell       += amt;
+            }
+            if (port.holdings[j] > 1e-6f && nd_open >= sell_all_price) {
+                float amt = port.holdings[j];
+                port.holdings[j] = 0.f;
+                port.cash        += sell_net(amt, nd_open);
+                local_sell       += amt;
+            }
+            if (!low_first && port.holdings[j] > 1e-6f &&
+                nd_low < sell_all_price && sell_all_price < nd_high) {
+                float slipped = sell_all_price * (1.f - SLIPPAGE_RATE);
+                float amt = port.holdings[j];
+                port.holdings[j] = 0.f;
+                port.cash        += sell_net(amt, slipped);
+                local_sell       += amt;
+            }
+            float stop_p = port.stop_prices[j];
+            if (stop_p > 0.f && port.holdings[j] > 1e-6f) {
+                if (nd_open <= stop_p) {
+                    float amt = port.holdings[j];
+                    port.holdings[j] = 0.f;
+                    port.cash        += sell_net(amt, nd_open);
+                    local_sell       += amt;
+                } else if (nd_low <= stop_p) {
+                    float slipped = stop_p * (1.f - SLIPPAGE_RATE);
+                    float amt = port.holdings[j];
+                    port.holdings[j] = 0.f;
+                    port.cash        += sell_net(amt, slipped);
+                    local_sell       += amt;
+                }
+            }
+            if (buy_qty > 1e-6f && buy_price > 0.f) {
+                float fill_price = 0.f;
+                if (nd_open <= buy_price)
+                    fill_price = nd_open;
+                else if (nd_low < buy_price && buy_price < nd_high)
+                    fill_price = buy_price * (1.f + SLIPPAGE_RATE);
+                if (fill_price > 0.f) {
+                    float affordable = port.cash / fill_price;
+                    float buy_amount = std::min(buy_qty, affordable);
+                    if (buy_amount > 1e-6f) {
+                        float port_value = port.cash;
+                        for (int k = 0; k < IND_SYMS; k++) {
+                            float cp = fill_sym[k].valid ? fill_sym[k].close :
+                                       day_sym[k].valid  ? day_sym[k].close  : 0.f;
+                            port_value += port.holdings[k] * cp;
+                        }
+                        float cur_sym_val = port.holdings[j] * fill_price;
+                        float max_spend   = std::max(0.f, MAX_SINGLE_STOCK_PCT * port_value - cur_sym_val);
+                        buy_amount = std::min(buy_amount, max_spend / fill_price);
+                    }
+                    if (buy_amount > 1e-6f) {
+                        port.holdings[j]    += buy_amount;
+                        port.cash           -= buy_amount * fill_price;
+                        port.stop_prices[j]  = stop_loss;
+                        local_buy           += buy_amount;
+                    }
+                }
+            }
+        }
+        // ── Phase 2: low-first intraday sell_all ──────────────────────────────
+        for (int j = 0; j < IND_SYMS; j++) {
+            if (!day_sym[j].valid) continue;
+            if (!seq_flags[ind_i * IND_SYMS + j]) continue;
+            float sell_all_price_frac = out48[4*j+2];
+            float span_t = std::max(day_sym[j].high - day_sym[j].low, 1e-9f);
+            float sell_all_price = day_sym[j].low + sell_all_price_frac * span_t;
+            float nd_low  = fill_sym[j].valid ? fill_sym[j].low  : day_sym[j].low;
+            float nd_high = fill_sym[j].valid ? fill_sym[j].high : day_sym[j].high;
+            if (port.holdings[j] > 1e-6f && nd_low < sell_all_price && sell_all_price < nd_high) {
+                float slipped = sell_all_price * (1.f - SLIPPAGE_RATE);
+                float amt = port.holdings[j];
+                port.holdings[j] = 0.f;
+                port.cash        += sell_net(amt, slipped);
+                local_sell       += amt;
+            }
+        }
+        hist_scores[h] = compute_value_ind(port, day_sym, fill_sym);
+        (void)local_buy; (void)local_sell;
+    }
+
     // ── Score, flags, floor check ────────────────────────────────────────────
     float best_score  = *std::max_element(slot_scores, slot_scores + N_SLOTS);
     float best_delta  = best_score - baseline;
     float worst_delta = *std::min_element(slot_scores, slot_scores + N_SLOTS) - baseline;
 
-    // HARD / SOFT gain flags
-    float pct_gain = baseline > 0.f ? (best_delta / baseline * 100.f) : 0.f;
-    if (pct_gain >= 12.5f) {
-        write_dump_json(ind_i, actual_day, "HARD", baseline, best_delta, pct_gain,
-                        slot_scores, day_sym, fill_sym);
-        log_msg(std::string("[") + IND_SHORT[ind_i] + "] Day " +
-                std::to_string(actual_day+1) + "/" + std::to_string(total_avail) +
-                " *** HARD FLAG: +" + std::to_string(pct_gain).substr(0,5) +
-                "% gain — dumped to data_dump/day_" + std::to_string(actual_day+1) + "/ ***");
-    } else if (pct_gain >= 10.0f) {
-        write_dump_json(ind_i, actual_day, "SOFT", baseline, best_delta, pct_gain,
-                        slot_scores, day_sym, fill_sym);
-        log_msg(std::string("[") + IND_SHORT[ind_i] + "] Day " +
-                std::to_string(actual_day+1) + "/" + std::to_string(total_avail) +
-                " ** SOFT FLAG: +" + std::to_string(pct_gain).substr(0,5) +
-                "% gain — dumped **");
-    }
+    // Elite stats (slots 0..ELITE_COUNT-1 portfolio values)
+    float elite_max_val = *std::max_element(slot_scores, slot_scores + ELITE_COUNT);
+    float elite_min_val = *std::min_element(slot_scores, slot_scores + ELITE_COUNT);
+    float elite_mean_val = 0.f;
+    for (int s = 0; s < ELITE_COUNT; s++) elite_mean_val += slot_scores[s];
+    elite_mean_val /= ELITE_COUNT;
 
     log_msg(std::string("[") + IND_SHORT[ind_i] + "] Day " +
             std::to_string(actual_day + 1) + "/" + std::to_string(total_avail) +
@@ -1575,7 +1098,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                 state.portfolios[s].stop_prices[j] = 0.f;
             }
         }
-        return {baseline, baseline, 0.f, 0.f, 0.f, 0};
+        return {baseline, baseline, 0.f, 0.f, 0.f, 0, 0.f, 0.f, 0.f};
     }
 
     // Zero-trade inaction filter
@@ -1608,96 +1131,6 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         }
     }
 
-    // ── Historical elite scoring ───────────────────────────────────────────────
-    struct HistCand {
-        float sel_score, slot_score;
-        int   ring_slot, elite_idx, age_offset;
-        Portfolio port;
-    };
-    std::vector<HistCand> hist_cands;
-    if (state.hist_ring_count > 0 && !all_inactive) {
-        scratch.ensure_hist_elite_buf();
-        float out48h[48];
-        float below_floor_thresh_h = baseline * 0.9f;
-        float survival_floor_h     = -(baseline * 0.1f);
-        for (int age = 0; age < state.hist_ring_count; age++) {
-            int ring_slot = (state.hist_ring_next - state.hist_ring_count + age +
-                             HIST_ELITE_DAYS * 2) % HIST_ELITE_DAYS;
-            if (!load_hist_ring_slot_ind(models_dir, g_ind_names[ind_i].c_str(),
-                                          ring_slot, scratch.hist_elite_buf))
-                continue;
-            for (int he = 0; he < ELITE_POOL; he++) {
-                Portfolio h_port;
-                h_port.cash = ref_cash;
-                for (int j = 0; j < IND_SYMS; j++) {
-                    h_port.holdings[j]    = ref_hold[j];
-                    h_port.stop_prices[j] = ref_stop[j];
-                }
-                float h_score = sim_ind_model(
-                    scratch.hist_elite_buf + (size_t)he * STOCKNN_PARAMS,
-                    history_arr, today_arr,
-                    day_sym, fill_sym,
-                    seq_flags + (size_t)ind_i * IND_SYMS,
-                    out48h, h_port);
-                if (h_score < below_floor_thresh_h) continue;
-                float raw_delta = h_score - baseline;
-                float hsel;
-                if (raw_delta > 0.f && h_score > 0.f) {
-                    float invested_pct = std::max(0.f, 1.f - h_port.cash / h_score);
-                    hsel = raw_delta * invested_pct;
-                } else {
-                    hsel = raw_delta;
-                }
-                if (hsel < survival_floor_h) continue;
-                hist_cands.push_back({hsel, h_score, ring_slot, he, age, h_port});
-            }
-        }
-    }
-
-    // UNDER_INVEST flag: check elite candidates (ELITE_COUNT slots by sel_score rank)
-    {
-        // Build top-ELITE_COUNT candidate indices by sel_score
-        std::vector<std::pair<float,int>> elite_candidates;
-        for (int s = 0; s < N_SLOTS; s++)
-            elite_candidates.push_back({sel_scores[s], s});
-        std::partial_sort(elite_candidates.begin(),
-                          elite_candidates.begin() + std::min((int)elite_candidates.size(), ELITE_COUNT),
-                          elite_candidates.end(),
-                          [](const auto& a, const auto& b){ return a.first > b.first; });
-        int n_cand = std::min((int)elite_candidates.size(), ELITE_COUNT);
-
-        // Detect fill-down day: majority of symbols closed below open on fill day
-        int fill_down_count = 0;
-        for (int j = 0; j < IND_SYMS; j++) {
-            if (fill_sym[j].valid && fill_sym[j].close < fill_sym[j].open)
-                fill_down_count++;
-        }
-        bool fill_down_day = (fill_down_count > IND_SYMS / 2);
-
-        if (!fill_down_day) {
-            // Mirror Python: collect elite slots with ≥50% cash; avg_invested over that subset
-            float ui_total_invested = 0.f;
-            int   n_over_cash = 0;
-            for (int k = 0; k < n_cand; k++) {
-                int s = elite_candidates[k].second;
-                float val = slot_scores[s];
-                if (val > 0.f && state.portfolios[s].cash / val >= 0.5f) {
-                    ui_total_invested += 1.f - state.portfolios[s].cash / val;
-                    n_over_cash++;
-                }
-            }
-            if (n_over_cash > 0) {
-                float avg_invested = ui_total_invested / n_over_cash;
-                write_dump_json(ind_i, actual_day, "UNDER_INVEST", baseline, best_delta,
-                                avg_invested * 100.f, slot_scores, day_sym, fill_sym);
-                log_msg(std::string("[") + IND_SHORT[ind_i] + "] Day " +
-                        std::to_string(actual_day+1) + "/" + std::to_string(total_avail) +
-                        " * UNDER_INVEST: " + std::to_string(n_over_cash) + " elite(s) ≥50% cash"
-                        ", avg_invested=" + std::to_string(avg_invested * 100.f).substr(0,5) + "% — dumped *");
-            }
-        }
-    }
-
     // Preserve slot 0's own portfolio before selection overwrites it
     Portfolio slot0_own = state.portfolios[0];
 
@@ -1706,7 +1139,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         float survival_floor = -(baseline * 0.1f);
         float below_floor_thresh = baseline * 0.9f;
 
-        // Build sorted surviving list (regular slots + historical candidates)
+        // Build sorted surviving list (N_SLOTS current slots + history candidates)
         std::vector<std::pair<float,int>> surviving;
         for (int s = 0; s < N_SLOTS; s++) {
             if (inactive[s]) continue;
@@ -1714,23 +1147,31 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             if (sel_scores[s] < survival_floor) continue;
             surviving.push_back({sel_scores[s], s});
         }
+        // History candidates (no inactive filter; slot index = N_SLOTS+h)
+        for (int h = 0; h < n_hist; h++) {
+            float raw_delta = hist_scores[h] - baseline;
+            float sel_h = (raw_delta > 0.f && hist_scores[h] > 0.f)
+                ? raw_delta * std::max(0.f, 1.f - hist_ports[h].cash / hist_scores[h])
+                : raw_delta;
+            if (hist_scores[h] < below_floor_thresh) continue;
+            if (sel_h < survival_floor) continue;
+            surviving.push_back({sel_h, N_SLOTS + h});
+        }
         if (surviving.empty()) {
-            // relax: drop inactive filter
+            // relax: drop inactive filter (history already included above)
             for (int s = 0; s < N_SLOTS; s++) {
                 if (slot_scores[s] < below_floor_thresh) continue;
                 if (sel_scores[s] < survival_floor) continue;
                 surviving.push_back({sel_scores[s], s});
             }
         }
-        // Historical candidates already filtered by floor in scoring block (negative IDs)
-        for (int h = 0; h < (int)hist_cands.size(); h++)
-            surviving.push_back({hist_cands[h].sel_score, -(h + 1)});
 
         if (!surviving.empty()) {
             std::sort(surviving.begin(), surviving.end(),
                       [](const auto& a, const auto& b){ return a.first > b.first; });
             int n_top = std::min((int)surviving.size(), ELITE_COUNT);
 
+            // Source ranks (indices into current state.elites[]) for top-17
             int   src_rank[ELITE_COUNT] = {};
             float src_val[ELITE_COUNT]  = {};
             for (int k = 0; k < n_top; k++) {
@@ -1746,47 +1187,40 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             normalize_weights(src_val, w10_weights, n10);
             normalize_weights(src_val, w15_weights, n15);
 
-            // Portfolio wavg — historical entries use their traded portfolio
+            // Portfolio wavg: normal slots → state.portfolios, history slots → hist_ports
+            auto get_port = [&](int sl) -> const Portfolio* {
+                return (sl < N_SLOTS) ? &state.portfolios[sl] : &hist_ports[sl - N_SLOTS];
+            };
             Portfolio wp5{}, wp10{}, wp15{};
             const Portfolio* p5[5], *p10[10], *p15[15];
-            auto port_ptr = [&](int id) -> const Portfolio* {
-                return id < 0 ? &hist_cands[-(id+1)].port : &state.portfolios[id];
-            };
-            for (int k = 0; k < n5;  k++) p5[k]  = port_ptr(src_rank[k]);
-            for (int k = 0; k < n10; k++) p10[k] = port_ptr(src_rank[k]);
-            for (int k = 0; k < n15; k++) p15[k] = port_ptr(src_rank[k]);
+            for (int k = 0; k < n5;  k++) p5[k]  = get_port(src_rank[k]);
+            for (int k = 0; k < n10; k++) p10[k] = get_port(src_rank[k]);
+            for (int k = 0; k < n15; k++) p15[k] = get_port(src_rank[k]);
             wavg_portfolio(p5,  w5_weights,  n5,  wp5);
             wavg_portfolio(p10, w10_weights, n10, wp10);
             wavg_portfolio(p15, w15_weights, n15, wp15);
 
-            // Copy/regenerate weights into new_elites; historical entries reload ring file
+            // Copy/regenerate top-n_top into new_elites[0..n_top-1].
+            // slot < ELITE_POOL: copy elite directly.
+            // ELITE_POOL <= slot < N_SLOTS: mutation — regenerate from parent + seed.
+            // slot >= N_SLOTS: history candidate — copy from hist_buf.
             Portfolio new_ports[ELITE_POOL];
             for (int k = 0; k < n_top; k++) {
-                int id = src_rank[k];
-                if (id < 0) {
-                    const auto& hc = hist_cands[-(id+1)];
-                    if (load_hist_ring_slot_ind(models_dir, g_ind_names[ind_i].c_str(),
-                                                hc.ring_slot, scratch.hist_elite_buf)) {
-                        memcpy(scratch.new_elite(k),
-                               scratch.hist_elite_buf + (size_t)hc.elite_idx * STOCKNN_PARAMS,
-                               STOCKNN_PARAMS * sizeof(float));
-                    } else {
-                        memcpy(scratch.new_elite(k), scratch.elite(0), STOCKNN_PARAMS * sizeof(float));
-                    }
-                    new_ports[k] = hc.port;
-                    log_msg(std::string("[") + IND_SHORT[ind_i] + "]   HIST ELITE re-entered: H" +
-                            std::to_string(hc.age_offset) + "." + std::to_string(hc.elite_idx) +
-                            " → slot " + std::to_string(k) +
-                            " (sel_score=" + std::to_string(hc.sel_score).substr(0,6) + ")");
-                } else if (id < ELITE_POOL) {
-                    memcpy(scratch.new_elite(k), scratch.elite(id), STOCKNN_PARAMS * sizeof(float));
-                    new_ports[k] = state.portfolios[id];
+                int slot = src_rank[k];
+                if (slot >= N_SLOTS) {
+                    int h = slot - N_SLOTS;
+                    memcpy(scratch.new_elite(k), scratch.hist(h / HIST_PER_DAY, h % HIST_PER_DAY),
+                           STOCKNN_PARAMS * sizeof(float));
+                    new_ports[k] = hist_ports[h];
+                } else if (slot < ELITE_POOL) {
+                    memcpy(scratch.new_elite(k), scratch.elite(slot), STOCKNN_PARAMS * sizeof(float));
+                    new_ports[k] = state.portfolios[slot];
                 } else {
-                    int mut_i  = id - ELITE_POOL;
+                    int mut_i  = slot - ELITE_POOL;
                     int parent = mut_i / MUTATIONS_PER_PARENT;
                     memcpy(scratch.new_elite(k), scratch.elite(parent), STOCKNN_PARAMS * sizeof(float));
                     apply_gaussian(scratch.new_elite(k), STOCKNN_PARAMS, sigma, mut_seeds[mut_i]);
-                    new_ports[k] = state.portfolios[id];
+                    new_ports[k] = state.portfolios[slot];
                 }
             }
             for (int k = n_top; k < ELITE_COUNT; k++) {
@@ -1822,19 +1256,19 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             std::string elite_display = "";
             for (int k = 0; k < std::min(n_top, 5); k++) {
                 if (k > 0) elite_display += ",";
-                int id = src_rank[k];
-                if (id < 0) {
-                    const auto& hc = hist_cands[-(id+1)];
-                    elite_display += "H" + std::to_string(hc.age_offset) + "." +
-                                     std::to_string(hc.elite_idx);
-                } else if (id < ELITE_COUNT) {
-                    elite_display += std::to_string(id) + ".0";
-                } else if (id < ELITE_POOL) {
+                int sl = src_rank[k];
+                if (sl >= N_SLOTS) {
+                    int h = sl - N_SLOTS;
+                    elite_display += "H" + std::to_string(h / HIST_PER_DAY) +
+                                     "." + std::to_string(h % HIST_PER_DAY);
+                } else if (sl < ELITE_COUNT) {
+                    elite_display += std::to_string(sl) + ".0";
+                } else if (sl < ELITE_POOL) {
                     const char* nm[] = {"w5","w10","w15"};
-                    elite_display += nm[id - ELITE_COUNT];
+                    elite_display += nm[sl - ELITE_COUNT];
                 } else {
-                    int p = (id - ELITE_POOL) / MUTATIONS_PER_PARENT;
-                    int m = (id - ELITE_POOL) % MUTATIONS_PER_PARENT + 1;
+                    int p = (sl - ELITE_POOL) / MUTATIONS_PER_PARENT;
+                    int m = (sl - ELITE_POOL) % MUTATIONS_PER_PARENT + 1;
                     elite_display += std::to_string(p) + "." + std::to_string(m);
                 }
             }
@@ -1858,15 +1292,20 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         }
     }
 
-    // Daily burst refinement (only when --daily flag is set)
-    if (daily_sigma > 0.f && !freeze)
-        run_daily_burst(ind_i, state, scratch, day_sym, fill_sym,
-                        ref_cash, ref_hold, ref_stop,
-                        history_arr, today_arr, seq_flags,
-                        models_dir, actual_day, total_avail, daily_sigma);
-
     // Restore slot 0's own portfolio
     state.portfolios[0] = slot0_own;
+
+    // ── Push today's top-7 elites + 3 wavg slots to history circular buffer ──
+    {
+        int hd = scratch.hist_head;
+        for (int k = 0; k < HIST_ELITE; k++)
+            memcpy(scratch.hist(hd, k), scratch.elite(k), STOCKNN_PARAMS * sizeof(float));
+        for (int k = 0; k < HIST_WAVG; k++)
+            memcpy(scratch.hist(hd, HIST_ELITE + k), scratch.elite(ELITE_COUNT + k),
+                   STOCKNN_PARAMS * sizeof(float));
+        scratch.hist_head = (hd + 1) % HIST_DAYS;
+        if (scratch.hist_count < HIST_DAYS) scratch.hist_count++;
+    }
 
     // Report: top_hold = slot0 holdings value, top_cash = slot0 cash
     float top_hold = 0.f;
@@ -1876,156 +1315,188 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         top_hold += slot0_own.holdings[j] * price;
     }
 
-    // Save updated elites back to disk; append to hist ring for next day
-    save_industry_elites(models_dir, ind_i, scratch.elite_buf);
-    if (!freeze)
-        save_hist_ring_ind(models_dir, g_ind_names[ind_i].c_str(), state, scratch.elite_buf);
+    // Save updated elites and history back to disk
+    if (!g_no_save) {
+        save_industry_elites(models_dir, ind_i, scratch.elite_buf);
+        save_ind_history(models_dir, ind_i, scratch);
+    }
 
     IndResult res;
-    res.baseline   = baseline;
-    res.slot0_score = slot_scores[0];
-    res.best_delta = best_delta;
-    res.top_hold   = top_hold;
-    res.top_cash   = slot0_own.cash;
-    res.new_streak = new_streak;
-    state.streak   = new_streak;
+    res.baseline      = baseline;
+    res.slot0_score   = slot_scores[0];
+    res.best_delta    = best_delta;
+    res.top_hold      = top_hold;
+    res.top_cash      = slot0_own.cash;
+    res.new_streak    = new_streak;
+    res.elite_max_val = elite_max_val;
+    res.elite_min_val = elite_min_val;
+    res.elite_mean_val= elite_mean_val;
+    state.streak      = new_streak;
     return res;
+}
+
+// ── Master feature construction helpers ─────────────────────────────────────────
+
+// Solve 3×3 augmented system A[3][4] in-place; result in x[3].
+static void gauss_solve3(float A[3][4], float x[3]) {
+    for (int col = 0; col < 3; col++) {
+        int piv = col;
+        for (int r = col+1; r < 3; r++)
+            if (fabsf(A[r][col]) > fabsf(A[piv][col])) piv = r;
+        if (piv != col) for (int j = 0; j < 4; j++) { float t=A[col][j]; A[col][j]=A[piv][j]; A[piv][j]=t; }
+        if (fabsf(A[col][col]) < 1e-12f) continue;
+        for (int r = col+1; r < 3; r++) {
+            float f = A[r][col] / A[col][col];
+            for (int j = col; j < 4; j++) A[r][j] -= f * A[col][j];
+        }
+    }
+    for (int i = 2; i >= 0; i--) {
+        x[i] = A[i][3];
+        for (int j = i+1; j < 3; j++) x[i] -= A[i][j] * x[j];
+        x[i] = fabsf(A[i][i]) > 1e-12f ? x[i] / A[i][i] : 0.f;
+    }
+}
+
+// Solve 4×4 augmented system A[4][5] in-place; result in x[4].
+static void gauss_solve4(float A[4][5], float x[4]) {
+    for (int col = 0; col < 4; col++) {
+        int piv = col;
+        for (int r = col+1; r < 4; r++)
+            if (fabsf(A[r][col]) > fabsf(A[piv][col])) piv = r;
+        if (piv != col) for (int j = 0; j < 5; j++) { float t=A[col][j]; A[col][j]=A[piv][j]; A[piv][j]=t; }
+        if (fabsf(A[col][col]) < 1e-12f) continue;
+        for (int r = col+1; r < 4; r++) {
+            float f = A[r][col] / A[col][col];
+            for (int j = col; j < 5; j++) A[r][j] -= f * A[col][j];
+        }
+    }
+    for (int i = 3; i >= 0; i--) {
+        x[i] = A[i][4];
+        for (int j = i+1; j < 4; j++) x[i] -= A[i][j] * x[j];
+        x[i] = fabsf(A[i][i]) > 1e-12f ? x[i] / A[i][i] : 0.f;
+    }
+}
+
+// Degree-2 polyfit via normal equations; coefs[3] = {a2, a1, a0} (highest power first).
+// x = linspace(0,1,n); n must be ≥ 1.
+static void polyfit2(const float* y, int n, float coefs[3]) {
+    float A[3][4] = {};
+    for (int i = 0; i < n; i++) {
+        float xi = (n > 1) ? (float)i / (float)(n-1) : 0.f;
+        float v[3] = {xi*xi, xi, 1.f};
+        for (int r = 0; r < 3; r++) {
+            for (int c = 0; c < 3; c++) A[r][c] += v[r] * v[c];
+            A[r][3] += v[r] * y[i];
+        }
+    }
+    gauss_solve3(A, coefs);
+}
+
+// Degree-3 polyfit; coefs[4] = {a3, a2, a1, a0}.
+static void polyfit3(const float* y, int n, float coefs[4]) {
+    float A[4][5] = {};
+    for (int i = 0; i < n; i++) {
+        float xi = (n > 1) ? (float)i / (float)(n-1) : 0.f;
+        float v[4] = {xi*xi*xi, xi*xi, xi, 1.f};
+        for (int r = 0; r < 4; r++) {
+            for (int c = 0; c < 4; c++) A[r][c] += v[r] * v[c];
+            A[r][4] += v[r] * y[i];
+        }
+    }
+    gauss_solve4(A, coefs);
+}
+
+// hist_at: clamp-to-oldest accessor into a rolling oldest-first buffer.
+// hist[0..hist_count-1]; k=0 → newest, k=hist_count-1 → oldest.
+static inline float hist_at(const float* hist, int hist_count, int k) {
+    int idx = hist_count - 1 - k;
+    return idx < 0 ? hist[0] : hist[idx];
+}
+
+// Fill window[0..win-1] with oldest-first values ending at newest, left-padding with oldest.
+static void fill_window(const float* hist, int hist_count, int win, float* window) {
+    for (int j = 0; j < win; j++) {
+        int src = (hist_count - win) + j;
+        window[j] = (src <= 0) ? hist[0] : hist[src];
+    }
+}
+
+// Build 444-feature vector for master from per-industry value history.
+// out444 layout per industry (37 features × 12 = 444):
+//   [0..17]   18 delta lookbacks at LOOKBACKS days
+//   [18..20]  3 poly-2 coefs over 5-day window
+//   [21..36]  16 poly-3 coefs over 4 windows (10,30,60,90 days)
+static void build_master_features(const float ind_val_hist[][IND_HIST_CAP],
+                                   int hist_count, float* out444) {
+    static constexpr int LOOKBACKS[18] = {1,2,3,4,5,6,7,8,9,10,15,20,25,30,40,50,60,90};
+    static constexpr int POLY3_WINS[4] = {10,30,60,90};
+    memset(out444, 0, 444 * sizeof(float));
+
+    for (int i = 0; i < N_IND; i++) {
+        const float* h = ind_val_hist[i];
+        float* feat = out444 + i * 37;
+
+        // 18 delta lookbacks
+        for (int lt = 0; lt < 18; lt++) {
+            int t  = LOOKBACKS[lt];
+            float vt  = hist_at(h, hist_count, t);
+            float vt1 = hist_at(h, hist_count, t + 1);
+            float denom = fabsf(vt1) > 1e-9f ? vt1 : (vt1 >= 0.f ? 1e-9f : -1e-9f);
+            feat[lt] = (vt - vt1) / fabsf(denom);
+        }
+
+        // poly-2 over 5-day window
+        float win5[5];
+        fill_window(h, hist_count, 5, win5);
+        polyfit2(win5, 5, feat + 18);
+
+        // poly-3 over 4 windows (10,30,60,90)
+        float polywin[90];
+        for (int wi = 0; wi < 4; wi++) {
+            int W = POLY3_WINS[wi];
+            fill_window(h, hist_count, W, polywin);
+            polyfit3(polywin, W, feat + 21 + wi * 4);
+        }
+    }
 }
 
 // ── step_master ─────────────────────────────────────────────────────────────────
 
-static float step_master(MasterState& state, MasterScratch& scratch,
-                         const DayData& day, const DayData* fill,
-                         const IndResult* ind_results,
-                         int actual_day, int total_avail, int day_num, int num_days,
-                         float sigma, const std::string& models_dir) {
-    const DayData& fd = fill ? *fill : day;
+static MasterResult step_master(MasterState& state, MasterScratch& scratch,
+                                const IndResult* ind_results,
+                                int actual_day, int total_avail,
+                                float sigma) {
+    // Gate: must have 30+ days of actual market data before master can train.
+    if (actual_day < MASTER_START_DAY) return {0.f, 0.f, 0.f, 0.f, 0.f};
 
-    // Resolve actual_perf[N_IND]
+    // Compute actual_perf[N_IND] from slot-0 industry results
     float actual_perf[N_IND] = {};
     for (int i = 0; i < N_IND; i++) {
         if (ind_results[i].baseline > 0.f)
             actual_perf[i] = ind_results[i].slot0_score / ind_results[i].baseline - 1.f;
     }
 
-    // Pre-compute ind_stats: mean_deltas[15][5] per industry
-    // mean_deltas[t][k]: t=0 most recent, t=14 oldest; k=0..4 delta channel
-    float ind_mean_deltas[N_IND][15][5] = {};
-    float ind_volatility[N_IND] = {};
-    float ind_momentum[N_IND]   = {};
+    // Build 444-feature vector (same for all slots — features independent of portfolio state)
+    float today444[444];
+    build_master_features(state.ind_val_hist, state.ind_hist_count, today444);
 
-    for (int i = 0; i < N_IND; i++) {
-        for (int t = 0; t < 15; t++) {
-            float sum[5] = {}; int cnt = 0;
-            for (int j = 0; j < IND_SYMS; j++) {
-                const SymHist& h = state.sym_hist[i * IND_SYMS + j];
-                if (h.len > t) {
-                    const float* d = h.get(h.len - 1 - t).data;  // t steps back from newest
-                    for (int k = 0; k < 5; k++) sum[k] += d[5 + k];
-                    cnt++;
-                }
-            }
-            if (cnt > 0) for (int k = 0; k < 5; k++) ind_mean_deltas[i][t][k] = sum[k] / cnt;
-        }
-        // volatility and momentum from mean_deltas[*][0] (delta close)
-        float vals[15]; int vlen = 0;
-        for (int t = 0; t < 15; t++) vals[vlen++] = ind_mean_deltas[i][t][0];
-        float mean_v = 0.f;
-        for (int t = 0; t < vlen; t++) mean_v += vals[t];
-        mean_v /= vlen > 0 ? vlen : 1;
-        float var_v = 0.f;
-        for (int t = 0; t < vlen; t++) { float dv = vals[t] - mean_v; var_v += dv*dv; }
-        float std_v = vlen > 0 ? sqrtf(var_v / vlen) : 0.f;
-        float abs_mean = fabsf(mean_v);
-        ind_volatility[i] = abs_mean > 1e-9f ? std_v / abs_mean : 0.f;
-        float mean5 = 0.f;
-        for (int t = 0; t < std::min(vlen, 5); t++) mean5 += vals[t];
-        mean5 /= std::min(vlen, 5) > 0 ? std::min(vlen, 5) : 1;
-        ind_momentum[i] = abs_mean > 1e-9f ? mean5 / mean_v : 1.f;
-    }
-
-    // flat_cos_hist padded to 15
-    float fc_padded[15] = {};
-    int fc_start = 15 - state.flat_cos_len;
-    memcpy(fc_padded + fc_start, state.flat_cos_hist, state.flat_cos_len * sizeof(float));
-
-    // Build master history: hist15x61, row 0 = oldest
-    float hist_arr[15 * 61] = {};
-    for (int row = 0; row < 15; row++) {
-        // row 0 = oldest (t=14 in mean_deltas), row 14 = newest (t=0)
-        int t = 14 - row;
-        for (int i = 0; i < N_IND; i++)
-            for (int k = 0; k < 5; k++)
-                hist_arr[row * 61 + i * 5 + k] = ind_mean_deltas[i][t][k];
-        hist_arr[row * 61 + 60] = fc_padded[row];
-    }
-
-    // Compute today_ind_data: delta aggs and ind_mean_today per industry
-    float today_ind_aggs[N_IND][15] = {};
-    float today_ind_mean[N_IND]     = {};
-
-    for (int i = 0; i < N_IND; i++) {
-        float dl[IND_SYMS][5] = {};
-        for (int j = 0; j < IND_SYMS; j++) {
-            int si = i * IND_SYMS + j;
-            const OHLCV& d = day.sym[i][j];
-            float raw_t[5] = {d.valid?d.open:0, d.valid?d.close:0,
-                              d.valid?d.high:0, d.valid?d.low:0, d.valid?d.volume:0};
-            const HistEntry* prev = state.sym_hist[si].newest();
-            for (int k = 0; k < 5; k++) dl[j][k] = prev ? raw_t[k] - prev->data[k] : 0.f;
-        }
-        float sum_delta_close = 0.f;
-        for (int k = 0; k < 5; k++) {
-            float mx = dl[0][k], mn = dl[0][k], sm = 0.f;
-            for (int j = 0; j < IND_SYMS; j++) {
-                if (dl[j][k] > mx) mx = dl[j][k];
-                if (dl[j][k] < mn) mn = dl[j][k];
-                sm += dl[j][k];
-            }
-            today_ind_aggs[i][k * 3 + 0] = mx;
-            today_ind_aggs[i][k * 3 + 1] = mn;
-            today_ind_aggs[i][k * 3 + 2] = sm / IND_SYMS;
-        }
-        // ind_mean_today = mean delta_close across symbols
-        for (int j = 0; j < IND_SYMS; j++) sum_delta_close += dl[j][1];
-        today_ind_mean[i] = sum_delta_close / IND_SYMS;
-    }
-    float all_mean_today = 0.f;
-    for (int i = 0; i < N_IND; i++) all_mean_today += today_ind_mean[i];
-    all_mean_today /= N_IND;
-
-    // Build today_arr [229]
-    float today_arr[229] = {};
-    for (int i = 0; i < N_IND; i++) {
-        int base = i * 18;
-        for (int k = 0; k < 15; k++) today_arr[base + k] = today_ind_aggs[i][k];
-        today_arr[base + 15] = ind_volatility[i];
-        today_arr[base + 16] = ind_momentum[i];
-        float corr = fabsf(all_mean_today) > 1e-9f ? today_ind_mean[i] / all_mean_today : 1.f;
-        today_arr[base + 17] = corr;
-    }
-    // State: [cash_norm, holdings[12]]
+    // Snapshot slot-0's portfolio as baseline
     float ref_cash = state.portfolios[0].cash;
     float ref_hold[N_IND];
     for (int i = 0; i < N_IND; i++) ref_hold[i] = state.portfolios[0].holdings[i];
-    today_arr[216] = ref_cash / std::max(MST_STARTING_CASH, 1.f);
-    for (int i = 0; i < N_IND; i++) today_arr[217 + i] = ref_hold[i] * IND_UNIT_PRICE;
-
-    // Baseline
     float baseline = ref_cash;
     for (int i = 0; i < N_IND; i++) baseline += ref_hold[i] * IND_UNIT_PRICE;
 
-    // Reset all portfolios
+    // Reset all portfolios to slot-0's state; zero_counts for slots 1+ inherit slot 0's counts
     for (int s = 0; s < N_SLOTS; s++) {
         state.portfolios[s].cash = ref_cash;
         for (int i = 0; i < N_IND; i++) state.portfolios[s].holdings[i] = ref_hold[i];
     }
+    for (int s = 1; s < N_SLOTS; s++)
+        memcpy(state.zero_counts[s], state.zero_counts[0], N_IND * sizeof(int));
 
-    // Inference + trade loop — use per-master scratch (no thread-local statics)
-    float pred_scores[N_SLOTS] = {};
-    float slot_preds[N_SLOTS][N_IND] = {};
-    float out36[36];
-    float*    mast_mut_buf  = scratch.mut_buf;
+    // Pregenerate mutation seeds
+    float*    mast_mut_buf   = scratch.mut_buf;
     uint64_t* mast_mut_seeds = scratch.mut_seeds;
     {
         PCG32 seed_rng; seed_rng.seed((uint64_t)actual_day * 777017ULL + 99999ULL);
@@ -2033,7 +1504,41 @@ static float step_master(MasterState& state, MasterScratch& scratch,
             mast_mut_seeds[i] = ((uint64_t)seed_rng.next() << 32) | seed_rng.next();
     }
 
-    float floor_value = MST_STARTING_CASH * 0.02f;
+    // Compute optimal tiers retroactively from actual_perf (for points scoring)
+    // Negatives → tier 0; positives sorted ascending, split bottom-up into thirds.
+    // n_pos==1: opt=3; n_pos==2: lower=2,higher=3; n_pos>=3: bottom-up formula.
+    int opt_tier[N_IND] = {};
+    {
+        int pos_idx[N_IND]; int n_pos_opt = 0;
+        for (int i = 0; i < N_IND; i++)
+            if (actual_perf[i] >= 0.f) pos_idx[n_pos_opt++] = i;
+        std::sort(pos_idx, pos_idx + n_pos_opt,
+                  [&actual_perf](int a, int b){ return actual_perf[a] < actual_perf[b]; });
+        if (n_pos_opt == 1) {
+            opt_tier[pos_idx[0]] = 3;
+        } else if (n_pos_opt == 2) {
+            opt_tier[pos_idx[0]] = 2;
+            opt_tier[pos_idx[1]] = 3;
+        } else {
+            int base = n_pos_opt / 3, rem = n_pos_opt % 3;
+            int n1 = base + (rem >= 1 ? 1 : 0);
+            int n2 = base + (rem >= 2 ? 1 : 0);
+            for (int rank = 0; rank < n_pos_opt; rank++) {
+                int ind = pos_idx[rank];
+                if      (rank < n1)        opt_tier[ind] = 1;
+                else if (rank < n1 + n2)   opt_tier[ind] = 2;
+                else                        opt_tier[ind] = 3;
+            }
+        }
+    }
+
+    float ideal_pts = 0.f;
+    for (int i = 0; i < N_IND; i++) ideal_pts += (float)opt_tier[i];
+
+    float pred_scores[N_SLOTS] = {};
+    float port_vals[N_SLOTS]   = {};
+    int   slot_tiers[N_SLOTS][N_IND] = {};
+    float out48[48];
 
     for (int slot = 0; slot < N_SLOTS; slot++) {
         const float* W;
@@ -2047,137 +1552,140 @@ static float step_master(MasterState& state, MasterScratch& scratch,
             W = mast_mut_buf;
         }
 
-        master_forward(W, hist_arr, today_arr, out36);
-        for (int i = 0; i < N_IND; i++) slot_preds[slot][i] = out36[i];
+        master_forward(W, today444, out48);
+
+        // Decode tiers: argmax over each group of 4 logits
+        int tier[N_IND];
+        for (int i = 0; i < N_IND; i++) {
+            const float* lg = out48 + i * 4;
+            int best = 0;
+            for (int k = 1; k < 4; k++) if (lg[k] > lg[best]) best = k;
+            tier[i] = best;
+            slot_tiers[slot][i] = best;
+        }
+
+        // Update consecutive-zero counts for this slot
+        for (int i = 0; i < N_IND; i++) {
+            if (tier[i] == 0) state.zero_counts[slot][i]++;
+            else              state.zero_counts[slot][i] = 0;
+        }
 
         MasterPortfolio& port = state.portfolios[slot];
 
-        // Liquidation: sorted ascending by alloc weight
-        int sorted_inds[N_IND];
-        for (int i = 0; i < N_IND; i++) sorted_inds[i] = i;
-        std::sort(sorted_inds, sorted_inds + N_IND,
-                  [&out36](int a, int b){ return out36[a] < out36[b]; });
-
-        for (int si = 0; si < N_IND; si++) {
-            int i = sorted_inds[si];
-            float price = IND_UNIT_PRICE;
-            if (out36[12 + i] <= 0.5f) continue;  // liq_trigger
-            float cur_hold_v = port.holdings[i] * price;
-            if (cur_hold_v <= floor_value) continue;
-            float target_hold_v = out36[i] * MST_STARTING_CASH;
-            float depth = out36[12 + i];
-            float eff_tgt = target_hold_v + (1.f - depth) * std::max(0.f, cur_hold_v - target_hold_v);
-            eff_tgt = std::max(eff_tgt, floor_value);
-            float liq_v = std::max(0.f, std::min(cur_hold_v - eff_tgt, cur_hold_v - floor_value));
-            float liq_units = liq_v / price;
-            if (liq_units > 1e-9f) {
-                port.holdings[i] -= liq_units;
-                port.cash        += sell_net(liq_units, price);
-            }
-        }
-
-        // Deployment
+        // Liquidate industries with 3+ consecutive tier-0 predictions
         for (int i = 0; i < N_IND; i++) {
-            float price = IND_UNIT_PRICE;
-            float cur_hold_v = port.holdings[i] * price;
-            float target_hold_v = out36[i] * MST_STARTING_CASH;
-            float diff = target_hold_v - cur_hold_v;
-            if (diff <= 1e-6f) continue;
-            float affordable = std::min(diff, port.cash);
-            float units = affordable / price;
-            if (units > 1e-9f) {
-                port.holdings[i] += units;
-                port.cash        -= units * price;
+            if (state.zero_counts[slot][i] >= 3 && port.holdings[i] > 1e-9f) {
+                port.cash        += sell_net(port.holdings[i], IND_UNIT_PRICE);
+                port.holdings[i]  = 0.f;
             }
         }
 
-        // Apply daily returns
+        // Compute tier-based allocation (bottom-up, null-padded for n_pos < 3)
+        int positives[N_IND]; int n_pos = 0;
+        for (int i = 0; i < N_IND; i++) if (tier[i] > 0) positives[n_pos++] = i;
+
+        float alloc[N_IND] = {};
+        if (n_pos > 0) {
+            std::sort(positives, positives + n_pos,
+                      [&tier](int a, int b){ return tier[a] < tier[b]; });
+
+            float pool = port.cash;
+            for (int i = 0; i < N_IND; i++) pool += port.holdings[i] * IND_UNIT_PRICE;
+
+            if (n_pos == 1) {
+                alloc[positives[0]] = TIER_WEIGHTS[3] / NULL_DENOM * pool;
+            } else if (n_pos == 2) {
+                alloc[positives[0]] = TIER_WEIGHTS[2] / NULL_DENOM * pool;
+                alloc[positives[1]] = TIER_WEIGHTS[3] / NULL_DENOM * pool;
+            } else {
+                int base = n_pos / 3, rem = n_pos % 3;
+                int n1 = base + (rem >= 1 ? 1 : 0);
+                int n2 = base + (rem >= 2 ? 1 : 0);
+
+                int assigned[N_IND] = {};
+                for (int rank = 0; rank < n_pos; rank++) {
+                    int ind = positives[rank];
+                    if      (rank < n1)        assigned[ind] = 1;
+                    else if (rank < n1 + n2)   assigned[ind] = 2;
+                    else                        assigned[ind] = 3;
+                }
+
+                float total_w = 0.f;
+                for (int k = 0; k < n_pos; k++)
+                    total_w += TIER_WEIGHTS[assigned[positives[k]]];
+
+                if (total_w > 0.f)
+                    for (int k = 0; k < n_pos; k++) {
+                        int ind = positives[k];
+                        alloc[ind] = TIER_WEIGHTS[assigned[ind]] / total_w * pool;
+                    }
+            }
+        }
+
+        // Apply allocation: liquidate first, then buy
+        for (int i = 0; i < N_IND; i++) {
+            float cur_v = port.holdings[i] * IND_UNIT_PRICE;
+            float tgt_v = alloc[i];
+            if (cur_v > tgt_v + 1e-6f) {
+                float units = (cur_v - tgt_v) / IND_UNIT_PRICE;
+                port.holdings[i] -= units;
+                port.cash        += sell_net(units, IND_UNIT_PRICE);
+            }
+        }
+        for (int i = 0; i < N_IND; i++) {
+            float cur_v = port.holdings[i] * IND_UNIT_PRICE;
+            float tgt_v = alloc[i];
+            if (tgt_v > cur_v + 1e-6f) {
+                float diff = std::min(tgt_v - cur_v, port.cash);
+                float units = diff / IND_UNIT_PRICE;
+                port.holdings[i] += units;
+                port.cash        -= units * IND_UNIT_PRICE;
+            }
+        }
+
+        // Apply daily industry returns
         for (int i = 0; i < N_IND; i++)
             port.holdings[i] *= (1.f + actual_perf[i]);
-    }
 
-    // Compute target_pct from ind_results
-    float raw_deltas[N_IND] = {};
-    bool have_deltas = false;
-    for (int i = 0; i < N_IND; i++) {
-        if (ind_results[i].baseline > 0.f) {
-            raw_deltas[i] = ind_results[i].slot0_score - ind_results[i].baseline;
-            have_deltas = true;
-        }
-    }
-
-    float target_pct[N_IND] = {};
-    float flat_cos = 0.f;
-    float best_pred = 0.f;
-
-    if (have_deltas) {
-        float min_d = *std::min_element(raw_deltas, raw_deltas + N_IND);
-        float total = 0.f;
-        float shifted[N_IND];
-        for (int i = 0; i < N_IND; i++) { shifted[i] = raw_deltas[i] - min_d + 1e-9f; total += shifted[i]; }
-        for (int i = 0; i < N_IND; i++) target_pct[i] = shifted[i] / total;
-
-        // Compute pred scores
-        for (int s = 0; s < N_SLOTS; s++) {
-            float dot=0, na=0, nb=0;
-            for (int i = 0; i < N_IND; i++) {
-                dot += slot_preds[s][i] * target_pct[i];
-                na  += slot_preds[s][i] * slot_preds[s][i];
-                nb  += target_pct[i]    * target_pct[i];
-            }
-            float denom = sqrtf(na) * sqrtf(nb);
-            pred_scores[s] = denom > 1e-9f ? dot / denom : 0.f;
-            if (pred_scores[s] > best_pred) best_pred = pred_scores[s];
-        }
-
-        // flat_cos: uniform alloc vs target_pct
-        float flat_alloc = 1.f / N_IND;
-        float dot=0, na=0, nb=0;
+        // Score via points table against retroactive optimal tiers
+        float port_val = port.cash;
+        for (int i = 0; i < N_IND; i++) port_val += port.holdings[i] * IND_UNIT_PRICE;
+        port_vals[slot] = port_val;
+        float pts = 0.f;
         for (int i = 0; i < N_IND; i++) {
-            dot += flat_alloc * target_pct[i];
-            na  += flat_alloc * flat_alloc;
-            nb  += target_pct[i] * target_pct[i];
-        }
-        float denom = sqrtf(na) * sqrtf(nb);
-        flat_cos = denom > 1e-9f ? dot / denom : 0.f;
-    }
-
-    // ── Historical master elite scoring ──────────────────────────────────────
-    struct HistMstCand {
-        float pred_score;
-        int   ring_slot, elite_idx, age_offset;
-    };
-    std::vector<HistMstCand> hist_mst_cands;
-    if (state.hist_ring_count > 0 && have_deltas) {
-        scratch.ensure_hist_elite_buf();
-        float out36h[36];
-        for (int age = 0; age < state.hist_ring_count; age++) {
-            int ring_slot = (state.hist_ring_next - state.hist_ring_count + age +
-                             HIST_ELITE_DAYS * 2) % HIST_ELITE_DAYS;
-            if (!load_hist_ring_slot_mst(models_dir, ring_slot, scratch.hist_elite_buf))
-                continue;
-            for (int he = 0; he < ELITE_POOL; he++) {
-                master_forward(scratch.hist_elite_buf + (size_t)he * MASTERNN_PARAMS,
-                               hist_arr, today_arr, out36h);
-                float dotp=0, nap=0, nbp=0;
-                for (int i = 0; i < N_IND; i++) {
-                    dotp += out36h[i] * target_pct[i];
-                    nap  += out36h[i] * out36h[i];
-                    nbp  += target_pct[i] * target_pct[i];
-                }
-                float dp = sqrtf(nap) * sqrtf(nbp);
-                float hscore = dp > 1e-9f ? dotp / dp : 0.f;
-                hist_mst_cands.push_back({hscore, ring_slot, he, age});
-                if (hscore > best_pred) best_pred = hscore;
+            int pred = tier[i], opt = opt_tier[i];
+            if (opt == 0) {
+                if (pred > 0) pts += -2.f - 0.25f * pred;
+            } else if (pred == 0) {
+                pts -= (float)opt;
+            } else if (pred <= opt) {
+                pts += (float)pred;
+            } else {
+                pts += (float)opt - 0.25f * (float)(pred - opt);
             }
         }
+        pred_scores[slot] = pts * 1e9f + port_val;
     }
 
+    // Log tier distribution for slot-0
+    int tier_counts[4] = {};
+    for (int i = 0; i < N_IND; i++) tier_counts[slot_tiers[0][i]]++;
+    int best_slot_idx = (int)(std::max_element(pred_scores, pred_scores + N_SLOTS) - pred_scores);
+    float best_score  = pred_scores[best_slot_idx];
+    float best_pts_v  = (best_score - port_vals[best_slot_idx]) / 1e9f;
+    float slot0_pts_v = (pred_scores[0] - port_vals[0]) / 1e9f;
+
+    auto fmt_pts = [](float v) -> std::string {
+        char buf[32]; snprintf(buf, sizeof(buf), "%+.2f", v); return buf;
+    };
     log_msg(std::string("[master  ] Day ") + std::to_string(actual_day + 1) +
             "/" + std::to_string(total_avail) +
-            " | pred=" + std::to_string(best_pred).substr(0,6) +
-            " flat=" + std::to_string(flat_cos).substr(0,6) +
-            " | prod=$" + std::to_string((int)baseline));
+            " | best_pts=" + fmt_pts(best_pts_v) +
+            " slot0_pts=" + fmt_pts(slot0_pts_v) +
+            " | t0=" + std::to_string(tier_counts[0]) +
+            " t1="   + std::to_string(tier_counts[1]) +
+            " t2="   + std::to_string(tier_counts[2]) +
+            " t3="   + std::to_string(tier_counts[3]));
 
     // Floor reset
     if (baseline < MST_STARTING_CASH * 0.9f) {
@@ -2185,35 +1693,28 @@ static float step_master(MasterState& state, MasterScratch& scratch,
             state.portfolios[s].cash = MST_STARTING_CASH;
             for (int i = 0; i < N_IND; i++) state.portfolios[s].holdings[i] = 0.f;
         }
-        return flat_cos;
+        memset(state.zero_counts, 0, sizeof(state.zero_counts));
+        return {0.f, 0.f, 0.f, 0.f, 0.f};
     }
 
+    // Snapshot slot-0's own portfolio and zero_counts before selection mutates them
     MasterPortfolio slot0_own = state.portfolios[0];
+    int slot0_zc[N_IND];
+    memcpy(slot0_zc, state.zero_counts[0], N_IND * sizeof(int));
 
-    // Selection
-    if (best_pred >= 0.50f) {
-        // Compute mean/variance over combined pool (regular + historical)
-        int total_n = N_SLOTS + (int)hist_mst_cands.size();
+    // Selection gate: run selection if any slot scored non-negative points today.
+    if (best_pts_v >= 0.f) {
         float mean_ps = 0.f;
         for (int s = 0; s < N_SLOTS; s++) mean_ps += pred_scores[s];
-        for (auto& hc : hist_mst_cands) mean_ps += hc.pred_score;
-        mean_ps /= total_n;
+        mean_ps /= N_SLOTS;
         float var_ps = 0.f;
-        for (int s = 0; s < N_SLOTS; s++) {
-            float d = pred_scores[s] - mean_ps; var_ps += d * d;
-        }
-        for (auto& hc : hist_mst_cands) {
-            float d = hc.pred_score - mean_ps; var_ps += d * d;
-        }
-        float pool_floor = mean_ps - sqrtf(var_ps / total_n);
+        for (int s = 0; s < N_SLOTS; s++) { float d = pred_scores[s]-mean_ps; var_ps += d*d; }
+        float pool_floor = mean_ps - sqrtf(var_ps / N_SLOTS);
 
         std::vector<std::pair<float,int>> surviving;
         for (int s = 0; s < N_SLOTS; s++)
             if (pred_scores[s] >= pool_floor)
                 surviving.push_back({pred_scores[s], s});
-        for (int h = 0; h < (int)hist_mst_cands.size(); h++)
-            if (hist_mst_cands[h].pred_score >= pool_floor)
-                surviving.push_back({hist_mst_cands[h].pred_score, -(h + 1)});
         if (surviving.empty()) surviving.push_back({pred_scores[0], 0});
 
         std::sort(surviving.begin(), surviving.end(),
@@ -2222,14 +1723,8 @@ static float step_master(MasterState& state, MasterScratch& scratch,
 
         int   src_rank[ELITE_COUNT] = {};
         float src_val[ELITE_COUNT]  = {};
-        for (int k = 0; k < n_top; k++) {
-            src_rank[k] = surviving[k].second;
-            src_val[k]  = surviving[k].first;
-        }
-        for (int k = n_top; k < ELITE_COUNT; k++) {
-            src_rank[k] = src_rank[0];
-            src_val[k]  = src_val[0];
-        }
+        for (int k = 0; k < n_top; k++) { src_rank[k] = surviving[k].second; src_val[k] = surviving[k].first; }
+        for (int k = n_top; k < ELITE_COUNT; k++) { src_rank[k] = src_rank[0]; src_val[k] = src_val[0]; }
 
         float w5_w[5], w10_w[10], w15_w[15];
         int n5 = std::min(n_top,5), n10 = std::min(n_top,10), n15 = std::min(n_top,15);
@@ -2237,55 +1732,36 @@ static float step_master(MasterState& state, MasterScratch& scratch,
         normalize_weights(src_val, w10_w, n10);
         normalize_weights(src_val, w15_w, n15);
 
-        MasterPortfolio new_mports[ELITE_POOL];
+        // New slot-0's zero_counts come from the best-scoring slot
+        memcpy(slot0_zc, state.zero_counts[src_rank[0]], N_IND * sizeof(int));
 
-        // Portfolio wavg — historical entries use slot0 as placeholder
-        auto mst_port_ptr = [&](int id) -> const MasterPortfolio* {
-            return id < 0 ? &state.portfolios[0] : &state.portfolios[id];
-        };
+        MasterPortfolio new_mports[ELITE_POOL];
         const MasterPortfolio* mp5[5], *mp10[10], *mp15[15];
-        for (int k=0;k<n5;k++)  mp5[k]  = mst_port_ptr(src_rank[k]);
-        for (int k=0;k<n10;k++) mp10[k] = mst_port_ptr(src_rank[k]);
-        for (int k=0;k<n15;k++) mp15[k] = mst_port_ptr(src_rank[k]);
+        for (int k=0;k<n5;k++)  mp5[k]  = &state.portfolios[src_rank[k]];
+        for (int k=0;k<n10;k++) mp10[k] = &state.portfolios[src_rank[k]];
+        for (int k=0;k<n15;k++) mp15[k] = &state.portfolios[src_rank[k]];
         MasterPortfolio wp5={}, wp10={}, wp15={};
         wavg_mst_portfolio(mp5,  w5_w,  n5,  wp5);
         wavg_mst_portfolio(mp10, w10_w, n10, wp10);
         wavg_mst_portfolio(mp15, w15_w, n15, wp15);
 
-        // Copy/regenerate into new_elites; historical entries reload ring file
         for (int k = 0; k < n_top; k++) {
-            int id = src_rank[k];
-            if (id < 0) {
-                const auto& hc = hist_mst_cands[-(id+1)];
-                if (load_hist_ring_slot_mst(models_dir, hc.ring_slot, scratch.hist_elite_buf)) {
-                    memcpy(scratch.new_elite(k),
-                           scratch.hist_elite_buf + (size_t)hc.elite_idx * MASTERNN_PARAMS,
-                           MASTERNN_PARAMS * sizeof(float));
-                } else {
-                    memcpy(scratch.new_elite(k), scratch.elite(0), MASTERNN_PARAMS * sizeof(float));
-                }
-                new_mports[k] = state.portfolios[0];
-                log_msg(std::string("[master  ] HIST ELITE re-entered: H") +
-                        std::to_string(hc.age_offset) + "." + std::to_string(hc.elite_idx) +
-                        " → slot " + std::to_string(k) +
-                        " (pred_score=" + std::to_string(hc.pred_score).substr(0,6) + ")");
-            } else if (id < ELITE_POOL) {
-                memcpy(scratch.new_elite(k), scratch.elite(id), MASTERNN_PARAMS * sizeof(float));
-                new_mports[k] = state.portfolios[id];
+            int slot = src_rank[k];
+            if (slot < ELITE_POOL) {
+                memcpy(scratch.new_elite(k), scratch.elite(slot), MASTERNN_PARAMS * sizeof(float));
             } else {
-                int mut_i  = id - ELITE_POOL;
+                int mut_i  = slot - ELITE_POOL;
                 int parent = mut_i / MUTATIONS_PER_PARENT;
                 memcpy(scratch.new_elite(k), scratch.elite(parent), MASTERNN_PARAMS * sizeof(float));
                 apply_gaussian(scratch.new_elite(k), MASTERNN_PARAMS, sigma, mast_mut_seeds[mut_i]);
-                new_mports[k] = state.portfolios[id];
             }
+            new_mports[k] = state.portfolios[slot];
         }
         for (int k = n_top; k < ELITE_COUNT; k++) {
             memcpy(scratch.new_elite(k), scratch.new_elite(0), MASTERNN_PARAMS * sizeof(float));
             new_mports[k] = new_mports[0];
         }
 
-        // Weight wavg from new_elites[0..n-1] (consecutive indices, no OOB risk)
         int seq[ELITE_COUNT]; for (int k = 0; k < ELITE_COUNT; k++) seq[k] = k;
         wavg_weights_flat(scratch.new_elites, MASTERNN_PARAMS, seq, w5_w,  n5,  scratch.wavg(0));
         wavg_weights_flat(scratch.new_elites, MASTERNN_PARAMS, seq, w10_w, n10, scratch.wavg(1));
@@ -2305,33 +1781,32 @@ static float step_master(MasterState& state, MasterScratch& scratch,
         for (int mut_i = 0; mut_i < N_SLOTS - ELITE_POOL; mut_i++)
             state.portfolios[ELITE_POOL + mut_i] = state.portfolios[mut_i / MUTATIONS_PER_PARENT];
     } else {
-        // Diversity injection
         int half = ELITE_COUNT / 2;
-        log_msg(std::string("[master  ] best_pred=") + std::to_string(best_pred).substr(0,6) +
-                " below floor — injecting diversity");
+        log_msg("[master  ] best_pts=" + fmt_pts(best_pts_v) + " < 0 — injecting diversity");
         PCG32 div_rng; div_rng.seed((uint64_t)actual_day * 55555ULL + 77777ULL);
         for (int k = half; k < ELITE_COUNT; k++) {
             init_master_weights(scratch.mut_buf, div_rng);
             for (int p = 0; p < MASTERNN_PARAMS; p++)
-                scratch.elite(k)[p] = 0.5f * scratch.elite(k - half)[p] + 0.5f * scratch.mut_buf[p];
+                scratch.elite(k)[p] = 0.5f * scratch.elite(k-half)[p] + 0.5f * scratch.mut_buf[p];
             state.portfolios[k] = state.portfolios[k - half];
         }
     }
 
+    // Restore slot-0's own portfolio and propagate its zero_counts to the new best
     state.portfolios[0] = slot0_own;
+    memcpy(state.zero_counts[0], slot0_zc, N_IND * sizeof(int));
 
-    // Append current elite pool to master hist ring (scratch.elite_buf already up to date)
-    save_hist_ring_mst(models_dir, state, scratch.elite_buf);
-
-    // Update flat_cos history
-    if (state.flat_cos_len < 15) {
-        state.flat_cos_hist[state.flat_cos_len++] = flat_cos;
-    } else {
-        memmove(state.flat_cos_hist, state.flat_cos_hist + 1, 14 * sizeof(float));
-        state.flat_cos_hist[14] = flat_cos;
+    // Elite pts stats (slots 0..ELITE_COUNT-1)
+    float elite_max_pts = -1e9f, elite_min_pts = 1e9f, elite_mean_pts = 0.f;
+    for (int s = 0; s < ELITE_COUNT; s++) {
+        float p = (pred_scores[s] - port_vals[s]) / 1e9f;
+        if (p > elite_max_pts) elite_max_pts = p;
+        if (p < elite_min_pts) elite_min_pts = p;
+        elite_mean_pts += p;
     }
+    elite_mean_pts /= ELITE_COUNT;
 
-    return flat_cos;
+    return {best_pts_v, elite_max_pts, elite_min_pts, elite_mean_pts, ideal_pts};
 }
 
 // ── History update (main thread after workers finish) ────────────────────────────
@@ -2355,6 +1830,33 @@ static void update_hist_sym(SymHist& h, const OHLCV& d) {
 }
 
 // ── Model persistence ──────────────────────────────────────────────────────────
+
+static void load_ind_history(const std::string& dir, int ind_i, WorkerScratch& scratch) {
+    std::string path = dir + "/" + g_ind_names[ind_i] + "_hist.bin";
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) { scratch.hist_head = 0; scratch.hist_count = 0; return; }
+    int meta[2] = {};
+    if (fread(meta, sizeof(int), 2, f) == 2) {
+        scratch.hist_head  = std::max(0, std::min(meta[0], HIST_DAYS - 1));
+        scratch.hist_count = std::max(0, std::min(meta[1], HIST_DAYS));
+    } else {
+        scratch.hist_head = 0; scratch.hist_count = 0;
+    }
+    size_t n = (size_t)HIST_DAYS * HIST_PER_DAY * STOCKNN_PARAMS;
+    fread(scratch.hist_buf, sizeof(float), n, f);
+    fclose(f);
+}
+
+static void save_ind_history(const std::string& dir, int ind_i, const WorkerScratch& scratch) {
+    std::string path = dir + "/" + g_ind_names[ind_i] + "_hist.bin";
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) { log_msg("WARNING: could not save history for " + g_ind_names[ind_i]); return; }
+    int meta[2] = {scratch.hist_head, scratch.hist_count};
+    fwrite(meta, sizeof(int), 2, f);
+    size_t n = (size_t)HIST_DAYS * HIST_PER_DAY * STOCKNN_PARAMS;
+    fwrite(scratch.hist_buf, sizeof(float), n, f);
+    fclose(f);
+}
 
 static void save_industry_elites(const std::string& dir, int ind_i,
                                   const float* elite_buf) {
@@ -2455,29 +1957,27 @@ static std::vector<DayData> load_all_stock_data(const std::string& data_dir,
 
 // ── Pre-load history warmup ─────────────────────────────────────────────────────
 
-static void warmup_history(IndustryState* ind_states, MasterState& mst,
+static void warmup_history(IndustryState* ind_states,
                             const std::vector<DayData>& all_days, int day_start) {
     if (day_start <= 0) return;
     int start = std::max(0, day_start - HIST_WINDOW);
-    for (int d = start; d < day_start; d++) {
-        for (int i = 0; i < N_IND; i++) {
-            for (int j = 0; j < IND_SYMS; j++) {
+    for (int d = start; d < day_start; d++)
+        for (int i = 0; i < N_IND; i++)
+            for (int j = 0; j < IND_SYMS; j++)
                 update_hist_sym(ind_states[i].hist[j], all_days[d].sym[i][j]);
-                update_hist_sym(mst.sym_hist[i * IND_SYMS + j], all_days[d].sym[i][j]);
-            }
-        }
-    }
     log_msg("Warmup: pre-loaded " + std::to_string(day_start - start) + " days of history");
 }
 
 // ── CSV logging ────────────────────────────────────────────────────────────────
 
 static void write_csv_row(FILE* csv, int pass_num, int actual_day,
-                           const IndResult* res, float flat_cos) {
+                           const IndResult* res, const MasterResult& mst) {
     fprintf(csv, "%d,%d", pass_num + 1, actual_day + 1);
     for (int i = 0; i < N_IND; i++)
-        fprintf(csv, ",%+10.2f", res[i].best_delta);
-    fprintf(csv, ",%+.4f\n", flat_cos);
+        fprintf(csv, ",%+10.2f,%+10.2f,%+10.2f",
+                res[i].elite_max_val, res[i].elite_min_val, res[i].elite_mean_val);
+    fprintf(csv, ",%+.2f,%+.2f,%+.2f,%+.2f\n",
+            mst.elite_max_pts, mst.elite_min_pts, mst.elite_mean_pts, mst.ideal_pts);
     fflush(csv);
 }
 
@@ -2490,12 +1990,9 @@ struct WorkerCtx {
     IndResult*          results;
     const bool*         seq_flags;
     std::string         models_dir;
-    std::string         load_dir;        // only used on day_num == 0
-    std::string         incremental_dir;
-    bool                do_incremental_save{false};
+    std::string         load_dir;   // only used on day_num == 0
     int                 actual_day, total_avail, day_num, num_days;
     float               sigma;
-    float               daily_sigma{-1.f};   // -1 = no burst
     bool                freeze, master_only;
     std::atomic<int>    next_ind{N_IND};
     std::counting_semaphore<N_IND> work_ready{0};
@@ -2516,21 +2013,15 @@ static void worker_fn(WorkerCtx* ctx) {
         while (true) {
             int i = ctx->next_ind.fetch_add(1, std::memory_order_relaxed);
             if (i >= N_IND) break;
-            if (!ctx->master_only) {
-                ctx->results[i] = step_industry(i, ctx->ind_states[i], scratch,
-                                                 ctx->models_dir, use_load,
-                                                 *ctx->day_ptr, ctx->fill_ptr,
-                                                 ctx->actual_day, ctx->total_avail,
-                                                 ctx->day_num, ctx->num_days,
-                                                 ctx->sigma, ctx->freeze, ctx->seq_flags,
-                                                 ctx->daily_sigma);
-                if (ctx->do_incremental_save)
-                    save_industry_elites(ctx->incremental_dir, i, scratch.elite_buf);
-            } else {
-                ctx->results[i] = {ctx->ind_states[i].portfolios[0].cash,
-                                   ctx->ind_states[i].portfolios[0].cash,
-                                   0.f, 0.f, 0.f, 0};
-            }
+            // In master_only mode, run industry with freeze=true so master gets real
+            // performance data for ind_val_hist without mutating industry models.
+            bool freeze = ctx->freeze || ctx->master_only;
+            ctx->results[i] = step_industry(i, ctx->ind_states[i], scratch,
+                                             ctx->models_dir, use_load,
+                                             *ctx->day_ptr, ctx->fill_ptr,
+                                             ctx->actual_day, ctx->total_avail,
+                                             ctx->day_num, ctx->num_days,
+                                             ctx->sigma, freeze, ctx->seq_flags);
         }
         ctx->work_done.release();
     }
@@ -2540,48 +2031,17 @@ static void worker_fn(WorkerCtx* ctx) {
 
 static void print_usage(const char* prog) {
     fprintf(stderr,
-        "Usage: %s [--output DIR] [--load-dir DIR] [--start-day N] [--stop-day N]\n"
+        "Usage: %s --output DIR [--load-dir DIR] [--start-day N] [--stop-day N]\n"
         "          [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F]\n"
-        "          [--workers N] [--master-only] [--preserve-stock-data]\n"
-        "          [--daily] [--daily-sigma F] [--promote DIR[,DIR]]\n"
-        "Defaults: --output models/training --start-day 17 --stop-day 20 --passes 1\n"
-        "          --sigma 0.01 --sigma-decay 0.5\n"
-        "Full run: --passes 5 --sigma 0.008 --master-sigma 0.006 --sigma-decay 1.0\n"
-        "          --start-day 17 --stop-day 1255\n"
-        "  --daily            run 4 burst refinements per industry per day after selection\n"
-        "  --daily-sigma F    override burst sigma (default: current training sigma)\n"
-        "  --promote DIR[,DIR] copy elite .bin files to sibling directories after training\n",
-        prog);
-}
-
-// ── promote_models ──────────────────────────────────────────────────────────────
-
-static void promote_models(const std::string& src_dir, const std::string& dst_dir) {
-    fs::create_directories(dst_dir);
-    for (int i = 0; i < N_IND; i++) {
-        for (int slot = 0; slot < ELITE_POOL; slot++) {
-            std::string src = elite_path(src_dir, g_ind_names[i].c_str(), slot);
-            std::string dst = elite_path(dst_dir, g_ind_names[i].c_str(), slot);
-            if (fs::exists(src)) fs::copy_file(src, dst, fs::copy_options::overwrite_existing);
-        }
-    }
-    for (int slot = 0; slot < ELITE_POOL; slot++) {
-        std::string src = elite_path(src_dir, "master", slot);
-        std::string dst = elite_path(dst_dir, "master", slot);
-        if (fs::exists(src)) fs::copy_file(src, dst, fs::copy_options::overwrite_existing);
-    }
-    log_msg("Promoted models: " + src_dir + " -> " + dst_dir);
+        "          [--workers N] [--master-only] [--preserve-stock-data] [--no-save]\n", prog);
 }
 
 int main(int argc, char* argv[]) {
     // Parse args
-    std::string output_dir = "models/training", load_dir;
-    int  start_day = 17, stop_day = 20, passes = 1, num_workers = 2;
+    std::string output_dir, load_dir;
+    int  start_day = -1, stop_day = -1, passes = 1, num_workers = 2;
     float sigma = 0.01f, master_sigma = -1.f, sigma_decay = 0.5f;
     bool master_only = false, preserve_stock = false;
-    bool daily = false;
-    float daily_sigma_override = -1.f;
-    std::string promote_targets;
 
     for (int a = 1; a < argc; a++) {
         std::string arg(argv[a]);
@@ -2596,11 +2056,10 @@ int main(int argc, char* argv[]) {
         else if (arg == "--workers"  && a+1<argc) { num_workers=atoi(argv[++a]);}
         else if (arg == "--master-only") master_only = true;
         else if (arg == "--preserve-stock-data") preserve_stock = true;
-        else if (arg == "--daily")               daily = true;
-        else if (arg == "--daily-sigma" && a+1<argc) { daily_sigma_override = atof(argv[++a]); }
-        else if (arg == "--promote"    && a+1<argc)  { promote_targets = argv[++a]; }
+        else if (arg == "--no-save") g_no_save = true;
         else if (arg == "--help" || arg == "-h") { print_usage(argv[0]); return 0; }
     }
+    if (output_dir.empty()) { print_usage(argv[0]); return 1; }
     if (master_sigma < 0.f) master_sigma = sigma;
 
     if (!load_universe_json("universe.json")) return 1;
@@ -2608,12 +2067,8 @@ int main(int argc, char* argv[]) {
     // Disable OpenBLAS internal threading: N workers × M BLAS threads = N×M threads on N CPUs
     openblas_set_num_threads(1);
 
-    fs::remove_all("data_dump");
     fs::create_directories(output_dir);
     fs::create_directories("stock_data");
-    const std::string incremental_dir = "models/incremental";
-    fs::create_directories(incremental_dir);
-    fs::create_directories(output_dir + "/hist_elite");
 
     // Load stock data
     std::vector<std::string> dates;
@@ -2640,17 +2095,18 @@ int main(int argc, char* argv[]) {
     FILE* csv = fopen(csv_path.c_str(), "w");
     if (csv) {
         fprintf(csv, "pass,day");
-        for (int i = 0; i < N_IND; i++) fprintf(csv, ",%s", g_ind_names[i].c_str());
-        fprintf(csv, ",flat_cos\n");
+        for (int i = 0; i < N_IND; i++)
+            fprintf(csv, ",%s_elite_max,%s_elite_min,%s_elite_mean",
+                    g_ind_names[i].c_str(), g_ind_names[i].c_str(), g_ind_names[i].c_str());
+        fprintf(csv, ",master_elite_max_pts,master_elite_min_pts,master_elite_mean_pts,master_ideal_pts\n");
     }
 
     // Threading setup
     num_workers = std::max(1, std::min(num_workers, N_IND));
     WorkerCtx wctx;
-    wctx.ind_states      = ind_states.get();
-    wctx.models_dir      = output_dir;
-    wctx.load_dir        = load_dir;
-    wctx.incremental_dir = incremental_dir;
+    wctx.ind_states  = ind_states.get();
+    wctx.models_dir  = output_dir;
+    wctx.load_dir    = load_dir;
 
     std::vector<std::thread> workers;
     for (int w = 0; w < num_workers; w++)
@@ -2673,9 +2129,7 @@ int main(int argc, char* argv[]) {
                 ind_states[i].portfolios[0].holdings[j]    = 0.f;
                 ind_states[i].portfolios[0].stop_prices[j] = 0.f;
             }
-            ind_states[i].streak         = 0;
-            ind_states[i].hist_ring_next  = 0;
-            ind_states[i].hist_ring_count = 0;
+            ind_states[i].streak = 0;
             for (int s = 1; s < N_SLOTS; s++) ind_states[i].portfolios[s] = ind_states[i].portfolios[0];
         }
         // Load master elites once at pass start (no per-day reload needed for master)
@@ -2683,18 +2137,17 @@ int main(int argc, char* argv[]) {
         mst->portfolios[0].cash = MST_STARTING_CASH;
         for (int i = 0; i < N_IND; i++) mst->portfolios[0].holdings[i] = 0.f;
         for (int s = 1; s < N_SLOTS; s++) mst->portfolios[s] = mst->portfolios[0];
-        mst->flat_cos_len     = 0;
-        mst->hist_ring_next   = 0;
-        mst->hist_ring_count  = 0;
+        memset(mst->ind_val_hist, 0, sizeof(mst->ind_val_hist));
+        mst->ind_hist_count = 0;
+        memset(mst->zero_counts, 0, sizeof(mst->zero_counts));
 
-        // Clear histories
+        // Clear industry OHLCV histories
         for (int i = 0; i < N_IND; i++)
             for (int j = 0; j < IND_SYMS; j++)
                 ind_states[i].hist[j] = SymHist{};
-        for (int si = 0; si < N_SYMS; si++) mst->sym_hist[si] = SymHist{};
 
         // Warmup history
-        warmup_history(ind_states.get(), *mst, all_days, day_start);
+        warmup_history(ind_states.get(), all_days, day_start);
 
         int num_days = day_end - day_start;
         IndResult results[N_IND] = {};
@@ -2714,7 +2167,6 @@ int main(int argc, char* argv[]) {
                 seq_flags[si] = (seq_rng.next() & 1);
 
             // Set up worker context for this day
-            bool do_snap = (day_num + 1) % 255 == 0 || day_num == num_days - 1;
             wctx.day_ptr    = day_ptr;
             wctx.fill_ptr   = fill_ptr;
             wctx.results    = results;
@@ -2724,10 +2176,8 @@ int main(int argc, char* argv[]) {
             wctx.day_num    = day_num;
             wctx.num_days   = num_days;
             wctx.sigma      = cur_sigma;
-            wctx.daily_sigma = daily ? (daily_sigma_override > 0.f ? daily_sigma_override : cur_sigma) : -1.f;
             wctx.freeze     = false;
             wctx.master_only = master_only;
-            wctx.do_incremental_save = do_snap && !master_only;
             wctx.next_ind.store(0, std::memory_order_relaxed);
 
             // Dispatch workers
@@ -2736,38 +2186,43 @@ int main(int argc, char* argv[]) {
             // Wait for all workers to finish
             for (int w = 0; w < num_workers; w++) wctx.work_done.acquire();
 
-            // Update histories (main thread is canonical, matching Python design)
-            for (int i = 0; i < N_IND; i++) {
-                for (int j = 0; j < IND_SYMS; j++) {
+            // Update industry OHLCV histories (main thread is canonical)
+            for (int i = 0; i < N_IND; i++)
+                for (int j = 0; j < IND_SYMS; j++)
                     update_hist_sym(ind_states[i].hist[j], day_ptr->sym[i][j]);
-                    update_hist_sym(mst->sym_hist[i * IND_SYMS + j], day_ptr->sym[i][j]);
+
+            // Run master step (uses ind_val_hist from days BEFORE today, then we append today)
+            MasterResult master_res = step_master(*mst, *mst_scratch, results,
+                                                   actual_day, total_days, cur_mst_sigma);
+
+            // Append today's best-slot industry values to rolling ind_val_hist buffer
+            for (int i = 0; i < N_IND; i++) {
+                float today_v = results[i].baseline + results[i].best_delta;
+                if (mst->ind_hist_count < IND_HIST_CAP) {
+                    mst->ind_val_hist[i][mst->ind_hist_count] = today_v;
+                } else {
+                    memmove(mst->ind_val_hist[i], mst->ind_val_hist[i] + 1,
+                            (IND_HIST_CAP - 1) * sizeof(float));
+                    mst->ind_val_hist[i][IND_HIST_CAP - 1] = today_v;
                 }
             }
-
-            // Master step
-            float flat_cos = step_master(*mst, *mst_scratch, *day_ptr, fill_ptr, results,
-                                         actual_day, total_days, day_num, num_days,
-                                         cur_mst_sigma, output_dir);
+            if (mst->ind_hist_count < IND_HIST_CAP) mst->ind_hist_count++;
 
             // Log CSV row
-            if (csv) write_csv_row(csv, pass, actual_day, results, flat_cos);
+            if (csv) write_csv_row(csv, pass, actual_day, results, master_res);
 
             // Periodic master save (industry elites already saved inside step_industry each day)
-            if (day_num % 50 == 49 || day_num == num_days - 1) {
+            if (!g_no_save && (day_num % 50 == 49 || day_num == num_days - 1)) {
                 log_msg("Saving master elites to " + output_dir + " ...");
                 save_master_elites(output_dir, mst_scratch->elite_buf);
-            }
-
-            // Incremental snapshot every 255 days and at pass end
-            if (do_snap) {
-                log_msg("Saving incremental snapshot to " + incremental_dir + " ...");
-                save_master_elites(incremental_dir, mst_scratch->elite_buf);
             }
         }
 
         // Save master after each pass (industry elites already saved)
-        log_msg("Pass " + std::to_string(pass+1) + " complete — saving master elites");
-        save_master_elites(output_dir, mst_scratch->elite_buf);
+        if (!g_no_save) {
+            log_msg("Pass " + std::to_string(pass+1) + " complete — saving master elites");
+            save_master_elites(output_dir, mst_scratch->elite_buf);
+        }
     }
 
     // Shutdown workers
@@ -2777,20 +2232,6 @@ int main(int argc, char* argv[]) {
     for (auto& t : workers) t.join();
 
     if (csv) fclose(csv);
-
-    // Promote models to sibling directories if requested
-    if (!promote_targets.empty()) {
-        std::string parent = fs::path(fs::absolute(output_dir)).parent_path().string();
-        std::stringstream ss(promote_targets);
-        std::string target;
-        while (std::getline(ss, target, ',')) {
-            if (target.empty()) continue;
-            std::string dst = parent + "/" + target;
-            log_msg("Promoting to " + dst + " ...");
-            promote_models(output_dir, dst);
-        }
-    }
-
     log_msg("Training complete.");
     return 0;
 }
