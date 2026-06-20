@@ -15,9 +15,9 @@ INDUSTRIES: dict[str, list[str]] = {
     # EVs, autos, travel — already volatile
     'consumer_discretionary': ['TSLA','RCL', 'XPEV','LI',  'APTV','GM',  'LEA', 'WYNN','BKNG','ABNB','UBER','LYFT'],
     # Streaming, social, gig economy
-    'consumer_services':      ['NFLX','ROKU','SPOT','META','IAC', 'PINS','DASH','RBLX','TTWO','LYV', 'MTCH','WBD' ],
+    'consumer_services':      ['NFLX','ROKU','SPOT','META','TKO', 'PINS','DASH','RBLX','TTWO','LYV', 'MTCH','WBD' ],
     # Biotech / genomics
-    'health_care':            ['MRNA','BNTX','IMVT','CRSP','ARWR','MYGN','NTRA','INMD','HIMS','BEAM','ACAD','BMRN'],
+    'health_care':            ['MRNA','BNTX','IMVT','CRSP','ARWR','IONS','NTRA','INMD','HIMS','BEAM','ACAD','BMRN'],
     # Airlines + industrials
     'industrials':            ['BA',  'GE',  'CAT', 'DE',  'DAL', 'UAL', 'XPO', 'LUV', 'ALK', 'GNRC','BTU', 'STLD'],
     # High-beta lifestyle/consumer

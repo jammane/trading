@@ -25,7 +25,7 @@ import torch.nn.functional as F
 import yfinance as yf
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, OrderType, QueryOrderStatus, TimeInForce
-from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, StopOrderRequest
+from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, MarketOrderRequest, StopOrderRequest
 
 from fees import BUY_FILL, FINRA_TAF_MAX, FINRA_TAF_PER_SHARE, SEC_FEE_RATE, SELL_FILL, _sell_net
 from models import MasterNN, StockNN
@@ -34,30 +34,30 @@ from universe import INDUSTRIES
 MAX_SINGLE_STOCK_PCT = 0.60   # max fraction of industry cash in one stock
 
 MODEL_DIR = 'models'
-STATE_FILE = 'state.json'
 STOCK_DATA_DIR = 'stock_data'
-OWNERS_DIR = 'owners'
-OWNERS_FILE = os.path.join(OWNERS_DIR, 'owners.json')
 
-def load_state():
-    """Load trading state from state.json, or return default initial state if absent."""
+def load_state(model_dir):
+    """Load trading state from {model_dir}/state.json, or return default initial state if absent."""
+    state_file = os.path.join(model_dir, 'state.json')
     try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE) as f:
+        if os.path.exists(state_file):
+            with open(state_file) as f:
                 return json.load(f)
     except Exception as e:
-        print(f"Error loading state file {STATE_FILE}: {e}")
+        print(f"Error loading state file {state_file}: {e}")
     industries = INDUSTRIES
     symbols = [sym for syms in industries.values() for sym in syms]
     return {'industries': industries, 'histories': {sym: [] for sym in symbols}, 'cash': 20000.0, 'holdings': {sym: 0.0 for sym in symbols}}
 
-def save_state(state):
-    """Persist the current trading state to state.json."""
+def save_state(state, model_dir):
+    """Persist the current trading state to {model_dir}/state.json."""
+    state_file = os.path.join(model_dir, 'state.json')
     try:
-        with open(STATE_FILE, 'w') as f:
+        os.makedirs(model_dir, exist_ok=True)
+        with open(state_file, 'w') as f:
             json.dump(state, f)
     except Exception as e:
-        print(f"Error saving state file {STATE_FILE}: {e}")
+        print(f"Error saving state file {state_file}: {e}")
 
 def compute_total_portfolio_value(cash, holdings, day_data, histories):
     """Return total portfolio value: cash plus all holdings marked at close prices."""
@@ -70,27 +70,25 @@ def compute_total_portfolio_value(cash, holdings, day_data, histories):
                 total_value += qty * price
     return total_value
 
-def update_owners_file(total_value, paper):
-    """Update the total_value field in owners/owners.json (skipped in paper mode)."""
-    if not paper:
-        try:
-            if not os.path.exists(OWNERS_DIR):
-                os.makedirs(OWNERS_DIR)
-                print(f"Created owners directory: {OWNERS_DIR}")
-            if not os.path.exists(OWNERS_FILE):
-                owners_data = {"total value": total_value}
-                with open(OWNERS_FILE, 'w') as f:
-                    json.dump(owners_data, f)
-                print(f"Created owners.json with total value: {total_value}")
-            else:
-                with open(OWNERS_FILE) as f:
-                    owners_data = json.load(f)
-                owners_data["total value"] = total_value
-                with open(OWNERS_FILE, 'w') as f:
-                    json.dump(owners_data, f)
-                print(f"Updated owners.json with total value: {total_value}")
-        except Exception as e:
-            print(f"Error updating owners.json: {e}")
+def update_owners_file(total_value, model_dir):
+    """Update the total_value field in {model_dir}/owners.json."""
+    owners_file = os.path.join(model_dir, 'owners.json')
+    try:
+        os.makedirs(model_dir, exist_ok=True)
+        if not os.path.exists(owners_file):
+            owners_data = {"total value": total_value}
+            with open(owners_file, 'w') as f:
+                json.dump(owners_data, f)
+            print(f"Created owners.json with total value: {total_value}")
+        else:
+            with open(owners_file) as f:
+                owners_data = json.load(f)
+            owners_data["total value"] = total_value
+            with open(owners_file, 'w') as f:
+                json.dump(owners_data, f)
+            print(f"Updated owners.json with total value: {total_value}")
+    except Exception as e:
+        print(f"Error updating owners.json: {e}")
 
 def _master_state_path(model_dir):
     return os.path.join(model_dir, 'master_state.json')
@@ -133,20 +131,22 @@ def load_weighted_model(model_class, model_dir, prefix):
 
 # Train an industry model on a single day's data (called from production daily run)
 def train_industry_one_day_prod(industry, symbols, yesterday_data, primed_portfolio,
-                                model_dir, today_data=None, seq_flags=None):
+                                model_dir, today_data=None, seq_flags=None,
+                                intraday_bars=None):
     """
     Upkeep training for one industry.
     yesterday_data: OHLCV for the prediction day (yesterday) — model input features.
     today_data:     OHLCV for the fill day (today) — actual market prices for execution.
-                    Pass this so training matches offline (predict day N, fill day N+1).
-    seq_flags:      {sym: bool} actual intraday high/low sequence (True=low-first).
-                    Derived from today's 1-minute bars.  Falls back to random 50/50 if None.
+    seq_flags:      {sym: bool} intraday high/low sequence; only used for symbols
+                    without 1-minute bar data in intraday_bars.
+    intraday_bars:  {sym: [bar, ...]} 1-minute bars for the fill day.  When present,
+                    fill simulation walks bars chronologically instead of using OHLC+seq_flags.
     """
     from training_v2 import train_industry_one_day
     try:
         return train_industry_one_day(industry, symbols, yesterday_data, primed_portfolio,
                                       model_dir, next_day_data=today_data,
-                                      seq_flags=seq_flags)
+                                      seq_flags=seq_flags, intraday_bars=intraday_bars)
     except Exception as e:
         print(f"Error training industry {industry}: {e}")
         return None
@@ -172,6 +172,12 @@ def build_primed_portfolios(trading_client, industries, allocations, zero_counts
     """
     Fetch real Alpaca account state and build per-industry primed portfolios
     plus a master primed portfolio for single-day retraining.
+
+    Each industry's upkeep training portfolio uses a flat 40% cash allocation so
+    all 12 industry models evolve with equal budgets regardless of master's current
+    tier predictions — this keeps models healthy across all sectors.
+    The tier-based dollar allocation (allocations dict) is used for actual order
+    generation, not for seeding upkeep training.
 
     Returns:
         ind_primed:    {industry: {'cash': float, 'holdings': {sym: float}}}
@@ -251,6 +257,19 @@ def save_stock_data(symbol, day_data):
         print(f"Error saving stock data for {symbol}: {e}")
 
 LOG_DIR = 'logs'
+
+def log_request_id(request_id, context, success=True):
+    """Persist Alpaca X-Request-ID to logs/request_ids.log for support tracing."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    path = os.path.join(LOG_DIR, 'request_ids.log')
+    entry = json.dumps({
+        'ts': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+        'request_id': request_id,
+        'context': context,
+        'success': success,
+    })
+    with open(path, 'a') as f:
+        f.write(entry + '\n')
 
 def log_data_failure(sym, reason, mode):
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -468,15 +487,15 @@ def generate_liquidation_sells(industry, symbols, liquidation_target,
 
 
 def main():
-    """Run one daily trading cycle: fetch data, infer, optionally submit orders, retrain."""
+    """Run one daily trading cycle: fetch data, infer, submit orders, retrain."""
     parser = argparse.ArgumentParser(description="Run stock trading system v2.")
-    parser.add_argument('--paper', action='store_true', help='Run in paper trading mode')
-    parser.add_argument('--output', action='store_true', help='Submit orders to Alpaca')
+    parser.add_argument('--paper', action='store_true', help='Use Alpaca paper trading API (real paper orders, real paper portfolio)')
     parser.add_argument('--model-dir', default=MODEL_DIR, help='Directory containing trained models')
+    parser.add_argument('--capital', type=float, default=None, help='Cap total deployed capital regardless of Alpaca account balance')
     parser.add_argument('--withdraw', type=float, help='Amount to withdraw from portfolio')
     args = parser.parse_args()
 
-    if args.paper or args.output:
+    if True:
         # Retrieve API keys
         api_key = os.environ.get('ALPACA_API_KEY')
         secret_key = os.environ.get('ALPACA_SECRET_KEY')
@@ -498,11 +517,30 @@ def main():
             return
 
         # Load state
-        state = load_state()
+        state = load_state(args.model_dir)
         industries = state['industries']
         histories = state['histories']
         cash = state['cash']
         holdings = state['holdings']
+
+        # Detect symbols new to the universe since last run → 5-day order hold.
+        # The hold suppresses paper/prod order submission only; training still runs normally.
+        _known = state.get('known_symbols', [])
+        if _known:
+            _current_syms = set(sym for syms in industries.values() for sym in syms)
+            _new_syms = _current_syms - set(_known)
+            if _new_syms:
+                _holds = state.setdefault('new_symbol_holds', {})
+                for sym in sorted(_new_syms):
+                    if sym not in _holds:
+                        _holds[sym] = 5
+                        print(f"New symbol {sym}: 5-day trading hold applied "
+                              f"(trains normally, no paper/prod orders until hold expires)")
+        state['known_symbols'] = [sym for syms in industries.values() for sym in syms]
+
+        if args.capital is not None:
+            cash = min(cash, args.capital)
+            print(f"Capital capped at ${args.capital:.2f} (account cash: ${state['cash']:.2f})")
 
         # Load today's stock data using yfinance
         symbols = [sym for syms in industries.values() for sym in syms]
@@ -580,6 +618,32 @@ def main():
             print(f"Master liquidation orders (3x tier-0): {liq_str}")
 
         orders = []
+
+        # Liquidate any positions in symbols that have been removed from the universe.
+        # Queued as market orders so they fill regardless of intraday price.
+        _universe_syms = set(sym for syms in industries.values() for sym in syms)
+        _orphaned = {sym: qty for sym, qty in holdings.items()
+                     if sym not in _universe_syms and qty >= 1}
+        if _orphaned:
+            print(f"Orphaned positions to liquidate (symbols no longer in universe): "
+                  f"{list(_orphaned.keys())}")
+            _orf_prices: dict = {}
+            try:
+                _orf_dl = yf.download(list(_orphaned.keys()), period='1d',
+                                      auto_adjust=True, progress=False)
+                for _sym in _orphaned:
+                    try:
+                        _orf_prices[_sym] = float(_orf_dl['Close'][_sym].iloc[-1])
+                    except Exception:
+                        _orf_prices[_sym] = 0.0
+            except Exception as _e:
+                print(f"  Warning: could not fetch orphaned prices: {_e}")
+            for _sym, _qty in _orphaned.items():
+                _price = _orf_prices.get(_sym, 0.0)
+                orders.append({'symbol': _sym, 'action': 'liquidate',
+                                'quantity': int(_qty), 'price': _price})
+                print(f"  {_sym}: queued market sell {int(_qty)} shares "
+                      f"(last known ~${_price:.2f})")
 
         # ── Industry activity flags: skip trading if capital < priciest stock ─
         active_industries = set()
@@ -714,9 +778,12 @@ def main():
                 sug  = {sym: out[j].tolist() for j, sym in enumerate(symbols)}
 
                 # ── Sells first: cancel existing stops, execute sells ────────
+                _sym_holds = state.get('new_symbol_holds', {})
                 for j, sym in enumerate(symbols):
                     if sym not in day_data:
                         continue
+                    if _sym_holds.get(sym, 0) > 0:
+                        continue  # new symbol hold active — no orders this run
                     buy_qty, buy_price_frac, sell_all_price_frac, sell_qty = sug[sym]
                     cur_qty        = holdings.get(sym, 0.0)
                     low            = day_data[sym]['low']
@@ -755,6 +822,8 @@ def main():
                 for j, sym in enumerate(symbols):
                     if sym not in day_data:
                         continue
+                    if _sym_holds.get(sym, 0) > 0:
+                        continue  # new symbol hold active — no orders this run
                     buy_qty, buy_price_frac, sell_all_price_frac, sell_qty = sug[sym]
                     low       = day_data[sym]['low']
                     high      = day_data[sym]['high']
@@ -810,13 +879,28 @@ def main():
                         orders.append({'symbol': sym, 'action': 'sell', 'quantity': to_sell, 'price': price})
                         current_needed -= _sell_net(to_sell, price)
 
+        # Decrement trading holds for new symbols; remove when they reach zero
+        _holds = state.get('new_symbol_holds', {})
+        for sym in list(_holds.keys()):
+            _holds[sym] -= 1
+            if _holds[sym] <= 0:
+                del _holds[sym]
+                print(f"Trading hold for {sym} has expired — orders now enabled")
+        state['new_symbol_holds'] = _holds
+
+        # Zero out orphaned holdings now that liquidation orders have been queued
+        for sym in _orphaned:
+            holdings.pop(sym, None)
+        if _orphaned:
+            print(f"Cleared orphaned holdings from state: {list(_orphaned.keys())}")
+
         # Save updated state
         state['histories'] = histories
-        save_state(state)
+        save_state(state, args.model_dir)
 
         # Update owners.json after processing day's data and potential withdrawals
         total_portfolio_value = compute_total_portfolio_value(cash, holdings, day_data, histories)
-        update_owners_file(total_portfolio_value, args.paper)
+        update_owners_file(total_portfolio_value, args.model_dir)
 
         # Retrain models using real Alpaca state as portfolio seed.
         # yesterday_data = model-input features (day N); day_data = fill prices (day N+1).
@@ -825,10 +909,10 @@ def main():
             trading_client, industries, allocations, zero_counts)
         industry_top_scores = {}
         for industry, symbols in industries.items():
-            if any(os.path.exists(f"{args.model_dir}/{industry}_model_{i}.pt") for i in range(10)):
+            if os.path.exists(f"{args.model_dir}/{industry}_best.pt"):
                 result = train_industry_one_day_prod(
                     industry, symbols, yesterday_data, ind_primed[industry], args.model_dir,
-                    today_data=day_data, seq_flags=seq_flags)
+                    today_data=day_data, seq_flags=seq_flags, intraday_bars=intraday_data)
                 if result is not None:
                     industry_top_scores[industry] = result
 
@@ -838,49 +922,75 @@ def main():
                 ind_value_history[ind].append(industry_top_scores[ind][1])
         _save_master_state(args.model_dir, ind_value_history, zero_counts)
 
-        if any(os.path.exists(f"{args.model_dir}/master_model_{i}.pt") for i in range(10)):
-            train_master_one_day_prod(industries, master_primed, args.model_dir,
-                                      ind_value_history,
-                                      industry_top_scores=industry_top_scores)
+        if os.path.exists(f"{args.model_dir}/master_best.pt"):
+            # Require ≥15 days of real-valued history per industry before master adapts.
+            # Filters placeholder/sentinel values ($3,000) and ensures ~3 weeks of live
+            # paper/prod data has accumulated.  Per-industry values for a $3k paper account
+            # are ~$1,200 (40% of account cash), so != 3000 also catches stale sentinels.
+            min_real_days = min(
+                (sum(1 for v in ind_value_history.get(ind, []) if v != 3000.0)
+                 for ind in industry_list),
+                default=0
+            )
+            if min_real_days >= 15:
+                train_master_one_day_prod(industries, master_primed, args.model_dir,
+                                          ind_value_history,
+                                          industry_top_scores=industry_top_scores)
+            else:
+                print(f"Master upkeep deferred: {min_real_days}/15 days of real history "
+                      f"(need ~3 weeks of live trades before master adapts)")
 
-        # Submit orders to Alpaca if requested
-        if args.output:
-            for order in orders:
-                try:
-                    if order['action'] == 'buy':
-                        order_req = LimitOrderRequest(
-                            symbol=order['symbol'],
-                            qty=order['quantity'],
-                            side=OrderSide.BUY,
-                            type=OrderType.LIMIT,
-                            time_in_force=TimeInForce.DAY,
-                            limit_price=order['price']
-                        )
-                        trading_client.submit_order(order_req)
-                    elif order['action'] == 'sell':
-                        order_req = LimitOrderRequest(
-                            symbol=order['symbol'],
-                            qty=order['quantity'],
-                            side=OrderSide.SELL,
-                            type=OrderType.LIMIT,
-                            time_in_force=TimeInForce.DAY,
-                            limit_price=order['price']
-                        )
-                        trading_client.submit_order(order_req)
-                    elif order['action'] == 'stop_loss':
-                        order_req = StopOrderRequest(
-                            symbol=order['symbol'],
-                            qty=order['quantity'],
-                            side=OrderSide.SELL,
-                            time_in_force=TimeInForce.GTC,
-                            stop_price=order['price']
-                        )
-                        trading_client.submit_order(order_req)
-                except Exception as e:
-                    print(f"Error submitting order for {order['symbol']}: {e}")
-
-    else:
-        parser.print_help()
+        # Submit orders to Alpaca (paper or live depending on --paper flag)
+        mode = 'paper' if args.paper else 'live'
+        for order in orders:
+            try:
+                if order['action'] == 'buy':
+                    order_req = LimitOrderRequest(
+                        symbol=order['symbol'],
+                        qty=order['quantity'],
+                        side=OrderSide.BUY,
+                        type=OrderType.LIMIT,
+                        time_in_force=TimeInForce.DAY,
+                        limit_price=order['price']
+                    )
+                    result = trading_client.submit_order(order_req)
+                    log_request_id(str(result.id), f"{mode} buy {order['symbol']} qty={order['quantity']}")
+                elif order['action'] == 'sell':
+                    order_req = LimitOrderRequest(
+                        symbol=order['symbol'],
+                        qty=order['quantity'],
+                        side=OrderSide.SELL,
+                        type=OrderType.LIMIT,
+                        time_in_force=TimeInForce.DAY,
+                        limit_price=order['price']
+                    )
+                    result = trading_client.submit_order(order_req)
+                    log_request_id(str(result.id), f"{mode} sell {order['symbol']} qty={order['quantity']}")
+                elif order['action'] == 'stop_loss':
+                    order_req = StopOrderRequest(
+                        symbol=order['symbol'],
+                        qty=order['quantity'],
+                        side=OrderSide.SELL,
+                        time_in_force=TimeInForce.GTC,
+                        stop_price=order['price']
+                    )
+                    result = trading_client.submit_order(order_req)
+                    log_request_id(str(result.id), f"{mode} stop_loss {order['symbol']} qty={order['quantity']}")
+                elif order['action'] == 'liquidate':
+                    order_req = MarketOrderRequest(
+                        symbol=order['symbol'],
+                        qty=order['quantity'],
+                        side=OrderSide.SELL,
+                        time_in_force=TimeInForce.DAY
+                    )
+                    result = trading_client.submit_order(order_req)
+                    log_request_id(str(result.id), f"{mode} liquidate {order['symbol']} qty={order['quantity']}")
+            except Exception as e:
+                rid = getattr(getattr(e, 'response', None), 'headers', {})
+                rid = rid.get('x-request-id', '') if hasattr(rid, 'get') else ''
+                if rid:
+                    log_request_id(rid, f"{mode} {order['action']} {order['symbol']} FAILED: {e}", success=False)
+                print(f"Error submitting order for {order['symbol']}: {e}")
 
 if __name__ == '__main__':
     main()

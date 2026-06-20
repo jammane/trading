@@ -32,6 +32,19 @@ export ANTHROPIC_API_KEY=$(kubectl get secret anthropic-credentials \
     -n trading -o jsonpath='{.data.ANTHROPIC_API_KEY}' | base64 -d)
 
 claude
+
+# Store Alpaca credentials per account+mode (paper and live keys are separate Alpaca accounts)
+kubectl create secret generic alpaca-credentials-acct0-paper \
+    --namespace trading \
+    --from-literal=ALPACA_API_KEY="PK..." \
+    --from-literal=ALPACA_SECRET_KEY="..." \
+    --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl create secret generic alpaca-credentials-acct0-prod \
+    --namespace trading \
+    --from-literal=ALPACA_API_KEY="AK..." \
+    --from-literal=ALPACA_SECRET_KEY="..." \
+    --dry-run=client -o yaml | kubectl apply -f -
 ```
 All 75 pytest tests (including `test_models.py`) run on the droplet where torch is available.
 The pre-commit hook runs the full suite automatically before every `git commit`.
@@ -94,17 +107,60 @@ python inspect_trades.py --industry energy --date 2024-01-10 --models-dir ./mode
 python inspect_trades.py --industry energy --day-index 17 --models-dir ./models --top-n 5
 ```
 
-**Paper / live trading:**
-```bash
-python production_v2.py --paper --model-dir models
-python production_v2.py --model-dir models         # live (requires ALPACA_API_KEY / ALPACA_SECRET_KEY)
+**Paper / live trading (per-account isolation):**
+
+Each Alpaca account gets its own directory tree: `models/acct#/[training|paper|prod]`.
+`--model-dir` points to the account+mode subdirectory; all per-run files (`state.json`,
+`owners.json`, `master_state.json`, `*.pt`) live there.
+
+Current account is `acct0`. Up to 5 accounts planned; additional accounts will likely
+require a droplet upgrade.
+
+**Scheduling convention (user is US Eastern Time, EDT=UTC-4, EST=UTC-5):**
+- Market close: 4:00 PM ET
+- acct0 paper: 1h05m after close = 5:05 PM ET (21:05 UTC EDT / 22:05 UTC EST)
+- acct0 prod:  30 min after paper = 5:35 PM ET
+- acct1 paper: acct0 paper + 1h = 6:05 PM ET
+- acct1 prod:  30 min after acct1 paper = 6:35 PM ET
+- (each additional account adds 1 hour to paper time, prod is always 30 min after paper)
+- **Cron times shift by 1 hour in November (EDT→EST) and March (EST→EDT)**
+
 ```
+# crontab on droplet (times in UTC, summer/EDT)
+5 21 * * 1-5  cd /root/trading && export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d) && export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d) && source .venv/bin/activate && python production_v2.py --paper --model-dir models/acct0/paper >> logs/acct0_paper.log 2>&1
+35 21 * * 1-5 cd /root/trading && export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d) && export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d) && source .venv/bin/activate && python production_v2.py --model-dir models/acct0/prod >> logs/acct0_prod.log 2>&1
+# acct1 (future): 5 22 paper, 35 22 prod
+# acct2 (future): 5 23 paper, 35 23 prod
+```
+
+```bash
+# Manual run (paper)
+export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d)
+export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d)
+python production_v2.py --paper --model-dir models/acct0/paper
+
+# Manual run (live, future)
+export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d)
+export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d)
+python production_v2.py --model-dir models/acct0/prod
+```
+
+Training output (`training_v4_cpp`) writes to `models/acct#/training`; after training run
+`convert_weights.py` targeting that directory, then copy `_best.pt` files to `.../prod`.
+
+Note: the current training run on the droplet writes to `models/training` (pre-acct structure).
+Once it completes, migrate: `mv models/training models/acct0/training` on the droplet.
 
 **Replace ticker symbols (full guided workflow):**
 ```bash
 ./swap_symbols.sh '{"OLDTICKER": "NEWTICKER"}'
 ```
 Runs all five steps: updates `universe.py` and regenerates `universe.json`, removes stale `stock_data/` JSON, downloads new symbol data, prompts to rebuild the Docker image, and prints optional model-cleanup commands for the droplet. The C++ binary reads `universe.json` at startup — no recompile needed after a symbol swap. Run locally — not inside a container.
+
+**Symbol swap thresholds (checked ~monthly — expect 1-2 swaps/month):**
+- **$15 watch floor** — symbol goes into `universe_watchlist.json` `"watch"` section with a candidate. Do NOT download candidate data yet. Do NOT run `swap_symbols.sh`.
+- **$10 swap floor** (or defunct/halted ticker) — perform the swap: run `swap_symbols.sh`, which downloads candidate data. The removed symbol's open positions are auto-liquidated via market order on the next `production_v2.py` run (orphaned-position logic). Update the watchlist accordingly.
+- **5-day new-symbol hold** — after any swap, `production_v2.py` automatically detects the new symbol (compares universe to `state['known_symbols']`) and applies a 5-run hold: paper/prod orders are suppressed for that symbol for 5 trading days. Training (regular C++ and daily upkeep) still runs on the new symbol immediately so the model starts adapting.
 
 ## Shared modules
 
@@ -170,7 +226,9 @@ When an elite holds ≥50% cash (industry) or ≥80% cash (master), an `UNDER_IN
 
 ### Production cycle
 
-`production_v2.py` runs once per trading day: fetch data from yfinance → run MasterNN to rebalance capital → run StockNN per active industry → submit limit/stop orders to Alpaca → perform one upkeep evolution step on yesterday's data. Alpaca credentials are read from `keyring` or environment variables.
+`production_v2.py` runs once per trading day: fetch data from yfinance → run MasterNN to rebalance capital → run StockNN per active industry → submit limit/stop orders to Alpaca → perform one upkeep evolution step on yesterday's data. Alpaca credentials are read from `keyring` or environment variables (`ALPACA_API_KEY` / `ALPACA_SECRET_KEY`). All per-account state files (`state.json`, `owners.json`, `master_state.json`) live under `--model-dir`, enabling multiple accounts to run independently with different `--model-dir` paths and credentials.
+
+`--paper` routes all API calls to Alpaca's paper trading endpoint — orders are submitted and portfolio state is read from the paper account, giving real paper trading history without risking real money. Omit `--paper` for live trading.
 
 ### Changelog hook
 
