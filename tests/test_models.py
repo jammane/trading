@@ -20,9 +20,8 @@ def stock_inputs():
 @pytest.fixture
 def master_inputs():
     torch.manual_seed(0)
-    history = torch.randn(1, 15, 61)
-    today   = torch.randn(1, 229)
-    return history, today
+    today = torch.randn(1, 444)
+    return (today,)
 
 
 # ── StockNN ────────────────────────────────────────────────────────────────────
@@ -131,58 +130,53 @@ class TestStockNN:
 
 # ── MasterNN ───────────────────────────────────────────────────────────────────
 
+import torch.nn.functional as F
+
 class TestMasterNN:
     def test_output_shape(self, master_inputs):
-        history, today = master_inputs
-        out = MasterNN()(history, today)
-        assert out.shape == (1, 36)
+        (today,) = master_inputs
+        out = MasterNN()(today)
+        assert out.shape == (1, 48)
 
-    def test_allocation_sums_to_one(self, master_inputs):
-        history, today = master_inputs
-        out = MasterNN()(history, today)
-        alloc_sum = out[0, :12].sum().item()
-        assert abs(alloc_sum - 1.0) < 1e-5, \
-            f"Allocation weights must sum to 1 (softmax); got {alloc_sum}"
+    def test_output_reshapes_to_12x4(self, master_inputs):
+        (today,) = master_inputs
+        out = MasterNN()(today)
+        assert out.view(12, 4).shape == (12, 4)
 
-    def test_allocation_all_positive(self, master_inputs):
-        history, today = master_inputs
-        out = MasterNN()(history, today)
-        assert (out[0, :12] > 0).all(), "All allocation weights must be positive (softmax)"
+    def test_per_industry_softmax_sums_to_one(self, master_inputs):
+        (today,) = master_inputs
+        out = MasterNN()(today)
+        probs = F.softmax(out.view(12, 4), dim=1)
+        row_sums = probs.sum(dim=1)
+        assert torch.allclose(row_sums, torch.ones(12), atol=1e-5), \
+            "Per-industry softmax rows must sum to 1"
 
-    def test_liquidation_depth_in_range(self, master_inputs):
-        history, today = master_inputs
-        out = MasterNN()(history, today)
-        depth = out[0, 12:24]
-        assert (depth >= 0).all() and (depth <= 1).all(), \
-            "Liquidation depth must be in [0, 1] (sigmoid)"
+    def test_tier_argmax_in_range(self, master_inputs):
+        (today,) = master_inputs
+        out  = MasterNN()(today)
+        tiers = F.softmax(out.view(12, 4), dim=1).argmax(dim=1)
+        assert ((tiers >= 0) & (tiers <= 3)).all(), "Tier argmax must be in {0,1,2,3}"
 
-    def test_liquidation_trigger_in_range(self, master_inputs):
-        history, today = master_inputs
-        out = MasterNN()(history, today)
-        trigger = out[0, 24:36]
-        assert (trigger >= 0).all() and (trigger <= 1).all(), \
-            "Liquidation trigger must be in [0, 1] (sigmoid)"
-
-    def test_output_has_12_industries(self, master_inputs):
-        history, today = master_inputs
-        out = MasterNN()(history, today)
-        assert out.shape[-1] == 36  # 12 alloc + 12 depth + 12 trigger
+    def test_output_has_12x4_logits(self, master_inputs):
+        (today,) = master_inputs
+        out = MasterNN()(today)
+        assert out.shape[-1] == 48  # 12 industries × 4 class logits
 
     def test_deterministic(self, master_inputs):
-        history, today = master_inputs
+        (today,) = master_inputs
         model = MasterNN()
         model.eval()
         with torch.no_grad():
-            out1 = model(history, today)
-            out2 = model(history, today)
+            out1 = model(today)
+            out2 = model(today)
         assert torch.equal(out1, out2)
 
     def test_serialization_roundtrip(self, master_inputs, tmp_path):
-        history, today = master_inputs
+        (today,) = master_inputs
         model = MasterNN()
         model.eval()
         with torch.no_grad():
-            out_before = model(history, today)
+            out_before = model(today)
 
         path = tmp_path / "master_model.pt"
         torch.save(model.state_dict(), path)
@@ -191,42 +185,29 @@ class TestMasterNN:
         model2.load_state_dict(torch.load(path, weights_only=True))
         model2.eval()
         with torch.no_grad():
-            out_after = model2(history, today)
+            out_after = model2(today)
 
         assert torch.allclose(out_before, out_after)
 
-    def test_inject_layers_grow(self):
+    def test_layer_dims(self):
         model = MasterNN()
-        for i, layer in enumerate(model.fc_inject):
-            assert layer.in_features  == 181 + 5 * i, \
-                f"fc_inject[{i}] in_features: expected {181 + 5*i}, got {layer.in_features}"
-            assert layer.out_features == 125 + 5 * i, \
-                f"fc_inject[{i}] out_features: expected {125 + 5*i}, got {layer.out_features}"
-
-    def test_inject_layer_count(self):
-        assert len(MasterNN().fc_inject) == 14
-
-    def test_seed_layer_dims(self):
-        model = MasterNN()
-        assert model.fc_seed.in_features  == 61   # 60 OHLCV means + 1 flat_cos regime signal
-        assert model.fc_seed.out_features == 120
-
-    def test_today_layer_dims(self):
-        model = MasterNN()
-        assert model.fc_today.in_features  == 419  # 190 (final hidden) + 229 (today features)
-        assert model.fc_today.out_features == 300
-
-    def test_output_layer_dims(self):
-        model = MasterNN()
-        assert model.fc_out.in_features  == 102
-        assert model.fc_out.out_features == 36
+        assert model.fc1.in_features    == 444
+        assert model.fc1.out_features   == 444
+        assert model.fc2.in_features    == 444
+        assert model.fc2.out_features   == 444
+        assert model.fc3.in_features    == 444
+        assert model.fc3.out_features   == 312
+        assert model.fc4.in_features    == 312
+        assert model.fc4.out_features   == 180
+        assert model.fc_out.in_features  == 180
+        assert model.fc_out.out_features == 48
 
     def test_no_nan_in_output(self, master_inputs):
-        history, today = master_inputs
-        out = MasterNN()(history, today)
+        (today,) = master_inputs
+        out = MasterNN()(today)
         assert not torch.isnan(out).any()
 
     def test_no_inf_in_output(self, master_inputs):
-        history, today = master_inputs
-        out = MasterNN()(history, today)
+        (today,) = master_inputs
+        out = MasterNN()(today)
         assert not torch.isinf(out).any()

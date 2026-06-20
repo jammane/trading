@@ -1,0 +1,34 @@
+{
+  "_comment": "Symbols between $10-$15 (watch) or queued for swap (pending). Run swap_symbols.sh only when a symbol hits the $10 floor or is defunct. Do NOT download candidate data until the swap actually happens.",
+  "thresholds": {
+    "watch_below": 15,
+    "swap_floor": 10
+  },
+  "watch": {
+    "DQ": {
+      "industry": "utilities",
+      "price_when_flagged": 14.18,
+      "flagged_date": "2026-06-20",
+      "candidate": "OKLO",
+      "candidate_price": 61.17,
+      "notes": "Daqo New Energy (Chinese solar polysilicon). Below $15 but above $10 floor. Do not swap yet. Do not download OKLO data yet."
+    }
+  },
+  "pending_swap": {},
+  "completed": {
+    "MYGN": {
+      "industry": "health_care",
+      "replaced_with": "IONS",
+      "swap_date": "2026-06-20",
+      "reason": "Price collapsed to $4.54, well below $10 floor",
+      "ions_price_at_swap": 74.12
+    },
+    "IAC": {
+      "industry": "consumer_services",
+      "replaced_with": "TKO",
+      "swap_date": "2026-06-20",
+      "reason": "Ticker reassigned to unrelated company (People Inc), tradeable=False since 2026-06-12",
+      "tko_price_at_swap": 198.78
+    }
+  }
+}
