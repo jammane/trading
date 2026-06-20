@@ -1783,7 +1783,7 @@ def step_master(output_dir, portfolios, ind_value_history, industries,
     slot0_own_port = copy.deepcopy(portfolios[0])
 
     if not no_save_master:
-        if best_pts >= 0.0:
+        if best_pts >= -1.0:
             score_vals = [v for _, v in pred_scores]
             mean_ps    = sum(score_vals) / len(score_vals)
             std_ps     = (sum((v - mean_ps) ** 2 for v in score_vals) / len(score_vals)) ** 0.5
@@ -1798,7 +1798,7 @@ def step_master(output_dir, portfolios, ind_value_history, industries,
         else:
             half = ELITE_COUNT // 2
             log(f"[master] Day {actual_day + 1}/{total_avail}   "
-                f"best_pts={best_pts:.2f} < 0 — "
+                f"best_pts={best_pts:.2f} < -1 — "
                 f"injecting diversity into bottom {ELITE_COUNT - half} elite slots")
             for inject_rank in range(half, ELITE_COUNT):
                 source_rank = inject_rank - half

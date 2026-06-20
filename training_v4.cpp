@@ -1702,8 +1702,8 @@ static MasterResult step_master(MasterState& state, MasterScratch& scratch,
     int slot0_zc[N_IND];
     memcpy(slot0_zc, state.zero_counts[0], N_IND * sizeof(int));
 
-    // Selection gate: run selection if any slot scored non-negative points today.
-    if (best_pts_v >= 0.f) {
+    // Selection gate: run selection unless best score is below -1 pt (injection threshold).
+    if (best_pts_v >= -1.f) {
         float mean_ps = 0.f;
         for (int s = 0; s < N_SLOTS; s++) mean_ps += pred_scores[s];
         mean_ps /= N_SLOTS;
@@ -1782,7 +1782,7 @@ static MasterResult step_master(MasterState& state, MasterScratch& scratch,
             state.portfolios[ELITE_POOL + mut_i] = state.portfolios[mut_i / MUTATIONS_PER_PARENT];
     } else {
         int half = ELITE_COUNT / 2;
-        log_msg("[master  ] best_pts=" + fmt_pts(best_pts_v) + " < 0 — injecting diversity");
+        log_msg("[master  ] best_pts=" + fmt_pts(best_pts_v) + " < -1 — injecting diversity");
         PCG32 div_rng; div_rng.seed((uint64_t)actual_day * 55555ULL + 77777ULL);
         for (int k = half; k < ELITE_COUNT; k++) {
             init_master_weights(scratch.mut_buf, div_rng);
