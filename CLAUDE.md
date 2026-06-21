@@ -65,14 +65,7 @@ ruff check --fix .
 python download_5y_data.py
 ```
 
-**Train (single-threaded):**
-```bash
-python training_v2.py --output models
-python training_v2.py --output models --load-dir models          # resume from checkpoint
-python training_v2.py --output models --start-day 16 --stop-day 35 --passes 1 --preserve-stock-data --no-save-master  # short diagnostic run
-```
-
-**Train (C++ binary — canonical; handles both industries and master):**
+**Train (C++ binary — canonical; handles industries, MT1, and MT2):**
 ```bash
 # Seed once from existing Python models (or after any convert_weights.py run):
 python prepare_models.py --load-dir models/training --output models/training
@@ -101,11 +94,6 @@ Note: existing master `.bin` files are incompatible after the MT1/MT2 architectu
 python read_mt_log.py models/training/mt_training_log.bin
 python read_mt_log.py models/training/mt_training_log.bin --pass 2
 python read_mt_log.py models/training/mt_training_log.bin --industry energy
-```
-
-**Train (parallel, 7 threads — requires ≥4 GB RAM):**
-```bash
-python training_v3.py --output models
 ```
 
 **Inspect elite model trade decisions:**
@@ -177,10 +165,11 @@ Runs all five steps: updates `universe.py` and regenerates `universe.json`, remo
 | `universe.py` | `INDUSTRIES` dict, `ALL_SYMBOLS`, `INDUSTRY_NAMES` — 144-symbol universe |
 | `universe.json` | Auto-generated from `universe.py`; read by the C++ trainer at runtime |
 | `fees.py` | Fee constants (`BUY_FILL`, `SEC_FEE_RATE`, etc.) and `_sell_net()` helper |
+| `training_lib.py` | Shared evolutionary functions (`step_industry`, `selection_and_mutation`, `build_master_features`, I/O helpers, constants) — imported by `upkeep.py` and `production_v2.py`; not a standalone training script |
 | `prepare_models.py` | `.pt` → `.bin` for C++ trainer (run before first C++ training) |
 | `convert_weights.py` | `.bin` → `.pt` + `_best.pt` for Python tools (run after C++ training) |
 
-All training scripts (`training_v2.py`, `training_v3.py`), `production_v2.py`, `upkeep.py`, and `inspect_trades.py` import from these modules. (`training_v4.py` was deleted — superseded by `training_v4_cpp` for all training.) `download_5y_data.py` imports from `universe.py`. To add or change a ticker, run `swap_symbols.sh` — it updates both `universe.py` and `universe.json` together.
+`production_v2.py`, `upkeep.py`, and `inspect_trades.py` import from these modules. (`training_v2.py` and `training_v3.py` were deleted — superseded by `training_v4_cpp` for all training and `upkeep.py` for daily evolution.) `download_5y_data.py` imports from `universe.py`. To add or change a ticker, run `swap_symbols.sh` — it updates both `universe.py` and `universe.json` together.
 
 ## Tests
 

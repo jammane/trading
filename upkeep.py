@@ -36,7 +36,7 @@ import torch
 import torch.nn.functional as F
 
 from models import MT1NN, MT2NN, StockNN
-from training_v2 import (
+from training_lib import (
     ELITE_COUNT,
     ELITE_POOL,
     N_SLOTS,
@@ -556,7 +556,7 @@ def run_mt_inference(model_dir, industries, ind_value_history, norm_stats,
     tier_map:     {ind: 0-3}
     mt1_outputs:  {ind: (conf, delta, range_hw)} — slot0 decoded MT1 outputs
     """
-    from training_v2 import build_master_features, tiers_to_alloc
+    from training_lib import build_master_features, tiers_to_alloc
 
     industry_list = list(industries.keys())
     today444 = build_master_features(ind_value_history, industry_list)
