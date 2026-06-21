@@ -538,3 +538,72 @@ def upkeep_mt2(model_dir, mt1_slot0_outputs, norm_stats, actual_perf, industry_l
     del slot0_final
 
     return best_pts, slot0_pts, injected
+
+
+# ── Production inference (MT1 → MT2) ──────────────────────────────────────────
+
+def run_mt_inference(model_dir, industries, ind_value_history, norm_stats,
+                     zero_counts, total_cash):
+    """
+    MT1→MT2 inference chain for daily capital allocation in production.
+
+    Loads mt1_{ind}_best.pt for each industry and mt2_best.pt, runs the full
+    chain, and returns (allocations, tier_map, mt1_outputs).
+
+    Caller should fall back to MasterNN/equal allocation if mt2_best.pt is absent.
+
+    allocations:  {ind: dollar_amount}
+    tier_map:     {ind: 0-3}
+    mt1_outputs:  {ind: (conf, delta, range_hw)} — slot0 decoded MT1 outputs
+    """
+    from training_v2 import build_master_features, tiers_to_alloc
+
+    industry_list = list(industries.keys())
+    today444 = build_master_features(ind_value_history, industry_list)
+
+    mt1_outputs: dict = {}
+    for i, ind in enumerate(industry_list):
+        in37_t  = today444[:, i * 37:(i + 1) * 37]
+        best_pt = os.path.join(model_dir, f"mt1_{ind}_best.pt")
+        mt1_m   = MT1NN()
+        if os.path.exists(best_pt):
+            try:
+                mt1_m.load_state_dict(torch.load(best_pt, weights_only=True))
+            except Exception as e:
+                print(f"Warning: could not load mt1_{ind}_best.pt: {e}")
+        mt1_m.eval()
+        with torch.no_grad():
+            conf, delta, range_hw = _mt1_decode(mt1_m, in37_t)
+        mt1_outputs[ind] = (conf, delta, range_hw)
+        del mt1_m
+
+    in36 = []
+    for ind in industry_list:
+        conf, delta, range_hw = mt1_outputs[ind]
+        in36.append(conf)
+        in36.append(_normalize_stat(delta,    norm_stats['delta_mean'], norm_stats['delta_var'], norm_stats['count']))
+        in36.append(_normalize_stat(range_hw, norm_stats['range_mean'], norm_stats['range_var'], norm_stats['count']))
+    in36_t = torch.tensor(in36, dtype=torch.float32).unsqueeze(0)
+
+    mt2_path = os.path.join(model_dir, 'mt2_best.pt')
+    mt2_m    = MT2NN()
+    if os.path.exists(mt2_path):
+        try:
+            mt2_m.load_state_dict(torch.load(mt2_path, weights_only=True))
+        except Exception as e:
+            print(f"Warning: could not load mt2_best.pt: {e}")
+    mt2_m.eval()
+    with torch.no_grad():
+        out = mt2_m(in36_t)
+    tier_preds = out.view(12, 4).argmax(dim=1).tolist()
+    tier_map   = {ind: tier_preds[i] for i, ind in enumerate(industry_list)}
+    del mt2_m
+
+    for ind in industry_list:
+        if tier_map[ind] == 0:
+            zero_counts[ind] = zero_counts.get(ind, 0) + 1
+        else:
+            zero_counts[ind] = 0
+
+    allocations = tiers_to_alloc(tier_map, industry_list, total_cash)
+    return allocations, tier_map, mt1_outputs
