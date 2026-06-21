@@ -170,7 +170,7 @@ def train_mt_one_day_prod(industries, model_dir, ind_value_history,
 
     Returns {ind: (conf, delta, range_hw)} — MT1 slot0 outputs after upkeep.
     """
-    from training_v2 import build_master_features
+    from training_lib import build_master_features
     industry_list = list(industries.keys())
 
     # actual_perf per industry from today's upkeep results
@@ -414,7 +414,7 @@ def run_master_allocation(master_model, industries, ind_value_history, zero_coun
       tier_map:     {ind: 0-3}
       mt1_outputs:  {ind: (conf, delta, range_hw)} or None for legacy path
     """
-    from training_v2 import build_master_features, decode_master_tiers, tiers_to_alloc
+    from training_lib import build_master_features, decode_master_tiers, tiers_to_alloc
     industry_list = list(industries.keys())
     tier_map      = {ind: 0 for ind in industry_list}
     mt1_outputs   = None
@@ -990,7 +990,7 @@ def main():
             save_mt2_norm_stats(args.model_dir, norm_stats)
         elif os.path.exists(f"{args.model_dir}/master_best.pt"):
             # Legacy MasterNN upkeep during transition period (≤15 real days)
-            from training_v2 import train_master_one_day
+            from training_lib import train_master_one_day
             try:
                 train_master_one_day(industries, master_primed, args.model_dir,
                                      ind_value_history,
