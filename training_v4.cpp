@@ -74,16 +74,22 @@ static bool load_universe_json(const std::string& path) {
     }
 
     const int expected = N_IND * (1 + IND_SYMS);   // 12 * 13 = 156
-    if ((int)tokens.size() != expected) {
+    // Extended format: token[0]="industries" key, then 156 name/symbol tokens, then extras
+    int offset = 0;
+    if ((int)tokens.size() == expected + 1 && tokens[0] == "industries") {
+        offset = 1;  // skip the "industries" key itself
+    } else if ((int)tokens.size() >= expected + 1 && tokens[0] == "industries") {
+        offset = 1;  // extended format (all_symbols/industry_names present too)
+    } else if ((int)tokens.size() != expected) {
         fprintf(stderr, "FATAL: %s has %d quoted tokens, expected %d.\n",
                 path.c_str(), (int)tokens.size(), expected);
         fprintf(stderr, "       Re-run: python swap_symbols.py '{}' to regenerate.\n");
         return false;
     }
     for (int i = 0; i < N_IND; i++) {
-        g_ind_names[i] = tokens[i * (1 + IND_SYMS)];
+        g_ind_names[i] = tokens[offset + i * (1 + IND_SYMS)];
         for (int j = 0; j < IND_SYMS; j++)
-            g_syms[i][j] = tokens[i * (1 + IND_SYMS) + 1 + j];
+            g_syms[i][j] = tokens[offset + i * (1 + IND_SYMS) + 1 + j];
     }
     return true;
 }
