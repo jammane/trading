@@ -120,6 +120,35 @@ static constexpr int HIST_PER_DAY = 10;
 static constexpr int HIST_ELITE   = 7;   // top-7 direct elite slots saved per day
 static constexpr int HIST_WAVG    = 3;   // wavg slots (17,18,19) saved per day
 
+// MT1NN: 37→37→29→20→12→3, per-industry preprocessor (12 pools)
+static constexpr int   MT1NN_PARAMS   = 3399;
+static constexpr int   MT1_START_DAY  = 25;
+static constexpr float MT1_SCALE      = 0.05f;   // tanh output scale for expected delta
+static constexpr float RANGE_SCALE    = 0.02f;   // e-folding half-width for score_range
+// MT1 weight layout offsets (kaiming_init writes weight+bias consecutively per layer)
+static constexpr int MT1_FC1_W = 0;       static constexpr int MT1_FC1_B = 1369;   // 37×37
+static constexpr int MT1_FC2_W = 1406;    static constexpr int MT1_FC2_B = 2479;   // +37, 37×29
+static constexpr int MT1_FC3_W = 2508;    static constexpr int MT1_FC3_B = 3088;   // +29, 29×20
+static constexpr int MT1_FC4_W = 3108;    static constexpr int MT1_FC4_B = 3348;   // +20, 20×12
+static constexpr int MT1_OUT_W = 3360;    static constexpr int MT1_OUT_B = 3396;   // +12, 12×3+3=3399
+
+// MT2NN: FC[36→36→36] ‖ LSTM[3→36×2layers] → concat72 → 66→60→54→48
+static constexpr int   MT2NN_PARAMS   = 33996;
+// FC branch
+static constexpr int MT2_FC1_W  =     0;  static constexpr int MT2_FC1_B  =  1296;  // 36×36
+static constexpr int MT2_FC2_W  =  1332;  static constexpr int MT2_FC2_B  =  2628;  // +36, 36×36
+// LSTM L1 (input_size=3, hidden=36): wih[144×3], whh[144×36], bih[144], bhh[144]
+static constexpr int MT2_L1_WIH =  2664;  static constexpr int MT2_L1_WHH =  3096;
+static constexpr int MT2_L1_BIH =  8280;  static constexpr int MT2_L1_BHH =  8424;
+// LSTM L2 (input_size=36, hidden=36): wih[144×36], whh[144×36], bih[144], bhh[144]
+static constexpr int MT2_L2_WIH =  8568;  static constexpr int MT2_L2_WHH = 13752;
+static constexpr int MT2_L2_BIH = 18936;  static constexpr int MT2_L2_BHH = 19080;
+// Taper (biases follow weights immediately for each layer → kaiming_init works)
+static constexpr int MT2_T1_W  = 19224;  static constexpr int MT2_T1_B  = 23976;  // 72×66
+static constexpr int MT2_T2_W  = 24042;  static constexpr int MT2_T2_B  = 28002;  // +66, 66×60
+static constexpr int MT2_T3_W  = 28062;  static constexpr int MT2_T3_B  = 31302;  // +60, 60×54
+static constexpr int MT2_OUT_W = 31356;  static constexpr int MT2_OUT_B = 33948;  // +54, 54×48+48=33996
+
 static bool g_no_save = false;  // --no-save: skip all model writes (diagnostic mode)
 
 // ── Layer dimensions ───────────────────────────────────────────────────────────
@@ -270,6 +299,73 @@ static void master_forward(const float* W, const float* today444, float* out48) 
     sgemv_only(W + MAST_OUT_W, W + MAST_OUT_B, h4,    out48,  48, 180);
 }
 
+// MT1NN forward: 37→37→29→20→12→3 (raw logits; activations applied at score time)
+static void mt1_forward(const float* W, const float* in37, float* out3) {
+    float h1[37], h2[29], h3[20], h4[12];
+    sgemv_relu(W + MT1_FC1_W, W + MT1_FC1_B, in37, h1, 37, 37);
+    sgemv_relu(W + MT1_FC2_W, W + MT1_FC2_B, h1,   h2, 29, 37);
+    sgemv_relu(W + MT1_FC3_W, W + MT1_FC3_B, h2,   h3, 20, 29);
+    sgemv_relu(W + MT1_FC4_W, W + MT1_FC4_B, h3,   h4, 12, 20);
+    sgemv_only(W + MT1_OUT_W, W + MT1_OUT_B, h4,  out3,  3, 12);
+}
+
+// Single LSTM time step (one layer). gates[4*hidden] is caller-provided scratch.
+static inline void lstm_step(const float* W_ih, const float* W_hh,
+                              const float* b_ih, const float* b_hh,
+                              const float* x_t, const float* h_prev, const float* c_prev,
+                              float* h_out, float* c_out,
+                              float* gates, int hidden, int input_sz) {
+    cblas_sgemv(CblasRowMajor, CblasNoTrans, 4*hidden, input_sz,
+                1.f, W_ih, input_sz, x_t, 1, 0.f, gates, 1);
+    for (int j = 0; j < 4*hidden; j++) gates[j] += b_ih[j];
+    cblas_sgemv(CblasRowMajor, CblasNoTrans, 4*hidden, hidden,
+                1.f, W_hh, hidden, h_prev, 1, 1.f, gates, 1);
+    for (int j = 0; j < 4*hidden; j++) gates[j] += b_hh[j];
+    for (int j = 0; j < hidden; j++) {
+        float i_g = sigmoidf(gates[j]);
+        float f_g = sigmoidf(gates[  hidden + j]);
+        float g_g = tanhf   (gates[2*hidden + j]);
+        float o_g = sigmoidf(gates[3*hidden + j]);
+        c_out[j] = f_g * c_prev[j] + i_g * g_g;
+        h_out[j] = o_g * tanhf(c_out[j]);
+    }
+}
+
+// MT2NN forward: FC‖LSTM parallel fork → concat72 → taper → 48 raw logits.
+// in36: 12 industries × 3 MT1 outputs (normalized). Cell/hidden reset to 0 each call.
+static void mt2_forward(const float* W, const float* in36, float* out48) {
+    // FC branch
+    float fc1[36], fc2[36];
+    sgemv_relu(W + MT2_FC1_W, W + MT2_FC1_B, in36, fc1, 36, 36);
+    sgemv_relu(W + MT2_FC2_W, W + MT2_FC2_B, fc1,  fc2, 36, 36);
+
+    // LSTM branch: 12 steps × 3 features, 2 layers, hidden=36
+    float h1[36]={}, c1[36]={}, hn1[36], cn1[36];
+    float h2[36]={}, c2[36]={}, hn2[36], cn2[36];
+    float gates[4*36];
+    for (int t = 0; t < 12; t++) {
+        const float* x_t = in36 + t * 3;
+        lstm_step(W+MT2_L1_WIH, W+MT2_L1_WHH, W+MT2_L1_BIH, W+MT2_L1_BHH,
+                  x_t, h1, c1, hn1, cn1, gates, 36, 3);
+        memcpy(h1, hn1, 36*sizeof(float)); memcpy(c1, cn1, 36*sizeof(float));
+        lstm_step(W+MT2_L2_WIH, W+MT2_L2_WHH, W+MT2_L2_BIH, W+MT2_L2_BHH,
+                  hn1, h2, c2, hn2, cn2, gates, 36, 36);
+        memcpy(h2, hn2, 36*sizeof(float)); memcpy(c2, cn2, 36*sizeof(float));
+    }
+
+    // Concatenate FC + LSTM final hidden
+    float cat72[72];
+    memcpy(cat72,      fc2, 36*sizeof(float));
+    memcpy(cat72 + 36, h2,  36*sizeof(float));
+
+    // Taper: 72→66→60→54→48
+    float t1[66], t2[60], t3[54];
+    sgemv_relu(W + MT2_T1_W, W + MT2_T1_B, cat72, t1, 66, 72);
+    sgemv_relu(W + MT2_T2_W, W + MT2_T2_B, t1,    t2, 60, 66);
+    sgemv_relu(W + MT2_T3_W, W + MT2_T3_B, t2,    t3, 54, 60);
+    sgemv_only(W + MT2_OUT_W, W + MT2_OUT_B, t3, out48, 48, 54);
+}
+
 // ── Data structures ─────────────────────────────────────────────────────────────
 
 struct OHLCV {
@@ -389,6 +485,86 @@ struct MasterScratch {
     float* wavg(int i)      { return wavg_buf   + (size_t)i * MASTERNN_PARAMS; }
 };
 
+// ── MT1/MT2 structures ──────────────────────────────────────────────────────────
+
+struct MT1Scratch {
+    float*   elite_buf;   // [ELITE_POOL × MT1NN_PARAMS]
+    float*   new_elites;  // [ELITE_POOL × MT1NN_PARAMS]
+    float*   wavg_buf;    // [3 × MT1NN_PARAMS]
+    float*   mut_buf;     // [MT1NN_PARAMS]
+    uint64_t mut_seeds[N_SLOTS - ELITE_POOL];
+
+    MT1Scratch() {
+        size_t ep = (size_t)ELITE_POOL * MT1NN_PARAMS;
+        elite_buf  = new float[ep]();
+        new_elites = new float[ep]();
+        wavg_buf   = new float[3 * MT1NN_PARAMS]();
+        mut_buf    = new float[MT1NN_PARAMS]();
+    }
+    ~MT1Scratch() { delete[] elite_buf; delete[] new_elites; delete[] wavg_buf; delete[] mut_buf; }
+    float* elite(int i)     { return elite_buf  + (size_t)i * MT1NN_PARAMS; }
+    float* new_elite(int i) { return new_elites + (size_t)i * MT1NN_PARAMS; }
+    float* wavg(int i)      { return wavg_buf   + (size_t)i * MT1NN_PARAMS; }
+};
+
+struct MT1Result {
+    float best_score, slot0_score, mean_score;
+    float slot0_conf, slot0_delta, slot0_range_hw;   // decoded outputs, pre-normalization
+};
+
+// Running stats for MT2 input normalization (delta and range across all 12 industries)
+struct MT2NormStats {
+    double delta_sum{0.}, delta_sum2{0.};
+    double range_sum{0.}, range_sum2{0.};
+    int    count{0};
+
+    void update(float delta, float range) {
+        count++;
+        delta_sum  += delta;        delta_sum2  += (double)delta  * delta;
+        range_sum  += range;        range_sum2  += (double)range  * range;
+    }
+    float delta_mean() const { return count > 0 ? (float)(delta_sum  / count) : 0.f; }
+    float range_mean() const { return count > 0 ? (float)(range_sum  / count) : 0.f; }
+    float delta_std()  const {
+        if (count < 2) return 1.f;
+        double m = delta_sum / count;
+        return sqrtf((float)std::max(0., delta_sum2 / count - m * m));
+    }
+    float range_std()  const {
+        if (count < 2) return 1.f;
+        double m = range_sum / count;
+        return sqrtf((float)std::max(0., range_sum2 / count - m * m));
+    }
+    float norm_delta(float v) const {
+        float s = delta_std(); if (s < 1e-9f) s = 1.f;
+        return (v - delta_mean()) / s;
+    }
+    float norm_range(float v) const {
+        float s = range_std(); if (s < 1e-9f) s = 1.f;
+        return (v - range_mean()) / s;
+    }
+};
+
+struct MT2Scratch {
+    float*   elite_buf;   // [ELITE_POOL × MT2NN_PARAMS]
+    float*   new_elites;  // [ELITE_POOL × MT2NN_PARAMS]
+    float*   wavg_buf;    // [3 × MT2NN_PARAMS]
+    float*   mut_buf;     // [MT2NN_PARAMS]
+    uint64_t mut_seeds[N_SLOTS - ELITE_POOL];
+
+    MT2Scratch() {
+        size_t ep = (size_t)ELITE_POOL * MT2NN_PARAMS;
+        elite_buf  = new float[ep]();
+        new_elites = new float[ep]();
+        wavg_buf   = new float[3 * MT2NN_PARAMS]();
+        mut_buf    = new float[MT2NN_PARAMS]();
+    }
+    ~MT2Scratch() { delete[] elite_buf; delete[] new_elites; delete[] wavg_buf; delete[] mut_buf; }
+    float* elite(int i)     { return elite_buf  + (size_t)i * MT2NN_PARAMS; }
+    float* new_elite(int i) { return new_elites + (size_t)i * MT2NN_PARAMS; }
+    float* wavg(int i)      { return wavg_buf   + (size_t)i * MT2NN_PARAMS; }
+};
+
 // ── Fee helpers ─────────────────────────────────────────────────────────────────
 
 static inline float sell_net(float shares, float price) {
@@ -467,6 +643,33 @@ static void init_master_weights(float* W, PCG32& rng) {
     kaiming_init(W + MAST_FC3_W, 312, 444, rng);
     kaiming_init(W + MAST_FC4_W, 180, 312, rng);
     kaiming_init(W + MAST_OUT_W,  48, 180, rng);
+}
+
+static void init_mt1_weights(float* W, PCG32& rng) {
+    kaiming_init(W + MT1_FC1_W, 37, 37, rng);
+    kaiming_init(W + MT1_FC2_W, 29, 37, rng);
+    kaiming_init(W + MT1_FC3_W, 20, 29, rng);
+    kaiming_init(W + MT1_FC4_W, 12, 20, rng);
+    kaiming_init(W + MT1_OUT_W,  3, 12, rng);
+}
+
+static void init_mt2_weights(float* W, PCG32& rng) {
+    kaiming_init(W + MT2_FC1_W, 36, 36, rng);
+    kaiming_init(W + MT2_FC2_W, 36, 36, rng);
+    // LSTM: PyTorch default — Uniform(-1/sqrt(hidden), 1/sqrt(hidden)) for all params
+    float lb = 1.f / sqrtf(36.f);
+    for (int j = 0; j < 4*36* 3; j++) W[MT2_L1_WIH+j] = (rng.next_float()*2.f-1.f)*lb;
+    for (int j = 0; j < 4*36*36; j++) W[MT2_L1_WHH+j] = (rng.next_float()*2.f-1.f)*lb;
+    for (int j = 0; j < 4*36;    j++) W[MT2_L1_BIH+j] = (rng.next_float()*2.f-1.f)*lb;
+    for (int j = 0; j < 4*36;    j++) W[MT2_L1_BHH+j] = (rng.next_float()*2.f-1.f)*lb;
+    for (int j = 0; j < 4*36*36; j++) W[MT2_L2_WIH+j] = (rng.next_float()*2.f-1.f)*lb;
+    for (int j = 0; j < 4*36*36; j++) W[MT2_L2_WHH+j] = (rng.next_float()*2.f-1.f)*lb;
+    for (int j = 0; j < 4*36;    j++) W[MT2_L2_BIH+j] = (rng.next_float()*2.f-1.f)*lb;
+    for (int j = 0; j < 4*36;    j++) W[MT2_L2_BHH+j] = (rng.next_float()*2.f-1.f)*lb;
+    kaiming_init(W + MT2_T1_W, 66, 72, rng);
+    kaiming_init(W + MT2_T2_W, 60, 66, rng);
+    kaiming_init(W + MT2_T3_W, 54, 60, rng);
+    kaiming_init(W + MT2_OUT_W, 48, 54, rng);
 }
 
 // ── Model file I/O ──────────────────────────────────────────────────────────────
@@ -1809,6 +2012,398 @@ static MasterResult step_master(MasterState& state, MasterScratch& scratch,
     return {best_pts_v, elite_max_pts, elite_min_pts, elite_mean_pts, ideal_pts};
 }
 
+// ── MT1 per-industry training step ──────────────────────────────────────────────
+
+static float compute_mt1_score(float actual, const float raw3[3]) {
+    float conf     = sigmoidf(raw3[0]);
+    float delta    = tanhf(raw3[1]) * MT1_SCALE;
+    float range_hw = log1pf(expf(raw3[2]));    // softplus
+
+    float sc_dir   = ((conf >= 0.5f) == (actual >= 0.f)) ? 1.f : 0.f;
+    float err      = fabsf(actual - delta);
+    float sc_range = (err <= range_hw) ? expf(-range_hw / RANGE_SCALE) : 0.f;
+    float rel_err  = err / (fabsf(actual) + 1e-9f);
+    float sc_acc   = 1.f - fminf(rel_err, 1.f);
+
+    return 0.50f * sc_dir + 0.33f * sc_range + 0.17f * sc_acc;
+}
+
+static MT1Result step_mt1(int ind_i, MT1Scratch& scratch,
+                           float actual_frac, const float in37[37],
+                           int actual_day, float sigma) {
+    if (actual_day < MT1_START_DAY) return {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    {
+        PCG32 seed_rng;
+        seed_rng.seed((uint64_t)actual_day * 987017ULL + (uint64_t)ind_i * 10007ULL + 11111ULL);
+        for (int i = 0; i < N_SLOTS - ELITE_POOL; i++)
+            scratch.mut_seeds[i] = ((uint64_t)seed_rng.next() << 32) | seed_rng.next();
+    }
+
+    float scores[N_SLOTS] = {};
+    float raw_out[N_SLOTS][3];
+    float out3[3];
+
+    for (int slot = 0; slot < N_SLOTS; slot++) {
+        const float* W;
+        if (slot < ELITE_POOL) {
+            W = scratch.elite(slot);
+        } else {
+            int mut_i = slot - ELITE_POOL, parent = mut_i / MUTATIONS_PER_PARENT;
+            memcpy(scratch.mut_buf, scratch.elite(parent), MT1NN_PARAMS * sizeof(float));
+            apply_gaussian(scratch.mut_buf, MT1NN_PARAMS, sigma, scratch.mut_seeds[mut_i]);
+            W = scratch.mut_buf;
+        }
+        mt1_forward(W, in37, out3);
+        raw_out[slot][0] = out3[0]; raw_out[slot][1] = out3[1]; raw_out[slot][2] = out3[2];
+        scores[slot] = compute_mt1_score(actual_frac, out3);
+    }
+
+    float mean_score = 0.f;
+    for (int s = 0; s < N_SLOTS; s++) mean_score += scores[s];
+    mean_score /= N_SLOTS;
+
+    int   best_slot = (int)(std::max_element(scores, scores + N_SLOTS) - scores);
+    float best_sc   = scores[best_slot];
+    float slot0_sc  = scores[0];
+
+    float slot0_conf     = sigmoidf(raw_out[0][0]);
+    float slot0_delta    = tanhf(raw_out[0][1]) * MT1_SCALE;
+    float slot0_range_hw = log1pf(expf(raw_out[0][2]));
+
+    // Selection: floor = mean − std
+    float var_s = 0.f;
+    for (int s = 0; s < N_SLOTS; s++) { float d = scores[s] - mean_score; var_s += d * d; }
+    float floor_s = mean_score - sqrtf(var_s / N_SLOTS);
+
+    std::vector<std::pair<float,int>> surviving;
+    surviving.reserve(N_SLOTS);
+    for (int s = 0; s < N_SLOTS; s++)
+        if (scores[s] >= floor_s) surviving.push_back({scores[s], s});
+    if (surviving.empty()) surviving.push_back({scores[0], 0});
+    std::sort(surviving.begin(), surviving.end(),
+              [](const auto& a, const auto& b){ return a.first > b.first; });
+    int n_top = std::min((int)surviving.size(), ELITE_COUNT);
+
+    int   src_rank[ELITE_COUNT] = {};
+    float src_val [ELITE_COUNT] = {};
+    for (int k = 0; k < n_top;      k++) { src_rank[k] = surviving[k].second; src_val[k] = surviving[k].first; }
+    for (int k = n_top; k < ELITE_COUNT; k++) { src_rank[k] = src_rank[0]; src_val[k] = src_val[0]; }
+
+    for (int k = 0; k < n_top; k++) {
+        int slot = src_rank[k];
+        if (slot < ELITE_POOL) {
+            memcpy(scratch.new_elite(k), scratch.elite(slot), MT1NN_PARAMS * sizeof(float));
+        } else {
+            int mut_i = slot - ELITE_POOL, parent = mut_i / MUTATIONS_PER_PARENT;
+            memcpy(scratch.new_elite(k), scratch.elite(parent), MT1NN_PARAMS * sizeof(float));
+            apply_gaussian(scratch.new_elite(k), MT1NN_PARAMS, sigma, scratch.mut_seeds[mut_i]);
+        }
+    }
+    for (int k = n_top; k < ELITE_COUNT; k++)
+        memcpy(scratch.new_elite(k), scratch.new_elite(0), MT1NN_PARAMS * sizeof(float));
+
+    float w5[5], w10[10], w15[15];
+    int n5 = std::min(n_top,5), n10 = std::min(n_top,10), n15 = std::min(n_top,15);
+    normalize_weights(src_val, w5,  n5);
+    normalize_weights(src_val, w10, n10);
+    normalize_weights(src_val, w15, n15);
+    int seq[ELITE_COUNT]; for (int k = 0; k < ELITE_COUNT; k++) seq[k] = k;
+    wavg_weights_flat(scratch.new_elites, MT1NN_PARAMS, seq, w5,  n5,  scratch.wavg(0));
+    wavg_weights_flat(scratch.new_elites, MT1NN_PARAMS, seq, w10, n10, scratch.wavg(1));
+    wavg_weights_flat(scratch.new_elites, MT1NN_PARAMS, seq, w15, n15, scratch.wavg(2));
+    memcpy(scratch.new_elite(ELITE_COUNT),     scratch.wavg(0), MT1NN_PARAMS * sizeof(float));
+    memcpy(scratch.new_elite(ELITE_COUNT + 1), scratch.wavg(1), MT1NN_PARAMS * sizeof(float));
+    memcpy(scratch.new_elite(ELITE_COUNT + 2), scratch.wavg(2), MT1NN_PARAMS * sizeof(float));
+
+    for (int k = 0; k < ELITE_POOL; k++)
+        memcpy(scratch.elite(k), scratch.new_elite(k), MT1NN_PARAMS * sizeof(float));
+
+    return {best_sc, slot0_sc, mean_score, slot0_conf, slot0_delta, slot0_range_hw};
+}
+
+// ── MT2 training step (replaces step_master) ────────────────────────────────────
+
+static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
+                              const float in36[36], const float actual_perf[N_IND],
+                              int actual_day, int total_avail,
+                              float sigma, bool* injected_out) {
+    if (actual_day < MASTER_START_DAY) {
+        if (injected_out) *injected_out = false;
+        return {0.f, 0.f, 0.f, 0.f, 0.f};
+    }
+
+    {
+        PCG32 seed_rng; seed_rng.seed((uint64_t)actual_day * 777017ULL + 99999ULL);
+        for (int i = 0; i < N_SLOTS - ELITE_POOL; i++)
+            scratch.mut_seeds[i] = ((uint64_t)seed_rng.next() << 32) | seed_rng.next();
+    }
+
+    // Compute optimal tiers retroactively
+    int opt_tier[N_IND] = {};
+    {
+        int pos_idx[N_IND]; int n_pos = 0;
+        for (int i = 0; i < N_IND; i++)
+            if (actual_perf[i] >= 0.f) pos_idx[n_pos++] = i;
+        std::sort(pos_idx, pos_idx + n_pos,
+                  [&actual_perf](int a, int b){ return actual_perf[a] < actual_perf[b]; });
+        if (n_pos == 1) { opt_tier[pos_idx[0]] = 3; }
+        else if (n_pos == 2) { opt_tier[pos_idx[0]] = 2; opt_tier[pos_idx[1]] = 3; }
+        else {
+            int base = n_pos/3, rem = n_pos%3;
+            int n1 = base + (rem>=1?1:0), n2 = base + (rem>=2?1:0);
+            for (int rank = 0; rank < n_pos; rank++) {
+                int ind = pos_idx[rank];
+                if      (rank < n1)      opt_tier[ind] = 1;
+                else if (rank < n1 + n2) opt_tier[ind] = 2;
+                else                     opt_tier[ind] = 3;
+            }
+        }
+    }
+    float ideal_pts = 0.f;
+    for (int i = 0; i < N_IND; i++) ideal_pts += (float)opt_tier[i];
+
+    float ref_cash = state.portfolios[0].cash;
+    float ref_hold[N_IND];
+    for (int i = 0; i < N_IND; i++) ref_hold[i] = state.portfolios[0].holdings[i];
+    float baseline = ref_cash;
+    for (int i = 0; i < N_IND; i++) baseline += ref_hold[i] * IND_UNIT_PRICE;
+
+    for (int s = 0; s < N_SLOTS; s++) {
+        state.portfolios[s].cash = ref_cash;
+        for (int i = 0; i < N_IND; i++) state.portfolios[s].holdings[i] = ref_hold[i];
+    }
+    for (int s = 1; s < N_SLOTS; s++)
+        memcpy(state.zero_counts[s], state.zero_counts[0], N_IND * sizeof(int));
+
+    float pred_scores[N_SLOTS] = {}, port_vals[N_SLOTS] = {};
+    int   slot_tiers[N_SLOTS][N_IND] = {};
+    float out48[48];
+
+    for (int slot = 0; slot < N_SLOTS; slot++) {
+        const float* W;
+        if (slot < ELITE_POOL) {
+            W = scratch.elite(slot);
+        } else {
+            int mut_i = slot - ELITE_POOL, parent = mut_i / MUTATIONS_PER_PARENT;
+            memcpy(scratch.mut_buf, scratch.elite(parent), MT2NN_PARAMS * sizeof(float));
+            apply_gaussian(scratch.mut_buf, MT2NN_PARAMS, sigma, scratch.mut_seeds[mut_i]);
+            W = scratch.mut_buf;
+        }
+        mt2_forward(W, in36, out48);
+
+        int tier[N_IND];
+        for (int i = 0; i < N_IND; i++) {
+            const float* lg = out48 + i * 4; int best = 0;
+            for (int k = 1; k < 4; k++) if (lg[k] > lg[best]) best = k;
+            tier[i] = best; slot_tiers[slot][i] = best;
+        }
+        for (int i = 0; i < N_IND; i++) {
+            if (tier[i] == 0) state.zero_counts[slot][i]++;
+            else              state.zero_counts[slot][i] = 0;
+        }
+
+        MasterPortfolio& port = state.portfolios[slot];
+        for (int i = 0; i < N_IND; i++) {
+            if (state.zero_counts[slot][i] >= 3 && port.holdings[i] > 1e-9f) {
+                port.cash += sell_net(port.holdings[i], IND_UNIT_PRICE);
+                port.holdings[i] = 0.f;
+            }
+        }
+
+        int positives[N_IND]; int n_pos = 0;
+        for (int i = 0; i < N_IND; i++) if (tier[i] > 0) positives[n_pos++] = i;
+        float alloc[N_IND] = {};
+        if (n_pos > 0) {
+            std::sort(positives, positives + n_pos,
+                      [&tier](int a, int b){ return tier[a] < tier[b]; });
+            float pool = port.cash;
+            for (int i = 0; i < N_IND; i++) pool += port.holdings[i] * IND_UNIT_PRICE;
+            if (n_pos == 1) {
+                alloc[positives[0]] = TIER_WEIGHTS[3] / NULL_DENOM * pool;
+            } else if (n_pos == 2) {
+                alloc[positives[0]] = TIER_WEIGHTS[2] / NULL_DENOM * pool;
+                alloc[positives[1]] = TIER_WEIGHTS[3] / NULL_DENOM * pool;
+            } else {
+                int base = n_pos/3, rem = n_pos%3;
+                int n1 = base+(rem>=1?1:0), n2 = base+(rem>=2?1:0);
+                int assigned[N_IND] = {};
+                for (int rank = 0; rank < n_pos; rank++) {
+                    int ind = positives[rank];
+                    if      (rank < n1)      assigned[ind] = 1;
+                    else if (rank < n1 + n2) assigned[ind] = 2;
+                    else                     assigned[ind] = 3;
+                }
+                float total_w = 0.f;
+                for (int k = 0; k < n_pos; k++) total_w += TIER_WEIGHTS[assigned[positives[k]]];
+                if (total_w > 0.f)
+                    for (int k = 0; k < n_pos; k++) {
+                        int ind = positives[k];
+                        alloc[ind] = TIER_WEIGHTS[assigned[ind]] / total_w * pool;
+                    }
+            }
+        }
+        for (int i = 0; i < N_IND; i++) {
+            float cur_v = port.holdings[i] * IND_UNIT_PRICE, tgt_v = alloc[i];
+            if (cur_v > tgt_v + 1e-6f) {
+                float units = (cur_v - tgt_v) / IND_UNIT_PRICE;
+                port.holdings[i] -= units; port.cash += sell_net(units, IND_UNIT_PRICE);
+            }
+        }
+        for (int i = 0; i < N_IND; i++) {
+            float cur_v = port.holdings[i] * IND_UNIT_PRICE, tgt_v = alloc[i];
+            if (tgt_v > cur_v + 1e-6f) {
+                float diff = std::min(tgt_v - cur_v, port.cash), units = diff / IND_UNIT_PRICE;
+                port.holdings[i] += units; port.cash -= units * IND_UNIT_PRICE;
+            }
+        }
+        for (int i = 0; i < N_IND; i++) port.holdings[i] *= (1.f + actual_perf[i]);
+
+        float port_val = port.cash;
+        for (int i = 0; i < N_IND; i++) port_val += port.holdings[i] * IND_UNIT_PRICE;
+        port_vals[slot] = port_val;
+        float pts = 0.f;
+        for (int i = 0; i < N_IND; i++) {
+            int pred = tier[i], opt = opt_tier[i];
+            if (opt == 0) { if (pred > 0) pts += -2.f - 0.25f * pred; }
+            else if (pred == 0) { pts -= (float)opt; }
+            else if (pred <= opt) { pts += (float)pred; }
+            else { pts += (float)opt - 0.25f * (float)(pred - opt); }
+        }
+        pred_scores[slot] = pts * 1e9f + port_val;
+    }
+
+    int tier_counts[4] = {};
+    for (int i = 0; i < N_IND; i++) tier_counts[slot_tiers[0][i]]++;
+    int best_slot_idx = (int)(std::max_element(pred_scores, pred_scores + N_SLOTS) - pred_scores);
+    float best_sc   = pred_scores[best_slot_idx];
+    float best_pts_v  = (best_sc - port_vals[best_slot_idx]) / 1e9f;
+    float slot0_pts_v = (pred_scores[0] - port_vals[0]) / 1e9f;
+
+    auto fmt_pts = [](float v) -> std::string {
+        char buf[32]; snprintf(buf, sizeof(buf), "%+.2f", v); return buf;
+    };
+    log_msg(std::string("[mt2     ] Day ") + std::to_string(actual_day+1) +
+            "/" + std::to_string(total_avail) +
+            " | best_pts=" + fmt_pts(best_pts_v) +
+            " slot0_pts=" + fmt_pts(slot0_pts_v) +
+            " | t0=" + std::to_string(tier_counts[0]) +
+            " t1=" + std::to_string(tier_counts[1]) +
+            " t2=" + std::to_string(tier_counts[2]) +
+            " t3=" + std::to_string(tier_counts[3]));
+
+    if (baseline < MST_STARTING_CASH * 0.9f) {
+        for (int s = 0; s < N_SLOTS; s++) {
+            state.portfolios[s].cash = MST_STARTING_CASH;
+            for (int i = 0; i < N_IND; i++) state.portfolios[s].holdings[i] = 0.f;
+        }
+        memset(state.zero_counts, 0, sizeof(state.zero_counts));
+        if (injected_out) *injected_out = false;
+        return {0.f, 0.f, 0.f, 0.f, 0.f};
+    }
+
+    MasterPortfolio slot0_own = state.portfolios[0];
+    int slot0_zc[N_IND];
+    memcpy(slot0_zc, state.zero_counts[0], N_IND * sizeof(int));
+
+    bool injected = false;
+    if (best_pts_v >= -1.f) {
+        float mean_ps = 0.f;
+        for (int s = 0; s < N_SLOTS; s++) mean_ps += pred_scores[s];
+        mean_ps /= N_SLOTS;
+        float var_ps = 0.f;
+        for (int s = 0; s < N_SLOTS; s++) { float d = pred_scores[s]-mean_ps; var_ps += d*d; }
+        float pool_floor = mean_ps - sqrtf(var_ps / N_SLOTS);
+
+        std::vector<std::pair<float,int>> surviving;
+        for (int s = 0; s < N_SLOTS; s++)
+            if (pred_scores[s] >= pool_floor) surviving.push_back({pred_scores[s], s});
+        if (surviving.empty()) surviving.push_back({pred_scores[0], 0});
+        std::sort(surviving.begin(), surviving.end(),
+                  [](const auto& a, const auto& b){ return a.first > b.first; });
+        int n_top = std::min((int)surviving.size(), ELITE_COUNT);
+
+        int   src_rank[ELITE_COUNT] = {};
+        float src_val [ELITE_COUNT] = {};
+        for (int k = 0;    k < n_top;       k++) { src_rank[k] = surviving[k].second; src_val[k] = surviving[k].first; }
+        for (int k = n_top; k < ELITE_COUNT; k++) { src_rank[k] = src_rank[0]; src_val[k] = src_val[0]; }
+
+        float w5[5], w10[10], w15[15];
+        int n5 = std::min(n_top,5), n10 = std::min(n_top,10), n15 = std::min(n_top,15);
+        normalize_weights(src_val, w5,  n5);
+        normalize_weights(src_val, w10, n10);
+        normalize_weights(src_val, w15, n15);
+
+        memcpy(slot0_zc, state.zero_counts[src_rank[0]], N_IND * sizeof(int));
+        MasterPortfolio new_mports[ELITE_POOL];
+        const MasterPortfolio* mp5[5], *mp10[10], *mp15[15];
+        for (int k=0;k<n5;k++)  mp5[k]  = &state.portfolios[src_rank[k]];
+        for (int k=0;k<n10;k++) mp10[k] = &state.portfolios[src_rank[k]];
+        for (int k=0;k<n15;k++) mp15[k] = &state.portfolios[src_rank[k]];
+        MasterPortfolio wp5={}, wp10={}, wp15={};
+        wavg_mst_portfolio(mp5,  w5,  n5,  wp5);
+        wavg_mst_portfolio(mp10, w10, n10, wp10);
+        wavg_mst_portfolio(mp15, w15, n15, wp15);
+
+        for (int k = 0; k < n_top; k++) {
+            int slot = src_rank[k];
+            if (slot < ELITE_POOL) {
+                memcpy(scratch.new_elite(k), scratch.elite(slot), MT2NN_PARAMS * sizeof(float));
+            } else {
+                int mut_i = slot - ELITE_POOL, parent = mut_i / MUTATIONS_PER_PARENT;
+                memcpy(scratch.new_elite(k), scratch.elite(parent), MT2NN_PARAMS * sizeof(float));
+                apply_gaussian(scratch.new_elite(k), MT2NN_PARAMS, sigma, scratch.mut_seeds[mut_i]);
+            }
+            new_mports[k] = state.portfolios[slot];
+        }
+        for (int k = n_top; k < ELITE_COUNT; k++) {
+            memcpy(scratch.new_elite(k), scratch.new_elite(0), MT2NN_PARAMS * sizeof(float));
+            new_mports[k] = new_mports[0];
+        }
+        int seq[ELITE_COUNT]; for (int k = 0; k < ELITE_COUNT; k++) seq[k] = k;
+        wavg_weights_flat(scratch.new_elites, MT2NN_PARAMS, seq, w5,  n5,  scratch.wavg(0));
+        wavg_weights_flat(scratch.new_elites, MT2NN_PARAMS, seq, w10, n10, scratch.wavg(1));
+        wavg_weights_flat(scratch.new_elites, MT2NN_PARAMS, seq, w15, n15, scratch.wavg(2));
+        memcpy(scratch.new_elite(ELITE_COUNT),     scratch.wavg(0), MT2NN_PARAMS * sizeof(float));
+        memcpy(scratch.new_elite(ELITE_COUNT + 1), scratch.wavg(1), MT2NN_PARAMS * sizeof(float));
+        memcpy(scratch.new_elite(ELITE_COUNT + 2), scratch.wavg(2), MT2NN_PARAMS * sizeof(float));
+        new_mports[ELITE_COUNT] = wp5; new_mports[ELITE_COUNT+1] = wp10; new_mports[ELITE_COUNT+2] = wp15;
+
+        for (int k = 0; k < ELITE_POOL; k++) {
+            memcpy(scratch.elite(k), scratch.new_elite(k), MT2NN_PARAMS * sizeof(float));
+            state.portfolios[k] = new_mports[k];
+        }
+        for (int mut_i = 0; mut_i < N_SLOTS - ELITE_POOL; mut_i++)
+            state.portfolios[ELITE_POOL + mut_i] = state.portfolios[mut_i / MUTATIONS_PER_PARENT];
+    } else {
+        injected = true;
+        log_msg("[mt2     ] best_pts=" + fmt_pts(best_pts_v) + " < -1 — injecting diversity");
+        PCG32 div_rng; div_rng.seed((uint64_t)actual_day * 55555ULL + 77777ULL);
+        int half = ELITE_COUNT / 2;
+        for (int k = half; k < ELITE_COUNT; k++) {
+            init_mt2_weights(scratch.mut_buf, div_rng);
+            for (int p = 0; p < MT2NN_PARAMS; p++)
+                scratch.elite(k)[p] = 0.5f * scratch.elite(k-half)[p] + 0.5f * scratch.mut_buf[p];
+            state.portfolios[k] = state.portfolios[k - half];
+        }
+    }
+
+    state.portfolios[0] = slot0_own;
+    memcpy(state.zero_counts[0], slot0_zc, N_IND * sizeof(int));
+
+    float elite_max_pts = -1e9f, elite_min_pts = 1e9f, elite_mean_pts = 0.f;
+    for (int s = 0; s < ELITE_COUNT; s++) {
+        float p = (pred_scores[s] - port_vals[s]) / 1e9f;
+        if (p > elite_max_pts) elite_max_pts = p;
+        if (p < elite_min_pts) elite_min_pts = p;
+        elite_mean_pts += p;
+    }
+    elite_mean_pts /= ELITE_COUNT;
+
+    if (injected_out) *injected_out = injected;
+    return {best_pts_v, elite_max_pts, elite_min_pts, elite_mean_pts, ideal_pts};
+}
+
 // ── History update (main thread after workers finish) ────────────────────────────
 
 static void update_hist_sym(SymHist& h, const OHLCV& d) {
@@ -1916,6 +2511,115 @@ static void load_or_init_master(const std::string& dir, const std::string& load_
             init_master_weights(e, rng);
         }
     }
+}
+
+// ── MT1/MT2 persistence ──────────────────────────────────────────────────────────
+
+static std::string mt1_elite_path(const std::string& dir, const char* ind, int slot) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s/mt1_%s_elite_%d.bin", dir.c_str(), ind, slot);
+    return buf;
+}
+
+static void save_mt1_elites(const std::string& dir, int ind_i, const float* elite_buf) {
+    for (int slot = 0; slot < ELITE_POOL; slot++) {
+        std::string p = mt1_elite_path(dir, g_ind_names[ind_i].c_str(), slot);
+        if (!save_bin(p, elite_buf + (size_t)slot * MT1NN_PARAMS, MT1NN_PARAMS))
+            log_msg("WARNING: could not save " + p);
+    }
+}
+
+static void load_or_init_mt1(const std::string& dir, const std::string& load_dir,
+                               int ind_i, float* elite_buf) {
+    PCG32 rng; rng.seed((uint64_t)(ind_i + N_IND) * 777777777ULL + 314159265ULL);
+    for (int slot = 0; slot < ELITE_POOL; slot++) {
+        float* e = elite_buf + (size_t)slot * MT1NN_PARAMS;
+        bool loaded = false;
+        if (!load_dir.empty()) {
+            std::string p = mt1_elite_path(load_dir, g_ind_names[ind_i].c_str(), slot);
+            loaded = load_bin(p, e, MT1NN_PARAMS);
+        }
+        if (!loaded) {
+            std::string p = mt1_elite_path(dir, g_ind_names[ind_i].c_str(), slot);
+            loaded = load_bin(p, e, MT1NN_PARAMS);
+        }
+        if (!loaded) init_mt1_weights(e, rng);
+    }
+}
+
+static void save_mt2_elites(const std::string& dir, const float* elite_buf) {
+    for (int slot = 0; slot < ELITE_POOL; slot++) {
+        char p[512]; snprintf(p, sizeof(p), "%s/mt2_elite_%d.bin", dir.c_str(), slot);
+        if (!save_bin(p, elite_buf + (size_t)slot * MT2NN_PARAMS, MT2NN_PARAMS))
+            log_msg(std::string("WARNING: could not save ") + p);
+    }
+}
+
+static void load_or_init_mt2(const std::string& dir, const std::string& load_dir,
+                               float* elite_buf) {
+    PCG32 rng; rng.seed(0xCAFED00DBEEF1234ULL);
+    for (int slot = 0; slot < ELITE_POOL; slot++) {
+        float* e = elite_buf + (size_t)slot * MT2NN_PARAMS;
+        bool loaded = false;
+        if (!load_dir.empty()) {
+            char p[512]; snprintf(p, sizeof(p), "%s/mt2_elite_%d.bin", load_dir.c_str(), slot);
+            loaded = load_bin(p, e, MT2NN_PARAMS);
+        }
+        if (!loaded) {
+            char p[512]; snprintf(p, sizeof(p), "%s/mt2_elite_%d.bin", dir.c_str(), slot);
+            loaded = load_bin(p, e, MT2NN_PARAMS);
+        }
+        if (!loaded) init_mt2_weights(e, rng);
+    }
+}
+
+static void save_mt2_norm_stats(const std::string& dir, const MT2NormStats& s) {
+    std::string path = dir + "/mt2_norm_stats.bin";
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) { log_msg("WARNING: could not save mt2_norm_stats.bin"); return; }
+    fwrite(&s.delta_sum,  sizeof(double), 1, f);
+    fwrite(&s.delta_sum2, sizeof(double), 1, f);
+    fwrite(&s.range_sum,  sizeof(double), 1, f);
+    fwrite(&s.range_sum2, sizeof(double), 1, f);
+    fwrite(&s.count,      sizeof(int),    1, f);
+    fclose(f);
+}
+
+static bool load_mt2_norm_stats(const std::string& dir, MT2NormStats& s) {
+    std::string path = dir + "/mt2_norm_stats.bin";
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    fread(&s.delta_sum,  sizeof(double), 1, f);
+    fread(&s.delta_sum2, sizeof(double), 1, f);
+    fread(&s.range_sum,  sizeof(double), 1, f);
+    fread(&s.range_sum2, sizeof(double), 1, f);
+    fread(&s.count,      sizeof(int),    1, f);
+    fclose(f);
+    return true;
+}
+
+// ── MT binary log ────────────────────────────────────────────────────────────────
+
+static constexpr uint32_t MT_LOG_MAGIC   = 0x4D543132u;  // 'MT12'
+static constexpr uint32_t MT_LOG_VERSION = 1u;
+
+static bool write_mt_log_header(FILE* f) {
+    uint32_t hdr[4] = {MT_LOG_MAGIC, MT_LOG_VERSION, (uint32_t)N_IND, 0u};
+    return fwrite(hdr, sizeof(uint32_t), 4, f) == 4;
+}
+
+struct MTLogRecord {
+    uint32_t pass_num, actual_day;
+    float    mt1_best[N_IND], mt1_slot0[N_IND], mt1_mean[N_IND];
+    float    mt2_best_pts, mt2_slot0_pts, mt2_ideal_pts;
+    uint8_t  mt2_injected;
+    uint8_t  pad[3];
+};
+static_assert(sizeof(MTLogRecord) == 168, "MTLogRecord must be 168 bytes");
+
+static void write_mt_log_record(FILE* f, const MTLogRecord& r) {
+    fwrite(&r, sizeof(MTLogRecord), 1, f);
+    fflush(f);
 }
 
 // ── Stock data loading ──────────────────────────────────────────────────────────
@@ -2085,10 +2789,12 @@ int main(int argc, char* argv[]) {
             "  Training: days " + std::to_string(day_start) +
             "–" + std::to_string(day_end));
 
-    // Allocate state on heap (small now — elites removed)
-    auto ind_states  = std::make_unique<IndustryState[]>(N_IND);
-    auto mst         = std::make_unique<MasterState>();
-    auto mst_scratch = std::make_unique<MasterScratch>();  // ~162 MB for master elites
+    // Allocate state on heap
+    auto ind_states   = std::make_unique<IndustryState[]>(N_IND);
+    auto mst          = std::make_unique<MasterState>();   // portfolio state reused by MT2
+    auto mt1_scratches = std::make_unique<MT1Scratch[]>(N_IND);   // 12 × ~272 KB ≈ 3.3 MB
+    auto mt2_scratch  = std::make_unique<MT2Scratch>();            // ~5.5 MB
+    MT2NormStats mt2_norm;
 
     // Open CSV log
     std::string csv_path = output_dir + "/training_log.csv";
@@ -2098,8 +2804,13 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < N_IND; i++)
             fprintf(csv, ",%s_elite_max,%s_elite_min,%s_elite_mean",
                     g_ind_names[i].c_str(), g_ind_names[i].c_str(), g_ind_names[i].c_str());
-        fprintf(csv, ",master_elite_max_pts,master_elite_min_pts,master_elite_mean_pts,master_ideal_pts\n");
+        fprintf(csv, ",mt2_elite_max_pts,mt2_elite_min_pts,mt2_elite_mean_pts,mt2_ideal_pts\n");
     }
+
+    // Open binary MT log
+    std::string mt_log_path = output_dir + "/mt_training_log.bin";
+    FILE* mt_log = fopen(mt_log_path.c_str(), "wb");
+    if (mt_log) write_mt_log_header(mt_log);
 
     // Threading setup
     num_workers = std::max(1, std::min(num_workers, N_IND));
@@ -2132,8 +2843,20 @@ int main(int argc, char* argv[]) {
             ind_states[i].streak = 0;
             for (int s = 1; s < N_SLOTS; s++) ind_states[i].portfolios[s] = ind_states[i].portfolios[0];
         }
-        // Load master elites once at pass start (no per-day reload needed for master)
-        load_or_init_master(output_dir, load_dir, mst_scratch->elite_buf);
+        // Load MT1 elites (12 per-industry pools) and MT2 elites once at pass start
+        for (int i = 0; i < N_IND; i++)
+            load_or_init_mt1(output_dir, load_dir, i, mt1_scratches[i].elite_buf);
+        load_or_init_mt2(output_dir, load_dir, mt2_scratch->elite_buf);
+        // Load running normalization stats (persist across passes; don't reset)
+        if (pass == 0) {
+            if (!load_dir.empty()) {
+                if (!load_mt2_norm_stats(load_dir, mt2_norm))
+                    load_mt2_norm_stats(output_dir, mt2_norm);
+            } else {
+                load_mt2_norm_stats(output_dir, mt2_norm);
+            }
+        }
+        // Init MT2 portfolio state
         mst->portfolios[0].cash = MST_STARTING_CASH;
         for (int i = 0; i < N_IND; i++) mst->portfolios[0].holdings[i] = 0.f;
         for (int s = 1; s < N_SLOTS; s++) mst->portfolios[s] = mst->portfolios[0];
@@ -2191,9 +2914,43 @@ int main(int argc, char* argv[]) {
                 for (int j = 0; j < IND_SYMS; j++)
                     update_hist_sym(ind_states[i].hist[j], day_ptr->sym[i][j]);
 
-            // Run master step (uses ind_val_hist from days BEFORE today, then we append today)
-            MasterResult master_res = step_master(*mst, *mst_scratch, results,
-                                                   actual_day, total_days, cur_mst_sigma);
+            // Build 444-feature vector (uses ind_val_hist from BEFORE today)
+            float today444[444];
+            build_master_features(mst->ind_val_hist, mst->ind_hist_count, today444);
+
+            // Compute actual fractional returns from slot0 results
+            float actual_perf[N_IND] = {};
+            for (int i = 0; i < N_IND; i++)
+                if (results[i].baseline > 0.f)
+                    actual_perf[i] = results[i].slot0_score / results[i].baseline - 1.f;
+
+            // MT1 step × 12 (actual_day >= MT1_START_DAY)
+            MT1Result mt1_res[N_IND] = {};
+            if (actual_day >= MT1_START_DAY) {
+                for (int i = 0; i < N_IND; i++) {
+                    const float* in37 = today444 + i * 37;
+                    mt1_res[i] = step_mt1(i, mt1_scratches[i], actual_perf[i],
+                                          in37, actual_day, cur_mst_sigma);
+                }
+                // Update running normalization stats with today's 12 industry outputs
+                for (int i = 0; i < N_IND; i++)
+                    mt2_norm.update(mt1_res[i].slot0_delta, mt1_res[i].slot0_range_hw);
+            }
+
+            // MT2 step (actual_day >= MASTER_START_DAY)
+            MasterResult master_res = {};
+            bool mt2_injected = false;
+            if (actual_day >= MASTER_START_DAY) {
+                // Build normalized 36-feature MT2 input from MT1 slot0 outputs
+                float in36[36];
+                for (int i = 0; i < N_IND; i++) {
+                    in36[i*3 + 0] = mt1_res[i].slot0_conf;                               // [0,1]
+                    in36[i*3 + 1] = mt2_norm.norm_delta(mt1_res[i].slot0_delta);         // normalized
+                    in36[i*3 + 2] = mt2_norm.norm_range(mt1_res[i].slot0_range_hw);      // normalized
+                }
+                master_res = step_mt2(*mst, *mt2_scratch, in36, actual_perf,
+                                      actual_day, total_days, cur_mst_sigma, &mt2_injected);
+            }
 
             // Append today's best-slot industry values to rolling ind_val_hist buffer
             for (int i = 0; i < N_IND; i++) {
@@ -2211,17 +2968,40 @@ int main(int argc, char* argv[]) {
             // Log CSV row
             if (csv) write_csv_row(csv, pass, actual_day, results, master_res);
 
-            // Periodic master save (industry elites already saved inside step_industry each day)
+            // Write MT binary log record (once MT1 is active)
+            if (mt_log && actual_day >= MT1_START_DAY) {
+                MTLogRecord rec{};
+                rec.pass_num     = (uint32_t)pass;
+                rec.actual_day   = (uint32_t)actual_day;
+                for (int i = 0; i < N_IND; i++) {
+                    rec.mt1_best[i]  = mt1_res[i].best_score;
+                    rec.mt1_slot0[i] = mt1_res[i].slot0_score;
+                    rec.mt1_mean[i]  = mt1_res[i].mean_score;
+                }
+                rec.mt2_best_pts   = master_res.best_pts;
+                rec.mt2_slot0_pts  = master_res.elite_mean_pts;  // slot0 pts proxy
+                rec.mt2_ideal_pts  = master_res.ideal_pts;
+                rec.mt2_injected   = mt2_injected ? 1u : 0u;
+                write_mt_log_record(mt_log, rec);
+            }
+
+            // Periodic MT1/MT2 save (industry elites already saved inside step_industry each day)
             if (!g_no_save && (day_num % 50 == 49 || day_num == num_days - 1)) {
-                log_msg("Saving master elites to " + output_dir + " ...");
-                save_master_elites(output_dir, mst_scratch->elite_buf);
+                log_msg("Saving MT1/MT2 elites to " + output_dir + " ...");
+                for (int i = 0; i < N_IND; i++)
+                    save_mt1_elites(output_dir, i, mt1_scratches[i].elite_buf);
+                save_mt2_elites(output_dir, mt2_scratch->elite_buf);
+                save_mt2_norm_stats(output_dir, mt2_norm);
             }
         }
 
-        // Save master after each pass (industry elites already saved)
+        // Save MT1/MT2 after each pass (industry elites already saved by step_industry)
         if (!g_no_save) {
-            log_msg("Pass " + std::to_string(pass+1) + " complete — saving master elites");
-            save_master_elites(output_dir, mst_scratch->elite_buf);
+            log_msg("Pass " + std::to_string(pass+1) + " complete — saving MT1/MT2 elites");
+            for (int i = 0; i < N_IND; i++)
+                save_mt1_elites(output_dir, i, mt1_scratches[i].elite_buf);
+            save_mt2_elites(output_dir, mt2_scratch->elite_buf);
+            save_mt2_norm_stats(output_dir, mt2_norm);
         }
     }
 
@@ -2231,7 +3011,8 @@ int main(int argc, char* argv[]) {
     for (int w = 0; w < num_workers; w++) wctx.work_done.acquire();
     for (auto& t : workers) t.join();
 
-    if (csv) fclose(csv);
+    if (csv)    fclose(csv);
+    if (mt_log) fclose(mt_log);
     log_msg("Training complete.");
     return 0;
 }

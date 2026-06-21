@@ -1,10 +1,10 @@
-"""Tests for StockNN and MasterNN model architecture."""
+"""Tests for StockNN, MasterNN, MT1NN, and MT2NN model architecture."""
 
 import io
 import pytest
 import torch
 
-from models import MasterNN, StockNN
+from models import MasterNN, MT1NN, MT2NN, StockNN
 
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
@@ -211,3 +211,134 @@ class TestMasterNN:
         (today,) = master_inputs
         out = MasterNN()(today)
         assert not torch.isinf(out).any()
+
+
+# ── MT1NN ──────────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def mt1_inputs():
+    torch.manual_seed(0)
+    return torch.randn(1, 37)
+
+
+class TestMT1NN:
+    def test_output_shape(self, mt1_inputs):
+        out = MT1NN()(mt1_inputs)
+        assert out.shape == (1, 3)
+
+    def test_param_count(self):
+        n = sum(p.numel() for p in MT1NN().parameters())
+        assert n == 3399, f"MT1NN param count: expected 3399, got {n}"
+
+    def test_layer_dims(self):
+        m = MT1NN()
+        assert m.fc1.in_features  == 37 and m.fc1.out_features  == 37
+        assert m.fc2.in_features  == 37 and m.fc2.out_features  == 29
+        assert m.fc3.in_features  == 29 and m.fc3.out_features  == 20
+        assert m.fc4.in_features  == 20 and m.fc4.out_features  == 12
+        assert m.fc_out.in_features == 12 and m.fc_out.out_features == 3
+
+    def test_confidence_after_sigmoid(self, mt1_inputs):
+        out = MT1NN()(mt1_inputs)
+        conf = torch.sigmoid(out[:, 0])
+        assert (conf >= 0).all() and (conf <= 1).all()
+
+    def test_range_after_softplus(self, mt1_inputs):
+        out = MT1NN()(mt1_inputs)
+        rng = F.softplus(out[:, 2])
+        assert (rng > 0).all()
+
+    def test_deterministic(self, mt1_inputs):
+        model = MT1NN()
+        model.eval()
+        with torch.no_grad():
+            assert torch.equal(model(mt1_inputs), model(mt1_inputs))
+
+    def test_serialization_roundtrip(self, mt1_inputs, tmp_path):
+        model = MT1NN()
+        model.eval()
+        with torch.no_grad():
+            out_before = model(mt1_inputs)
+        path = tmp_path / "mt1.pt"
+        torch.save(model.state_dict(), path)
+        model2 = MT1NN()
+        model2.load_state_dict(torch.load(path, weights_only=True))
+        model2.eval()
+        with torch.no_grad():
+            assert torch.allclose(out_before, model2(mt1_inputs))
+
+    def test_no_nan(self, mt1_inputs):
+        assert not torch.isnan(MT1NN()(mt1_inputs)).any()
+
+    def test_no_inf(self, mt1_inputs):
+        assert not torch.isinf(MT1NN()(mt1_inputs)).any()
+
+
+# ── MT2NN ──────────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def mt2_inputs():
+    torch.manual_seed(0)
+    return torch.randn(1, 36)
+
+
+class TestMT2NN:
+    def test_output_shape(self, mt2_inputs):
+        out = MT2NN()(mt2_inputs)
+        assert out.shape == (1, 48)
+
+    def test_param_count(self):
+        n = sum(p.numel() for p in MT2NN().parameters())
+        assert n == 33996, f"MT2NN param count: expected 33996, got {n}"
+
+    def test_output_reshapes_to_12x4(self, mt2_inputs):
+        out = MT2NN()(mt2_inputs)
+        assert out.view(12, 4).shape == (12, 4)
+
+    def test_tier_argmax_in_range(self, mt2_inputs):
+        out = MT2NN()(mt2_inputs)
+        tiers = out.view(12, 4).argmax(dim=1)
+        assert ((tiers >= 0) & (tiers <= 3)).all()
+
+    def test_fc_branch_dims(self):
+        m = MT2NN()
+        assert m.fc1.in_features == 36 and m.fc1.out_features == 36
+        assert m.fc2.in_features == 36 and m.fc2.out_features == 36
+
+    def test_lstm_dims(self):
+        m = MT2NN()
+        assert m.lstm.input_size  == 3
+        assert m.lstm.hidden_size == 36
+        assert m.lstm.num_layers  == 2
+
+    def test_taper_dims(self):
+        m = MT2NN()
+        assert m.taper1.in_features == 72  and m.taper1.out_features == 66
+        assert m.taper2.in_features == 66  and m.taper2.out_features == 60
+        assert m.taper3.in_features == 60  and m.taper3.out_features == 54
+        assert m.fc_out.in_features == 54  and m.fc_out.out_features == 48
+
+    def test_deterministic(self, mt2_inputs):
+        model = MT2NN()
+        model.eval()
+        with torch.no_grad():
+            assert torch.equal(model(mt2_inputs), model(mt2_inputs))
+
+    def test_serialization_roundtrip(self, mt2_inputs, tmp_path):
+        model = MT2NN()
+        model.eval()
+        with torch.no_grad():
+            out_before = model(mt2_inputs)
+        path = tmp_path / "mt2.pt"
+        torch.save(model.state_dict(), path)
+        model2 = MT2NN()
+        model2.load_state_dict(torch.load(path, weights_only=True))
+        model2.eval()
+        with torch.no_grad():
+            assert torch.allclose(out_before, model2(mt2_inputs))
+
+    def test_no_nan(self, mt2_inputs):
+        assert not torch.isnan(MT2NN()(mt2_inputs)).any()
+
+    def test_no_inf(self, mt2_inputs):
+        assert not torch.isinf(MT2NN()(mt2_inputs)).any()
