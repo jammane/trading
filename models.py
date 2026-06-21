@@ -1,9 +1,8 @@
 """
 models.py — Shared neural network definitions.
 
-Single source of truth for StockNN and MasterNN.
-All training scripts (training_v2.py, training_v3.py, training_v4.py), production_v2.py,
-and inspect_trades.py import from this module rather than defining their own copies.
+Single source of truth for StockNN, MasterNN, MT1NN, and MT2NN.
+All training scripts, production_v2.py, and inspect_trades.py import from here.
 """
 
 import torch
@@ -101,3 +100,96 @@ class MasterNN(nn.Module):
         x = F.relu(self.fc3(x))
         x = F.relu(self.fc4(x))
         return self.fc_out(x)   # (1, 48) raw logits
+
+
+class MT1NN(nn.Module):
+    """
+    Per-industry preprocessor — one pool per industry (12 total).
+
+    Input: (1, 37) — one industry's slice of the 444-feature vector:
+             18 delta lookbacks + 3 poly-2 coefs + 16 poly-3 coefs
+
+    FC1:    37 → 37  ReLU  (width = n_inputs)
+    FC2:    37 → 29  ReLU  (taper step ≈ 8)
+    FC3:    29 → 20  ReLU
+    FC4:    20 → 12  ReLU
+    fc_out: 12 →  3  (raw logits decoded at score time)
+
+    Output (1, 3) raw logits:
+      out[0] → sigmoid → P(positive return), confidence ∈ [0,1]
+      out[1] → tanh * MT1_SCALE → expected fractional return
+      out[2] → softplus → error range half-width (positive)
+
+    Total params: 3,399
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.fc1    = nn.Linear(37, 37)
+        self.fc2    = nn.Linear(37, 29)
+        self.fc3    = nn.Linear(29, 20)
+        self.fc4    = nn.Linear(20, 12)
+        self.fc_out = nn.Linear(12,  3)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        x = F.relu(self.fc4(x))
+        return self.fc_out(x)   # (1, 3) raw logits
+
+
+class MT2NN(nn.Module):
+    """
+    Cross-industry tier allocator — replaces MasterNN.
+
+    Input: (1, 36) — 3 MT1 outputs × 12 industries (after running-stat normalization
+           of delta and range; confidence already ∈ [0,1]).
+           Reshaped to (1, 12, 3) for the LSTM branch (12 steps × 3 features,
+           one step per industry in INDUSTRY_NAMES order).
+
+    FC branch (2 layers, width = n_inputs):
+      FC1:  36 → 36  ReLU
+      FC2:  36 → 36  ReLU          output: 36
+
+    LSTM branch (12 steps × 3 features):
+      LSTM layer 1: input=3,  hidden=36
+      LSTM layer 2: input=36, hidden=36   output: 36 (final hidden state)
+
+    Concatenate: [FC_out ‖ LSTM_out] = 72
+
+    Taper FC layers (step = 6):
+      T1:   72 → 66  ReLU
+      T2:   66 → 60  ReLU
+      T3:   60 → 54  ReLU
+      fc_out: 54 → 48  (raw logits)
+
+    Output (1, 48): raw logits, reshape to (12, 4) → argmax per industry → tier ∈ {0,1,2,3}
+
+    Total params: 33,996
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.fc1    = nn.Linear(36, 36)
+        self.fc2    = nn.Linear(36, 36)
+        self.lstm   = nn.LSTM(input_size=3, hidden_size=36, num_layers=2, batch_first=True)
+        self.taper1 = nn.Linear(72, 66)
+        self.taper2 = nn.Linear(66, 60)
+        self.taper3 = nn.Linear(60, 54)
+        self.fc_out = nn.Linear(54, 48)
+
+    def forward(self, x):
+        # x: (batch, 36)
+        fc = F.relu(self.fc1(x))
+        fc = F.relu(self.fc2(fc))                       # (batch, 36)
+
+        lstm_in = x.view(x.size(0), 12, 3)             # (batch, 12 steps, 3 features)
+        _, (h_n, _) = self.lstm(lstm_in)               # h_n: (2, batch, 36)
+        lstm_out = h_n[-1]                              # last layer final hidden: (batch, 36)
+
+        combined = torch.cat([fc, lstm_out], dim=1)    # (batch, 72)
+        combined = F.relu(self.taper1(combined))
+        combined = F.relu(self.taper2(combined))
+        combined = F.relu(self.taper3(combined))
+        return self.fc_out(combined)                    # (batch, 48) raw logits
