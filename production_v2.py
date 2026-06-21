@@ -28,8 +28,16 @@ from alpaca.trading.enums import OrderSide, OrderType, QueryOrderStatus, TimeInF
 from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, MarketOrderRequest, StopOrderRequest
 
 from fees import BUY_FILL, FINRA_TAF_MAX, FINRA_TAF_PER_SHARE, SEC_FEE_RATE, SELL_FILL, _sell_net
-from models import MasterNN, StockNN
+from models import MasterNN, MT1NN, MT2NN, StockNN
 from universe import INDUSTRIES
+from upkeep import (
+    load_mt2_norm_stats,
+    run_mt_inference,
+    save_mt2_norm_stats,
+    upkeep_industry,
+    upkeep_mt1_industry,
+    upkeep_mt2,
+)
 
 MAX_SINGLE_STOCK_PCT = 0.60   # max fraction of industry cash in one stock
 
@@ -94,16 +102,18 @@ def _master_state_path(model_dir):
     return os.path.join(model_dir, 'master_state.json')
 
 def _load_master_state(model_dir, industry_list):
-    """Load persisted ind_value_history and zero_counts. Returns defaults on missing/corrupt."""
+    """Load persisted ind_value_history, zero_counts, and MT2 norm stats."""
     path = _master_state_path(model_dir)
     try:
         with open(path) as f:
             state = json.load(f)
-        hist  = state.get('ind_value_history', {ind: [] for ind in industry_list})
-        zcnt  = state.get('zero_counts',       {ind: 0  for ind in industry_list})
-        return hist, zcnt
+        hist = state.get('ind_value_history', {ind: [] for ind in industry_list})
+        zcnt = state.get('zero_counts',       {ind: 0  for ind in industry_list})
     except Exception:
-        return {ind: [] for ind in industry_list}, {ind: 0 for ind in industry_list}
+        hist = {ind: [] for ind in industry_list}
+        zcnt = {ind: 0  for ind in industry_list}
+    norm_stats = load_mt2_norm_stats(model_dir)
+    return hist, zcnt, norm_stats
 
 def _save_master_state(model_dir, ind_value_history, zero_counts):
     try:
@@ -129,43 +139,68 @@ def load_weighted_model(model_class, model_dir, prefix):
     print(f"WARNING: no trained model found at {best_path} — using random weights")
     return model_class()
 
-# Train an industry model on a single day's data (called from production daily run)
 def train_industry_one_day_prod(industry, symbols, yesterday_data, primed_portfolio,
                                 model_dir, today_data=None, seq_flags=None,
                                 intraday_bars=None):
     """
-    Upkeep training for one industry.
-    yesterday_data: OHLCV for the prediction day (yesterday) — model input features.
-    today_data:     OHLCV for the fill day (today) — actual market prices for execution.
-    seq_flags:      {sym: bool} intraday high/low sequence; only used for symbols
-                    without 1-minute bar data in intraday_bars.
-    intraday_bars:  {sym: [bar, ...]} 1-minute bars for the fill day.  When present,
-                    fill simulation walks bars chronologically instead of using OHLC+seq_flags.
+    Upkeep training for one industry (burst refinement now correctly enabled).
+    yesterday_data: OHLCV for the prediction day — model input features.
+    today_data:     OHLCV for the fill day — actual fill prices.
     """
-    from training_v2 import train_industry_one_day
     try:
-        return train_industry_one_day(industry, symbols, yesterday_data, primed_portfolio,
-                                      model_dir, next_day_data=today_data,
-                                      seq_flags=seq_flags, intraday_bars=intraday_bars)
+        return upkeep_industry(
+            industry, symbols, model_dir, primed_portfolio,
+            yesterday_data, next_day_data=today_data,
+            seq_flags=seq_flags, intraday_bars=intraday_bars,
+        )
     except Exception as e:
-        print(f"Error training industry {industry}: {e}")
+        print(f"Error in upkeep_industry {industry}: {e}")
         return None
 
 
-def train_master_one_day_prod(industries, primed_portfolio, model_dir,
-                               ind_value_history, industry_top_scores=None):
+def train_mt_one_day_prod(industries, model_dir, ind_value_history,
+                          norm_stats, industry_top_scores, mt1_outputs_prev=None):
     """
-    Upkeep training for the master model.
-    ind_value_history: already updated for today (today's values appended by caller).
-    industry_top_scores: {ind: (baseline_v, top_v)} from today's industry runs.
+    Upkeep training for MT1 (12 pools) and MT2.
+
+    ind_value_history: already updated for today before this is called.
+    industry_top_scores: {ind: (baseline_score, slot0_score)} from today's industry runs.
+    mt1_outputs_prev: MT1 slot0 outputs from production inference this cycle (optional,
+                      used to seed the upkeep in37 without re-running build_master_features).
+
+    Returns {ind: (conf, delta, range_hw)} — MT1 slot0 outputs after upkeep.
     """
-    from training_v2 import train_master_one_day
+    from training_v2 import build_master_features
+    industry_list = list(industries.keys())
+
+    # actual_perf per industry from today's upkeep results
+    actual_perf: dict = {}
+    for ind in industry_list:
+        if industry_top_scores and ind in industry_top_scores:
+            baseline, slot0 = industry_top_scores[ind]
+            actual_perf[ind] = (slot0 / baseline - 1.0) if baseline > 0 else 0.0
+        else:
+            actual_perf[ind] = 0.0
+
+    today444 = build_master_features(ind_value_history, industry_list)
+
+    mt1_slot0_outputs: dict = {}
+    for i, ind in enumerate(industry_list):
+        in37_t = today444[:, i * 37:(i + 1) * 37]
+        try:
+            _, _, conf, delta, range_hw = upkeep_mt1_industry(
+                ind, model_dir, in37_t, actual_perf[ind])
+            mt1_slot0_outputs[ind] = (conf, delta, range_hw)
+        except Exception as e:
+            print(f"Error in upkeep_mt1_industry {ind}: {e}")
+            mt1_slot0_outputs[ind] = (0.5, 0.0, 0.02)
+
     try:
-        train_master_one_day(industries, primed_portfolio, model_dir,
-                             ind_value_history,
-                             industry_top_scores=industry_top_scores)
+        upkeep_mt2(model_dir, mt1_slot0_outputs, norm_stats, actual_perf, industry_list)
     except Exception as e:
-        print(f"Error training master: {e}")
+        print(f"Error in upkeep_mt2: {e}")
+
+    return mt1_slot0_outputs
 
 
 def build_primed_portfolios(trading_client, industries, allocations, zero_counts=None):
@@ -367,18 +402,34 @@ def compute_industry_current_values(industries, holdings, histories):
     return ind_values
 
 
-def run_master_allocation(master_model, industries, ind_value_history, zero_counts, total_cash):
+def run_master_allocation(master_model, industries, ind_value_history, zero_counts,
+                          total_cash, norm_stats=None, model_dir=None):
     """
     Run master inference to get tier classification and capital allocation.
     Mutates zero_counts in place.
-    Returns (allocations, tier_map).
-      allocations: {ind: dollar_amount}
-      tier_map:    {ind: 0-3}
+
+    Priority: MT2 (mt2_best.pt exists) → legacy MasterNN → equal allocation.
+    Returns (allocations, tier_map, mt1_outputs).
+      allocations:  {ind: dollar_amount}
+      tier_map:     {ind: 0-3}
+      mt1_outputs:  {ind: (conf, delta, range_hw)} or None for legacy path
     """
     from training_v2 import build_master_features, decode_master_tiers, tiers_to_alloc
     industry_list = list(industries.keys())
     tier_map      = {ind: 0 for ind in industry_list}
+    mt1_outputs   = None
 
+    # MT2 path — preferred if mt2_best.pt exists and norm_stats are available
+    mt2_path = os.path.join(model_dir, 'mt2_best.pt') if model_dir else None
+    if mt2_path and os.path.exists(mt2_path) and norm_stats is not None:
+        try:
+            allocations, tier_map, mt1_outputs = run_mt_inference(
+                model_dir, industries, ind_value_history, norm_stats, zero_counts, total_cash)
+            return allocations, tier_map, mt1_outputs
+        except Exception as e:
+            print(f"Warning: MT2 inference failed ({e}) — falling back to MasterNN")
+
+    # Legacy MasterNN fallback
     if master_model is not None:
         try:
             today_t = build_master_features(ind_value_history, industry_list)
@@ -395,7 +446,7 @@ def run_master_allocation(master_model, industries, ind_value_history, zero_coun
             zero_counts[ind] = 0
 
     allocations = tiers_to_alloc(tier_map, industry_list, total_cash)
-    return allocations, tier_map
+    return allocations, tier_map, mt1_outputs
 
 
 def compute_liquidation_orders(industries, ind_current_values, alloc_prop,
@@ -596,13 +647,14 @@ def main():
         print(f"Intraday sequence: {n_low_first} low-first, {n_high_first} high-first "
               f"({len(intraday_data)} symbols with 1-min data)")
 
-        # ── Master: predict tier allocations ──────────────────────────────
+        # ── Master: predict tier allocations (MT2 preferred, MasterNN fallback) ──
         all_symbols_flat  = [sym for syms in industries.values() for sym in syms]
         industry_list     = list(industries.keys())
-        ind_value_history, zero_counts = _load_master_state(args.model_dir, industry_list)
+        ind_value_history, zero_counts, norm_stats = _load_master_state(args.model_dir, industry_list)
         master = load_weighted_model(MasterNN, args.model_dir, 'master')
-        allocations, tier_map = run_master_allocation(
-            master, industries, ind_value_history, zero_counts, cash)
+        allocations, tier_map, _mt1_inf_outputs = run_master_allocation(
+            master, industries, ind_value_history, zero_counts, cash,
+            norm_stats=norm_stats, model_dir=args.model_dir)
 
         # Liquidate industries with 3+ consecutive tier-0 predictions
         ind_current_values = compute_industry_current_values(industries, holdings, histories)
@@ -916,29 +968,38 @@ def main():
                 if result is not None:
                     industry_top_scores[industry] = result
 
-        # Append today's industry values and persist master state for next day
+        # Append today's industry slot0 values and persist master state for next day.
         for ind in industry_list:
             if ind in industry_top_scores:
                 ind_value_history[ind].append(industry_top_scores[ind][1])
         _save_master_state(args.model_dir, ind_value_history, zero_counts)
 
-        if os.path.exists(f"{args.model_dir}/master_best.pt"):
-            # Require ≥15 days of real-valued history per industry before master adapts.
-            # Filters placeholder/sentinel values ($3,000) and ensures ~3 weeks of live
-            # paper/prod data has accumulated.  Per-industry values for a $3k paper account
-            # are ~$1,200 (40% of account cash), so != 3000 also catches stale sentinels.
-            min_real_days = min(
-                (sum(1 for v in ind_value_history.get(ind, []) if v != 3000.0)
-                 for ind in industry_list),
-                default=0
-            )
-            if min_real_days >= 15:
-                train_master_one_day_prod(industries, master_primed, args.model_dir,
-                                          ind_value_history,
-                                          industry_top_scores=industry_top_scores)
-            else:
-                print(f"Master upkeep deferred: {min_real_days}/15 days of real history "
-                      f"(need ~3 weeks of live trades before master adapts)")
+        # MT1/MT2 upkeep — gate on ≥15 days of real history (same guard as old master).
+        # MT1 upkeep needs build_master_features input; MT2 upkeep needs ≥5 MT1 warmup.
+        # Sentinel filter: per-industry values ≠ 3000 (40% of $3k paper account = $1200).
+        min_real_days = min(
+            (sum(1 for v in ind_value_history.get(ind, []) if v != 3000.0)
+             for ind in industry_list),
+            default=0,
+        )
+        if min_real_days >= 15:
+            print(f"Running MT1/MT2 upkeep ({min_real_days} real history days) ...")
+            train_mt_one_day_prod(
+                industries, args.model_dir, ind_value_history,
+                norm_stats, industry_top_scores)
+            save_mt2_norm_stats(args.model_dir, norm_stats)
+        elif os.path.exists(f"{args.model_dir}/master_best.pt"):
+            # Legacy MasterNN upkeep during transition period (≤15 real days)
+            from training_v2 import train_master_one_day
+            try:
+                train_master_one_day(industries, master_primed, args.model_dir,
+                                     ind_value_history,
+                                     industry_top_scores=industry_top_scores)
+            except Exception as e:
+                print(f"Error in legacy master upkeep: {e}")
+            print(f"MT upkeep deferred: {min_real_days}/15 days of real history")
+        else:
+            print(f"MT upkeep deferred: {min_real_days}/15 days of real history")
 
         # Submit orders to Alpaca (paper or live depending on --paper flag)
         mode = 'paper' if args.paper else 'live'
