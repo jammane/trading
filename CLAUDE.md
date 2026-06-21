@@ -90,11 +90,18 @@ mkdir -p /root/diag_logs
 # After training, convert back to .pt before inspect_trades.py or production_v2.py:
 python convert_weights.py --models-dir models/training --output models/training
 ```
-`--no-save` suppresses all model writes (industry elites, history, master).
+`--no-save` suppresses all model writes (industry elites, history, master, MT1, MT2).
 Always use real disk paths (`models/training`, `logs/`, `/root/diag_logs`) — never `/tmp` which is a 978 MB RAM-backed tmpfs on the droplet. Training and production can run concurrently; both write to real disk only.
-Master trains via tier-classification (444 features, FN/FP penalties) starting at day 30.
+MT1 trains via direction/delta/range scoring starting at `actual_day >= 25`; MT2 trains via tier-classification starting at `actual_day >= 30`.
 `convert_weights.py` is required after C++ training before using `inspect_trades.py` or `production_v2.py`.
-Note: existing master `.bin` files are incompatible after the architecture change — regenerate with `prepare_models.py`.
+Note: existing master `.bin` files are incompatible after the MT1/MT2 architecture change — regenerate with `prepare_models.py`.
+
+**Inspect MT1/MT2 training log:**
+```bash
+python read_mt_log.py models/training/mt_training_log.bin
+python read_mt_log.py models/training/mt_training_log.bin --pass 2
+python read_mt_log.py models/training/mt_training_log.bin --industry energy
+```
 
 **Train (parallel, 7 threads — requires ≥4 GB RAM):**
 ```bash
@@ -166,19 +173,19 @@ Runs all five steps: updates `universe.py` and regenerates `universe.json`, remo
 
 | Module | Contents |
 |--------|----------|
-| `models.py` | `StockNN`, `MasterNN` — single source of truth for both model classes |
+| `models.py` | `StockNN`, `MasterNN`, `MT1NN`, `MT2NN` — single source of truth for all model classes |
 | `universe.py` | `INDUSTRIES` dict, `ALL_SYMBOLS`, `INDUSTRY_NAMES` — 144-symbol universe |
 | `universe.json` | Auto-generated from `universe.py`; read by the C++ trainer at runtime |
 | `fees.py` | Fee constants (`BUY_FILL`, `SEC_FEE_RATE`, etc.) and `_sell_net()` helper |
 | `prepare_models.py` | `.pt` → `.bin` for C++ trainer (run before first C++ training) |
 | `convert_weights.py` | `.bin` → `.pt` + `_best.pt` for Python tools (run after C++ training) |
 
-All training scripts (`training_v2.py`, `training_v3.py`), `production_v2.py`, and `inspect_trades.py` import from these modules. (`training_v4.py` was deleted — superseded by `training_v4_cpp` for all training.) `download_5y_data.py` imports from `universe.py`. To add or change a ticker, run `swap_symbols.sh` — it updates both `universe.py` and `universe.json` together.
+All training scripts (`training_v2.py`, `training_v3.py`), `production_v2.py`, `upkeep.py`, and `inspect_trades.py` import from these modules. (`training_v4.py` was deleted — superseded by `training_v4_cpp` for all training.) `download_5y_data.py` imports from `universe.py`. To add or change a ticker, run `swap_symbols.sh` — it updates both `universe.py` and `universe.json` together.
 
 ## Tests
 
-75 pytest tests across three files in `tests/`:
-- `test_models.py` — output shapes, output constraints (ReLU/sigmoid/softmax), serialization roundtrip, inject-layer growth dimensions
+95 pytest tests across three files in `tests/`:
+- `test_models.py` — output shapes, output constraints (ReLU/sigmoid/softmax), serialization roundtrip, inject-layer growth dimensions; MT1NN/MT2NN shape + activation + forward tests
 - `test_universe.py` — industry count, symbols per industry, no duplicates, formatting
 - `test_fees.py` — fee constant values, `_sell_net` calculations, FINRA cap boundary
 
@@ -188,10 +195,47 @@ A `PreToolUse` hook in `.claude/settings.json` runs the suite automatically befo
 
 ### Models
 
-Two model classes are defined identically in `training_v2.py`, `training_v3.py`, and `production_v2.py` — they must stay in sync manually:
+All model classes are defined in `models.py` (single source of truth) and imported everywhere:
 
 - **`StockNN`** — one instance per industry sector (12 sectors). FC injection architecture: seed day → 14 inject layers → today layer → 2 flat layers → funnel. Output is `(12, 4)` — one row per stock in the sector, columns are `[buy_qty, buy_price_frac, sell_all_price_frac, sell_qty]`.
-- **`MasterNN`** — single cross-sector allocator. Same injection pattern with wider today vector (229 vs 208 features). Output is `(12, 3)` — per-industry `[allocation_weight, liquidation_depth, liquidation_trigger]`.
+- **`MasterNN`** — legacy single cross-sector allocator (444→48). Kept for backward compatibility; superseded by MT1+MT2 in production once MT2 models are available.
+- **`MT1NN`** (37→3, 3,399 params per slot) — per-industry preprocessor. One independent 200-slot pool per industry. Input: one industry's 37-feature slice of the 444-feature master vector. Output (after activation): `sigmoid(out0)` = confidence P(positive return), `tanh(out1)*0.05` = expected delta, `softplus(out2)` = error range half-width. Activates at `actual_day >= 25`. Files: `mt1_{industry}_model_{n}.pt` / `mt1_{industry}_best.pt`.
+- **`MT2NN`** (FC+LSTM→48, 33,708 params per slot) — cross-industry allocator. Replaces `MasterNN`. Input: 36 normalized MT1 slot0 outputs (3 per industry × 12 industries, sequence arranged for LSTM as 12 steps × 3 features). Parallel FC branch (36→36→36) + 2-layer LSTM (hidden=36) → concat 72 → taper (72→66→60→54→48). Activates at `actual_day >= 30`. Files: `mt2_model_{n}.pt` / `mt2_best.pt` / `mt2_norm_stats.json`.
+
+### MT1 scoring formula
+
+```
+conf = sigmoid(out[0]);  delta = tanh(out[1])*0.05;  range_hw = softplus(out[2])
+score_direction = 1.0 if (conf>=0.5) == (actual>=0) else 0.0
+score_range     = exp(-range_hw/0.02) if |actual-delta|<=range_hw else 0.0
+score_accuracy  = max(0, 1 - clip(|actual-delta|/(|actual|+1e-9), 0, 1))
+mt1_score       = 0.50*score_direction + 0.33*score_range + 0.17*score_accuracy
+```
+
+### MT2 input normalization
+
+Confidence stays as-is (∈[0,1]). Delta and range are normalized via running Welford mean/variance accumulated across all 12 industries per training day. Stats persisted as `mt2_norm_stats.json` (Python) / `mt2_norm_stats.bin` (C++, 4 doubles + 1 int = 36 bytes). `prepare_models.py` and `convert_weights.py` handle conversion in both directions.
+
+### Production inference chain (when MT2 models available)
+
+```
+build_master_features() → today444
+  → MT1 slot0 ×12 (slices today444[i*37:(i+1)*37]) → 36 raw outputs
+  → normalize delta/range via mt2_norm_stats.json
+  → MT2 slot0 forward pass → (12,4) logits → argmax per industry → tier map
+  → allocation/liquidation (unchanged from MasterNN path)
+```
+
+`run_master_allocation()` in `production_v2.py` tries MT2 first (`mt2_best.pt` exists), falls back to MasterNN, then equal allocation.
+
+### Daily upkeep (production_v2.py + upkeep.py)
+
+`upkeep.py` handles single-step evolution in production (one day per run):
+- `upkeep_industry()` — calls `step_industry()` with `daily_sigma=UPKEEP_SIGMA` (fixes the silent burst-skip bug in training_v2's upkeep path)
+- `upkeep_mt1_industry()` — MT1 selection/mutation + 4 burst passes; bootstraps from `mt1_{ind}_best.pt` if no slot files exist
+- `upkeep_mt2()` — MT2 selection/mutation; fires diversity injection when `best_pts < -1`
+
+`UPKEEP_SIGMA = 0.004` (half of full-train 0.008). Four burst passes at sigma/2, /4, /8, /16.
 
 ### Evolutionary pool (training)
 
@@ -212,7 +256,7 @@ History files per industry:
 
 **Swap file (droplet):** `/swapfile` (2 GB, btrfs-compatible via `chattr +C` + `dd`) is active on the DigitalOcean droplet alongside `/dev/zram0` (1.9 GB), giving ~3.9 GB total swap. To recreate after a rebuild: `truncate -s 0 /swapfile && chattr +C /swapfile && dd if=/dev/zero of=/swapfile bs=1M count=2048 && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /etc/fstab`.
 
-`training_v4_cpp` (C++ binary) is the canonical trainer — handles both industry and master training with ~6× speedup over Python. Master training uses tier-classification (444 features: 18 delta lookbacks + polynomial regression over per-industry portfolio value history; FN/FP penalty scoring; 3-consecutive-zero liquidation). Master only activates at `actual_day >= 30`.
+`training_v4_cpp` (C++ binary) is the canonical trainer — handles industry, MT1, and MT2 training with ~6× speedup over Python. Writes `mt_training_log.bin` alongside `training_log.csv`; read with `read_mt_log.py`. MT2 tier-classification uses 444→12×37 per-industry feature slices fed through MT1, then normalized outputs fed to MT2 (FC + LSTM forward). MT1 activates at `actual_day >= 25`; MT2 at `actual_day >= 30`.
 
 `training_v3.py` (parallel) differs from `training_v2.py` in: 7 worker threads, in-RAM model cache (`_model_cache`), no slippage on limit fills, and slot-level portfolio JSON persisted alongside weights. History candidates in v3 cause the model cache to be invalidated before `selection_and_mutation` (so virtual slot files load from disk); the cache is repopulated on the next day's `load_all_models` call.
 
@@ -226,7 +270,7 @@ When an elite holds ≥50% cash (industry) or ≥80% cash (master), an `UNDER_IN
 
 ### Production cycle
 
-`production_v2.py` runs once per trading day: fetch data from yfinance → run MasterNN to rebalance capital → run StockNN per active industry → submit limit/stop orders to Alpaca → perform one upkeep evolution step on yesterday's data. Alpaca credentials are read from `keyring` or environment variables (`ALPACA_API_KEY` / `ALPACA_SECRET_KEY`). All per-account state files (`state.json`, `owners.json`, `master_state.json`) live under `--model-dir`, enabling multiple accounts to run independently with different `--model-dir` paths and credentials.
+`production_v2.py` runs once per trading day: fetch data from yfinance → run MT1×12 + MT2 (or MasterNN fallback) to rebalance capital → run StockNN per active industry → submit limit/stop orders to Alpaca → perform one upkeep evolution step on yesterday's data (via `upkeep.py`). Alpaca credentials are read from `keyring` or environment variables (`ALPACA_API_KEY` / `ALPACA_SECRET_KEY`). All per-account state files (`state.json`, `owners.json`, `master_state.json`, `mt2_norm_stats.json`) live under `--model-dir`, enabling multiple accounts to run independently with different `--model-dir` paths and credentials.
 
 `--paper` routes all API calls to Alpaca's paper trading endpoint — orders are submitted and portfolio state is read from the paper account, giving real paper trading history without risking real money. Omit `--paper` for live trading.
 
