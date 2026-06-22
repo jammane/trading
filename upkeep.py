@@ -515,6 +515,24 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
             save_slot_model(prefix, model_dir, slot, child)
             del child
         del base
+    elif not os.path.exists(_model_path(prefix, model_dir, N_SLOTS - 1)):
+        # Partial pool: elite slots exist (old format) but mutations are missing.
+        # Expand to full N_SLOTS by filling missing elite slots and generating mutations
+        # round-robin from whatever trained elites are present.
+        n_existing = sum(1 for s in range(MT1_ELITE_POOL)
+                         if os.path.exists(_model_path(prefix, model_dir, s)))
+        n_parents  = max(n_existing, 1)
+        log(f"[mt1/{sn(industry)}] Expanding MT1 pool from {n_existing} elites to {N_SLOTS} slots")
+        for s in range(n_existing, MT1_ELITE_POOL):
+            base = load_slot_model(prefix, model_dir, 0, MT1NN)
+            save_slot_model(prefix, model_dir, s, base)
+            del base
+        for i, slot in enumerate(range(MT1_ELITE_POOL, N_SLOTS)):
+            parent_rank = i % n_parents
+            parent = load_slot_model(prefix, model_dir, parent_rank, MT1NN)
+            child  = _mutate_generic(parent, MT1NN, sigma)
+            save_slot_model(prefix, model_dir, slot, child)
+            del parent, child
 
     in37_t = in37_t.detach()
 
