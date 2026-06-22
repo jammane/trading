@@ -15,4 +15,4 @@ Versioning scheme:
               replaced by 1. on first production promotion.
 """
 
-VERSION = "0.1.0.8"
+VERSION = "0.2.0.0"

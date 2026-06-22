@@ -18,6 +18,7 @@ HEADER_SIZE     = 16
 RECORD_SIZE_V1  = 168   # original: best + slot0 + mean
 RECORD_SIZE_V2  = 216   # added mt1_min[12]
 RECORD_SIZE_V3  = 792   # added dir/rng/acc component stats (4 stats × 3 components × 12 ind)
+RECORD_SIZE_V4  = 984   # added conf4 component stats (4 stats × 5 components × 12 ind)
 MAGIC           = 0x4D543132   # 'MT12'
 N_IND           = 12
 
@@ -41,25 +42,34 @@ INDUSTRY_NAMES = [
 #   float  mt1_acc_{best,slot0,mean,min}[12]  — accuracy component
 #   float  mt2_best_pts, mt2_slot0_pts, mt2_ideal_pts
 #   uint8  mt2_injected; uint8 pad[3]
+#
+# Record layout v4 (984 bytes — adds conf4 component stats):
+#   ... same as v3 + float mt1_conf4_{best,slot0,mean,min}[12] before MT2 fields
 
 RECORD_FMT_V1 = '<II' + 'f'*12 + 'f'*12 + 'f'*12 + 'fff' + 'B3x'
 RECORD_FMT_V2 = '<II' + 'f'*12 + 'f'*12 + 'f'*12 + 'f'*12 + 'fff' + 'B3x'
 RECORD_FMT_V3 = '<II' + 'f'*12 * 16 + 'fff' + 'B3x'  # 4 stats × 4 components × 12 ind
+RECORD_FMT_V4 = '<II' + 'f'*12 * 20 + 'fff' + 'B3x'  # 4 stats × 5 components × 12 ind
 assert struct.calcsize(RECORD_FMT_V1) == RECORD_SIZE_V1
 assert struct.calcsize(RECORD_FMT_V2) == RECORD_SIZE_V2
 assert struct.calcsize(RECORD_FMT_V3) == RECORD_SIZE_V3
+assert struct.calcsize(RECORD_FMT_V4) == RECORD_SIZE_V4
 
 
 def parse_log(path):
     file_size = os.path.getsize(path)
     data_size = file_size - HEADER_SIZE
+    fits_v4 = data_size > 0 and data_size % RECORD_SIZE_V4 == 0
     fits_v3 = data_size > 0 and data_size % RECORD_SIZE_V3 == 0
     fits_v2 = data_size > 0 and data_size % RECORD_SIZE_V2 == 0
     fits_v1 = data_size > 0 and data_size % RECORD_SIZE_V1 == 0
-    if not fits_v1 and not fits_v2 and not fits_v3:
-        sys.exit(f'ERROR: data size {data_size} not divisible by {RECORD_SIZE_V1}, {RECORD_SIZE_V2}, or {RECORD_SIZE_V3}')
+    if not fits_v1 and not fits_v2 and not fits_v3 and not fits_v4:
+        sys.exit(f'ERROR: data size {data_size} not divisible by '
+                 f'{RECORD_SIZE_V1}, {RECORD_SIZE_V2}, {RECORD_SIZE_V3}, or {RECORD_SIZE_V4}')
     # Prefer newest format that fits
-    if fits_v3:
+    if fits_v4:
+        rec_size, fmt, ver = RECORD_SIZE_V4, RECORD_FMT_V4, 4
+    elif fits_v3:
         rec_size, fmt, ver = RECORD_SIZE_V3, RECORD_FMT_V3, 3
     elif fits_v2:
         rec_size, fmt, ver = RECORD_SIZE_V2, RECORD_FMT_V2, 2
@@ -82,68 +92,103 @@ def parse_log(path):
             if len(raw) < rec_size:
                 break
             vals = struct.unpack(fmt, raw)
-            if ver == 3:
+            if ver == 4:
                 rec = {
-                    'pass':             vals[0],
-                    'day':              vals[1],
-                    'mt1_best':         list(vals[2:14]),
-                    'mt1_slot0':        list(vals[14:26]),
-                    'mt1_mean':         list(vals[26:38]),
-                    'mt1_min':          list(vals[38:50]),
-                    'mt1_dir_best':     list(vals[50:62]),
-                    'mt1_dir_slot0':    list(vals[62:74]),
-                    'mt1_dir_mean':     list(vals[74:86]),
-                    'mt1_dir_min':      list(vals[86:98]),
-                    'mt1_rng_best':     list(vals[98:110]),
-                    'mt1_rng_slot0':    list(vals[110:122]),
-                    'mt1_rng_mean':     list(vals[122:134]),
-                    'mt1_rng_min':      list(vals[134:146]),
-                    'mt1_acc_best':     list(vals[146:158]),
-                    'mt1_acc_slot0':    list(vals[158:170]),
-                    'mt1_acc_mean':     list(vals[170:182]),
-                    'mt1_acc_min':      list(vals[182:194]),
-                    'mt2_best_pts':     vals[194],
-                    'mt2_slot0_pts':    vals[195],
-                    'mt2_ideal_pts':    vals[196],
-                    'mt2_injected':     vals[197],
+                    'pass':              vals[0],
+                    'day':               vals[1],
+                    'mt1_best':          list(vals[2:14]),
+                    'mt1_slot0':         list(vals[14:26]),
+                    'mt1_mean':          list(vals[26:38]),
+                    'mt1_min':           list(vals[38:50]),
+                    'mt1_dir_best':      list(vals[50:62]),
+                    'mt1_dir_slot0':     list(vals[62:74]),
+                    'mt1_dir_mean':      list(vals[74:86]),
+                    'mt1_dir_min':       list(vals[86:98]),
+                    'mt1_rng_best':      list(vals[98:110]),
+                    'mt1_rng_slot0':     list(vals[110:122]),
+                    'mt1_rng_mean':      list(vals[122:134]),
+                    'mt1_rng_min':       list(vals[134:146]),
+                    'mt1_acc_best':      list(vals[146:158]),
+                    'mt1_acc_slot0':     list(vals[158:170]),
+                    'mt1_acc_mean':      list(vals[170:182]),
+                    'mt1_acc_min':       list(vals[182:194]),
+                    'mt1_conf4_best':    list(vals[194:206]),
+                    'mt1_conf4_slot0':   list(vals[206:218]),
+                    'mt1_conf4_mean':    list(vals[218:230]),
+                    'mt1_conf4_min':     list(vals[230:242]),
+                    'mt2_best_pts':      vals[242],
+                    'mt2_slot0_pts':     vals[243],
+                    'mt2_ideal_pts':     vals[244],
+                    'mt2_injected':      vals[245],
+                }
+            elif ver == 3:
+                rec = {
+                    'pass':              vals[0],
+                    'day':               vals[1],
+                    'mt1_best':          list(vals[2:14]),
+                    'mt1_slot0':         list(vals[14:26]),
+                    'mt1_mean':          list(vals[26:38]),
+                    'mt1_min':           list(vals[38:50]),
+                    'mt1_dir_best':      list(vals[50:62]),
+                    'mt1_dir_slot0':     list(vals[62:74]),
+                    'mt1_dir_mean':      list(vals[74:86]),
+                    'mt1_dir_min':       list(vals[86:98]),
+                    'mt1_rng_best':      list(vals[98:110]),
+                    'mt1_rng_slot0':     list(vals[110:122]),
+                    'mt1_rng_mean':      list(vals[122:134]),
+                    'mt1_rng_min':       list(vals[134:146]),
+                    'mt1_acc_best':      list(vals[146:158]),
+                    'mt1_acc_slot0':     list(vals[158:170]),
+                    'mt1_acc_mean':      list(vals[170:182]),
+                    'mt1_acc_min':       list(vals[182:194]),
+                    'mt1_conf4_best':    _nan12, 'mt1_conf4_slot0': _nan12,
+                    'mt1_conf4_mean':    _nan12, 'mt1_conf4_min':   _nan12,
+                    'mt2_best_pts':      vals[194],
+                    'mt2_slot0_pts':     vals[195],
+                    'mt2_ideal_pts':     vals[196],
+                    'mt2_injected':      vals[197],
                 }
             elif ver == 2:
                 rec = {
-                    'pass':             vals[0],
-                    'day':              vals[1],
-                    'mt1_best':         list(vals[2:14]),
-                    'mt1_slot0':        list(vals[14:26]),
-                    'mt1_mean':         list(vals[26:38]),
-                    'mt1_min':          list(vals[38:50]),
-                    'mt1_dir_best':     _nan12, 'mt1_dir_slot0': _nan12,
-                    'mt1_dir_mean':     _nan12, 'mt1_dir_min':   _nan12,
-                    'mt1_rng_best':     _nan12, 'mt1_rng_slot0': _nan12,
-                    'mt1_rng_mean':     _nan12, 'mt1_rng_min':   _nan12,
-                    'mt1_acc_best':     _nan12, 'mt1_acc_slot0': _nan12,
-                    'mt1_acc_mean':     _nan12, 'mt1_acc_min':   _nan12,
-                    'mt2_best_pts':     vals[50],
-                    'mt2_slot0_pts':    vals[51],
-                    'mt2_ideal_pts':    vals[52],
-                    'mt2_injected':     vals[53],
+                    'pass':              vals[0],
+                    'day':               vals[1],
+                    'mt1_best':          list(vals[2:14]),
+                    'mt1_slot0':         list(vals[14:26]),
+                    'mt1_mean':          list(vals[26:38]),
+                    'mt1_min':           list(vals[38:50]),
+                    'mt1_dir_best':      _nan12, 'mt1_dir_slot0': _nan12,
+                    'mt1_dir_mean':      _nan12, 'mt1_dir_min':   _nan12,
+                    'mt1_rng_best':      _nan12, 'mt1_rng_slot0': _nan12,
+                    'mt1_rng_mean':      _nan12, 'mt1_rng_min':   _nan12,
+                    'mt1_acc_best':      _nan12, 'mt1_acc_slot0': _nan12,
+                    'mt1_acc_mean':      _nan12, 'mt1_acc_min':   _nan12,
+                    'mt1_conf4_best':    _nan12, 'mt1_conf4_slot0': _nan12,
+                    'mt1_conf4_mean':    _nan12, 'mt1_conf4_min':   _nan12,
+                    'mt2_best_pts':      vals[50],
+                    'mt2_slot0_pts':     vals[51],
+                    'mt2_ideal_pts':     vals[52],
+                    'mt2_injected':      vals[53],
                 }
             else:  # v1
                 rec = {
-                    'pass':             vals[0],
-                    'day':              vals[1],
-                    'mt1_best':         list(vals[2:14]),
-                    'mt1_slot0':        list(vals[14:26]),
-                    'mt1_mean':         list(vals[26:38]),
-                    'mt1_min':          _nan12,
-                    'mt1_dir_best':     _nan12, 'mt1_dir_slot0': _nan12,
-                    'mt1_dir_mean':     _nan12, 'mt1_dir_min':   _nan12,
-                    'mt1_rng_best':     _nan12, 'mt1_rng_slot0': _nan12,
-                    'mt1_rng_mean':     _nan12, 'mt1_rng_min':   _nan12,
-                    'mt1_acc_best':     _nan12, 'mt1_acc_slot0': _nan12,
-                    'mt1_acc_mean':     _nan12, 'mt1_acc_min':   _nan12,
-                    'mt2_best_pts':     vals[38],
-                    'mt2_slot0_pts':    vals[39],
-                    'mt2_ideal_pts':    vals[40],
-                    'mt2_injected':     vals[41],
+                    'pass':              vals[0],
+                    'day':               vals[1],
+                    'mt1_best':          list(vals[2:14]),
+                    'mt1_slot0':         list(vals[14:26]),
+                    'mt1_mean':          list(vals[26:38]),
+                    'mt1_min':           _nan12,
+                    'mt1_dir_best':      _nan12, 'mt1_dir_slot0': _nan12,
+                    'mt1_dir_mean':      _nan12, 'mt1_dir_min':   _nan12,
+                    'mt1_rng_best':      _nan12, 'mt1_rng_slot0': _nan12,
+                    'mt1_rng_mean':      _nan12, 'mt1_rng_min':   _nan12,
+                    'mt1_acc_best':      _nan12, 'mt1_acc_slot0': _nan12,
+                    'mt1_acc_mean':      _nan12, 'mt1_acc_min':   _nan12,
+                    'mt1_conf4_best':    _nan12, 'mt1_conf4_slot0': _nan12,
+                    'mt1_conf4_mean':    _nan12, 'mt1_conf4_min':   _nan12,
+                    'mt2_best_pts':      vals[38],
+                    'mt2_slot0_pts':     vals[39],
+                    'mt2_ideal_pts':     vals[40],
+                    'mt2_injected':      vals[41],
                 }
             records.append(rec)
     return records
@@ -229,12 +274,19 @@ def print_pass_summary(pass_num, recs, industry_filter=None):
               f'  mean: {mn_e:.3f}→{mn_m:.3f}→{mn_l:.3f}'
               f'{min_str}')
 
+    has_conf4 = not math.isnan(recs[0]['mt1_conf4_best'][0])
+
     if has_comp_v3:
-        for comp_label, best_key, s0_key, mean_key, min_key in [
-            ('direction', 'mt1_dir_best', 'mt1_dir_slot0', 'mt1_dir_mean', 'mt1_dir_min'),
-            ('range',     'mt1_rng_best', 'mt1_rng_slot0', 'mt1_rng_mean', 'mt1_rng_min'),
-            ('accuracy',  'mt1_acc_best', 'mt1_acc_slot0', 'mt1_acc_mean', 'mt1_acc_min'),
-        ]:
+        components = [
+            ('direction',   'mt1_dir_best',   'mt1_dir_slot0',   'mt1_dir_mean',   'mt1_dir_min'),
+            ('range',       'mt1_rng_best',   'mt1_rng_slot0',   'mt1_rng_mean',   'mt1_rng_min'),
+            ('accuracy',    'mt1_acc_best',   'mt1_acc_slot0',   'mt1_acc_mean',   'mt1_acc_min'),
+        ]
+        if has_conf4:
+            components.append(
+                ('confidence', 'mt1_conf4_best', 'mt1_conf4_slot0', 'mt1_conf4_mean', 'mt1_conf4_min')
+            )
+        for comp_label, best_key, s0_key, mean_key, min_key in components:
             print(f'  MT1 {comp_label} component (early→mid→late) — slot0 | max | mean | min')
             for i, name in enumerate(INDUSTRY_NAMES):
                 if industry_filter and industry_filter.lower() not in name:
