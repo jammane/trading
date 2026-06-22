@@ -2,12 +2,12 @@
 inspect_trades.py — Trade audit tool for trained StockNN / MasterNN elite models.
 
 Usage (by calendar date):
-  python inspect_trades.py --industry tech_hardware --date 2024-11-15 --models-dir ./models
-  python inspect_trades.py --industry energy --date 2024-11-15 --models-dir ./models --top-n 5
+  python inspect_trades.py --industry tech_hardware --date 2024-11-15 --account acct0
+  python inspect_trades.py --industry energy --date 2024-11-15 --account acct0 --top-n 5
 
 Usage (by training day index, matching --start-day used in any training script):
-  python inspect_trades.py --industry tech_hardware --day-index 17 --models-dir ./models
-  python inspect_trades.py --industry energy --day-index 17 --models-dir ./models --top-n 5
+  python inspect_trades.py --industry tech_hardware --day-index 17 --account acct0
+  python inspect_trades.py --industry energy --day-index 17 --account acct0 --top-n 5
 
 What it does
 ------------
@@ -31,8 +31,7 @@ Arguments
                  *next* available trading day, exactly as training does.
   --day-index    Alternative to --date: the day number as printed in the training log
                  (e.g. --day-index 17 inspects the day logged as "Day 17/1256").
-  --models-dir   Directory containing the trained .pt files and top10_meta.json
-                 (the --output directory you passed to training_v2.py).
+  --account      Account identifier (default: acct0); reads models/ACCOUNT/training.
   --top-n        How many elite models to show (default 3, max 10).
   --stock-data   Path to stock_data/ directory (default: ./stock_data).
   --starting-cash  Starting cash per industry portfolio (default: 1666.67, matches training).
@@ -676,8 +675,8 @@ def main():
                             help="Training log day number (the N in 'Day N/...' printed during training). "
                                  "E.g. --day-index 17 inspects the day logged as 'Day 17'.")
 
-    parser.add_argument('--models-dir',    required=True,
-                        help="Directory containing trained .pt files and top10_meta.json")
+    parser.add_argument('--account',       default='acct0',
+                        help="Account identifier (e.g. acct0); reads models/ACCOUNT/training")
     parser.add_argument('--top-n',         type=int, default=3,
                         help="Number of top elite models to show (default 3, max 10)")
     parser.add_argument('--stock-data',    default='./stock_data',
@@ -685,6 +684,8 @@ def main():
     parser.add_argument('--starting-cash', type=float, default=1666.67,
                         help="Starting cash per portfolio (default 1666.67)")
     args = parser.parse_args()
+
+    models_dir = os.path.join('models', args.account, 'training')
 
     if args.industry not in INDUSTRIES:
         sys.exit(f"Unknown industry '{args.industry}'. Valid: {list(INDUSTRIES)}")
@@ -706,7 +707,7 @@ def main():
 
     print(f"\n{'═'*90}")
     print(f"  Trade Audit — {args.industry.upper()}  |  date: {target_date}")
-    print(f"  Models dir : {args.models_dir}   |   Top {top_n} elite model(s)")
+    print(f"  Models dir : {models_dir}   |   Top {top_n} elite model(s)")
     print(f"{'═'*90}\n")
 
     # Load price data
@@ -732,9 +733,9 @@ def main():
                          target_date, fill_date_str)
 
     # Load elite meta
-    meta = load_top10_meta(args.industry, args.models_dir)
+    meta = load_top10_meta(args.industry, models_dir)
     if not meta:
-        print(f"  [WARN] No top10_meta.json found in {args.models_dir}. "
+        print(f"  [WARN] No top10_meta.json found in {models_dir}. "
               f"Using slots 0–{top_n-1} with random/untrained weights.")
         meta = [{'slot': i, 'score': 0.0} for i in range(top_n)]
 
@@ -744,7 +745,7 @@ def main():
         score = entry.get('score', 0.0)
 
         print(f"Loading elite model #{rank} (slot {slot}, training score ${score:.2f}) …")
-        model = load_model(args.industry, args.models_dir, slot)
+        model = load_model(args.industry, models_dir, slot)
 
         cash     = args.starting_cash
         holdings = {sym: 0.0 for sym in symbols}

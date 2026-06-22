@@ -41,7 +41,7 @@ from upkeep import (
 
 MAX_SINGLE_STOCK_PCT = 0.60   # max fraction of industry cash in one stock
 
-MODEL_DIR = 'models'
+MODEL_DIR = 'models'  # legacy; superseded by --account in main()
 STOCK_DATA_DIR = 'stock_data'
 
 def load_state(model_dir):
@@ -291,7 +291,7 @@ def save_stock_data(symbol, day_data):
     except Exception as e:
         print(f"Error saving stock data for {symbol}: {e}")
 
-LOG_DIR = 'logs'  # overridden in main() from --model-dir: models/acct0/paper → logs/acct0/paper
+LOG_DIR = 'logs'  # overridden in main() via --account/--paper: logs/ACCOUNT/paper|prod
 
 def log_request_id(request_id, context, success=True):
     """Persist Alpaca X-Request-ID to {LOG_DIR}/request_ids.log for support tracing."""
@@ -541,17 +541,16 @@ def generate_liquidation_sells(industry, symbols, liquidation_target,
 def main():
     """Run one daily trading cycle: fetch data, infer, submit orders, retrain."""
     parser = argparse.ArgumentParser(description="Run stock trading system v2.")
-    parser.add_argument('--paper', action='store_true', help='Use Alpaca paper trading API (real paper orders, real paper portfolio)')
-    parser.add_argument('--model-dir', default=MODEL_DIR, help='Directory containing trained models')
+    parser.add_argument('--paper',   action='store_true', help='Use Alpaca paper trading API (real paper orders, real paper portfolio)')
+    parser.add_argument('--account', default='acct0', help='Account identifier (e.g. acct0); derives models/ACCOUNT/paper|prod and logs/ACCOUNT/paper|prod')
     parser.add_argument('--capital', type=float, default=None, help='Cap total deployed capital regardless of Alpaca account balance')
     parser.add_argument('--withdraw', type=float, help='Amount to withdraw from portfolio')
     args = parser.parse_args()
 
-    # Derive log directory from model_dir so logs co-locate with model path hierarchy.
-    # e.g. models/acct0/paper → logs/acct0/paper
+    subtype   = 'paper' if args.paper else 'prod'
+    model_dir = os.path.join('models', args.account, subtype)
     global LOG_DIR
-    parts = os.path.normpath(args.model_dir).split(os.sep)
-    LOG_DIR = os.path.join('logs', *parts[1:]) if len(parts) > 1 else 'logs'
+    LOG_DIR   = os.path.join('logs', args.account, subtype)
 
     # `if True:` preserves the existing indentation scope; all logic below runs unconditionally.
     if True:
@@ -576,7 +575,7 @@ def main():
             return
 
         # Load state
-        state = load_state(args.model_dir)
+        state = load_state(model_dir)
         industries = state['industries']
         histories = state['histories']
         cash = state['cash']
@@ -658,11 +657,11 @@ def main():
         # ── Master: predict tier allocations (MT2 preferred, MasterNN fallback) ──
         all_symbols_flat  = [sym for syms in industries.values() for sym in syms]
         industry_list     = list(industries.keys())
-        ind_value_history, zero_counts, norm_stats = _load_master_state(args.model_dir, industry_list)
-        master = load_weighted_model(MasterNN, args.model_dir, 'master')
+        ind_value_history, zero_counts, norm_stats = _load_master_state(model_dir, industry_list)
+        master = load_weighted_model(MasterNN, model_dir, 'master')
         allocations, tier_map, _mt1_inf_outputs = run_master_allocation(
             master, industries, ind_value_history, zero_counts, cash,
-            norm_stats=norm_stats, model_dir=args.model_dir)
+            norm_stats=norm_stats, model_dir=model_dir)
 
         # Liquidate industries with 3+ consecutive tier-0 predictions
         ind_current_values = compute_industry_current_values(industries, holdings, histories)
@@ -749,7 +748,7 @@ def main():
                 continue
 
             # Step 3: normal industry model inference — new 208-feature input, 48 outputs
-            model = load_weighted_model(StockNN, args.model_dir, industry)
+            model = load_weighted_model(StockNN, model_dir, industry)
             if model is None:
                 print(f"Model for {industry} not found.")
                 continue
@@ -956,11 +955,11 @@ def main():
 
         # Save updated state
         state['histories'] = histories
-        save_state(state, args.model_dir)
+        save_state(state, model_dir)
 
         # Update owners.json after processing day's data and potential withdrawals
         total_portfolio_value = compute_total_portfolio_value(cash, holdings, day_data, histories)
-        update_owners_file(total_portfolio_value, args.model_dir)
+        update_owners_file(total_portfolio_value, model_dir)
 
         # Retrain models using real Alpaca state as portfolio seed.
         # yesterday_data = model-input features (day N); day_data = fill prices (day N+1).
@@ -969,9 +968,9 @@ def main():
             trading_client, industries, allocations, zero_counts)
         industry_top_scores = {}
         for industry, symbols in industries.items():
-            if os.path.exists(f"{args.model_dir}/{industry}_best.pt"):
+            if os.path.exists(f"{model_dir}/{industry}_best.pt"):
                 result = train_industry_one_day_prod(
-                    industry, symbols, yesterday_data, ind_primed[industry], args.model_dir,
+                    industry, symbols, yesterday_data, ind_primed[industry], model_dir,
                     today_data=day_data, seq_flags=seq_flags, intraday_bars=intraday_data)
                 if result is not None:
                     industry_top_scores[industry] = result
@@ -980,7 +979,7 @@ def main():
         for ind in industry_list:
             if ind in industry_top_scores:
                 ind_value_history[ind].append(industry_top_scores[ind][1])
-        _save_master_state(args.model_dir, ind_value_history, zero_counts)
+        _save_master_state(model_dir, ind_value_history, zero_counts)
 
         # MT1/MT2 upkeep — gate on ≥15 days of real history (same guard as old master).
         # MT1 upkeep needs build_master_features input; MT2 upkeep needs ≥5 MT1 warmup.
@@ -993,14 +992,14 @@ def main():
         if min_real_days >= 15:
             print(f"Running MT1/MT2 upkeep ({min_real_days} real history days) ...")
             train_mt_one_day_prod(
-                industries, args.model_dir, ind_value_history,
+                industries, model_dir, ind_value_history,
                 norm_stats, industry_top_scores)
-            save_mt2_norm_stats(args.model_dir, norm_stats)
-        elif os.path.exists(f"{args.model_dir}/master_best.pt"):
+            save_mt2_norm_stats(model_dir, norm_stats)
+        elif os.path.exists(f"{model_dir}/master_best.pt"):
             # Legacy MasterNN upkeep during transition period (≤15 real days)
             from training_lib import train_master_one_day
             try:
-                train_master_one_day(industries, master_primed, args.model_dir,
+                train_master_one_day(industries, master_primed, model_dir,
                                      ind_value_history,
                                      industry_top_scores=industry_top_scores)
             except Exception as e:

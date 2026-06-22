@@ -107,5 +107,5 @@ else:
 
 print("   You can now run initial training (C++ trainer):")
 print("   cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)")
-print("   python prepare_models.py --load-dir models/training --output models/training")
-print("   ./build/training_v4_cpp --output models/training --load-dir models/training --passes 5")
+print("   python prepare_models.py --account acct0")
+print("   ./build/training_v4_cpp --account acct0 --passes 5")

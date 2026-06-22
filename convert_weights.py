@@ -6,8 +6,7 @@ for use with production_v2.py and inspect_trades.py.
 Run this after a C++ training run to make the trained models available to the Python stack.
 
 Usage:
-  python convert_weights.py --models-dir models --output models
-  python convert_weights.py --models-dir /tmp/cpp_out --output /tmp/cpp_pt
+  python convert_weights.py --account acct0
 """
 
 import argparse
@@ -144,11 +143,12 @@ def convert_mt2(models_dir, output_dir):
 
 def main():
     parser = argparse.ArgumentParser(description='Convert .bin C++ elite models to .pt for Python stack')
-    parser.add_argument('--models-dir', required=True, help='Directory containing .bin files')
-    parser.add_argument('--output',     required=True, help='Directory to write .pt files')
+    parser.add_argument('--account', default='acct0', help='Account identifier (e.g. acct0); derives models/ACCOUNT/training as source and output dir')
     args = parser.parse_args()
 
-    os.makedirs(args.output, exist_ok=True)
+    models_dir = os.path.join('models', args.account, 'training')
+    output_dir = models_dir
+    os.makedirs(output_dir, exist_ok=True)
 
     industries = [
         'tech_hardware', 'tech_software_ai', 'financials', 'consumer_discretionary',
@@ -156,22 +156,22 @@ def main():
         'energy', 'utilities', 'real_estate', 'materials',
     ]
 
-    print(f'Converting industry elite models from {args.models_dir} → {args.output}')
+    print(f'Converting industry elite models from {models_dir} → {output_dir}')
     for ind in industries:
-        convert_industry(ind, args.models_dir, args.output, STOCK_LAYER_DEFS, StockNN, ind)
+        convert_industry(ind, models_dir, output_dir, STOCK_LAYER_DEFS, StockNN, ind)
 
-    print(f'Converting master elite models from {args.models_dir} → {args.output}')
-    convert_industry('master', args.models_dir, args.output, MASTER_LAYER_DEFS, MasterNN, 'master')
+    print(f'Converting master elite models from {models_dir} → {output_dir}')
+    convert_industry('master', models_dir, output_dir, MASTER_LAYER_DEFS, MasterNN, 'master')
 
-    print(f'Converting MT1 elite models from {args.models_dir} → {args.output}')
+    print(f'Converting MT1 elite models from {models_dir} → {output_dir}')
     for ind in industries:
-        convert_industry(f'mt1_{ind}', args.models_dir, args.output, MT1_LAYER_DEFS, MT1NN, f'mt1_{ind}')
+        convert_industry(f'mt1_{ind}', models_dir, output_dir, MT1_LAYER_DEFS, MT1NN, f'mt1_{ind}')
 
-    print(f'Converting MT2 elite models from {args.models_dir} → {args.output}')
-    convert_mt2(args.models_dir, args.output)
+    print(f'Converting MT2 elite models from {models_dir} → {output_dir}')
+    convert_mt2(models_dir, output_dir)
 
-    print(f'Converting MT2 norm stats from {args.models_dir} → {args.output}')
-    convert_mt2_norm_stats(args.models_dir, args.output)
+    print(f'Converting MT2 norm stats from {models_dir} → {output_dir}')
+    convert_mt2_norm_stats(models_dir, output_dir)
 
     print('Done.')
 

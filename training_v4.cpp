@@ -2748,22 +2748,24 @@ static void worker_fn(WorkerCtx* ctx) {
 
 static void print_usage(const char* prog) {
     fprintf(stderr,
-        "Usage: %s --output DIR [--load-dir DIR] [--start-day N] [--stop-day N]\n"
+        "Usage: %s --account ACCT [--start-day N] [--stop-day N]\n"
         "          [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F]\n"
-        "          [--workers N] [--master-only] [--preserve-stock-data] [--no-save]\n", prog);
+        "          [--workers N] [--master-only] [--preserve-stock-data] [--no-save]\n"
+        "       %s --output DIR [--load-dir DIR] ...  (diagnostic/override)\n", prog, prog);
 }
 
 int main(int argc, char* argv[]) {
     // Parse args
-    std::string output_dir, load_dir;
+    std::string output_dir, load_dir, account;
     int  start_day = -1, stop_day = -1, passes = 1, num_workers = 2;
     float sigma = 0.01f, master_sigma = -1.f, sigma_decay = 0.5f;
     bool master_only = false, preserve_stock = false;
 
     for (int a = 1; a < argc; a++) {
         std::string arg(argv[a]);
-        if (arg == "--output"    && a+1<argc) { output_dir   = argv[++a]; }
-        else if (arg == "--load-dir" && a+1<argc) { load_dir = argv[++a]; }
+        if      (arg == "--account"  && a+1<argc) { account    = argv[++a]; }
+        else if (arg == "--output"   && a+1<argc) { output_dir = argv[++a]; }
+        else if (arg == "--load-dir" && a+1<argc) { load_dir   = argv[++a]; }
         else if (arg == "--start-day"&& a+1<argc) { start_day= atoi(argv[++a]); }
         else if (arg == "--stop-day" && a+1<argc) { stop_day = atoi(argv[++a]); }
         else if (arg == "--passes"   && a+1<argc) { passes   = atoi(argv[++a]); }
@@ -2775,6 +2777,12 @@ int main(int argc, char* argv[]) {
         else if (arg == "--preserve-stock-data") preserve_stock = true;
         else if (arg == "--no-save") g_no_save = true;
         else if (arg == "--help" || arg == "-h") { print_usage(argv[0]); return 0; }
+    }
+    // --account sets both dirs; --output/--load-dir override (diagnostic use)
+    if (!account.empty()) {
+        std::string acct_dir = "models/" + account + "/training";
+        if (output_dir.empty()) output_dir = acct_dir;
+        if (load_dir.empty())   load_dir   = acct_dir;
     }
     if (output_dir.empty()) { print_usage(argv[0]); return 1; }
     if (master_sigma < 0.f) master_sigma = sigma;
