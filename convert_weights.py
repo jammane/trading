@@ -19,7 +19,8 @@ import torch
 
 from models import StockNN, MasterNN, MT1NN, MT2NN
 from prepare_models import (
-    STOCK_LAYER_DEFS, MASTER_LAYER_DEFS, MT1_LAYER_DEFS, MT2_LAYOUT, ELITE_POOL
+    STOCK_LAYER_DEFS, MASTER_LAYER_DEFS, MT1_LAYER_DEFS, MT2_LAYOUT,
+    ELITE_POOL, MT1_ELITE_POOL,
 )
 
 
@@ -86,11 +87,13 @@ def convert_mt2_norm_stats(models_dir, output_dir):
         print(f'  [mt2_norm_stats] ERROR — {e}')
 
 
-def convert_industry(prefix, models_dir, output_dir, layer_defs, model_class, label):
-    """Convert all ELITE_POOL C++ .bin files for a prefix to PyTorch .pt, copying slot 0 to _best.pt."""
+def convert_industry(prefix, models_dir, output_dir, layer_defs, model_class, label, n_elites=None):
+    """Convert C++ .bin elite files for a prefix to PyTorch .pt, copying slot 0 to _best.pt."""
     import shutil
+    if n_elites is None:
+        n_elites = ELITE_POOL
     converted = 0
-    for slot in range(ELITE_POOL):
+    for slot in range(n_elites):
         src = os.path.join(models_dir, f'{prefix}_elite_{slot}.bin')
         if not os.path.exists(src):
             print(f'  [{label}] slot {slot:2d}: {src} not found — skipping')
@@ -105,7 +108,7 @@ def convert_industry(prefix, models_dir, output_dir, layer_defs, model_class, la
             converted += 1
         except Exception as e:
             print(f'  [{label}] slot {slot:2d}: ERROR — {e}')
-    print(f'  [{label}] {converted}/{ELITE_POOL} elite slots converted')
+    print(f'  [{label}] {converted}/{n_elites} elite slots converted')
 
     # Slot 0 is the production model — copy to _best.pt for production_v2.py
     slot0 = os.path.join(output_dir, f'{prefix}_model_0.pt')
@@ -165,7 +168,8 @@ def main():
 
     print(f'Converting MT1 elite models from {models_dir} → {output_dir}')
     for ind in industries:
-        convert_industry(f'mt1_{ind}', models_dir, output_dir, MT1_LAYER_DEFS, MT1NN, f'mt1_{ind}')
+        convert_industry(f'mt1_{ind}', models_dir, output_dir, MT1_LAYER_DEFS, MT1NN, f'mt1_{ind}',
+                         n_elites=MT1_ELITE_POOL)
 
     print(f'Converting MT2 elite models from {models_dir} → {output_dir}')
     convert_mt2(models_dir, output_dir)

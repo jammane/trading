@@ -101,8 +101,16 @@ static bool load_universe_json(const std::string& path) {
 static constexpr int   N_SLOTS             = 200;
 static constexpr int   ELITE_COUNT         = 17;
 static constexpr int   WAVG_COUNT          = 3;
-static constexpr int   ELITE_POOL          = 20;
+static constexpr int   ELITE_POOL          = 20;   // industry + MT2
 static constexpr int   MUTATIONS_PER_PARENT = 9;
+
+// MT1 uses a separate elite pool: 5 per scoring category (composite, direction,
+// range, accuracy) = 20 direct elites, plus 3 wavg blends = 23 total.
+static constexpr int   MT1_ELITES_PER_CAT  = 5;
+static constexpr int   MT1_N_CATS          = 4;   // composite, direction, range, accuracy
+static constexpr int   MT1_DIRECT_ELITES   = MT1_N_CATS * MT1_ELITES_PER_CAT;   // 20
+static constexpr int   MT1_WAVG_BLENDS     = 3;
+static constexpr int   MT1_ELITE_POOL      = MT1_DIRECT_ELITES + MT1_WAVG_BLENDS; // 23
 static constexpr int   HIST_WINDOW         = 15;
 
 static constexpr float IND_STARTING_CASH   = 25000.0f;
@@ -498,23 +506,20 @@ struct MasterScratch {
 // ── MT1/MT2 structures ──────────────────────────────────────────────────────────
 
 struct MT1Scratch {
-    float*   elite_buf;   // [ELITE_POOL × MT1NN_PARAMS]
-    float*   new_elites;  // [ELITE_POOL × MT1NN_PARAMS]
-    float*   wavg_buf;    // [3 × MT1NN_PARAMS]
-    float*   mut_buf;     // [MT1NN_PARAMS]
-    uint64_t mut_seeds[N_SLOTS - ELITE_POOL];
+    float*   elite_buf;   // [MT1_ELITE_POOL × MT1NN_PARAMS]
+    float*   new_elites;  // [MT1_ELITE_POOL × MT1NN_PARAMS]
+    float*   mut_buf;     // [MT1NN_PARAMS] — scratch for weight reconstruction
+    uint64_t mut_seeds[N_SLOTS - MT1_ELITE_POOL];  // 177
 
     MT1Scratch() {
-        size_t ep = (size_t)ELITE_POOL * MT1NN_PARAMS;
+        size_t ep = (size_t)MT1_ELITE_POOL * MT1NN_PARAMS;
         elite_buf  = new float[ep]();
         new_elites = new float[ep]();
-        wavg_buf   = new float[3 * MT1NN_PARAMS]();
         mut_buf    = new float[MT1NN_PARAMS]();
     }
-    ~MT1Scratch() { delete[] elite_buf; delete[] new_elites; delete[] wavg_buf; delete[] mut_buf; }
+    ~MT1Scratch() { delete[] elite_buf; delete[] new_elites; delete[] mut_buf; }
     float* elite(int i)     { return elite_buf  + (size_t)i * MT1NN_PARAMS; }
     float* new_elite(int i) { return new_elites + (size_t)i * MT1NN_PARAMS; }
-    float* wavg(int i)      { return wavg_buf   + (size_t)i * MT1NN_PARAMS; }
 };
 
 struct MT1Result {
@@ -2024,112 +2029,140 @@ static MasterResult step_master(MasterState& state, MasterScratch& scratch,
 
 // ── MT1 per-industry training step ──────────────────────────────────────────────
 
-static float compute_mt1_score(float actual, const float raw3[3]) {
+struct MT1ScoreBreakdown { float composite, direction, range, accuracy; };
+
+static MT1ScoreBreakdown compute_mt1_scores(float actual, const float raw3[3]) {
     float conf     = sigmoidf(raw3[0]);
     float delta    = tanhf(raw3[1]) * MT1_SCALE;
-    float range_hw = log1pf(expf(raw3[2]));    // softplus
-
+    float range_hw = log1pf(expf(raw3[2]));
     float sc_dir   = ((conf >= 0.5f) == (actual >= 0.f)) ? 1.f : 0.f;
     float err      = fabsf(actual - delta);
     float sc_range = (err <= range_hw) ? expf(-range_hw / RANGE_SCALE) : 0.f;
     float rel_err  = err / (fabsf(actual) + 1e-9f);
     float sc_acc   = 1.f - fminf(rel_err, 1.f);
-
-    return 0.50f * sc_dir + 0.33f * sc_range + 0.17f * sc_acc;
+    return {0.50f * sc_dir + 0.33f * sc_range + 0.17f * sc_acc, sc_dir, sc_range, sc_acc};
 }
 
 static MT1Result step_mt1(int ind_i, MT1Scratch& scratch,
                            float actual_frac, const float in37[37],
                            int actual_day, float sigma) {
-    if (actual_day < MT1_START_DAY) return {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    if (actual_day < MT1_START_DAY) return {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 
+    // Deterministic seeds for mutation slots
     {
         PCG32 seed_rng;
         seed_rng.seed((uint64_t)actual_day * 987017ULL + (uint64_t)ind_i * 10007ULL + 11111ULL);
-        for (int i = 0; i < N_SLOTS - ELITE_POOL; i++)
+        for (int i = 0; i < N_SLOTS - MT1_ELITE_POOL; i++)
             scratch.mut_seeds[i] = ((uint64_t)seed_rng.next() << 32) | seed_rng.next();
     }
 
-    float scores[N_SLOTS] = {};
-    float raw_out[N_SLOTS][3];
-    float out3[3];
+    // Score all slots across all 4 components
+    float comp_sc[N_SLOTS]={}, dir_sc[N_SLOTS]={}, rng_sc[N_SLOTS]={}, acc_sc[N_SLOTS]={};
+    float out3[3], raw0[3] = {};
 
     for (int slot = 0; slot < N_SLOTS; slot++) {
         const float* W;
-        if (slot < ELITE_POOL) {
+        if (slot < MT1_ELITE_POOL) {
             W = scratch.elite(slot);
         } else {
-            int mut_i = slot - ELITE_POOL, parent = mut_i / MUTATIONS_PER_PARENT;
+            int mut_i  = slot - MT1_ELITE_POOL;
+            int parent = mut_i % MT1_ELITE_POOL;   // round-robin parent assignment
             memcpy(scratch.mut_buf, scratch.elite(parent), MT1NN_PARAMS * sizeof(float));
             apply_gaussian(scratch.mut_buf, MT1NN_PARAMS, sigma, scratch.mut_seeds[mut_i]);
             W = scratch.mut_buf;
         }
         mt1_forward(W, in37, out3);
-        raw_out[slot][0] = out3[0]; raw_out[slot][1] = out3[1]; raw_out[slot][2] = out3[2];
-        scores[slot] = compute_mt1_score(actual_frac, out3);
+        if (slot == 0) { raw0[0]=out3[0]; raw0[1]=out3[1]; raw0[2]=out3[2]; }
+        auto sb       = compute_mt1_scores(actual_frac, out3);
+        comp_sc[slot] = sb.composite;
+        dir_sc [slot] = sb.direction;
+        rng_sc [slot] = sb.range;
+        acc_sc [slot] = sb.accuracy;
     }
 
+    // Pool statistics (composite)
     float mean_score = 0.f;
-    for (int s = 0; s < N_SLOTS; s++) mean_score += scores[s];
+    for (int s = 0; s < N_SLOTS; s++) mean_score += comp_sc[s];
     mean_score /= N_SLOTS;
+    float best_sc  = *std::max_element(comp_sc, comp_sc + N_SLOTS);
+    float min_sc   = *std::min_element(comp_sc, comp_sc + N_SLOTS);
+    float slot0_sc = comp_sc[0];
 
-    int   best_slot = (int)(std::max_element(scores, scores + N_SLOTS) - scores);
-    float best_sc   = scores[best_slot];
-    float min_sc    = *std::min_element(scores, scores + N_SLOTS);
-    float slot0_sc  = scores[0];
+    // Per-category sorted index arrays
+    int idx_comp[N_SLOTS], idx_dir[N_SLOTS], idx_rng[N_SLOTS], idx_acc[N_SLOTS];
+    std::iota(idx_comp, idx_comp+N_SLOTS, 0);
+    std::iota(idx_dir,  idx_dir +N_SLOTS, 0);
+    std::iota(idx_rng,  idx_rng +N_SLOTS, 0);
+    std::iota(idx_acc,  idx_acc +N_SLOTS, 0);
+    std::sort(idx_comp,idx_comp+N_SLOTS,[&](int a,int b){return comp_sc[a]>comp_sc[b];});
+    std::sort(idx_dir, idx_dir +N_SLOTS,[&](int a,int b){return dir_sc [a]>dir_sc [b];});
+    std::sort(idx_rng, idx_rng +N_SLOTS,[&](int a,int b){return rng_sc [a]>rng_sc [b];});
+    std::sort(idx_acc, idx_acc +N_SLOTS,[&](int a,int b){return acc_sc [a]>acc_sc [b];});
 
-    float slot0_conf     = sigmoidf(raw_out[0][0]);
-    float slot0_delta    = tanhf(raw_out[0][1]) * MT1_SCALE;
-    float slot0_range_hw = log1pf(expf(raw_out[0][2]));
-
-    // Selection: floor = mean − std
-    float var_s = 0.f;
-    for (int s = 0; s < N_SLOTS; s++) { float d = scores[s] - mean_score; var_s += d * d; }
-    float floor_s = mean_score - sqrtf(var_s / N_SLOTS);
-
-    std::vector<std::pair<float,int>> surviving;
-    surviving.reserve(N_SLOTS);
-    for (int s = 0; s < N_SLOTS; s++)
-        if (scores[s] >= floor_s) surviving.push_back({scores[s], s});
-    if (surviving.empty()) surviving.push_back({scores[0], 0});
-    std::sort(surviving.begin(), surviving.end(),
-              [](const auto& a, const auto& b){ return a.first > b.first; });
-    int n_top = std::min((int)surviving.size(), ELITE_COUNT);
-
-    int   src_rank[ELITE_COUNT] = {};
-    float src_val [ELITE_COUNT] = {};
-    for (int k = 0; k < n_top;      k++) { src_rank[k] = surviving[k].second; src_val[k] = surviving[k].first; }
-    for (int k = n_top; k < ELITE_COUNT; k++) { src_rank[k] = src_rank[0]; src_val[k] = src_val[0]; }
-
-    for (int k = 0; k < n_top; k++) {
-        int slot = src_rank[k];
-        if (slot < ELITE_POOL) {
-            memcpy(scratch.new_elite(k), scratch.elite(slot), MT1NN_PARAMS * sizeof(float));
+    // Reconstruct weight vector for any slot (elite or mutation) into dst
+    auto get_weights = [&](int slot, float* dst) {
+        if (slot < MT1_ELITE_POOL) {
+            memcpy(dst, scratch.elite(slot), MT1NN_PARAMS * sizeof(float));
         } else {
-            int mut_i = slot - ELITE_POOL, parent = mut_i / MUTATIONS_PER_PARENT;
-            memcpy(scratch.new_elite(k), scratch.elite(parent), MT1NN_PARAMS * sizeof(float));
-            apply_gaussian(scratch.new_elite(k), MT1NN_PARAMS, sigma, scratch.mut_seeds[mut_i]);
+            int mut_i  = slot - MT1_ELITE_POOL;
+            int parent = mut_i % MT1_ELITE_POOL;
+            memcpy(dst, scratch.elite(parent), MT1NN_PARAMS * sizeof(float));
+            apply_gaussian(dst, MT1NN_PARAMS, sigma, scratch.mut_seeds[mut_i]);
         }
-    }
-    for (int k = n_top; k < ELITE_COUNT; k++)
+    };
+
+    // Select direct elites: top MT1_ELITES_PER_CAT per category, globally deduped
+    // Slot layout: 0–4 composite | 5–9 direction | 10–14 range | 15–19 accuracy
+    bool selected[N_SLOTS] = {};
+    int  elite_slots[MT1_DIRECT_ELITES];
+    int  n_direct = 0;
+
+    auto pick_top_k = [&](const int* sorted_idx, int k) {
+        int picked = 0;
+        for (int i = 0; i < N_SLOTS && picked < k; i++) {
+            int s = sorted_idx[i];
+            if (!selected[s]) { selected[s]=true; elite_slots[n_direct++]=s; picked++; }
+        }
+    };
+    pick_top_k(idx_comp, MT1_ELITES_PER_CAT);
+    pick_top_k(idx_dir,  MT1_ELITES_PER_CAT);
+    pick_top_k(idx_rng,  MT1_ELITES_PER_CAT);
+    pick_top_k(idx_acc,  MT1_ELITES_PER_CAT);
+
+    for (int k = 0; k < n_direct; k++)
+        get_weights(elite_slots[k], scratch.new_elite(k));
+    for (int k = n_direct; k < MT1_DIRECT_ELITES; k++)
         memcpy(scratch.new_elite(k), scratch.new_elite(0), MT1NN_PARAMS * sizeof(float));
 
-    float w5[5], w10[10], w15[15];
-    int n5 = std::min(n_top,5), n10 = std::min(n_top,10), n15 = std::min(n_top,15);
-    normalize_weights(src_val, w5,  n5);
-    normalize_weights(src_val, w10, n10);
-    normalize_weights(src_val, w15, n15);
-    int seq[ELITE_COUNT]; for (int k = 0; k < ELITE_COUNT; k++) seq[k] = k;
-    wavg_weights_flat(scratch.new_elites, MT1NN_PARAMS, seq, w5,  n5,  scratch.wavg(0));
-    wavg_weights_flat(scratch.new_elites, MT1NN_PARAMS, seq, w10, n10, scratch.wavg(1));
-    wavg_weights_flat(scratch.new_elites, MT1NN_PARAMS, seq, w15, n15, scratch.wavg(2));
-    memcpy(scratch.new_elite(ELITE_COUNT),     scratch.wavg(0), MT1NN_PARAMS * sizeof(float));
-    memcpy(scratch.new_elite(ELITE_COUNT + 1), scratch.wavg(1), MT1NN_PARAMS * sizeof(float));
-    memcpy(scratch.new_elite(ELITE_COUNT + 2), scratch.wavg(2), MT1NN_PARAMS * sizeof(float));
+    // Wavg blends: w1/w2/w3 — equal-weight average of top-L unique models per category
+    // w1: top-1 from each category (≤4 unique); w2: top-2 (≤8); w3: top-3 (≤12)
+    const int* cats[MT1_N_CATS] = {idx_comp, idx_dir, idx_rng, idx_acc};
+    for (int L = 0; L < MT1_WAVG_BLENDS; L++) {
+        int blend_level = L + 1;
+        bool in_blend[N_SLOTS] = {};
+        std::vector<int> blend_slots;
+        for (int c = 0; c < MT1_N_CATS; c++) {
+            for (int r = 0; r < blend_level; r++) {
+                int s = cats[c][r];
+                if (!in_blend[s]) { in_blend[s]=true; blend_slots.push_back(s); }
+            }
+        }
+        float* dst    = scratch.new_elite(MT1_DIRECT_ELITES + L);
+        float  inv_n  = 1.f / (float)blend_slots.size();
+        memset(dst, 0, MT1NN_PARAMS * sizeof(float));
+        for (int s : blend_slots) {
+            get_weights(s, scratch.mut_buf);
+            for (int p = 0; p < MT1NN_PARAMS; p++) dst[p] += scratch.mut_buf[p] * inv_n;
+        }
+    }
 
-    for (int k = 0; k < ELITE_POOL; k++)
-        memcpy(scratch.elite(k), scratch.new_elite(k), MT1NN_PARAMS * sizeof(float));
+    // Commit new elite set
+    memcpy(scratch.elite_buf, scratch.new_elites,
+           (size_t)MT1_ELITE_POOL * MT1NN_PARAMS * sizeof(float));
 
+    float slot0_conf     = sigmoidf(raw0[0]);
+    float slot0_delta    = tanhf(raw0[1]) * MT1_SCALE;
+    float slot0_range_hw = log1pf(expf(raw0[2]));
     return {best_sc, slot0_sc, mean_score, min_sc, slot0_conf, slot0_delta, slot0_range_hw};
 }
 
@@ -2538,7 +2571,7 @@ static std::string mt1_elite_path(const std::string& dir, const char* ind, int s
 }
 
 static void save_mt1_elites(const std::string& dir, int ind_i, const float* elite_buf) {
-    for (int slot = 0; slot < ELITE_POOL; slot++) {
+    for (int slot = 0; slot < MT1_ELITE_POOL; slot++) {
         std::string p = mt1_elite_path(dir, g_ind_names[ind_i].c_str(), slot);
         if (!save_bin(p, elite_buf + (size_t)slot * MT1NN_PARAMS, MT1NN_PARAMS))
             log_msg("WARNING: could not save " + p);
@@ -2548,7 +2581,7 @@ static void save_mt1_elites(const std::string& dir, int ind_i, const float* elit
 static void load_or_init_mt1(const std::string& dir, const std::string& load_dir,
                                int ind_i, float* elite_buf) {
     PCG32 rng; rng.seed((uint64_t)(ind_i + N_IND) * 777777777ULL + 314159265ULL);
-    for (int slot = 0; slot < ELITE_POOL; slot++) {
+    for (int slot = 0; slot < MT1_ELITE_POOL; slot++) {
         float* e = elite_buf + (size_t)slot * MT1NN_PARAMS;
         bool loaded = false;
         if (!load_dir.empty()) {

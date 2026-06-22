@@ -39,6 +39,11 @@ from models import MT1NN, MT2NN, StockNN
 from training_lib import (
     ELITE_COUNT,
     ELITE_POOL,
+    MT1_DIRECT_ELITES,
+    MT1_ELITES_PER_CAT,
+    MT1_ELITE_POOL,
+    MT1_N_CATS,
+    MT1_WAVG_BLENDS,
     N_SLOTS,
     _master_points,
     _model_path,
@@ -141,15 +146,113 @@ def _select_and_mutate(prefix, model_dir, model_class, scores, sigma):
     return elite_slots, elite_vals
 
 
+def _select_and_mutate_mt1(prefix, model_dir, scores_breakdown, sigma):
+    """
+    Multi-category elite selection for MT1 pool (23 total parent slots).
+
+    scores_breakdown: list of (slot, composite, direction, range_, accuracy) for N_SLOTS slots.
+
+    Slot layout after selection:
+      0–4   composite top-5 (globally deduped across all categories)
+      5–9   direction top-5
+      10–14 range top-5
+      15–19 accuracy top-5
+      20    wavg of top-1 per category (≤4 unique models, equal weight)
+      21    wavg of top-2 per category (≤8 unique, equal weight)
+      22    wavg of top-3 per category (≤12 unique, equal weight)
+      23–199 mutations, round-robin over 23 parents
+    """
+    n = len(scores_breakdown)
+
+    # Build sorted index lists per category (position in scores_breakdown)
+    by_comp = sorted(range(n), key=lambda i: scores_breakdown[i][1], reverse=True)
+    by_dir  = sorted(range(n), key=lambda i: scores_breakdown[i][2], reverse=True)
+    by_rng  = sorted(range(n), key=lambda i: scores_breakdown[i][3], reverse=True)
+    by_acc  = sorted(range(n), key=lambda i: scores_breakdown[i][4], reverse=True)
+    cats    = [by_comp, by_dir, by_rng, by_acc]
+
+    # Pick top MT1_ELITES_PER_CAT from each category, globally deduped
+    selected            = set()
+    elite_slots_ordered = []
+    for cat in cats:
+        picked = 0
+        for i in cat:
+            s = scores_breakdown[i][0]
+            if s not in selected and picked < MT1_ELITES_PER_CAT:
+                selected.add(s)
+                elite_slots_ordered.append(s)
+                picked += 1
+    while len(elite_slots_ordered) < MT1_DIRECT_ELITES:
+        elite_slots_ordered.append(elite_slots_ordered[0])
+
+    # Build blend slot lists: top-L per category, deduped within each blend level
+    blend_lists = []
+    for L in range(MT1_WAVG_BLENDS):
+        seen  = set()
+        blist = []
+        for cat in cats:
+            for r in range(L + 1):
+                s = scores_breakdown[cat[r]][0]
+                if s not in seen:
+                    seen.add(s)
+                    blist.append(s)
+        blend_lists.append(blist)
+
+    # Pre-load all needed models before any writes to avoid clobber
+    needed = set(elite_slots_ordered)
+    for blist in blend_lists:
+        needed.update(blist)
+    cache = {s: load_slot_model(prefix, model_dir, s, MT1NN) for s in needed}
+
+    # Compute equal-weight wavg blend states in memory
+    blend_states = []
+    for blist in blend_lists:
+        inv_n  = 1.0 / len(blist)
+        avg_st = None
+        for s in blist:
+            state = cache[s].state_dict()
+            if avg_st is None:
+                avg_st = {k: (v.clone().float() * inv_n if torch.is_floating_point(v) else v.clone())
+                          for k, v in state.items()}
+            else:
+                for k, v in state.items():
+                    if torch.is_floating_point(v) and k in avg_st:
+                        avg_st[k] = avg_st[k] + v.float() * inv_n
+        blend_states.append(avg_st)
+
+    # Write direct elites 0–MT1_DIRECT_ELITES-1
+    for rank, s in enumerate(elite_slots_ordered):
+        save_slot_model(prefix, model_dir, rank, cache[s])
+
+    # Write wavg blends MT1_DIRECT_ELITES – MT1_ELITE_POOL-1
+    for L, avg_st in enumerate(blend_states):
+        m = MT1NN()
+        m.load_state_dict(avg_st)
+        save_slot_model(prefix, model_dir, MT1_DIRECT_ELITES + L, m)
+        del m
+
+    del cache, blend_states
+
+    # Mutations: round-robin over MT1_ELITE_POOL parents (slots 23–199)
+    for i, slot in enumerate(range(MT1_ELITE_POOL, N_SLOTS)):
+        parent_rank = i % MT1_ELITE_POOL
+        parent = load_slot_model(prefix, model_dir, parent_rank, MT1NN)
+        child  = _mutate_generic(parent, MT1NN, sigma)
+        save_slot_model(prefix, model_dir, slot, child)
+        del parent, child
+
+    return elite_slots_ordered
+
+
 # ── MT1 scoring ────────────────────────────────────────────────────────────────
 
-def _mt1_score(out3, actual):
+def _mt1_score_breakdown(out3, actual):
     """
     Score one MT1 slot against the industry's actual fractional return.
 
     out3:   raw logit tensor shape (3,)
     actual: float — fractional return (slot0_industry_value / baseline - 1)
-    Returns float in [0.0, 1.0].
+    Returns (composite, direction, range_, accuracy) all in [0.0, 1.0].
     """
     conf     = torch.sigmoid(out3[0]).item()
     delta    = torch.tanh(out3[1]).item() * MT1_SCALE
@@ -159,8 +262,14 @@ def _mt1_score(out3, actual):
     in_range    = abs(actual - delta) <= range_hw
     score_range = math.exp(-range_hw / RANGE_SCALE) if in_range else 0.0
     score_acc   = max(0.0, 1.0 - min(abs(actual - delta) / (abs(actual) + 1e-9), 1.0))
+    composite   = 0.50 * score_dir + 0.33 * score_range + 0.17 * score_acc
 
-    return 0.50 * score_dir + 0.33 * score_range + 0.17 * score_acc
+    return composite, score_dir, score_range, score_acc
+
+
+def _mt1_score(out3, actual):
+    """Composite MT1 score only (wrapper over _mt1_score_breakdown)."""
+    return _mt1_score_breakdown(out3, actual)[0]
 
 
 def _mt1_decode(model, in37_t):
@@ -180,30 +289,32 @@ def _mt1_burst(prefix, model_dir, in37_t, actual_perf_i, burst_sigma):
     """
     One burst refinement pass for an MT1 pool.
 
-    Generates 200 mutants (10 per ELITE_POOL parent), scores via _mt1_score,
-    merges top-ELITE_COUNT with current elites (cap: 2 burst replacements),
-    and regenerates wavg slots 17–19. Returns new best score.
+    Generates 230 mutants (10 per MT1_ELITE_POOL=23 parents), scores via composite,
+    merges top-MT1_DIRECT_ELITES with current elites (cap: 2 burst replacements),
+    and regenerates wavg slots 20–22. Returns new best composite score.
     """
     burst_candidates = []
-    for elite_slot in range(ELITE_POOL):
+    for elite_slot in range(MT1_ELITE_POOL):
         parent = load_slot_model(prefix, model_dir, elite_slot, MT1NN)
         for _ in range(10):
             child = _mutate_generic(parent, MT1NN, burst_sigma)
             child.eval()
             with torch.inference_mode():
                 out3 = child(in37_t).squeeze(0)
-            burst_candidates.append((child, _mt1_score(out3, actual_perf_i)))
+            comp, _, _, _ = _mt1_score_breakdown(out3, actual_perf_i)
+            burst_candidates.append((child, comp))
         del parent
     burst_candidates.sort(key=lambda x: x[1], reverse=True)
-    top_burst = burst_candidates[:ELITE_COUNT]
+    top_burst = burst_candidates[:MT1_DIRECT_ELITES]
 
     current_elites = []
-    for rank in range(ELITE_COUNT):
+    for rank in range(MT1_DIRECT_ELITES):
         m = load_slot_model(prefix, model_dir, rank, MT1NN)
         m.eval()
         with torch.inference_mode():
             out3 = m(in37_t).squeeze(0)
-        current_elites.append((m, _mt1_score(out3, actual_perf_i)))
+        comp, _, _, _ = _mt1_score_breakdown(out3, actual_perf_i)
+        current_elites.append((m, comp))
 
     burst_ids  = {id(m) for m, _ in top_burst}
     all_cands  = current_elites + top_burst
@@ -212,7 +323,7 @@ def _mt1_burst(prefix, model_dir, in37_t, actual_perf_i, burst_sigma):
     new_elites  = []
     burst_count = 0
     for cand in all_cands:
-        if len(new_elites) >= ELITE_COUNT:
+        if len(new_elites) >= MT1_DIRECT_ELITES:
             break
         if id(cand[0]) in burst_ids:
             if burst_count >= 2:
@@ -230,12 +341,26 @@ def _mt1_burst(prefix, model_dir, in37_t, actual_perf_i, burst_sigma):
     for rank, (m, _) in enumerate(new_elites):
         save_slot_model(prefix, model_dir, rank, m)
 
-    elite_scores = [s for _, s in new_elites]
-    for n_avg, wavg_slot in [(5, ELITE_COUNT), (10, ELITE_COUNT + 1), (15, ELITE_COUNT + 2)]:
-        k    = min(n_avg, ELITE_COUNT)
-        wavg = compute_weighted_avg_model(prefix, model_dir, list(range(k)), elite_scores[:k], MT1NN)
-        save_slot_model(prefix, model_dir, wavg_slot, wavg)
-        del wavg
+    # Regenerate wavg blends at slots 20, 21, 22 (equal-weight average of top-k)
+    for k, wavg_slot in [(3, MT1_DIRECT_ELITES), (6, MT1_DIRECT_ELITES + 1), (9, MT1_DIRECT_ELITES + 2)]:
+        n_src  = min(k, MT1_DIRECT_ELITES)
+        inv_n  = 1.0 / n_src
+        avg_st = None
+        for rank in range(n_src):
+            m = load_slot_model(prefix, model_dir, rank, MT1NN)
+            state = m.state_dict()
+            if avg_st is None:
+                avg_st = {kk: (v.clone().float() * inv_n if torch.is_floating_point(v) else v.clone())
+                          for kk, v in state.items()}
+            else:
+                for kk, v in state.items():
+                    if torch.is_floating_point(v) and kk in avg_st:
+                        avg_st[kk] = avg_st[kk] + v.float() * inv_n
+            del m
+        wavg_m = MT1NN()
+        wavg_m.load_state_dict(avg_st)
+        save_slot_model(prefix, model_dir, wavg_slot, wavg_m)
+        del wavg_m, avg_st
 
     del burst_candidates, current_elites, top_burst, all_cands, new_elites
     gc.collect()
@@ -393,14 +518,15 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
 
     in37_t = in37_t.detach()
 
-    # Score all N_SLOTS slots
-    scores = []
+    # Score all N_SLOTS slots across all 4 MT1 components
+    scores_breakdown = []   # [(slot, composite, direction, range_, accuracy), ...]
     for slot in range(N_SLOTS):
         m = load_slot_model(prefix, model_dir, slot, MT1NN)
         m.eval()
         with torch.inference_mode():
             out3 = m(in37_t).squeeze(0)
-        scores.append((slot, _mt1_score(out3, actual_perf_i)))
+        comp, dir_, rng_, acc_ = _mt1_score_breakdown(out3, actual_perf_i)
+        scores_breakdown.append((slot, comp, dir_, rng_, acc_))
         del m
 
     # Record slot0 outputs before selection (selection may overwrite slot 0)
@@ -408,13 +534,13 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
     slot0_conf, slot0_delta, slot0_range_hw = _mt1_decode(slot0_m, in37_t)
     del slot0_m
 
-    best_score  = max(s for _, s in scores)
-    slot0_score = dict(scores)[0]
+    best_score  = max(bd[1] for bd in scores_breakdown)
+    slot0_score = scores_breakdown[0][1]
 
     log(f"[mt1/{sn(industry)}] best={best_score:.4f} slot0={slot0_score:.4f} "
         f"actual={actual_perf_i:+.4f}")
 
-    _select_and_mutate(prefix, model_dir, MT1NN, scores, sigma)
+    _select_and_mutate_mt1(prefix, model_dir, scores_breakdown, sigma)
 
     # 4 burst refinement passes
     log(f"[mt1/{sn(industry)}] Running 4 burst passes ...")

@@ -32,6 +32,13 @@ ELITE_POOL            = ELITE_COUNT + WAVG_COUNT   # 20 — all parent slots
 MUTATIONS_PER_PARENT  = 9           # each of the ELITE_POOL parents gets this many children
 # Layout: 0–16 direct elites | 17 w5 | 18 w10 | 19 w15 | 20–199 mutations (9 per parent)
 
+# MT1-specific pool layout (different from StockNN/MasterNN)
+MT1_ELITES_PER_CAT   = 5           # best models per scoring category
+MT1_N_CATS           = 4           # categories: composite, direction, range, accuracy
+MT1_DIRECT_ELITES    = MT1_N_CATS * MT1_ELITES_PER_CAT   # 20 direct elite slots
+MT1_WAVG_BLENDS      = 3           # cross-category wavg blend slots
+MT1_ELITE_POOL       = MT1_DIRECT_ELITES + MT1_WAVG_BLENDS   # 23 total parent slots
+
 IND_STARTING_CASH     = 25_000.0    # per-industry portfolio starting capital
 MST_STARTING_CASH     = 300_000.0   # master starting capital (12 × IND_STARTING_CASH)
 IND_UNIT_PRICE        = 25_000.0    # fixed price per industry "unit" in master's portfolio
