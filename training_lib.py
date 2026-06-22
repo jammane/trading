@@ -583,10 +583,12 @@ def compute_value(portfolio, day_data, symbols):
 
 
 def _mst_hist_at(history, lookback):
+    """Return the history value at `lookback` steps ago; clamps to oldest entry."""
     idx = len(history) - 1 - lookback
     return history[max(0, idx)]
 
 def _mst_window(history, n_days):
+    """Return a list of exactly n_days values, padding with the oldest entry if history is short."""
     oldest = history[0] if history else 0.0
     pad    = max(0, n_days - len(history))
     return [oldest] * pad + list(history[-n_days:])
@@ -611,12 +613,20 @@ def build_master_features(ind_value_history, industry_list):
     return torch.tensor(features, dtype=torch.float32).unsqueeze(0)
 
 def decode_master_tiers(out_logits, industry_list):
+    """Convert raw (1,48) MasterNN logits to {ind: tier} where tier ∈ {0,1,2,3}."""
     logits = out_logits.view(12, 4)
     probs  = F.softmax(logits, dim=1)
     tiers  = probs.argmax(dim=1).tolist()
     return {ind: tiers[i] for i, ind in enumerate(industry_list)}
 
 def tiers_to_alloc(tier_map, industry_list, available_cash):
+    """
+    Convert a {ind: tier} map to {ind: dollar_amount} allocation.
+
+    Industries with tier 0 receive $0. Positive-tier industries are divided
+    into three terciles (lowest→tier 1, mid→tier 2, top→tier 3) and weighted
+    by TIER_WEIGHTS. Returns {ind: 0.0} for all if no positive-tier industries.
+    """
     positives = sorted([ind for ind in industry_list if tier_map[ind] > 0],
                        key=lambda ind: tier_map[ind])
     n_pos = len(positives)
@@ -644,6 +654,13 @@ def tiers_to_alloc(tier_map, industry_list, available_cash):
 
 
 def _optimal_tiers(actual_perf, industry_list):
+    """
+    Compute the ideal tier assignment given actual industry returns.
+
+    Divides positive-return industries into terciles (same logic as tiers_to_alloc)
+    and assigns tiers 1/2/3 bottom-to-top. Zero/negative-return industries get tier 0.
+    Used by MT2 scoring to build the oracle target for _master_points.
+    """
     positives = sorted(
         [ind for ind in industry_list if actual_perf.get(ind, 0.0) >= 0],
         key=lambda ind: actual_perf.get(ind, 0.0)
@@ -667,6 +684,14 @@ def _optimal_tiers(actual_perf, industry_list):
 
 
 def _master_points(pred, opt):
+    """
+    Score one industry's tier prediction against the optimal tier.
+
+    Correct predictions score positive (equal to the tier).
+    Predicting non-zero when optimal is 0 scores -2 minus a penalty.
+    Predicting 0 when optimal is positive scores -(optimal).
+    Over-predicting the tier penalises at 0.25 per tier of overshoot.
+    """
     if opt == 0:
         if pred == 0:
             return 0.0
@@ -744,12 +769,15 @@ def _meta_path(prefix, directory):
     return os.path.join(directory, f"{prefix}_top10_meta.json")
 
 def _hist_model_path(industry, directory, day_slot, pos):
+    """Return path for a history model file at circular buffer slot day_slot, position pos."""
     return os.path.join(directory, f"{industry}_hist_{day_slot}_{pos}.pt")
 
 def _hist_meta_path(industry, directory):
+    """Return path for the history circular buffer metadata JSON file."""
     return os.path.join(directory, f"{industry}_hist_meta.json")
 
 def _load_hist_meta(industry, directory):
+    """Load (head, count) for the history circular buffer; returns (0, 0) if missing or corrupt."""
     path = _hist_meta_path(industry, directory)
     if os.path.exists(path):
         try:
@@ -761,6 +789,7 @@ def _load_hist_meta(industry, directory):
     return 0, 0
 
 def _save_hist_meta(industry, directory, head, count):
+    """Persist the history circular buffer (head, count) to disk."""
     with open(_hist_meta_path(industry, directory), 'w') as f:
         json.dump({'head': head, 'count': count}, f)
 
@@ -1545,37 +1574,16 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
 def train_master_one_day(industries, primed_portfolio, model_dir,
                          ind_value_history, industry_top_scores=None):
     """
-    Production upkeep wrapper — one evolution step for the master model.
-    ind_value_history must already contain today's values before calling.
-    Returns (best_pts, slot0_val) from step_master, or (None, None) if skipped.
+    Legacy MasterNN upkeep stub — superseded by MT1/MT2 upkeep in upkeep.py.
+
+    Called only during the ≤15-real-day transition window in production_v2.py
+    while MT history is still too short for MT1/MT2. step_master was removed
+    with training_v2/v3; this now returns (None, None) safely.
     """
-    industry_list = list(industries.keys())
-
-    # Bootstrap: if master slot files don't exist but master_best.pt does, seed the pool.
-    slot0_path = _model_path('master', model_dir, 0)
-    best_path  = os.path.join(model_dir, 'master_best.pt')
-    if not os.path.exists(slot0_path) and os.path.exists(best_path):
-        log("[master] Bootstrapping upkeep pool from master_best.pt")
-        shutil.copy2(best_path, slot0_path)
-        base_model = load_slot_model('master', model_dir, 0, MasterNN)
-        for slot in range(1, N_SLOTS):
-            child = mutate(base_model)
-            save_slot_model('master', model_dir, slot, child)
-            del child
-        del base_model
-
-    portfolios = [copy.deepcopy(primed_portfolio) for _ in range(N_SLOTS)]
-    for p in portfolios:
-        p.setdefault('zero_counts', {ind: 0 for ind in industry_list})
-        for ind in industry_list:
-            p['holdings'].setdefault(ind, 0.0)
-
-    result = step_master(model_dir, portfolios, ind_value_history, industries,
-                         actual_day=MASTER_START_DAY, total_avail=1,
-                         day_num=0, total_days=1,
-                         industry_top_scores=industry_top_scores)
-    best_pts, slot0_val, *_ = result
-    return best_pts, slot0_val
+    # step_master was removed when training_v2/v3 were retired; legacy master
+    # upkeep is a no-op until MT1/MT2 have enough history to take over.
+    log("[master] Legacy upkeep skipped — step_master removed; MT1/MT2 will take over at 15 real days")
+    return None, None
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────

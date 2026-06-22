@@ -88,6 +88,7 @@ def convert_mt2_norm_stats(models_dir, output_dir):
 
 
 def convert_industry(prefix, models_dir, output_dir, layer_defs, model_class, label):
+    """Convert all ELITE_POOL C++ .bin files for a prefix to PyTorch .pt, copying slot 0 to _best.pt."""
     import shutil
     converted = 0
     for slot in range(ELITE_POOL):

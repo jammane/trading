@@ -33,15 +33,27 @@ The 48-element output is reshaped to a 12×4 matrix — one row per stock in the
 
 Each industry portfolio is initialised at $25,000 ($300,000 total across 12 sectors).
 
-### Master allocator (MasterNN)
+### Master allocator stack (MT1NN + MT2NN, with legacy MasterNN fallback)
 
-MasterNN uses the same FC injection architecture with a 61-feature history input (60 OHLCV means + 1 flat-cosine regime signal per day) and a 229-feature today vector. Its 36-element output encodes, per industry:
+Capital allocation uses a two-stage stack trained concurrently with the industry models:
 
-- **Allocation weight** (softmax, sums to 1)
-- **Liquidation depth** (sigmoid, 0 = hold, 1 = liquidate to floor)
-- **Liquidation trigger** (sigmoid, > 0.5 = execute)
+**MT1NN** (per-industry preprocessor, one pool per sector, 3,399 params):
+- Input: `(1, 37)` — one industry's slice of a 444-feature master vector (18 delta lookbacks + poly-2 coefs + 4× poly-3 coefs)
+- FC: 37→37→29→20→12→3 (ReLU activations, raw logits out)
+- Output interpretation: `sigmoid(out[0])` = P(positive return), `tanh(out[1]) × 0.05` = expected delta, `softplus(out[2])` = error half-width
+- Activates at `actual_day ≥ 25`
 
-Capital is capped at 40% per industry with a 2% minimum floor enforced at decode time.
+**MT2NN** (cross-industry tier allocator, replaces MasterNN, 33,996 params):
+- Input: `(1, 36)` — 3 MT1 outputs × 12 industries (delta/range normalized via Welford running stats)
+- Parallel FC branch (36→36→36) + 2-layer LSTM (12 steps × 3 features, hidden=36) → concat 72 → taper 72→66→60→54→48
+- Output: `(1, 48)` raw logits → reshape `(12, 4)` → per-industry softmax → argmax → tier ∈ {0,1,2,3}
+- Tier 0 = expected net loss (no allocation). Tiers 1/2/3 = positive-return terciles (low→high). Activates at `actual_day ≥ 30`
+
+**MasterNN** (legacy fallback, 599,028 params):
+- Flat 5-layer FC: 444→444→444→312→180→48 (ReLU activations, raw tier logits out)
+- Same `(12, 4)` → tier decoding as MT2NN. Used when `mt2_best.pt` is absent or norm stats unavailable.
+
+Capital allocation from tiers: positive-tier industries are divided into terciles weighted 1:1.5:2.25 (tier 1:2:3). Tier-0 industries receive $0. Industries with 3+ consecutive tier-0 predictions are fully liquidated.
 
 ### Evolutionary training
 
@@ -98,24 +110,36 @@ python download_5y_data.py
 
 Saves approximately five years of daily OHLCV JSON for all 144 symbols under `stock_data/`.
 
-### 3. Train models
+### 3. Build and train models
 
-Full run from scratch (recommended — 2-process parallel):
+Build the C++ trainer (one-time):
 ```bash
-python training_v4.py --output models
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)
 ```
 
-Continue from an existing checkpoint:
+Seed the C++ trainer from any existing Python `.pt` checkpoints (or skip on first run):
 ```bash
-python training_v4.py --output models --load-dir models
+python prepare_models.py --load-dir models/training --output models/training
 ```
 
-Short diagnostic run (days 17–22 only):
+Full training run (canonical — industry + MT1 + MT2):
 ```bash
-python training_v4.py --output models --preserve-stock-data --start-day 16 --stop-day 21 --passes 1
+./build/training_v4_cpp --output models/training --load-dir models/training \
+  --passes 5 --sigma 0.008 --master-sigma 0.006 --sigma-decay 1.0 \
+  --start-day 17 --stop-day 1255
 ```
 
-For single-process training on memory-constrained hardware, use `training_v2.py` with the same flags.
+After training, convert `.bin` weights back to `.pt` for Python tools:
+```bash
+python convert_weights.py --models-dir models/training --output models/training
+```
+
+Short diagnostic run (verifies history accumulates, days 16–37 only):
+```bash
+mkdir -p /root/diag_logs
+./build/training_v4_cpp --output /root/diag_logs --load-dir /root/diag_logs \
+  --start-day 16 --stop-day 37 --passes 1 --preserve-stock-data --no-save
+```
 
 ### 4. Inspect trade decisions
 
@@ -147,26 +171,24 @@ Requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` set in the environment (or sto
 
 ## CLI Reference
 
-### `training_v4.py` / `training_v2.py`
+### `training_v4_cpp` (C++ binary)
 
-`training_v4.py` (parallel, 2-process dynamic industry pool) and `training_v2.py`
-(single-process) share identical CLI flags. The process count in v4 is a source-level constant
-(`NUM_WORKERS = 2`) rather than a CLI argument.
+The canonical trainer — handles industry, MT1, and MT2 evolution with ~6× speedup over Python.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--output` | *(required)* | Directory to save trained `.pt` models and metadata |
-| `--load-dir` | None | Seed elite slots from models in this directory before training |
-| `--start-day` | 0 | First training day index (0-based, relative to sorted `all_data` dates) |
+| `--output` | *(required)* | Directory to write `.bin` model files and logs |
+| `--load-dir` | None | Seed elite slots from `.bin` models in this directory |
+| `--start-day` | 0 | First training day index (0-based, matches sorted stock_data dates) |
 | `--stop-day` | end | Last training day index (exclusive) |
 | `--passes` | 1 | Number of full passes over the day range |
-| `--sigma` | 0.01 | Initial Gaussian mutation standard deviation for industry models |
-| `--master-sigma` | same as `--sigma` | Mutation standard deviation for the master model |
-| `--sigma-decay` | 0.5 | Multiply sigma by this value after each pass |
-| `--daily` | False | Run 4 burst-refinement passes per day after normal selection |
-| `--preserve-stock-data` | False | Do not trim `stock_data/` JSON files after training |
-| `--promote` | None | Comma-separated sibling directories to copy best models into after training (e.g. `uat,prod`) |
-| `--master-only` | False | Freeze industry models; train master allocator only |
+| `--sigma` | 0.008 | Gaussian mutation sigma for industry models |
+| `--master-sigma` | 0.006 | Mutation sigma for MT1/MT2 models |
+| `--sigma-decay` | 1.0 | Multiply sigma by this value after each pass (1.0 = no decay) |
+| `--workers` | nproc | Number of parallel industry-training threads |
+| `--preserve-stock-data` | False | Do not trim `stock_data/` JSON files during training |
+| `--no-save` | False | Suppress all model writes (diagnostic runs only) |
+| `--master-only` | False | Freeze industry models; evolve MT1/MT2 only |
 
 ### `inspect_trades.py`
 
@@ -180,12 +202,35 @@ Requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` set in the environment (or sto
 | `--stock-data` | `./stock_data` | Path to historical data directory |
 | `--starting-cash` | 1666.67 | Starting cash per portfolio for the audit simulation |
 
+### `prepare_models.py`
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--load-dir` | *(required)* | Directory containing `.pt` elite model files |
+| `--output` | *(required)* | Directory to write `.bin` files for the C++ trainer |
+
+### `convert_weights.py`
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--models-dir` | *(required)* | Directory containing `.bin` elite model files from C++ training |
+| `--output` | *(required)* | Directory to write `.pt` and `_best.pt` files for Python tools |
+
+### `read_mt_log.py`
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `log` | *(required)* | Path to `mt_training_log.bin` |
+| `--pass` | all | Limit output to a single pass number |
+| `--industry` | all | Substring filter for industry names (e.g. `energy`) |
+
 ### `production_v2.py`
 
 | Flag | Description |
 |------|-------------|
-| `--paper` | Paper trading mode (no orders submitted) |
+| `--paper` | Route all Alpaca API calls to the paper trading endpoint (orders are submitted to paper, not suppressed) |
 | `--model-dir` | Directory containing trained `.pt` model files (default: `models`) |
+| `--capital` | Cap total deployed capital regardless of Alpaca account balance |
 | `--withdraw` | Request a cash withdrawal of the specified dollar amount |
 
 ---
@@ -196,17 +241,20 @@ Requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` set in the environment (or sto
 
 | File | Purpose |
 |------|---------|
-| `models.py` | `StockNN` and `MasterNN` class definitions — single source of truth |
+| `models.py` | `StockNN`, `MasterNN`, `MT1NN`, `MT2NN` class definitions — single source of truth |
 | `universe.py` | 144-symbol trading universe (`INDUSTRIES`, `ALL_SYMBOLS`, `INDUSTRY_NAMES`) |
 | `fees.py` | Broker fee constants and `_sell_net()` helper |
+| `training_lib.py` | Shared evolutionary functions (fill simulation, selection, history, I/O) imported by `upkeep.py` and `production_v2.py` |
+| `upkeep.py` | Single-day evolution for MT1/MT2/StockNN pools — called by `production_v2.py` after each trading day |
 
 ### Training
 
 | File | Purpose |
 |------|---------|
-| `training_v4.py` | **Recommended.** Parallel training: v2 per-slot loading + dynamic 2-process industry pool |
-| `training_v2.py` | Single-process training — lower RAM requirement, identical logic to v4 |
-| `training_v3.py` | 7-thread parallel variant using an in-RAM model cache (requires ≥4 GB RAM) |
+| `training_v4.cpp` | **Canonical C++ trainer** — industry + MT1 + MT2 evolution, ~6× Python speedup. Build with CMake. |
+| `prepare_models.py` | Convert Python `.pt` elite slots → flat float32 `.bin` for the C++ trainer (run before first C++ training) |
+| `convert_weights.py` | Convert C++ `.bin` elite slots → `.pt` + `_best.pt` for Python tools (run after C++ training) |
+| `read_mt_log.py` | Read and summarize `mt_training_log.bin` produced by the C++ trainer |
 
 ### Data and tooling
 
@@ -214,14 +262,14 @@ Requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` set in the environment (or sto
 |------|---------|
 | `download_5y_data.py` | Download ~5 years of daily OHLCV data into `stock_data/` |
 | `inspect_trades.py` | Audit elite model trade decisions for a given day and industry |
-| `swap_symbols.sh` | Guided ticker-replacement: updates `universe.py`, cleans old data, downloads new data, prompts to rebuild Docker image |
-| `swap_symbols.py` | Core replacement logic called by `swap_symbols.sh` — exact quoted-string match in `universe.py` |
+| `swap_symbols.sh` | Guided ticker-replacement: updates `universe.py` + `universe.json`, cleans old data, downloads new data |
+| `swap_symbols.py` | Core replacement logic called by `swap_symbols.sh` |
 
 ### Production
 
 | File | Purpose |
 |------|---------|
-| `production_v2.py` | Daily trading cycle: fetch data, infer, submit orders, upkeep training |
+| `production_v2.py` | Daily trading cycle: fetch data → MT1/MT2 allocation → StockNN orders → Alpaca → upkeep evolution |
 
 ### Setup
 
