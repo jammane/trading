@@ -17,6 +17,7 @@ from collections import defaultdict
 HEADER_SIZE     = 16
 RECORD_SIZE_V1  = 168   # original: best + slot0 + mean
 RECORD_SIZE_V2  = 216   # added mt1_min[12]
+RECORD_SIZE_V3  = 792   # added dir/rng/acc component stats (4 stats × 3 components × 12 ind)
 MAGIC           = 0x4D543132   # 'MT12'
 N_IND           = 12
 
@@ -26,44 +27,46 @@ INDUSTRY_NAMES = [
     'energy', 'utilities', 'real_estate', 'materials',
 ]
 
-# Record layout v1 (168 bytes — logs written before mt1_min was added):
-#   uint32  pass_num         (0)
-#   uint32  actual_day       (4)
-#   float32 mt1_best[12]     (8..55)
-#   float32 mt1_slot0[12]    (56..103)
-#   float32 mt1_mean[12]     (104..151)
-#   float32 mt2_best_pts     (152)
-#   float32 mt2_slot0_pts    (156)
-#   float32 mt2_ideal_pts    (160)
-#   uint8   mt2_injected     (164)
-#   uint8   padding[3]       (165..167)
+# Record layout v1 (168 bytes):
+#   uint32 pass_num, actual_day; float mt1_best/slot0/mean[12]; float mt2×3; uint8 inj; pad[3]
 #
 # Record layout v2 (216 bytes — adds mt1_min[12]):
-#   ... same as v1 through mt1_mean[12] ...
-#   float32 mt1_min[12]      (152..199)
-#   float32 mt2_best_pts     (200)
-#   float32 mt2_slot0_pts    (204)
-#   float32 mt2_ideal_pts    (208)
-#   uint8   mt2_injected     (212)
-#   uint8   padding[3]       (213..215)
+#   ... same as v1 + float mt1_min[12] before MT2 fields
+#
+# Record layout v3 (792 bytes — adds direction/range/accuracy component stats):
+#   uint32 pass_num, actual_day
+#   float  mt1_{best,slot0,mean,min}[12]      — composite
+#   float  mt1_dir_{best,slot0,mean,min}[12]  — direction component
+#   float  mt1_rng_{best,slot0,mean,min}[12]  — range component
+#   float  mt1_acc_{best,slot0,mean,min}[12]  — accuracy component
+#   float  mt2_best_pts, mt2_slot0_pts, mt2_ideal_pts
+#   uint8  mt2_injected; uint8 pad[3]
 
 RECORD_FMT_V1 = '<II' + 'f'*12 + 'f'*12 + 'f'*12 + 'fff' + 'B3x'
 RECORD_FMT_V2 = '<II' + 'f'*12 + 'f'*12 + 'f'*12 + 'f'*12 + 'fff' + 'B3x'
+RECORD_FMT_V3 = '<II' + 'f'*12 * 16 + 'fff' + 'B3x'  # 4 stats × 4 components × 12 ind
 assert struct.calcsize(RECORD_FMT_V1) == RECORD_SIZE_V1
 assert struct.calcsize(RECORD_FMT_V2) == RECORD_SIZE_V2
+assert struct.calcsize(RECORD_FMT_V3) == RECORD_SIZE_V3
 
 
 def parse_log(path):
     file_size = os.path.getsize(path)
     data_size = file_size - HEADER_SIZE
-    fits_v1 = data_size > 0 and data_size % RECORD_SIZE_V1 == 0
+    fits_v3 = data_size > 0 and data_size % RECORD_SIZE_V3 == 0
     fits_v2 = data_size > 0 and data_size % RECORD_SIZE_V2 == 0
-    if not fits_v1 and not fits_v2:
-        sys.exit(f'ERROR: data size {data_size} not divisible by {RECORD_SIZE_V1} or {RECORD_SIZE_V2}')
-    # Both divide when data_size is a multiple of LCM(168,216)=1512; v2 wins (prefer newer format)
-    v2 = fits_v2
-    rec_size = RECORD_SIZE_V2 if v2 else RECORD_SIZE_V1
-    fmt      = RECORD_FMT_V2  if v2 else RECORD_FMT_V1
+    fits_v1 = data_size > 0 and data_size % RECORD_SIZE_V1 == 0
+    if not fits_v1 and not fits_v2 and not fits_v3:
+        sys.exit(f'ERROR: data size {data_size} not divisible by {RECORD_SIZE_V1}, {RECORD_SIZE_V2}, or {RECORD_SIZE_V3}')
+    # Prefer newest format that fits
+    if fits_v3:
+        rec_size, fmt, ver = RECORD_SIZE_V3, RECORD_FMT_V3, 3
+    elif fits_v2:
+        rec_size, fmt, ver = RECORD_SIZE_V2, RECORD_FMT_V2, 2
+    else:
+        rec_size, fmt, ver = RECORD_SIZE_V1, RECORD_FMT_V1, 1
+
+    _nan12 = [float('nan')] * N_IND
 
     with open(path, 'rb') as f:
         hdr = f.read(HEADER_SIZE)
@@ -79,31 +82,68 @@ def parse_log(path):
             if len(raw) < rec_size:
                 break
             vals = struct.unpack(fmt, raw)
-            if v2:
+            if ver == 3:
                 rec = {
-                    'pass':         vals[0],
-                    'day':          vals[1],
-                    'mt1_best':     list(vals[2:14]),
-                    'mt1_slot0':    list(vals[14:26]),
-                    'mt1_mean':     list(vals[26:38]),
-                    'mt1_min':      list(vals[38:50]),
-                    'mt2_best_pts': vals[50],
-                    'mt2_slot0_pts':vals[51],
-                    'mt2_ideal_pts':vals[52],
-                    'mt2_injected': vals[53],
+                    'pass':             vals[0],
+                    'day':              vals[1],
+                    'mt1_best':         list(vals[2:14]),
+                    'mt1_slot0':        list(vals[14:26]),
+                    'mt1_mean':         list(vals[26:38]),
+                    'mt1_min':          list(vals[38:50]),
+                    'mt1_dir_best':     list(vals[50:62]),
+                    'mt1_dir_slot0':    list(vals[62:74]),
+                    'mt1_dir_mean':     list(vals[74:86]),
+                    'mt1_dir_min':      list(vals[86:98]),
+                    'mt1_rng_best':     list(vals[98:110]),
+                    'mt1_rng_slot0':    list(vals[110:122]),
+                    'mt1_rng_mean':     list(vals[122:134]),
+                    'mt1_rng_min':      list(vals[134:146]),
+                    'mt1_acc_best':     list(vals[146:158]),
+                    'mt1_acc_slot0':    list(vals[158:170]),
+                    'mt1_acc_mean':     list(vals[170:182]),
+                    'mt1_acc_min':      list(vals[182:194]),
+                    'mt2_best_pts':     vals[194],
+                    'mt2_slot0_pts':    vals[195],
+                    'mt2_ideal_pts':    vals[196],
+                    'mt2_injected':     vals[197],
                 }
-            else:
+            elif ver == 2:
                 rec = {
-                    'pass':         vals[0],
-                    'day':          vals[1],
-                    'mt1_best':     list(vals[2:14]),
-                    'mt1_slot0':    list(vals[14:26]),
-                    'mt1_mean':     list(vals[26:38]),
-                    'mt1_min':      [float('nan')] * N_IND,  # not in v1
-                    'mt2_best_pts': vals[38],
-                    'mt2_slot0_pts':vals[39],
-                    'mt2_ideal_pts':vals[40],
-                    'mt2_injected': vals[41],
+                    'pass':             vals[0],
+                    'day':              vals[1],
+                    'mt1_best':         list(vals[2:14]),
+                    'mt1_slot0':        list(vals[14:26]),
+                    'mt1_mean':         list(vals[26:38]),
+                    'mt1_min':          list(vals[38:50]),
+                    'mt1_dir_best':     _nan12, 'mt1_dir_slot0': _nan12,
+                    'mt1_dir_mean':     _nan12, 'mt1_dir_min':   _nan12,
+                    'mt1_rng_best':     _nan12, 'mt1_rng_slot0': _nan12,
+                    'mt1_rng_mean':     _nan12, 'mt1_rng_min':   _nan12,
+                    'mt1_acc_best':     _nan12, 'mt1_acc_slot0': _nan12,
+                    'mt1_acc_mean':     _nan12, 'mt1_acc_min':   _nan12,
+                    'mt2_best_pts':     vals[50],
+                    'mt2_slot0_pts':    vals[51],
+                    'mt2_ideal_pts':    vals[52],
+                    'mt2_injected':     vals[53],
+                }
+            else:  # v1
+                rec = {
+                    'pass':             vals[0],
+                    'day':              vals[1],
+                    'mt1_best':         list(vals[2:14]),
+                    'mt1_slot0':        list(vals[14:26]),
+                    'mt1_mean':         list(vals[26:38]),
+                    'mt1_min':          _nan12,
+                    'mt1_dir_best':     _nan12, 'mt1_dir_slot0': _nan12,
+                    'mt1_dir_mean':     _nan12, 'mt1_dir_min':   _nan12,
+                    'mt1_rng_best':     _nan12, 'mt1_rng_slot0': _nan12,
+                    'mt1_rng_mean':     _nan12, 'mt1_rng_min':   _nan12,
+                    'mt1_acc_best':     _nan12, 'mt1_acc_slot0': _nan12,
+                    'mt1_acc_mean':     _nan12, 'mt1_acc_min':   _nan12,
+                    'mt2_best_pts':     vals[38],
+                    'mt2_slot0_pts':    vals[39],
+                    'mt2_ideal_pts':    vals[40],
+                    'mt2_injected':     vals[41],
                 }
             records.append(rec)
     return records
@@ -126,6 +166,37 @@ def _thirds(recs, key_fn):
            _mean([key_fn(r) for r in late])
 
 
+def print_per_day(pass_num, recs, industry_filter=None):
+    import math
+    has_min = not math.isnan(recs[0]['mt1_min'][0])
+    print(f'\n{"="*70}')
+    print(f'  Pass {pass_num}  per-day  ({len(recs)} days, day {recs[0]["day"]} – {recs[-1]["day"]})')
+    print(f'{"="*70}')
+    header = f'  {"day":>4}  {"mt2_best":>9} {"mt2_s0":>9} {"mt2_ideal":>9} {"inj":>3}'
+    for i, name in enumerate(INDUSTRY_NAMES):
+        if industry_filter and industry_filter.lower() not in name:
+            continue
+        short = name[:10]
+        header += f'  {short+":s0":>14} {short+":max":>14} {short+":mn":>14}'
+        if has_min:
+            header += f' {short+":min":>14}'
+    print(header)
+    for r in recs:
+        line = (f'  {r["day"]:>4}  {r["mt2_best_pts"]:>+9.2f} {r["mt2_slot0_pts"]:>+9.2f}'
+                f' {r["mt2_ideal_pts"]:>+9.2f} {"Y" if r["mt2_injected"] else ".":>3}')
+        for i, name in enumerate(INDUSTRY_NAMES):
+            if industry_filter and industry_filter.lower() not in name:
+                continue
+            s0  = r['mt1_slot0'][i]
+            mx  = r['mt1_best'][i]
+            mn  = r['mt1_mean'][i]
+            mi  = r['mt1_min'][i]
+            line += f'  {s0:>14.3f} {mx:>14.3f} {mn:>14.3f}'
+            if has_min:
+                line += f' {mi:>14.3f}'
+        print(line)
+
+
 def print_pass_summary(pass_num, recs, industry_filter=None):
     print(f'\n{"="*70}')
     print(f'  Pass {pass_num}  ({len(recs)} days, day {recs[0]["day"]} – {recs[-1]["day"]})')
@@ -138,24 +209,45 @@ def print_pass_summary(pass_num, recs, industry_filter=None):
     print(f'  MT2 best_pts  early={mt2_early:+.2f}  mid={mt2_mid:+.2f}  late={mt2_late:+.2f}'
           f'  (ideal avg={avg_ideal:+.2f}  inj={mt2_inj}/{len(recs)})')
 
-    # MT1 per-industry trends (slot0, pool_max, pool_mean, pool_min)
+    # MT1 per-industry trends
     import math
-    has_min = not math.isnan(recs[0]['mt1_min'][0])
-    print(f'  MT1 score trends (early→mid→late) — slot0 | pool_max | pool_mean'
-          + (' | pool_min' if has_min else ' | pool_min: n/a (v1 log)'))
+    has_comp = not math.isnan(recs[0]['mt1_min'][0])
+    has_comp_v3 = not math.isnan(recs[0]['mt1_dir_best'][0])
+
+    print(f'  MT1 composite (early→mid→late) — slot0 | max | mean | min')
     for i, name in enumerate(INDUSTRY_NAMES):
         if industry_filter and industry_filter.lower() not in name:
             continue
-        s0_e, s0_m, s0_l   = _thirds(recs, lambda r, ii=i: r['mt1_slot0'][ii])
-        mx_e, mx_m, mx_l   = _thirds(recs, lambda r, ii=i: r['mt1_best'][ii])
-        mn_e, mn_m, mn_l   = _thirds(recs, lambda r, ii=i: r['mt1_mean'][ii])
-        mi_e, mi_m, mi_l   = _thirds(recs, lambda r, ii=i: r['mt1_min'][ii])
-        min_str = f'  min: {mi_e:.3f}→{mi_m:.3f}→{mi_l:.3f}' if has_min else ''
+        s0_e, s0_m, s0_l = _thirds(recs, lambda r, ii=i: r['mt1_slot0'][ii])
+        mx_e, mx_m, mx_l = _thirds(recs, lambda r, ii=i: r['mt1_best'][ii])
+        mn_e, mn_m, mn_l = _thirds(recs, lambda r, ii=i: r['mt1_mean'][ii])
+        mi_e, mi_m, mi_l = _thirds(recs, lambda r, ii=i: r['mt1_min'][ii])
+        min_str = f'  min: {mi_e:.3f}→{mi_m:.3f}→{mi_l:.3f}' if has_comp else ''
         print(f'    {name:<28s}'
               f'  slot0: {s0_e:.3f}→{s0_m:.3f}→{s0_l:.3f}'
               f'  max: {mx_e:.3f}→{mx_m:.3f}→{mx_l:.3f}'
               f'  mean: {mn_e:.3f}→{mn_m:.3f}→{mn_l:.3f}'
               f'{min_str}')
+
+    if has_comp_v3:
+        for comp_label, best_key, s0_key, mean_key, min_key in [
+            ('direction', 'mt1_dir_best', 'mt1_dir_slot0', 'mt1_dir_mean', 'mt1_dir_min'),
+            ('range',     'mt1_rng_best', 'mt1_rng_slot0', 'mt1_rng_mean', 'mt1_rng_min'),
+            ('accuracy',  'mt1_acc_best', 'mt1_acc_slot0', 'mt1_acc_mean', 'mt1_acc_min'),
+        ]:
+            print(f'  MT1 {comp_label} component (early→mid→late) — slot0 | max | mean | min')
+            for i, name in enumerate(INDUSTRY_NAMES):
+                if industry_filter and industry_filter.lower() not in name:
+                    continue
+                s0_e, s0_m, s0_l = _thirds(recs, lambda r, ii=i, k=s0_key:   r[k][ii])
+                mx_e, mx_m, mx_l = _thirds(recs, lambda r, ii=i, k=best_key:  r[k][ii])
+                mn_e, mn_m, mn_l = _thirds(recs, lambda r, ii=i, k=mean_key:  r[k][ii])
+                mi_e, mi_m, mi_l = _thirds(recs, lambda r, ii=i, k=min_key:   r[k][ii])
+                print(f'    {name:<28s}'
+                      f'  slot0: {s0_e:.3f}→{s0_m:.3f}→{s0_l:.3f}'
+                      f'  max: {mx_e:.3f}→{mx_m:.3f}→{mx_l:.3f}'
+                      f'  mean: {mn_e:.3f}→{mn_m:.3f}→{mn_l:.3f}'
+                      f'  min: {mi_e:.3f}→{mi_m:.3f}→{mi_l:.3f}')
 
 
 def main():
@@ -165,6 +257,8 @@ def main():
                         help='Limit output to a single pass number')
     parser.add_argument('--industry', default=None,
                         help='Substring filter for industry names')
+    parser.add_argument('--per-day', action='store_true',
+                        help='Print per-day numbers instead of early/mid/late summary')
     args = parser.parse_args()
 
     if not os.path.exists(args.log):
@@ -188,7 +282,10 @@ def main():
         passes = [args.passnum]
 
     for p in passes:
-        print_pass_summary(p, by_pass[p], industry_filter=args.industry)
+        if args.per_day:
+            print_per_day(p, by_pass[p], industry_filter=args.industry)
+        else:
+            print_pass_summary(p, by_pass[p], industry_filter=args.industry)
 
     print()
 
