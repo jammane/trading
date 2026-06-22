@@ -2778,11 +2778,15 @@ int main(int argc, char* argv[]) {
         else if (arg == "--no-save") g_no_save = true;
         else if (arg == "--help" || arg == "-h") { print_usage(argv[0]); return 0; }
     }
-    // --account sets both dirs; --output/--load-dir override (diagnostic use)
+    // --account derives model and log dirs; --output/--load-dir are diagnostic overrides
+    std::string log_dir;
     if (!account.empty()) {
         std::string acct_dir = "models/" + account + "/training";
         if (output_dir.empty()) output_dir = acct_dir;
         if (load_dir.empty())   load_dir   = acct_dir;
+        log_dir = "logs/" + account + "/training";
+    } else {
+        log_dir = output_dir;  // diagnostic: co-locate logs with models
     }
     if (output_dir.empty()) { print_usage(argv[0]); return 1; }
     if (master_sigma < 0.f) master_sigma = sigma;
@@ -2793,6 +2797,7 @@ int main(int argc, char* argv[]) {
     openblas_set_num_threads(1);
 
     fs::create_directories(output_dir);
+    fs::create_directories(log_dir);
     fs::create_directories("stock_data");
 
     // Load stock data
@@ -2817,8 +2822,8 @@ int main(int argc, char* argv[]) {
     auto mt2_scratch  = std::make_unique<MT2Scratch>();            // ~5.5 MB
     MT2NormStats mt2_norm;
 
-    // Open CSV log
-    std::string csv_path = output_dir + "/training_log.csv";
+    // Open CSV log (goes to log_dir, not output_dir)
+    std::string csv_path = log_dir + "/training_log.csv";
     FILE* csv = fopen(csv_path.c_str(), "w");
     if (csv) {
         fprintf(csv, "pass,day");
@@ -2828,8 +2833,8 @@ int main(int argc, char* argv[]) {
         fprintf(csv, ",mt2_elite_max_pts,mt2_elite_min_pts,mt2_elite_mean_pts,mt2_ideal_pts\n");
     }
 
-    // Open binary MT log
-    std::string mt_log_path = output_dir + "/mt_training_log.bin";
+    // Open binary MT log (goes to log_dir, not output_dir)
+    std::string mt_log_path = log_dir + "/mt_training_log.bin";
     FILE* mt_log = fopen(mt_log_path.c_str(), "wb");
     if (mt_log) write_mt_log_header(mt_log);
 

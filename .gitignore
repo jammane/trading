@@ -209,6 +209,7 @@ __marimo__/
 
 # Trading project
 models/
+logs/
 stock_data/
 data_dump/
 owners/

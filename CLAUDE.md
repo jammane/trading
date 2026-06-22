@@ -91,9 +91,9 @@ Note: existing master `.bin` files are incompatible after the MT1/MT2 architectu
 
 **Inspect MT1/MT2 training log:**
 ```bash
-python read_mt_log.py models/acct0/training/mt_training_log.bin
-python read_mt_log.py models/acct0/training/mt_training_log.bin --pass 2
-python read_mt_log.py models/acct0/training/mt_training_log.bin --industry energy
+python read_mt_log.py logs/acct0/training/mt_training_log.bin
+python read_mt_log.py logs/acct0/training/mt_training_log.bin --pass 2
+python read_mt_log.py logs/acct0/training/mt_training_log.bin --industry energy
 ```
 
 **Inspect elite model trade decisions:**
@@ -147,12 +147,13 @@ Training output (`training_v4_cpp`) writes to `models/acct#/training`; after tra
 `python convert_weights.py --account acct0`, then copy `_best.pt` files to `.../prod`.
 
 **Output directory convention:** `output_type/acct#/[subtype/]files` — applies to both `models/` and `logs/`:
-- `models/acct0/training/` — C++ trainer output
+- `models/acct0/training/` — C++ trainer model weights (`.bin`, `.pt` after convert_weights.py)
 - `models/acct0/paper/` — paper trading state (`state.json`, `owners.json`, `*.pt`)
 - `models/acct0/prod/` — live trading state
+- `logs/acct0/training/` — training CSV + MT binary log (`training_log.csv`, `mt_training_log.bin`)
 - `logs/acct0/training.log` — training stdout (tee'd from tmux)
 - `logs/acct0/paper.log` — production_v2.py stdout (crontab redirect)
-- `logs/acct0/paper/` — internal logs (`request_ids.log`, `data_fetch_failures.log`) via `LOG_DIR` (set from `--account`+`--paper`)
+- `logs/acct0/paper/` — internal logs (`request_ids.log`, `data_fetch_failures.log`, `data_dump/`) via `LOG_DIR` (set from `--account`+`--paper`)
 - `logs/acct0/prod.log` / `logs/acct0/prod/` — same pattern for live
 
 **Replace ticker symbols (full guided workflow):**
@@ -254,7 +255,7 @@ History files per industry:
 
 **Swap file (droplet):** `/swapfile` (2 GB, btrfs-compatible via `chattr +C` + `dd`) is active on the DigitalOcean droplet alongside `/dev/zram0` (1.9 GB), giving ~3.9 GB total swap. To recreate after a rebuild: `truncate -s 0 /swapfile && chattr +C /swapfile && dd if=/dev/zero of=/swapfile bs=1M count=2048 && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /etc/fstab`.
 
-`training_v4_cpp` (C++ binary) is the canonical trainer — handles industry, MT1, and MT2 training with ~6× speedup over Python. Writes `mt_training_log.bin` alongside `training_log.csv`; read with `read_mt_log.py`. MT2 tier-classification uses 444→12×37 per-industry feature slices fed through MT1, then normalized outputs fed to MT2 (FC + LSTM forward). MT1 activates at `actual_day >= 25`; MT2 at `actual_day >= 30`.
+`training_v4_cpp` (C++ binary) is the canonical trainer — handles industry, MT1, and MT2 training with ~6× speedup over Python. Writes `mt_training_log.bin` and `training_log.csv` to `logs/acct0/training/`; read with `read_mt_log.py`. MT2 tier-classification uses 444→12×37 per-industry feature slices fed through MT1, then normalized outputs fed to MT2 (FC + LSTM forward). MT1 activates at `actual_day >= 25`; MT2 at `actual_day >= 30`.
 
 `training_v3.py` (parallel) differs from `training_v2.py` in: 7 worker threads, in-RAM model cache (`_model_cache`), no slippage on limit fills, and slot-level portfolio JSON persisted alongside weights. History candidates in v3 cause the model cache to be invalidated before `selection_and_mutation` (so virtual slot files load from disk); the cache is repopulated on the next day's `load_all_models` call.
 
@@ -264,7 +265,7 @@ Orders are placed end-of-day N and filled against next-day OHLCV with `SLIPPAGE_
 
 ### Diagnostics and data dump
 
-When an elite holds ≥50% cash (industry) or ≥80% cash (master), an `UNDER_INVEST` soft flag writes JSON to `data_dump/day_N/<prefix>.json`. A single-day gain >12.5% of baseline raises a `HardFlagError`. Use `inspect_trades.py` to audit flagged days.
+When an elite holds ≥50% cash (industry) or ≥80% cash (master), an `UNDER_INVEST` soft flag writes JSON to `logs/acct0/paper|prod/data_dump/day_N/<prefix>.json` (production) or `data_dump/` (fallback). A single-day gain >12.5% of baseline raises a `HardFlagError`. Use `inspect_trades.py` to audit flagged days.
 
 ### Production cycle
 
@@ -293,4 +294,4 @@ A `PostToolUse` hook in `.claude/settings.json` auto-updates `CHANGELOG.md` and 
 
 ## Ignored directories
 
-`models/`, `stock_data/`, and `data_dump/` are git-ignored (large binaries, data, and diagnostics).
+`models/`, `logs/`, `stock_data/`, and `data_dump/` are git-ignored (large binaries, runtime logs, data, and diagnostics).
