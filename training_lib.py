@@ -23,7 +23,7 @@ from models import MasterNN, StockNN
 from universe import INDUSTRIES
 
 
-DUMP_DIR = 'data_dump'
+DUMP_DIR = 'data_dump'  # overridden by production_v2.py to logs/ACCOUNT/SUBTYPE/data_dump
 
 N_SLOTS               = 200         # total model slots per pool (elites + mutations)
 ELITE_COUNT           = 17          # direct elite slots (0 … ELITE_COUNT-1)
@@ -54,7 +54,7 @@ class HardFlagError(Exception):
 
 
 def _dump_day(actual_day, prefix, flag_type, baseline, best_delta, pct_gain, scores, day_data, fill_data, models=None):
-    """Write diagnostic JSON for a flagged day to data_dump/day_{N}/."""
+    """Write diagnostic JSON for a flagged day to DUMP_DIR/day_{N}/."""
     day_dir = os.path.join(DUMP_DIR, f"day_{actual_day + 1}")
     os.makedirs(day_dir, exist_ok=True)
     payload = {

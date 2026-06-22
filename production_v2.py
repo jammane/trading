@@ -27,6 +27,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, OrderType, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, MarketOrderRequest, StopOrderRequest
 
+import training_lib
 from fees import BUY_FILL, FINRA_TAF_MAX, FINRA_TAF_PER_SHARE, SEC_FEE_RATE, SELL_FILL, _sell_net
 from models import MasterNN, MT1NN, MT2NN, StockNN
 from universe import INDUSTRIES
@@ -551,6 +552,7 @@ def main():
     model_dir = os.path.join('models', args.account, subtype)
     global LOG_DIR
     LOG_DIR   = os.path.join('logs', args.account, subtype)
+    training_lib.DUMP_DIR = os.path.join(LOG_DIR, 'data_dump')
 
     # `if True:` preserves the existing indentation scope; all logic below runs unconditionally.
     if True:
