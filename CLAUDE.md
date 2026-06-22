@@ -68,20 +68,20 @@ python download_5y_data.py
 **Train (C++ binary — canonical; handles industries, MT1, and MT2):**
 ```bash
 # Seed once from existing Python models (or after any convert_weights.py run):
-python prepare_models.py --load-dir models/acct0/training --output models/acct0/training
+python prepare_models.py --account acct0
 # Full training run (canonical settings — industries + master):
-./build/training_v4_cpp --output models/acct0/training --load-dir models/acct0/training \
+./build/training_v4_cpp --account acct0 \
   --passes 5 --sigma 0.008 --master-sigma 0.006 --sigma-decay 1.0 \
   --start-day 17 --stop-day 1255 2>&1 | tee logs/acct0/training.log
 # Retrain master only (freeze industries, use their slot-0 perf for ind_val_hist):
-./build/training_v4_cpp --output models/acct0/training --load-dir models/acct0/training \
+./build/training_v4_cpp --account acct0 \
   --master-only --passes 5 --start-day 17 --stop-day 1255 2>&1 | tee logs/acct0/training.log
 # Short diagnostic (verifies history accumulates at day 5+, CSV has elite columns):
 mkdir -p /root/diag_logs
 ./build/training_v4_cpp --output /root/diag_logs --load-dir /root/diag_logs \
   --start-day 16 --stop-day 37 --passes 1 --preserve-stock-data --no-save
 # After training, convert back to .pt before inspect_trades.py or production_v2.py:
-python convert_weights.py --models-dir models/acct0/training --output models/acct0/training
+python convert_weights.py --account acct0
 ```
 `--no-save` suppresses all model writes (industry elites, history, master, MT1, MT2).
 Always use real disk paths (`models/acct0/training`, `logs/`, `/root/diag_logs`) — never `/tmp` which is a 978 MB RAM-backed tmpfs on the droplet. Training and production can run concurrently; both write to real disk only.
@@ -98,15 +98,16 @@ python read_mt_log.py models/acct0/training/mt_training_log.bin --industry energ
 
 **Inspect elite model trade decisions:**
 ```bash
-python inspect_trades.py --industry energy --date 2024-01-10 --models-dir ./models
-python inspect_trades.py --industry energy --day-index 17 --models-dir ./models --top-n 5
+python inspect_trades.py --industry energy --date 2024-01-10 --account acct0
+python inspect_trades.py --industry energy --day-index 17 --account acct0 --top-n 5
 ```
 
 **Paper / live trading (per-account isolation):**
 
 Each Alpaca account gets its own directory tree: `models/acct#/[training|paper|prod]`.
-`--model-dir` points to the account+mode subdirectory; all per-run files (`state.json`,
-`owners.json`, `master_state.json`, `*.pt`) live there.
+`--account acct0` selects the account; `--paper` selects subtype (paper vs prod).
+All per-run files (`state.json`, `owners.json`, `master_state.json`, `*.pt`) live under
+`models/ACCOUNT/paper|prod/`; internal logs under `logs/ACCOUNT/paper|prod/`.
 
 Current account is `acct0`. Up to 5 accounts planned; additional accounts will likely
 require a droplet upgrade.
@@ -124,8 +125,8 @@ require a droplet upgrade.
 # crontab on droplet (times in UTC, summer/EDT)
 # Log layout: logs/output_type/acct#/[subtype/]files
 #   stdout → logs/acct0/paper.log  (internal logs → logs/acct0/paper/ via LOG_DIR in production_v2.py)
-5 21 * * 1-5  cd /root/trading && mkdir -p logs/acct0 && export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d) && export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d) && source .venv/bin/activate && python production_v2.py --paper --model-dir models/acct0/paper >> logs/acct0/paper.log 2>&1
-35 21 * * 1-5 cd /root/trading && mkdir -p logs/acct0 && export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d) && export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d) && source .venv/bin/activate && python production_v2.py --model-dir models/acct0/prod >> logs/acct0/prod.log 2>&1
+5 21 * * 1-5  cd /root/trading && mkdir -p logs/acct0 && export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d) && export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d) && source .venv/bin/activate && python production_v2.py --paper --account acct0 >> logs/acct0/paper.log 2>&1
+35 21 * * 1-5 cd /root/trading && mkdir -p logs/acct0 && export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d) && export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d) && source .venv/bin/activate && python production_v2.py --account acct0 >> logs/acct0/prod.log 2>&1
 # acct1 (future): 5 22 paper, 35 22 prod
 # acct2 (future): 5 23 paper, 35 23 prod
 ```
@@ -134,16 +135,16 @@ require a droplet upgrade.
 # Manual run (paper)
 export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d)
 export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d)
-python production_v2.py --paper --model-dir models/acct0/paper
+python production_v2.py --paper --account acct0
 
 # Manual run (live, future)
 export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d)
 export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d)
-python production_v2.py --model-dir models/acct0/prod
+python production_v2.py --account acct0
 ```
 
 Training output (`training_v4_cpp`) writes to `models/acct#/training`; after training run
-`convert_weights.py` targeting that directory, then copy `_best.pt` files to `.../prod`.
+`python convert_weights.py --account acct0`, then copy `_best.pt` files to `.../prod`.
 
 **Output directory convention:** `output_type/acct#/[subtype/]files` — applies to both `models/` and `logs/`:
 - `models/acct0/training/` — C++ trainer output
@@ -151,7 +152,7 @@ Training output (`training_v4_cpp`) writes to `models/acct#/training`; after tra
 - `models/acct0/prod/` — live trading state
 - `logs/acct0/training.log` — training stdout (tee'd from tmux)
 - `logs/acct0/paper.log` — production_v2.py stdout (crontab redirect)
-- `logs/acct0/paper/` — internal logs (`request_ids.log`, `data_fetch_failures.log`) via `LOG_DIR`
+- `logs/acct0/paper/` — internal logs (`request_ids.log`, `data_fetch_failures.log`) via `LOG_DIR` (set from `--account`+`--paper`)
 - `logs/acct0/prod.log` / `logs/acct0/prod/` — same pattern for live
 
 **Replace ticker symbols (full guided workflow):**

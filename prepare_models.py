@@ -7,8 +7,7 @@ Run this once before the first C++ training run, or whenever you want to seed
 the C++ trainer from a Python-trained checkpoint.
 
 Usage:
-  python prepare_models.py --load-dir models --output models
-  python prepare_models.py --load-dir /tmp/py_out --output /tmp/cpp_out
+  python prepare_models.py --account acct0
 """
 
 import argparse
@@ -177,11 +176,12 @@ def convert_mt2_norm_stats(load_dir, output_dir):
 
 def main():
     parser = argparse.ArgumentParser(description='Convert .pt elite models to .bin for C++ trainer')
-    parser.add_argument('--load-dir', required=True, help='Directory containing .pt files')
-    parser.add_argument('--output',   required=True, help='Directory to write .bin files')
+    parser.add_argument('--account', default='acct0', help='Account identifier (e.g. acct0); derives models/ACCOUNT/training as load and output dir')
     args = parser.parse_args()
 
-    os.makedirs(args.output, exist_ok=True)
+    load_dir   = os.path.join('models', args.account, 'training')
+    output_dir = load_dir
+    os.makedirs(output_dir, exist_ok=True)
 
     industries = [
         'tech_hardware', 'tech_software_ai', 'financials', 'consumer_discretionary',
@@ -189,22 +189,22 @@ def main():
         'energy', 'utilities', 'real_estate', 'materials',
     ]
 
-    print(f'Converting industry elite models from {args.load_dir} → {args.output}')
+    print(f'Converting industry elite models from {load_dir} → {output_dir}')
     for ind in industries:
-        convert_industry(ind, args.load_dir, args.output, STOCK_LAYER_DEFS, ind)
+        convert_industry(ind, load_dir, output_dir, STOCK_LAYER_DEFS, ind)
 
-    print(f'Converting master elite models from {args.load_dir} → {args.output}')
-    convert_industry('master', args.load_dir, args.output, MASTER_LAYER_DEFS, 'master')
+    print(f'Converting master elite models from {load_dir} → {output_dir}')
+    convert_industry('master', load_dir, output_dir, MASTER_LAYER_DEFS, 'master')
 
-    print(f'Converting MT1 elite models from {args.load_dir} → {args.output}')
+    print(f'Converting MT1 elite models from {load_dir} → {output_dir}')
     for ind in industries:
-        convert_industry(f'mt1_{ind}', args.load_dir, args.output, MT1_LAYER_DEFS, f'mt1_{ind}')
+        convert_industry(f'mt1_{ind}', load_dir, output_dir, MT1_LAYER_DEFS, f'mt1_{ind}')
 
-    print(f'Converting MT2 elite models from {args.load_dir} → {args.output}')
-    convert_mt2(args.load_dir, args.output)
+    print(f'Converting MT2 elite models from {load_dir} → {output_dir}')
+    convert_mt2(load_dir, output_dir)
 
-    print(f'Converting MT2 norm stats from {args.load_dir} → {args.output}')
-    convert_mt2_norm_stats(args.load_dir, args.output)
+    print(f'Converting MT2 norm stats from {load_dir} → {output_dir}')
+    convert_mt2_norm_stats(load_dir, output_dir)
 
     print('Done.')
 
