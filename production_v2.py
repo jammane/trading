@@ -270,7 +270,11 @@ def load_stock_data(symbols):
     return histories
 
 def save_stock_data(symbol, day_data):
-    """Append today's OHLCV to stock_data/<symbol>.json, retaining the last 15 days."""
+    """Append today's OHLCV to stock_data/<symbol>.json without truncating.
+
+    Full history is preserved so the C++ trainer and download_daily.py can
+    use the same files. download_daily.py trims to MAX_HISTORY_DAYS on each run.
+    """
     try:
         file_path = f"{STOCK_DATA_DIR}/{symbol}.json"
         existing_data = []
@@ -286,9 +290,11 @@ def save_stock_data(symbol, day_data):
             'low': day_data['low'],
             'volume': day_data['volume']
         }
+        # Dedup: replace the entry for today if it already exists (e.g. re-run)
+        existing_data = [d for d in existing_data if d['date'] != today_str]
         existing_data.append(new_data_point)
         with open(file_path, 'w') as f:
-            json.dump({'days': existing_data[-15:]}, f)
+            json.dump({'days': existing_data}, f)
     except Exception as e:
         print(f"Error saving stock data for {symbol}: {e}")
 
