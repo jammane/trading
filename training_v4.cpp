@@ -3,6 +3,8 @@
 // Run:   ./build/training_v4_cpp --output models [--load-dir DIR] [--start-day N] [--stop-day N]
 //        [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F] [--workers N]
 
+#define TRAINER_VERSION "0.1.0.0"
+
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -2790,6 +2792,9 @@ int main(int argc, char* argv[]) {
     }
     if (output_dir.empty()) { print_usage(argv[0]); return 1; }
     if (master_sigma < 0.f) master_sigma = sigma;
+
+    log_msg(std::string("training_v4_cpp v") + TRAINER_VERSION +
+            "  account=" + (account.empty() ? "(diagnostic)" : account));
 
     if (!load_universe_json("universe.json")) return 1;
 

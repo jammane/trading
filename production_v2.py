@@ -31,6 +31,7 @@ import training_lib
 from fees import BUY_FILL, FINRA_TAF_MAX, FINRA_TAF_PER_SHARE, SEC_FEE_RATE, SELL_FILL, _sell_net
 from models import MasterNN, MT1NN, MT2NN, StockNN
 from universe import INDUSTRIES
+from version import VERSION
 from upkeep import (
     load_mt2_norm_stats,
     run_mt_inference,
@@ -559,6 +560,7 @@ def main():
     global LOG_DIR
     LOG_DIR   = os.path.join('logs', args.account, subtype)
     training_lib.DUMP_DIR = os.path.join(LOG_DIR, 'data_dump')
+    print(f"[production_v2] v{VERSION}  account={args.account}  mode={subtype}")
 
     # `if True:` preserves the existing indentation scope; all logic below runs unconditionally.
     if True:

@@ -186,6 +186,7 @@ Runs all five steps: updates `universe_acct0.py` and regenerates `universe.json`
 
 | Module | Contents |
 |--------|----------|
+| `version.py` | `VERSION` string — single source of truth for the project version (mirrored as `TRAINER_VERSION` in `training_v4.cpp`) |
 | `models.py` | `StockNN`, `MasterNN`, `MT1NN`, `MT2NN` — single source of truth for all model classes |
 | `universe_acct0.py` | `INDUSTRIES` dict, `ALL_SYMBOLS`, `INDUSTRY_NAMES` for acct0 (144 symbols) |
 | `universe.py` | Aggregator: discovers all `universe_acct*.py`, exposes union for download/cleanup scripts |
@@ -309,6 +310,20 @@ A `PostToolUse` hook in `.claude/settings.json` auto-updates `CHANGELOG.md` and 
 | `HIST_PER_DAY` | 10 | Models saved per day (HIST_ELITE + HIST_WAVG) |
 | `HIST_ELITE` | 7 | Direct elite slots saved to history each day |
 | `HIST_WAVG` | 3 | Wavg blend slots saved to history each day |
+
+## Versioning
+
+Version string is defined in `version.py` (`VERSION`) and mirrored as `TRAINER_VERSION` in `training_v4.cpp`.
+
+**Scheme (pre-paper-trading):** `0.BREAKING.FEATURE.BUILD`
+- `0.` prefix until paper trading performance is deemed acceptable; replaced by `1.` on first production promotion (version then becomes `MAJOR.FEATURE.BUILD`).
+- `BREAKING` — increment when backward compatibility is lost (model file format, `state.json` schema, etc.); resets all trailing digits to 0.
+- `FEATURE` — increment for any new capability or significant improvement; resets `BUILD` to 0.
+- `BUILD` — increment for bug fixes and minor changes within a `FEATURE`.
+
+Current version: **0.1.0.0**
+
+To bump the version, edit `VERSION` in `version.py` and `TRAINER_VERSION` in `training_v4.cpp`, then rebuild the C++ binary.
 
 ## Ignored directories
 
