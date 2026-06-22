@@ -291,10 +291,10 @@ def save_stock_data(symbol, day_data):
     except Exception as e:
         print(f"Error saving stock data for {symbol}: {e}")
 
-LOG_DIR = 'logs'
+LOG_DIR = 'logs'  # overridden in main() from --model-dir: models/acct0/paper → logs/acct0/paper
 
 def log_request_id(request_id, context, success=True):
-    """Persist Alpaca X-Request-ID to logs/request_ids.log for support tracing."""
+    """Persist Alpaca X-Request-ID to {LOG_DIR}/request_ids.log for support tracing."""
     os.makedirs(LOG_DIR, exist_ok=True)
     path = os.path.join(LOG_DIR, 'request_ids.log')
     entry = json.dumps({
@@ -307,7 +307,7 @@ def log_request_id(request_id, context, success=True):
         f.write(entry + '\n')
 
 def log_data_failure(sym, reason, mode):
-    """Append a JSON entry to logs/data_fetch_failures.log and print an alert."""
+    """Append a JSON entry to {LOG_DIR}/data_fetch_failures.log and print an alert."""
     os.makedirs(LOG_DIR, exist_ok=True)
     path = os.path.join(LOG_DIR, 'data_fetch_failures.log')
     entry = json.dumps({
@@ -546,6 +546,12 @@ def main():
     parser.add_argument('--capital', type=float, default=None, help='Cap total deployed capital regardless of Alpaca account balance')
     parser.add_argument('--withdraw', type=float, help='Amount to withdraw from portfolio')
     args = parser.parse_args()
+
+    # Derive log directory from model_dir so logs co-locate with model path hierarchy.
+    # e.g. models/acct0/paper → logs/acct0/paper
+    global LOG_DIR
+    parts = os.path.normpath(args.model_dir).split(os.sep)
+    LOG_DIR = os.path.join('logs', *parts[1:]) if len(parts) > 1 else 'logs'
 
     # `if True:` preserves the existing indentation scope; all logic below runs unconditionally.
     if True:
