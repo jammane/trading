@@ -148,6 +148,10 @@ static constexpr int MT1_FC3_W = 2508;    static constexpr int MT1_FC3_B = 3088;
 static constexpr int MT1_FC4_W = 3108;    static constexpr int MT1_FC4_B = 3348;   // +20, 20×12
 static constexpr int MT1_OUT_W = 3360;    static constexpr int MT1_OUT_B = 3396;   // +12, 12×3+3=3399
 
+// MT2 injection: fire when ≥75% of pool scores below threshold (worst ~15% of days)
+static constexpr float MT2_INJ_THRESHOLD = -7.0f;
+static constexpr int   MT2_INJ_MIN_BELOW = (int)(N_SLOTS * 0.75f);  // 150/200
+
 // MT2NN: FC[36→36→36] ‖ LSTM[3→36×2layers] → concat72 → 66→60→54→48
 static constexpr int   MT2NN_PARAMS   = 33996;
 // FC branch
@@ -2354,8 +2358,15 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
     if (state.mt2_injection_hold > 0) --state.mt2_injection_hold;
     bool injection_suppressed = (state.mt2_injection_hold > 0);
 
+    // Count slots below injection threshold (75%-of-pool criterion)
+    int below_thresh = 0;
+    for (int s = 0; s < N_SLOTS; s++) {
+        if ((pred_scores[s] - port_vals[s]) / 1e9f < MT2_INJ_THRESHOLD) ++below_thresh;
+    }
+    bool inject_triggered = (below_thresh >= MT2_INJ_MIN_BELOW) && !injection_suppressed;
+
     bool injected = false;
-    if (best_pts_v >= -1.f || injection_suppressed) {
+    if (!inject_triggered) {
         float mean_ps = 0.f;
         for (int s = 0; s < N_SLOTS; s++) mean_ps += pred_scores[s];
         mean_ps /= N_SLOTS;
@@ -2426,7 +2437,8 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
     } else {
         injected = true;
         state.mt2_injection_hold = 10;  // suppress re-injection for 10 days
-        log_msg("[mt2     ] best_pts=" + fmt_pts(best_pts_v) + " < -1 — injecting diversity");
+        log_msg("[mt2     ] " + std::to_string(below_thresh) + "/" + std::to_string(N_SLOTS) +
+                " slots < " + fmt_pts(MT2_INJ_THRESHOLD) + " — injecting diversity");
         PCG32 div_rng; div_rng.seed((uint64_t)actual_day * 55555ULL + 77777ULL);
         int half = ELITE_COUNT / 2;
         for (int k = half; k < ELITE_COUNT; k++) {
@@ -2875,7 +2887,7 @@ int main(int argc, char* argv[]) {
     // Open binary MT log (goes to log_dir, not output_dir)
     std::string mt_log_path = log_dir + "/mt_training_log.bin";
     FILE* mt_log = fopen(mt_log_path.c_str(), "wb");
-    if (mt_log) write_mt_log_header(mt_log);
+    if (mt_log) { write_mt_log_header(mt_log); fflush(mt_log); }
 
     // Threading setup
     num_workers = std::max(1, std::min(num_workers, N_IND));
