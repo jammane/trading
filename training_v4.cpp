@@ -2221,9 +2221,6 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
         state.portfolios[s].cash = ref_cash;
         for (int i = 0; i < N_IND; i++) state.portfolios[s].holdings[i] = ref_hold[i];
     }
-    for (int s = 1; s < N_SLOTS; s++)
-        memcpy(state.zero_counts[s], state.zero_counts[0], N_IND * sizeof(int));
-
     float pred_scores[N_SLOTS] = {}, port_vals[N_SLOTS] = {};
     int   slot_tiers[N_SLOTS][N_IND] = {};
     float out48[48];
@@ -2246,19 +2243,8 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
             for (int k = 1; k < 4; k++) if (lg[k] > lg[best]) best = k;
             tier[i] = best; slot_tiers[slot][i] = best;
         }
-        for (int i = 0; i < N_IND; i++) {
-            if (tier[i] == 0) state.zero_counts[slot][i]++;
-            else              state.zero_counts[slot][i] = 0;
-        }
 
         MasterPortfolio& port = state.portfolios[slot];
-        for (int i = 0; i < N_IND; i++) {
-            if (state.zero_counts[slot][i] >= 3 && port.holdings[i] > 1e-9f) {
-                port.cash += sell_net(port.holdings[i], IND_UNIT_PRICE);
-                port.holdings[i] = 0.f;
-            }
-        }
-
         int positives[N_IND]; int n_pos = 0;
         for (int i = 0; i < N_IND; i++) if (tier[i] > 0) positives[n_pos++] = i;
         float alloc[N_IND] = {};
@@ -2341,18 +2327,15 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
             " t3=" + std::to_string(tier_counts[3]));
 
     if (baseline < MST_STARTING_CASH * 0.9f) {
+        // Portfolio simulation drifted — reset for next day but still select on pts
+        log_msg("[mt2     ] Portfolio reset (baseline dropped below 90%)");
         for (int s = 0; s < N_SLOTS; s++) {
             state.portfolios[s].cash = MST_STARTING_CASH;
             for (int i = 0; i < N_IND; i++) state.portfolios[s].holdings[i] = 0.f;
         }
-        memset(state.zero_counts, 0, sizeof(state.zero_counts));
-        if (injected_out) *injected_out = false;
-        return {0.f, 0.f, 0.f, 0.f, 0.f};
     }
 
     MasterPortfolio slot0_own = state.portfolios[0];
-    int slot0_zc[N_IND];
-    memcpy(slot0_zc, state.zero_counts[0], N_IND * sizeof(int));
 
     // Enforce 10-day post-injection hold to prevent consecutive diversity washes
     if (state.mt2_injection_hold > 0) --state.mt2_injection_hold;
@@ -2393,7 +2376,6 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
         normalize_weights(src_val, w10, n10);
         normalize_weights(src_val, w15, n15);
 
-        memcpy(slot0_zc, state.zero_counts[src_rank[0]], N_IND * sizeof(int));
         MasterPortfolio new_mports[ELITE_POOL];
         const MasterPortfolio* mp5[5], *mp10[10], *mp15[15];
         for (int k=0;k<n5;k++)  mp5[k]  = &state.portfolios[src_rank[k]];
@@ -2450,7 +2432,6 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
     }
 
     state.portfolios[0] = slot0_own;
-    memcpy(state.zero_counts[0], slot0_zc, N_IND * sizeof(int));
 
     float elite_max_pts = -1e9f, elite_min_pts = 1e9f, elite_mean_pts = 0.f;
     for (int s = 0; s < ELITE_COUNT; s++) {
