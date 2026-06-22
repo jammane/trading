@@ -60,10 +60,23 @@ ruff check --fix .
 .venv/bin/pytest tests/ -v
 ```
 
-**Download training data:**
+**Download training data (initial / full reset):**
 ```bash
 python download_5y_data.py
 ```
+
+**Daily incremental update (run automatically at 4:30 PM ET via cron):**
+```bash
+python download_daily.py
+```
+Appends new trading days for all universe symbols; does a full 5-year fetch for any symbol whose file is missing (new symbol after a swap). Trims each file to the most recent 1255 days. Uses the same shared `stock_data/` directory as the C++ trainer — no truncation.
+
+**Stock data cleanup (run automatically weekly via cron):**
+```bash
+python cleanup_stock_data.py           # live removal
+python cleanup_stock_data.py --dry-run # preview only
+```
+Removes `stock_data/<SYM>.json` for any symbol not in the current universe AND not held in any open Alpaca position (checked via `models/acct*/*/state.json`). Safe to run at any time.
 
 **Train (C++ binary — canonical; handles industries, MT1, and MT2):**
 ```bash
@@ -122,12 +135,14 @@ require a droplet upgrade.
 - **Cron times shift by 1 hour in November (EDT→EST) and March (EST→EDT)**
 
 ```
-# crontab on droplet (times in UTC, summer/EDT)
-# Log layout: logs/output_type/acct#/[subtype/]files
-#   stdout → logs/acct0/paper.log  (internal logs → logs/acct0/paper/ via LOG_DIR in production_v2.py)
+# crontab on droplet (times in UTC, summer/EDT — shift +1h in Nov, -1h in Mar)
+# Stock data: shared across all accounts; download once, cleanup weekly
+30 20 * * 1-5 cd /root/trading && mkdir -p logs/data && source .venv/bin/activate && python download_daily.py >> logs/data/download_daily.log 2>&1
+0  4  * * 0   cd /root/trading && mkdir -p logs/data && source .venv/bin/activate && python cleanup_stock_data.py >> logs/data/cleanup_stock_data.log 2>&1
+# acct0 paper trading: 21:05 UTC (5:05 PM EDT); prod: 21:35 UTC
 5 21 * * 1-5  cd /root/trading && mkdir -p logs/acct0 && export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d) && export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d) && source .venv/bin/activate && python production_v2.py --paper --account acct0 >> logs/acct0/paper.log 2>&1
 35 21 * * 1-5 cd /root/trading && mkdir -p logs/acct0 && export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d) && export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d) && source .venv/bin/activate && python production_v2.py --account acct0 >> logs/acct0/prod.log 2>&1
-# acct1 (future): 5 22 paper, 35 22 prod
+# acct1 (future): 30 21 download_daily if diff universe; 5 22 paper, 35 22 prod
 # acct2 (future): 5 23 paper, 35 23 prod
 ```
 
@@ -160,7 +175,7 @@ Training output (`training_v4_cpp`) writes to `models/acct#/training`; after tra
 ```bash
 ./swap_symbols.sh '{"OLDTICKER": "NEWTICKER"}'
 ```
-Runs all five steps: updates `universe.py` and regenerates `universe.json`, removes stale `stock_data/` JSON, downloads new symbol data, prompts to rebuild the Docker image, and prints optional model-cleanup commands for the droplet. The C++ binary reads `universe.json` at startup — no recompile needed after a symbol swap. Run locally — not inside a container.
+Runs all five steps: updates `universe.py` and regenerates `universe.json`, removes the old symbol's `stock_data/` JSON, runs `download_daily.py` (full 5-year fetch for the new symbol, incremental for all others), prompts to rebuild the Docker image, and prints optional model-cleanup commands for the droplet. The C++ binary reads `universe.json` at startup — no recompile needed after a symbol swap. Run locally — not inside a container.
 
 **Symbol swap thresholds (checked ~monthly — expect 1-2 swaps/month):**
 - **$15 watch floor** — symbol goes into `universe_watchlist.json` `"watch"` section with a candidate. Do NOT download candidate data yet. Do NOT run `swap_symbols.sh`.
@@ -178,6 +193,8 @@ Runs all five steps: updates `universe.py` and regenerates `universe.json`, remo
 | `training_lib.py` | Shared evolutionary functions (`step_industry`, `selection_and_mutation`, `build_master_features`, I/O helpers, constants) — imported by `upkeep.py` and `production_v2.py`; not a standalone training script |
 | `prepare_models.py` | `.pt` → `.bin` for C++ trainer (run before first C++ training) |
 | `convert_weights.py` | `.bin` → `.pt` + `_best.pt` for Python tools (run after C++ training) |
+| `download_daily.py` | Incremental daily OHLCV update — appends new days, full fetch for new symbols, trims to 1255 days |
+| `cleanup_stock_data.py` | Weekly purge of `stock_data/` files for symbols no longer in any universe or held position |
 
 `production_v2.py`, `upkeep.py`, and `inspect_trades.py` import from these modules. (`training_v2.py` and `training_v3.py` were deleted — superseded by `training_v4_cpp` for all training and `upkeep.py` for daily evolution.) `download_5y_data.py` imports from `universe.py`. To add or change a ticker, run `swap_symbols.sh` — it updates both `universe.py` and `universe.json` together.
 

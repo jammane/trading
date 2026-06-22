@@ -73,8 +73,8 @@ done <<< "$OLD_TICKERS"
 
 # ── Step 3: download data for new symbols ─────────────────────────────────────
 echo ""
-echo "==> Step 3/5: Downloading historical data for new symbols ..."
-python download_5y_data.py
+echo "==> Step 3/5: Downloading data for new symbols (incremental update for all others) ..."
+python download_daily.py
 
 # ── Step 4: rebuild Docker image ──────────────────────────────────────────────
 echo ""
