@@ -429,6 +429,8 @@ struct MasterState {
     int             ind_hist_count{0};
     // Consecutive tier-0 counter per slot per industry; slot 0 persists across days
     int             zero_counts[N_SLOTS][N_IND];
+    // Days remaining before another diversity injection is allowed (counts down each day)
+    int             mt2_injection_hold{0};
     // elites removed — stored in MasterScratch (heap-allocated in main)
 };
 
@@ -2312,8 +2314,12 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
     int slot0_zc[N_IND];
     memcpy(slot0_zc, state.zero_counts[0], N_IND * sizeof(int));
 
+    // Enforce 10-day post-injection hold to prevent consecutive diversity washes
+    if (state.mt2_injection_hold > 0) --state.mt2_injection_hold;
+    bool injection_suppressed = (state.mt2_injection_hold > 0);
+
     bool injected = false;
-    if (best_pts_v >= -1.f) {
+    if (best_pts_v >= -1.f || injection_suppressed) {
         float mean_ps = 0.f;
         for (int s = 0; s < N_SLOTS; s++) mean_ps += pred_scores[s];
         mean_ps /= N_SLOTS;
@@ -2383,6 +2389,7 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
             state.portfolios[ELITE_POOL + mut_i] = state.portfolios[mut_i / MUTATIONS_PER_PARENT];
     } else {
         injected = true;
+        state.mt2_injection_hold = 10;  // suppress re-injection for 10 days
         log_msg("[mt2     ] best_pts=" + fmt_pts(best_pts_v) + " < -1 — injecting diversity");
         PCG32 div_rng; div_rng.seed((uint64_t)actual_day * 55555ULL + 77777ULL);
         int half = ELITE_COUNT / 2;
