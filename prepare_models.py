@@ -75,7 +75,8 @@ MT2_LAYOUT = [
     ('fc_out.bias',        (48,)),
 ]
 
-ELITE_POOL = 20
+ELITE_POOL     = 20
+MT1_ELITE_POOL = 23   # MT1 uses 20 direct elites + 3 wavg blends
 
 
 def state_dict_to_arr(state_dict, layer_defs):
@@ -103,10 +104,12 @@ def mt2_state_dict_to_arr(state_dict):
     return np.concatenate(parts).astype(np.float32)
 
 
-def convert_industry(prefix, load_dir, output_dir, layer_defs, label):
-    """Convert all ELITE_POOL PyTorch .pt files for a prefix to flat float32 .bin for the C++ trainer."""
+def convert_industry(prefix, load_dir, output_dir, layer_defs, label, n_elites=None):
+    """Convert elite PyTorch .pt files for a prefix to flat float32 .bin for the C++ trainer."""
+    if n_elites is None:
+        n_elites = ELITE_POOL
     converted = 0
-    for slot in range(ELITE_POOL):
+    for slot in range(n_elites):
         src = os.path.join(load_dir, f'{prefix}_model_{slot}.pt')
         if not os.path.exists(src):
             print(f'  [{label}] slot {slot:2d}: {src} not found — skipping')
@@ -119,7 +122,7 @@ def convert_industry(prefix, load_dir, output_dir, layer_defs, label):
             converted += 1
         except Exception as e:
             print(f'  [{label}] slot {slot:2d}: ERROR — {e}')
-    print(f'  [{label}] {converted}/{ELITE_POOL} elite slots converted')
+    print(f'  [{label}] {converted}/{n_elites} elite slots converted')
 
 
 def convert_mt2(load_dir, output_dir):
@@ -198,7 +201,8 @@ def main():
 
     print(f'Converting MT1 elite models from {load_dir} → {output_dir}')
     for ind in industries:
-        convert_industry(f'mt1_{ind}', load_dir, output_dir, MT1_LAYER_DEFS, f'mt1_{ind}')
+        convert_industry(f'mt1_{ind}', load_dir, output_dir, MT1_LAYER_DEFS, f'mt1_{ind}',
+                         n_elites=MT1_ELITE_POOL)
 
     print(f'Converting MT2 elite models from {load_dir} → {output_dir}')
     convert_mt2(load_dir, output_dir)
