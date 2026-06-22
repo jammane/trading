@@ -14,9 +14,11 @@ Imported by production_v2.py after each trading day. Provides three upkeep funct
                              portfolio simulation.
 
     upkeep_mt2()           — one evolution step for the MT2NN cross-industry allocator pool.
+                             Diversity injection fires when ≥75% of the 200-slot pool scores
+                             below MT2_INJ_THRESHOLD (-7.0 pts), with a 10-day hold after each.
                              Uses MT1 slot0 outputs (normalized via running stats) as input.
                              No burst refinement — portfolio simulation already runs all 200
-                             slots. Diversity injection fires when best_pts < -1.
+                             slots.
 
 Constants:
     UPKEEP_SIGMA = 0.004  — base sigma for burst refinement (half of full-train 0.008)
@@ -63,6 +65,8 @@ from training_lib import (
 UPKEEP_SIGMA  = 0.004
 MT1_SCALE     = 0.05
 RANGE_SCALE   = 0.02
+MT2_INJ_THRESHOLD = -7.0             # injection fires when ≥75% of pool below this
+MT2_INJ_MIN_BELOW = int(N_SLOTS * 0.75)  # 150 of 200
 
 
 # ── Generic helpers ────────────────────────────────────────────────────────────
@@ -663,13 +667,16 @@ def upkeep_mt2(model_dir, mt1_slot0_outputs, norm_stats, actual_perf, industry_l
     log(f"[mt2] best_pts={best_pts:+.2f} slot0_pts={slot0_pts:+.2f} ideal={ideal_pts} "
         f"tiers(0/1/2/3)={tier_counts[0]}/{tier_counts[1]}/{tier_counts[2]}/{tier_counts[3]}")
 
+    below_thresh = sum(1 for p in slot_pts if p < MT2_INJ_THRESHOLD)
+    inject_triggered = below_thresh >= MT2_INJ_MIN_BELOW
+
     injected = False
-    if best_pts >= -1.0:
+    if not inject_triggered:
         _select_and_mutate(prefix, model_dir, MT2NN, pred_scores, sigma)
     else:
         injected = True
         half = ELITE_COUNT // 2
-        log(f"[mt2] best_pts={best_pts:.2f} < -1 — diversity injection into bottom {ELITE_COUNT - half} elites")
+        log(f"[mt2] {below_thresh}/{N_SLOTS} slots < {MT2_INJ_THRESHOLD:+.1f} — diversity injection into bottom {ELITE_COUNT - half} elites")
         for inject_rank in range(half, ELITE_COUNT):
             source_rank = inject_rank - half
             elite = load_slot_model(prefix, model_dir, source_rank, MT2NN)
