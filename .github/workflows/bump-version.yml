@@ -1,0 +1,61 @@
+name: Bump Build Version
+
+on:
+  push:
+    branches: ['**']
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    # Skip bumps triggered by a previous bump to prevent infinite loop
+    if: "!startsWith(github.event.head_commit.message, 'Bump version to')"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Increment BUILD number
+        run: |
+          python3 - <<'PYEOF'
+          import re, sys
+
+          def bump_file(path, pattern, fmt):
+              text = open(path).read()
+              m = re.search(pattern, text)
+              if not m:
+                  print(f"ERROR: version pattern not found in {path}", file=sys.stderr)
+                  sys.exit(1)
+              parts = m.group(1).split('.')
+              parts[-1] = str(int(parts[-1]) + 1)
+              new_ver = '.'.join(parts)
+              open(path, 'w').write(re.sub(pattern, fmt(new_ver), text, count=1))
+              return new_ver
+
+          ver = bump_file(
+              'version.py',
+              r'VERSION = "([^"]+)"',
+              lambda v: f'VERSION = "{v}"',
+          )
+          bump_file(
+              'training_v4.cpp',
+              r'#define TRAINER_VERSION "([^"]+)"',
+              lambda v: f'#define TRAINER_VERSION "{v}"',
+          )
+          print(f"Bumped to {ver}")
+          PYEOF
+
+          # Capture the new version for the commit message
+          VERSION=$(python3 -c "
+          import re
+          m = re.search(r'VERSION = \"([^\"]+)\"', open('version.py').read())
+          print(m.group(1))
+          ")
+          echo "NEW_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add version.py training_v4.cpp
+          git commit -m "Bump version to ${{ env.NEW_VERSION }}"
+          git push
