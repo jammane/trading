@@ -14,10 +14,11 @@ import struct
 import sys
 from collections import defaultdict
 
-HEADER_SIZE  = 16
-RECORD_SIZE  = 168
-MAGIC        = 0x4D543132   # 'MT12'
-N_IND        = 12
+HEADER_SIZE     = 16
+RECORD_SIZE_V1  = 168   # original: best + slot0 + mean
+RECORD_SIZE_V2  = 216   # added mt1_min[12]
+MAGIC           = 0x4D543132   # 'MT12'
+N_IND           = 12
 
 INDUSTRY_NAMES = [
     'tech_hardware', 'tech_software_ai', 'financials', 'consumer_discretionary',
@@ -25,7 +26,7 @@ INDUSTRY_NAMES = [
     'energy', 'utilities', 'real_estate', 'materials',
 ]
 
-# Record layout (168 bytes):
+# Record layout v1 (168 bytes — logs written before mt1_min was added):
 #   uint32  pass_num         (0)
 #   uint32  actual_day       (4)
 #   float32 mt1_best[12]     (8..55)
@@ -36,9 +37,20 @@ INDUSTRY_NAMES = [
 #   float32 mt2_ideal_pts    (160)
 #   uint8   mt2_injected     (164)
 #   uint8   padding[3]       (165..167)
+#
+# Record layout v2 (216 bytes — adds mt1_min[12]):
+#   ... same as v1 through mt1_mean[12] ...
+#   float32 mt1_min[12]      (152..199)
+#   float32 mt2_best_pts     (200)
+#   float32 mt2_slot0_pts    (204)
+#   float32 mt2_ideal_pts    (208)
+#   uint8   mt2_injected     (212)
+#   uint8   padding[3]       (213..215)
 
-RECORD_FMT = '<II' + 'f'*12 + 'f'*12 + 'f'*12 + 'fff' + 'B3x'
-assert struct.calcsize(RECORD_FMT) == RECORD_SIZE
+RECORD_FMT_V1 = '<II' + 'f'*12 + 'f'*12 + 'f'*12 + 'fff' + 'B3x'
+RECORD_FMT_V2 = '<II' + 'f'*12 + 'f'*12 + 'f'*12 + 'f'*12 + 'fff' + 'B3x'
+assert struct.calcsize(RECORD_FMT_V1) == RECORD_SIZE_V1
+assert struct.calcsize(RECORD_FMT_V2) == RECORD_SIZE_V2
 
 
 def parse_log(path):
@@ -49,23 +61,48 @@ def parse_log(path):
         magic, version, n_ind, _ = struct.unpack('<IIII', hdr)
         if magic != MAGIC:
             sys.exit(f'ERROR: bad magic 0x{magic:08X} (expected 0x{MAGIC:08X})')
+
+        # Auto-detect record size from first record probe
+        probe = f.read(RECORD_SIZE_V2)
+        if len(probe) < RECORD_SIZE_V1:
+            sys.exit('ERROR: file too short for even one record')
+        v2 = len(probe) == RECORD_SIZE_V2
+        rec_size = RECORD_SIZE_V2 if v2 else RECORD_SIZE_V1
+        fmt      = RECORD_FMT_V2  if v2 else RECORD_FMT_V1
+        f.seek(HEADER_SIZE)  # rewind past header to re-read all records uniformly
+
         records = []
         while True:
-            raw = f.read(RECORD_SIZE)
-            if len(raw) < RECORD_SIZE:
+            raw = f.read(rec_size)
+            if len(raw) < rec_size:
                 break
-            vals = struct.unpack(RECORD_FMT, raw)
-            rec = {
-                'pass':         vals[0],
-                'day':          vals[1],
-                'mt1_best':     list(vals[2:14]),
-                'mt1_slot0':    list(vals[14:26]),
-                'mt1_mean':     list(vals[26:38]),
-                'mt2_best_pts': vals[38],
-                'mt2_slot0_pts':vals[39],
-                'mt2_ideal_pts':vals[40],
-                'mt2_injected': vals[41],
-            }
+            vals = struct.unpack(fmt, raw)
+            if v2:
+                rec = {
+                    'pass':         vals[0],
+                    'day':          vals[1],
+                    'mt1_best':     list(vals[2:14]),
+                    'mt1_slot0':    list(vals[14:26]),
+                    'mt1_mean':     list(vals[26:38]),
+                    'mt1_min':      list(vals[38:50]),
+                    'mt2_best_pts': vals[50],
+                    'mt2_slot0_pts':vals[51],
+                    'mt2_ideal_pts':vals[52],
+                    'mt2_injected': vals[53],
+                }
+            else:
+                rec = {
+                    'pass':         vals[0],
+                    'day':          vals[1],
+                    'mt1_best':     list(vals[2:14]),
+                    'mt1_slot0':    list(vals[14:26]),
+                    'mt1_mean':     list(vals[26:38]),
+                    'mt1_min':      [float('nan')] * N_IND,  # not in v1
+                    'mt2_best_pts': vals[38],
+                    'mt2_slot0_pts':vals[39],
+                    'mt2_ideal_pts':vals[40],
+                    'mt2_injected': vals[41],
+                }
             records.append(rec)
     return records
 
@@ -99,16 +136,24 @@ def print_pass_summary(pass_num, recs, industry_filter=None):
     print(f'  MT2 best_pts  early={mt2_early:+.2f}  mid={mt2_mid:+.2f}  late={mt2_late:+.2f}'
           f'  (ideal avg={avg_ideal:+.2f}  inj={mt2_inj}/{len(recs)})')
 
-    # MT1 per-industry trend
-    print('  MT1 slot0 score (early → late):')
+    # MT1 per-industry trends (slot0, pool_max, pool_mean, pool_min)
+    import math
+    has_min = not math.isnan(recs[0]['mt1_min'][0])
+    print(f'  MT1 score trends (early→mid→late) — slot0 | pool_max | pool_mean'
+          + (' | pool_min' if has_min else ' | pool_min: n/a (v1 log)'))
     for i, name in enumerate(INDUSTRY_NAMES):
         if industry_filter and industry_filter.lower() not in name:
             continue
-        e2, m2, l2 = _thirds(recs, lambda r, ii=i: r['mt1_slot0'][ii])
-        best_avg   = _mean([r['mt1_best'][i] for r in recs])
-        mean_avg   = _mean([r['mt1_mean'][i] for r in recs])
-        print(f'    {name:<28s}  slot0: {e2:.3f}→{m2:.3f}→{l2:.3f}  '
-              f'(best={best_avg:.3f}  pool_mean={mean_avg:.3f})')
+        s0_e, s0_m, s0_l   = _thirds(recs, lambda r, ii=i: r['mt1_slot0'][ii])
+        mx_e, mx_m, mx_l   = _thirds(recs, lambda r, ii=i: r['mt1_best'][ii])
+        mn_e, mn_m, mn_l   = _thirds(recs, lambda r, ii=i: r['mt1_mean'][ii])
+        mi_e, mi_m, mi_l   = _thirds(recs, lambda r, ii=i: r['mt1_min'][ii])
+        min_str = f'  min: {mi_e:.3f}→{mi_m:.3f}→{mi_l:.3f}' if has_min else ''
+        print(f'    {name:<28s}'
+              f'  slot0: {s0_e:.3f}→{s0_m:.3f}→{s0_l:.3f}'
+              f'  max: {mx_e:.3f}→{mx_m:.3f}→{mx_l:.3f}'
+              f'  mean: {mn_e:.3f}→{mn_m:.3f}→{mn_l:.3f}'
+              f'{min_str}')
 
 
 def main():

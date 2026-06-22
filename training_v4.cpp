@@ -518,7 +518,7 @@ struct MT1Scratch {
 };
 
 struct MT1Result {
-    float best_score, slot0_score, mean_score;
+    float best_score, slot0_score, mean_score, min_score;
     float slot0_conf, slot0_delta, slot0_range_hw;   // decoded outputs, pre-normalization
 };
 
@@ -2075,6 +2075,7 @@ static MT1Result step_mt1(int ind_i, MT1Scratch& scratch,
 
     int   best_slot = (int)(std::max_element(scores, scores + N_SLOTS) - scores);
     float best_sc   = scores[best_slot];
+    float min_sc    = *std::min_element(scores, scores + N_SLOTS);
     float slot0_sc  = scores[0];
 
     float slot0_conf     = sigmoidf(raw_out[0][0]);
@@ -2129,7 +2130,7 @@ static MT1Result step_mt1(int ind_i, MT1Scratch& scratch,
     for (int k = 0; k < ELITE_POOL; k++)
         memcpy(scratch.elite(k), scratch.new_elite(k), MT1NN_PARAMS * sizeof(float));
 
-    return {best_sc, slot0_sc, mean_score, slot0_conf, slot0_delta, slot0_range_hw};
+    return {best_sc, slot0_sc, mean_score, min_sc, slot0_conf, slot0_delta, slot0_range_hw};
 }
 
 // ── MT2 training step (replaces step_master) ────────────────────────────────────
@@ -2625,12 +2626,12 @@ static bool write_mt_log_header(FILE* f) {
 
 struct MTLogRecord {
     uint32_t pass_num, actual_day;
-    float    mt1_best[N_IND], mt1_slot0[N_IND], mt1_mean[N_IND];
+    float    mt1_best[N_IND], mt1_slot0[N_IND], mt1_mean[N_IND], mt1_min[N_IND];
     float    mt2_best_pts, mt2_slot0_pts, mt2_ideal_pts;
     uint8_t  mt2_injected;
     uint8_t  pad[3];
 };
-static_assert(sizeof(MTLogRecord) == 168, "MTLogRecord must be 168 bytes");
+static_assert(sizeof(MTLogRecord) == 216, "MTLogRecord must be 216 bytes");
 
 static void write_mt_log_record(FILE* f, const MTLogRecord& r) {
     fwrite(&r, sizeof(MTLogRecord), 1, f);
@@ -3008,6 +3009,7 @@ int main(int argc, char* argv[]) {
                     rec.mt1_best[i]  = mt1_res[i].best_score;
                     rec.mt1_slot0[i] = mt1_res[i].slot0_score;
                     rec.mt1_mean[i]  = mt1_res[i].mean_score;
+                    rec.mt1_min[i]   = mt1_res[i].min_score;
                 }
                 rec.mt2_best_pts   = master_res.best_pts;
                 rec.mt2_slot0_pts  = master_res.elite_mean_pts;  // slot0 pts proxy
