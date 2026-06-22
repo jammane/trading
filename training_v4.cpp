@@ -529,6 +529,10 @@ struct MT1Scratch {
 struct MT1Result {
     float best_score, slot0_score, mean_score, min_score;
     float slot0_conf, slot0_delta, slot0_range_hw;   // decoded outputs, pre-normalization
+    // per-component pool stats (direction, range, accuracy)
+    float best_dir, slot0_dir, mean_dir, min_dir;
+    float best_rng, slot0_rng, mean_rng, min_rng;
+    float best_acc, slot0_acc, mean_acc, min_acc;
 };
 
 // Running stats for MT2 input normalization (delta and range across all 12 industries)
@@ -2084,13 +2088,24 @@ static MT1Result step_mt1(int ind_i, MT1Scratch& scratch,
         acc_sc [slot] = sb.accuracy;
     }
 
-    // Pool statistics (composite)
-    float mean_score = 0.f;
-    for (int s = 0; s < N_SLOTS; s++) mean_score += comp_sc[s];
-    mean_score /= N_SLOTS;
+    // Pool statistics (composite + per-component)
+    float mean_score = 0.f, mean_dir_s = 0.f, mean_rng_s = 0.f, mean_acc_s = 0.f;
+    for (int s = 0; s < N_SLOTS; s++) {
+        mean_score += comp_sc[s];
+        mean_dir_s += dir_sc[s];
+        mean_rng_s += rng_sc[s];
+        mean_acc_s += acc_sc[s];
+    }
+    mean_score /= N_SLOTS; mean_dir_s /= N_SLOTS; mean_rng_s /= N_SLOTS; mean_acc_s /= N_SLOTS;
     float best_sc  = *std::max_element(comp_sc, comp_sc + N_SLOTS);
     float min_sc   = *std::min_element(comp_sc, comp_sc + N_SLOTS);
     float slot0_sc = comp_sc[0];
+    float best_dir_s = *std::max_element(dir_sc, dir_sc + N_SLOTS);
+    float min_dir_s  = *std::min_element(dir_sc, dir_sc + N_SLOTS);
+    float best_rng_s = *std::max_element(rng_sc, rng_sc + N_SLOTS);
+    float min_rng_s  = *std::min_element(rng_sc, rng_sc + N_SLOTS);
+    float best_acc_s = *std::max_element(acc_sc, acc_sc + N_SLOTS);
+    float min_acc_s  = *std::min_element(acc_sc, acc_sc + N_SLOTS);
 
     // Per-category sorted index arrays
     int idx_comp[N_SLOTS], idx_dir[N_SLOTS], idx_rng[N_SLOTS], idx_acc[N_SLOTS];
@@ -2167,7 +2182,10 @@ static MT1Result step_mt1(int ind_i, MT1Scratch& scratch,
     float slot0_conf     = sigmoidf(raw0[0]);
     float slot0_delta    = tanhf(raw0[1]) * MT1_SCALE;
     float slot0_range_hw = log1pf(expf(raw0[2]));
-    return {best_sc, slot0_sc, mean_score, min_sc, slot0_conf, slot0_delta, slot0_range_hw};
+    return {best_sc, slot0_sc, mean_score, min_sc, slot0_conf, slot0_delta, slot0_range_hw,
+            best_dir_s, dir_sc[0], mean_dir_s, min_dir_s,
+            best_rng_s, rng_sc[0], mean_rng_s, min_rng_s,
+            best_acc_s, acc_sc[0], mean_acc_s, min_acc_s};
 }
 
 // ── MT2 training step (replaces step_master) ────────────────────────────────────
@@ -2643,7 +2661,7 @@ static bool load_mt2_norm_stats(const std::string& dir, MT2NormStats& s) {
 // ── MT binary log ────────────────────────────────────────────────────────────────
 
 static constexpr uint32_t MT_LOG_MAGIC   = 0x4D543132u;  // 'MT12'
-static constexpr uint32_t MT_LOG_VERSION = 1u;
+static constexpr uint32_t MT_LOG_VERSION = 2u;
 
 static bool write_mt_log_header(FILE* f) {
     uint32_t hdr[4] = {MT_LOG_MAGIC, MT_LOG_VERSION, (uint32_t)N_IND, 0u};
@@ -2652,12 +2670,20 @@ static bool write_mt_log_header(FILE* f) {
 
 struct MTLogRecord {
     uint32_t pass_num, actual_day;
-    float    mt1_best[N_IND], mt1_slot0[N_IND], mt1_mean[N_IND], mt1_min[N_IND];
+    // MT1 composite pool stats
+    float mt1_best[N_IND],     mt1_slot0[N_IND],     mt1_mean[N_IND],     mt1_min[N_IND];
+    // MT1 direction component pool stats
+    float mt1_dir_best[N_IND], mt1_dir_slot0[N_IND], mt1_dir_mean[N_IND], mt1_dir_min[N_IND];
+    // MT1 range component pool stats
+    float mt1_rng_best[N_IND], mt1_rng_slot0[N_IND], mt1_rng_mean[N_IND], mt1_rng_min[N_IND];
+    // MT1 accuracy component pool stats
+    float mt1_acc_best[N_IND], mt1_acc_slot0[N_IND], mt1_acc_mean[N_IND], mt1_acc_min[N_IND];
+    // MT2
     float    mt2_best_pts, mt2_slot0_pts, mt2_ideal_pts;
     uint8_t  mt2_injected;
     uint8_t  pad[3];
 };
-static_assert(sizeof(MTLogRecord) == 216, "MTLogRecord must be 216 bytes");
+static_assert(sizeof(MTLogRecord) == 792, "MTLogRecord must be 792 bytes");
 
 static void write_mt_log_record(FILE* f, const MTLogRecord& r) {
     fwrite(&r, sizeof(MTLogRecord), 1, f);
@@ -3032,10 +3058,22 @@ int main(int argc, char* argv[]) {
                 rec.pass_num     = (uint32_t)pass;
                 rec.actual_day   = (uint32_t)actual_day;
                 for (int i = 0; i < N_IND; i++) {
-                    rec.mt1_best[i]  = mt1_res[i].best_score;
-                    rec.mt1_slot0[i] = mt1_res[i].slot0_score;
-                    rec.mt1_mean[i]  = mt1_res[i].mean_score;
-                    rec.mt1_min[i]   = mt1_res[i].min_score;
+                    rec.mt1_best[i]      = mt1_res[i].best_score;
+                    rec.mt1_slot0[i]     = mt1_res[i].slot0_score;
+                    rec.mt1_mean[i]      = mt1_res[i].mean_score;
+                    rec.mt1_min[i]       = mt1_res[i].min_score;
+                    rec.mt1_dir_best[i]  = mt1_res[i].best_dir;
+                    rec.mt1_dir_slot0[i] = mt1_res[i].slot0_dir;
+                    rec.mt1_dir_mean[i]  = mt1_res[i].mean_dir;
+                    rec.mt1_dir_min[i]   = mt1_res[i].min_dir;
+                    rec.mt1_rng_best[i]  = mt1_res[i].best_rng;
+                    rec.mt1_rng_slot0[i] = mt1_res[i].slot0_rng;
+                    rec.mt1_rng_mean[i]  = mt1_res[i].mean_rng;
+                    rec.mt1_rng_min[i]   = mt1_res[i].min_rng;
+                    rec.mt1_acc_best[i]  = mt1_res[i].best_acc;
+                    rec.mt1_acc_slot0[i] = mt1_res[i].slot0_acc;
+                    rec.mt1_acc_mean[i]  = mt1_res[i].mean_acc;
+                    rec.mt1_acc_min[i]   = mt1_res[i].min_acc;
                 }
                 rec.mt2_best_pts   = master_res.best_pts;
                 rec.mt2_slot0_pts  = master_res.elite_mean_pts;  // slot0 pts proxy

@@ -125,25 +125,25 @@ All per-run files (`state.json`, `owners.json`, `master_state.json`, `*.pt`) liv
 Current account is `acct0`. Up to 5 accounts planned; additional accounts will likely
 require a droplet upgrade.
 
-**Scheduling convention (user is US Eastern Time, EDT=UTC-4, EST=UTC-5):**
+**Scheduling convention (user is US Eastern Time):**
 - Market close: 4:00 PM ET
-- acct0 paper: 1h05m after close = 5:05 PM ET (21:05 UTC EDT / 22:05 UTC EST)
+- acct0 paper: 1h05m after close = 5:05 PM ET
 - acct0 prod:  30 min after paper = 5:35 PM ET
 - acct1 paper: acct0 paper + 1h = 6:05 PM ET
 - acct1 prod:  30 min after acct1 paper = 6:35 PM ET
 - (each additional account adds 1 hour to paper time, prod is always 30 min after paper)
-- **Cron times shift by 1 hour in November (EDT→EST) and March (EST→EDT)**
+- DST transitions are handled automatically — droplet timezone is America/New_York
 
 ```
-# crontab on droplet (times in UTC, summer/EDT — shift +1h in Nov, -1h in Mar)
-# Stock data: shared across all accounts; download once, cleanup weekly
-30 20 * * 1-5 cd /root/trading && mkdir -p logs/data && source .venv/bin/activate && python download_daily.py >> logs/data/download_daily.log 2>&1
-0  4  * * 0   cd /root/trading && mkdir -p logs/data && source .venv/bin/activate && python cleanup_stock_data.py >> logs/data/cleanup_stock_data.log 2>&1
-# acct0 paper trading: 21:05 UTC (5:05 PM EDT); prod: 21:35 UTC
-5 21 * * 1-5  cd /root/trading && mkdir -p logs/acct0 && export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d) && export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d) && source .venv/bin/activate && python production_v2.py --paper --account acct0 >> logs/acct0/paper.log 2>&1
-35 21 * * 1-5 cd /root/trading && mkdir -p logs/acct0 && export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d) && export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d) && source .venv/bin/activate && python production_v2.py --account acct0 >> logs/acct0/prod.log 2>&1
-# acct1 (future): 30 21 download_daily if diff universe; 5 22 paper, 35 22 prod
-# acct2 (future): 5 23 paper, 35 23 prod
+# crontab on droplet (times in Eastern Time — DST handled automatically by system timezone)
+# Stock data: shared across all accounts; download once daily, cleanup weekly
+30 16 * * 1-5 cd /root/trading && mkdir -p logs/data && source .venv/bin/activate && python download_daily.py >> logs/data/download_daily.log 2>&1
+0  0  * * 0   cd /root/trading && mkdir -p logs/data && source .venv/bin/activate && python cleanup_stock_data.py >> logs/data/cleanup_stock_data.log 2>&1
+# acct0 paper trading: 5:05 PM ET; prod: 5:35 PM ET
+#5 17 * * 1-5 cd /root/trading && mkdir -p logs/acct0 && export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d) && export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d) && source .venv/bin/activate && python production_v2.py --paper --account acct0 >> logs/acct0/paper.log 2>&1
+#35 17 * * 1-5 cd /root/trading && mkdir -p logs/acct0 && export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d) && export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d) && source .venv/bin/activate && python production_v2.py --account acct0 >> logs/acct0/prod.log 2>&1
+# acct1 (future): 30 16 download_daily if diff universe; 5 18 paper, 35 18 prod
+# acct2 (future): 5 19 paper, 35 19 prod
 ```
 
 ```bash
