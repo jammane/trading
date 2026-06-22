@@ -105,6 +105,7 @@ def mt2_state_dict_to_arr(state_dict):
 
 
 def convert_industry(prefix, load_dir, output_dir, layer_defs, label):
+    """Convert all ELITE_POOL PyTorch .pt files for a prefix to flat float32 .bin for the C++ trainer."""
     converted = 0
     for slot in range(ELITE_POOL):
         src = os.path.join(load_dir, f'{prefix}_model_{slot}.pt')

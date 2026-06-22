@@ -75,6 +75,7 @@ def _mutate_generic(model, model_class, sigma):
 
 
 def _normalize_weights(values):
+    """Clip negatives to zero and normalise values to sum to 1.0; equal weights on all-zero input."""
     clipped = [max(float(v), 0.0) for v in values]
     total   = sum(clipped)
     if total <= 0:
@@ -257,6 +258,7 @@ def load_mt2_norm_stats(model_dir):
 
 
 def save_mt2_norm_stats(model_dir, stats):
+    """Persist MT2 running normalization stats to mt2_norm_stats.json."""
     try:
         with open(os.path.join(model_dir, 'mt2_norm_stats.json'), 'w') as f:
             json.dump(stats, f)
@@ -277,6 +279,7 @@ def _update_norm_stats(stats, delta, range_hw):
 
 
 def _normalize_stat(val, mean, var, count):
+    """Z-score normalize val using Welford running mean/variance; returns raw val if count ≤ 1."""
     std = math.sqrt(var / count) if count > 1 else 1.0
     return (val - mean) / (std + 1e-9)
 

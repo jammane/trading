@@ -307,6 +307,7 @@ def log_request_id(request_id, context, success=True):
         f.write(entry + '\n')
 
 def log_data_failure(sym, reason, mode):
+    """Append a JSON entry to logs/data_fetch_failures.log and print an alert."""
     os.makedirs(LOG_DIR, exist_ok=True)
     path = os.path.join(LOG_DIR, 'data_fetch_failures.log')
     entry = json.dumps({
@@ -546,6 +547,7 @@ def main():
     parser.add_argument('--withdraw', type=float, help='Amount to withdraw from portfolio')
     args = parser.parse_args()
 
+    # `if True:` preserves the existing indentation scope; all logic below runs unconditionally.
     if True:
         # Retrieve API keys
         api_key = os.environ.get('ALPACA_API_KEY')

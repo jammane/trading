@@ -105,5 +105,7 @@ else:
     for sym, count in incomplete_symbols:
         print(f"   - {sym}: {count}/{expected_days} days")
 
-print("   You can now run initial training:")
-print("   python training_v4.py --output models")
+print("   You can now run initial training (C++ trainer):")
+print("   cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)")
+print("   python prepare_models.py --load-dir models/training --output models/training")
+print("   ./build/training_v4_cpp --output models/training --load-dir models/training --passes 5")
