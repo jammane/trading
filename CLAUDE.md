@@ -175,7 +175,7 @@ Training output (`training_v4_cpp`) writes to `models/acct#/training`; after tra
 ```bash
 ./swap_symbols.sh '{"OLDTICKER": "NEWTICKER"}'
 ```
-Runs all five steps: updates `universe.py` and regenerates `universe.json`, removes the old symbol's `stock_data/` JSON, runs `download_daily.py` (full 5-year fetch for the new symbol, incremental for all others), prompts to rebuild the Docker image, and prints optional model-cleanup commands for the droplet. The C++ binary reads `universe.json` at startup — no recompile needed after a symbol swap. Run locally — not inside a container.
+Runs all five steps: updates `universe_acct0.py` and regenerates `universe.json`, removes the old symbol's `stock_data/` JSON, runs `download_daily.py` (full 5-year fetch for the new symbol, incremental for all others), prompts to rebuild the Docker image, and prints optional model-cleanup commands for the droplet. The C++ binary reads `universe.json` at startup — no recompile needed after a symbol swap. Run locally — not inside a container.
 
 **Symbol swap thresholds (checked ~monthly — expect 1-2 swaps/month):**
 - **$15 watch floor** — symbol goes into `universe_watchlist.json` `"watch"` section with a candidate. Do NOT download candidate data yet. Do NOT run `swap_symbols.sh`.
@@ -187,8 +187,9 @@ Runs all five steps: updates `universe.py` and regenerates `universe.json`, remo
 | Module | Contents |
 |--------|----------|
 | `models.py` | `StockNN`, `MasterNN`, `MT1NN`, `MT2NN` — single source of truth for all model classes |
-| `universe.py` | `INDUSTRIES` dict, `ALL_SYMBOLS`, `INDUSTRY_NAMES` — 144-symbol universe |
-| `universe.json` | Auto-generated from `universe.py`; read by the C++ trainer at runtime |
+| `universe_acct0.py` | `INDUSTRIES` dict, `ALL_SYMBOLS`, `INDUSTRY_NAMES` for acct0 (144 symbols) |
+| `universe.py` | Aggregator: discovers all `universe_acct*.py`, exposes union for download/cleanup scripts |
+| `universe.json` | Auto-generated from `universe_acct0.py` by `swap_symbols.py`; read by the C++ trainer |
 | `fees.py` | Fee constants (`BUY_FILL`, `SEC_FEE_RATE`, etc.) and `_sell_net()` helper |
 | `training_lib.py` | Shared evolutionary functions (`step_industry`, `selection_and_mutation`, `build_master_features`, I/O helpers, constants) — imported by `upkeep.py` and `production_v2.py`; not a standalone training script |
 | `prepare_models.py` | `.pt` → `.bin` for C++ trainer (run before first C++ training) |
@@ -196,7 +197,7 @@ Runs all five steps: updates `universe.py` and regenerates `universe.json`, remo
 | `download_daily.py` | Incremental daily OHLCV update — appends new days, full fetch for new symbols, trims to 1255 days |
 | `cleanup_stock_data.py` | Weekly purge of `stock_data/` files for symbols no longer in any universe or held position |
 
-`production_v2.py`, `upkeep.py`, and `inspect_trades.py` import from these modules. (`training_v2.py` and `training_v3.py` were deleted — superseded by `training_v4_cpp` for all training and `upkeep.py` for daily evolution.) `download_5y_data.py` imports from `universe.py`. To add or change a ticker, run `swap_symbols.sh` — it updates both `universe.py` and `universe.json` together.
+`production_v2.py`, `upkeep.py`, and `inspect_trades.py` import from `universe.py` (the aggregator). (`training_v2.py` and `training_v3.py` were deleted — superseded by `training_v4_cpp` for all training and `upkeep.py` for daily evolution.) To add or change a ticker for acct0, run `swap_symbols.sh` — it updates `universe_acct0.py` and regenerates `universe.json`. To add a new account, create `universe_acct1.py` with the same structure; `universe.py` and the download/cleanup scripts pick it up automatically.
 
 ## Tests
 
