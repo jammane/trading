@@ -52,9 +52,9 @@ if [ -z "${VIRTUAL_ENV:-}" ]; then
     fi
 fi
 
-# ── Step 1: update universe.py ────────────────────────────────────────────────
+# ── Step 1: update universe_acct0.py ─────────────────────────────────────────
 echo ""
-echo "==> Step 1/5: Updating universe.py ..."
+echo "==> Step 1/5: Updating universe_acct0.py ..."
 python swap_symbols.py "$JSON_MAP"
 
 # ── Step 2: remove stale stock data ───────────────────────────────────────────
@@ -79,7 +79,7 @@ python download_daily.py
 # ── Step 4: rebuild Docker image ──────────────────────────────────────────────
 echo ""
 echo "==> Step 4/5: Docker image"
-echo "universe.py has been updated.  Rebuild the Docker image so the new symbol"
+echo "universe_acct0.py has been updated.  Rebuild the Docker image so the new symbol"
 echo "set is baked into the next training or production container."
 echo ""
 read -rp "Rebuild and push jammane80/trading:latest now? [y/N] " REPLY

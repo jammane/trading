@@ -242,7 +242,8 @@ The canonical trainer — handles industry, MT1, and MT2 evolution with ~6× spe
 | File | Purpose |
 |------|---------|
 | `models.py` | `StockNN`, `MasterNN`, `MT1NN`, `MT2NN` class definitions — single source of truth |
-| `universe.py` | 144-symbol trading universe (`INDUSTRIES`, `ALL_SYMBOLS`, `INDUSTRY_NAMES`) |
+| `universe_acct0.py` | 144-symbol universe for acct0 (`INDUSTRIES`, `ALL_SYMBOLS`, `INDUSTRY_NAMES`) |
+| `universe.py` | Aggregator: auto-discovers all `universe_acct*.py` and exposes their union |
 | `fees.py` | Broker fee constants and `_sell_net()` helper |
 | `training_lib.py` | Shared evolutionary functions (fill simulation, selection, history, I/O) imported by `upkeep.py` and `production_v2.py` |
 | `upkeep.py` | Single-day evolution for MT1/MT2/StockNN pools — called by `production_v2.py` after each trading day |
@@ -260,9 +261,11 @@ The canonical trainer — handles industry, MT1, and MT2 evolution with ~6× spe
 
 | File | Purpose |
 |------|---------|
-| `download_5y_data.py` | Download ~5 years of daily OHLCV data into `stock_data/` |
+| `download_5y_data.py` | One-time bulk download of ~5 years of daily OHLCV data into `stock_data/` |
+| `download_daily.py` | Incremental daily update (run at 4:30 PM ET): appends new OHLCV for all acct universes, trims to 1255 days, full fetch for new symbols |
+| `cleanup_stock_data.py` | Weekly cleanup: purges `stock_data/` entries for symbols no longer in any `universe_acct*.py` or held in any account |
 | `inspect_trades.py` | Audit elite model trade decisions for a given day and industry |
-| `swap_symbols.sh` | Guided ticker-replacement: updates `universe.py` + `universe.json`, cleans old data, downloads new data |
+| `swap_symbols.sh` | Guided ticker-replacement: updates `universe_acct0.py` + `universe.json`, cleans old data, downloads new data |
 | `swap_symbols.py` | Core replacement logic called by `swap_symbols.sh` |
 
 ### Production
