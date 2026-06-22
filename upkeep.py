@@ -667,22 +667,40 @@ def upkeep_mt2(model_dir, mt1_slot0_outputs, norm_stats, actual_perf, industry_l
     log(f"[mt2] best_pts={best_pts:+.2f} slot0_pts={slot0_pts:+.2f} ideal={ideal_pts} "
         f"tiers(0/1/2/3)={tier_counts[0]}/{tier_counts[1]}/{tier_counts[2]}/{tier_counts[3]}")
 
+    # Load 10-day post-injection hold counter
+    inj_state_path = os.path.join(model_dir, 'mt2_inj_state.json')
+    try:
+        with open(inj_state_path) as _f:
+            injection_hold = json.load(_f).get('injection_hold', 0)
+    except Exception:
+        injection_hold = 0
+    if injection_hold > 0:
+        injection_hold -= 1
+    injection_suppressed = injection_hold > 0
+
     below_thresh = sum(1 for p in slot_pts if p < MT2_INJ_THRESHOLD)
-    inject_triggered = below_thresh >= MT2_INJ_MIN_BELOW
+    inject_triggered = below_thresh >= MT2_INJ_MIN_BELOW and not injection_suppressed
 
     injected = False
     if not inject_triggered:
         _select_and_mutate(prefix, model_dir, MT2NN, pred_scores, sigma)
     else:
         injected = True
+        injection_hold = 10
         half = ELITE_COUNT // 2
-        log(f"[mt2] {below_thresh}/{N_SLOTS} slots < {MT2_INJ_THRESHOLD:+.1f} — diversity injection into bottom {ELITE_COUNT - half} elites")
+        log(f"[mt2] {below_thresh}/{N_SLOTS} slots < {MT2_INJ_THRESHOLD:+.1f} — injecting diversity (hold=10)")
         for inject_rank in range(half, ELITE_COUNT):
             source_rank = inject_rank - half
             elite = load_slot_model(prefix, model_dir, source_rank, MT2NN)
             blend = blend_model_halfway(elite, MT2NN)
             save_slot_model(prefix, model_dir, inject_rank, blend)
             del elite, blend
+
+    try:
+        with open(inj_state_path, 'w') as _f:
+            json.dump({'injection_hold': injection_hold}, _f)
+    except Exception as e:
+        log(f"WARNING: could not save mt2_inj_state.json: {e}")
 
     slot0_final = load_slot_model(prefix, model_dir, 0, MT2NN)
     try:
