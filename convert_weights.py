@@ -10,9 +10,7 @@ Usage:
 """
 
 import argparse
-import json
 import os
-import struct
 
 import numpy as np
 import torch
@@ -54,37 +52,6 @@ def arr_to_mt2_state_dict(arr):
     assert offset == len(arr), f'MT2: consumed {offset} floats but array has {len(arr)}'
     return state_dict
 
-
-def convert_mt2_norm_stats(models_dir, output_dir):
-    """Convert C++ binary norm stats (36 bytes) to Python JSON format."""
-    src = os.path.join(models_dir, 'mt2_norm_stats.bin')
-    if not os.path.exists(src):
-        print('  [mt2_norm_stats] .bin file not found — skipping')
-        return
-    try:
-        with open(src, 'rb') as f:
-            raw = f.read(36)
-        delta_sum, delta_sum2, range_sum, range_sum2, count = struct.unpack('<ddddi', raw)
-        if count == 0:
-            print('  [mt2_norm_stats] count=0 in binary — skipping')
-            return
-        dm = delta_sum / count
-        dv = delta_sum2 - delta_sum * delta_sum / count   # Welford M2
-        rm = range_sum / count
-        rv = range_sum2 - range_sum * range_sum / count
-        stats = {
-            'delta_mean': dm,
-            'delta_var':  dv,
-            'range_mean': rm,
-            'range_var':  rv,
-            'count':      count,
-        }
-        dst = os.path.join(output_dir, 'mt2_norm_stats.json')
-        with open(dst, 'w') as f:
-            json.dump(stats, f, indent=2)
-        print(f'  [mt2_norm_stats] written to {dst} (count={count})')
-    except Exception as e:
-        print(f'  [mt2_norm_stats] ERROR — {e}')
 
 
 def convert_industry(prefix, models_dir, output_dir, layer_defs, model_class, label, n_elites=None):
@@ -173,9 +140,6 @@ def main():
 
     print(f'Converting MT2 elite models from {models_dir} → {output_dir}')
     convert_mt2(models_dir, output_dir)
-
-    print(f'Converting MT2 norm stats from {models_dir} → {output_dir}')
-    convert_mt2_norm_stats(models_dir, output_dir)
 
     print('Done.')
 

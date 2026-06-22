@@ -113,14 +113,15 @@ class MT1NN(nn.Module):
     FC2:    37 → 29  ReLU  (taper step ≈ 8)
     FC3:    29 → 20  ReLU
     FC4:    20 → 12  ReLU
-    fc_out: 12 →  3  (raw logits decoded at score time)
+    fc_out: 12 →  4  (raw logits decoded at score time)
 
-    Output (1, 3) raw logits:
-      out[0] → sigmoid → P(positive return), confidence ∈ [0,1]
-      out[1] → tanh * MT1_SCALE → expected fractional return
-      out[2] → softplus → error range half-width (positive)
+    Output (1, 4) raw logits:
+      out[0] → sigmoid → P(positive return), direction confidence ∈ [0,1]
+      out[1] → tanh × $10K → expected dollar P&L (ceiling ≈ 5yr max swing)
+      out[2] → softplus → range as % of effective_delta (dimensionless)
+      out[3] → sigmoid → calibrated confidence (how well range covers actual)
 
-    Total params: 3,399
+    Total params: 3,412
     """
 
     def __init__(self):
@@ -129,31 +130,30 @@ class MT1NN(nn.Module):
         self.fc2    = nn.Linear(37, 29)
         self.fc3    = nn.Linear(29, 20)
         self.fc4    = nn.Linear(20, 12)
-        self.fc_out = nn.Linear(12,  3)
+        self.fc_out = nn.Linear(12,  4)
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = F.relu(self.fc3(x))
         x = F.relu(self.fc4(x))
-        return self.fc_out(x)   # (1, 3) raw logits
+        return self.fc_out(x)   # (1, 4) raw logits
 
 
 class MT2NN(nn.Module):
     """
     Cross-industry tier allocator — replaces MasterNN.
 
-    Input: (1, 36) — 3 MT1 outputs × 12 industries (after running-stat normalization
-           of delta and range; confidence already ∈ [0,1]).
-           Reshaped to (1, 12, 3) for the LSTM branch (12 steps × 3 features,
-           one step per industry in INDUSTRY_NAMES order).
+    Input: (1, 48) — 4 MT1 slot0 raw activations × 12 industries, no normalization.
+           [conf0, delta_tanh, range_pct, conf4] per industry in INDUSTRY_NAMES order.
+           Reshaped to (1, 12, 4) for the LSTM branch (12 steps × 4 features).
 
-    FC branch (2 layers, width = n_inputs):
-      FC1:  36 → 36  ReLU
+    FC branch (projects 48→36, then holds width):
+      FC1:  48 → 36  ReLU
       FC2:  36 → 36  ReLU          output: 36
 
-    LSTM branch (12 steps × 3 features):
-      LSTM layer 1: input=3,  hidden=36
+    LSTM branch (12 steps × 4 features):
+      LSTM layer 1: input=4,  hidden=36
       LSTM layer 2: input=36, hidden=36   output: 36 (final hidden state)
 
     Concatenate: [FC_out ‖ LSTM_out] = 72
@@ -166,25 +166,25 @@ class MT2NN(nn.Module):
 
     Output (1, 48): raw logits, reshape to (12, 4) → argmax per industry → tier ∈ {0,1,2,3}
 
-    Total params: 33,996
+    Total params: 34,572
     """
 
     def __init__(self):
         super().__init__()
-        self.fc1    = nn.Linear(36, 36)
+        self.fc1    = nn.Linear(48, 36)
         self.fc2    = nn.Linear(36, 36)
-        self.lstm   = nn.LSTM(input_size=3, hidden_size=36, num_layers=2, batch_first=True)
+        self.lstm   = nn.LSTM(input_size=4, hidden_size=36, num_layers=2, batch_first=True)
         self.taper1 = nn.Linear(72, 66)
         self.taper2 = nn.Linear(66, 60)
         self.taper3 = nn.Linear(60, 54)
         self.fc_out = nn.Linear(54, 48)
 
     def forward(self, x):
-        # x: (batch, 36)
+        # x: (batch, 48)
         fc = F.relu(self.fc1(x))
         fc = F.relu(self.fc2(fc))                       # (batch, 36)
 
-        lstm_in = x.view(x.size(0), 12, 3)             # (batch, 12 steps, 3 features)
+        lstm_in = x.view(x.size(0), 12, 4)             # (batch, 12 steps, 4 features)
         _, (h_n, _) = self.lstm(lstm_in)               # h_n: (2, batch, 36)
         lstm_out = h_n[-1]                              # last layer final hidden: (batch, 36)
 

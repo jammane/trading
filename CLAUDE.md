@@ -217,34 +217,64 @@ All model classes are defined in `models.py` (single source of truth) and import
 
 - **`StockNN`** — one instance per industry sector (12 sectors). FC injection architecture: seed day → 14 inject layers → today layer → 2 flat layers → funnel. Output is `(12, 4)` — one row per stock in the sector, columns are `[buy_qty, buy_price_frac, sell_all_price_frac, sell_qty]`.
 - **`MasterNN`** — legacy single cross-sector allocator (444→48). Kept for backward compatibility; superseded by MT1+MT2 in production once MT2 models are available.
-- **`MT1NN`** (37→3, 3,399 params per slot) — per-industry preprocessor. One independent 200-slot pool per industry. Input: one industry's 37-feature slice of the 444-feature master vector. Output (after activation): `sigmoid(out0)` = confidence P(positive return), `tanh(out1)*0.05` = expected delta, `softplus(out2)` = error range half-width. Activates at `actual_day >= 25`. Files: `mt1_{industry}_model_{n}.pt` / `mt1_{industry}_best.pt`.
-- **`MT2NN`** (FC+LSTM→48, 33,708 params per slot) — cross-industry allocator. Replaces `MasterNN`. Input: 36 normalized MT1 slot0 outputs (3 per industry × 12 industries, sequence arranged for LSTM as 12 steps × 3 features). Parallel FC branch (36→36→36) + 2-layer LSTM (hidden=36) → concat 72 → taper (72→66→60→54→48). Activates at `actual_day >= 30`. Files: `mt2_model_{n}.pt` / `mt2_best.pt` / `mt2_norm_stats.json`.
+- **`MT1NN`** (37→4, ~3,412 params per slot) — per-industry preprocessor. One independent 200-slot pool per industry. Input: one industry's 37-feature slice of the 444-feature master vector. Outputs (raw logits, activations applied at score time): `sigmoid(out[0])` = direction confidence P(positive return), `tanh(out[1])×$10K` = dollar P&L prediction, `softplus(out[2])` = range as fraction of effective delta, `sigmoid(out[3])` = calibrated confidence. Activates at `actual_day >= 25`. Files: `mt1_{industry}_model_{n}.pt` / `mt1_{industry}_best.pt`.
+- **`MT2NN`** (FC+LSTM→48, ~34,572 params per slot) — cross-industry allocator. Replaces `MasterNN`. Input: 48 raw MT1 slot0 activations (4 per industry × 12 industries, no normalization — dollar magnitude IS the allocation signal). Parallel FC branch (48→36→36) + 2-layer LSTM (input=4, hidden=36) → concat 72 → taper (72→66→60→54→48). Activates at `actual_day >= 30`. Files: `mt2_model_{n}.pt` / `mt2_best.pt`.
 
-### MT1 scoring formula
+### MT1 scoring formulas
 
 ```
-conf = sigmoid(out[0]);  delta = tanh(out[1])*0.05;  range_hw = softplus(out[2])
-score_direction = 1.0 if (conf>=0.5) == (actual>=0) else 0.0
-score_range     = exp(-range_hw/0.02) if |actual-delta|<=range_hw else 0.0
-score_accuracy  = max(0, 1 - clip(|actual-delta|/(|actual|+1e-9), 0, 1))
-mt1_score       = 0.50*score_direction + 0.33*score_range + 0.17*score_accuracy
+conf = sigmoid(out[0]);  delta_t = tanh(out[1]);  delta_d = delta_t × 10000
+range_pct = softplus(out[2]);  conf4 = sigmoid(out[3])
+
+# 10-day rolling floor (per industry, cold-start $250):
+floor_d = max(mean(|actual_d| over last 10 days), 250.0)
+actual_d = actual_frac × portfolio_value  (true dollars earned)
+
+# Direction:
+score_dir = 1.0 if (conf>=0.5) == (actual_d>=0) else 0.0
+
+# Range (calibration: reward tightness that still covers actual_d):
+eff_delta = max(|delta_d|, floor_d);  r = range_pct × eff_delta
+m = |actual_d - delta_d| / r
+score_range = m if m < 1.0 else 0.0   # higher=tighter; 0 if miss
+
+# Accuracy (dollar-denominated):
+denom = max(|actual_d|, floor_d)
+score_acc = clamp(1 - |actual_d - delta_d| / denom, 0, 1)
+
+# Confidence (grades out[3] against range geometry ideal):
+d = |actual_d - delta_d|
+ideal = (1 - 0.5×d/r) if d≤r else r/(d+r)    # 1.0→0.5→0 (continuous at boundary)
+score_conf = 1 - |conf4 - ideal|
+
+# Composite:
+mt1_score = 0.50×score_dir + 0.33×score_range + 0.17×score_acc
+
+# Edge case: if all 200 slots have score_range==0 (actual_d==delta_d for all),
+# skip range elite slot reassignment for that day (keep previous day's range elites).
 ```
 
-### MT2 input normalization
-
-Confidence stays as-is (∈[0,1]). Delta and range are normalized via running Welford mean/variance accumulated across all 12 industries per training day. Stats persisted as `mt2_norm_stats.json` (Python) / `mt2_norm_stats.bin` (C++, 4 doubles + 1 int = 36 bytes). `prepare_models.py` and `convert_weights.py` handle conversion in both directions.
+**MT1 elite pool (28 slots):**
+- Slots 0–4: composite elites (slot 0 = production model)
+- Slots 5–9: direction elites
+- Slots 10–14: range elites
+- Slots 15–19: accuracy elites
+- Slots 20–24: confidence elites
+- Slot 25: equal-weight blend of {0,5,10,15,20} (top-1 from each category)
+- Slot 26: equal-weight blend of {0,1,5,6,10,11,15,16,20,21} (top-2 from each)
+- Slot 27: equal-weight blend of {0,1,2,5,6,7,10,11,12,15,16,17,20,21,22} (top-3 from each)
 
 ### Production inference chain (when MT2 models available)
 
 ```
 build_master_features() → today444
-  → MT1 slot0 ×12 (slices today444[i*37:(i+1)*37]) → 36 raw outputs
-  → normalize delta/range via mt2_norm_stats.json
+  → MT1 slot0 ×12 (slices today444[i*37:(i+1)*37]) → 4 raw activations each
+  → build in48: [conf, delta_t, range_pct, conf4] × 12 (no normalization)
   → MT2 slot0 forward pass → (12,4) logits → argmax per industry → tier map
   → allocation/liquidation (unchanged from MasterNN path)
 ```
 
-`run_master_allocation()` in `production_v2.py` tries MT2 first (`mt2_best.pt` exists), falls back to MasterNN, then equal allocation.
+`run_master_allocation()` in `production_v2.py` tries MT2 first (`mt2_best.pt` exists), falls back to MasterNN, then equal allocation. MT2 input: 48 raw MT1 activations (no normalization; `mt2_norm_stats.json` no longer used).
 
 ### Daily upkeep (production_v2.py + upkeep.py)
 
@@ -288,7 +318,7 @@ When an elite holds ≥50% cash (industry) or ≥80% cash (master), an `UNDER_IN
 
 ### Production cycle
 
-`production_v2.py` runs once per trading day: fetch data from yfinance → run MT1×12 + MT2 (or MasterNN fallback) to rebalance capital → run StockNN per active industry → submit limit/stop orders to Alpaca → perform one upkeep evolution step on yesterday's data (via `upkeep.py`). Alpaca credentials are read from `keyring` or environment variables (`ALPACA_API_KEY` / `ALPACA_SECRET_KEY`). All per-account state files (`state.json`, `owners.json`, `master_state.json`, `mt2_norm_stats.json`) live under `--model-dir`, enabling multiple accounts to run independently with different `--model-dir` paths and credentials.
+`production_v2.py` runs once per trading day: fetch data from yfinance → run MT1×12 + MT2 (or MasterNN fallback) to rebalance capital → run StockNN per active industry → submit limit/stop orders to Alpaca → perform one upkeep evolution step on yesterday's data (via `upkeep.py`). Alpaca credentials are read from `keyring` or environment variables (`ALPACA_API_KEY` / `ALPACA_SECRET_KEY`). All per-account state files (`state.json`, `owners.json`, `master_state.json`, `mt1_rolling_state.json`) live under `--model-dir`, enabling multiple accounts to run independently with different `--model-dir` paths and credentials.
 
 `--paper` routes all API calls to Alpaca's paper trading endpoint — orders are submitted and portfolio state is read from the paper account, giving real paper trading history without risking real money. Omit `--paper` for live trading.
 
@@ -301,8 +331,14 @@ A `PostToolUse` hook in `.claude/settings.json` auto-updates `CHANGELOG.md` and 
 | Constant | Value | Meaning |
 |----------|-------|---------|
 | `N_SLOTS` | 200 | Total model slots per pool |
-| `ELITE_COUNT` | 17 | Direct elite slots |
-| `ELITE_POOL` | 20 | Elites + weighted-average slots |
+| `ELITE_COUNT` | 17 | Direct elite slots (industry + MT2) |
+| `ELITE_POOL` | 20 | Elites + weighted-average slots (industry + MT2) |
+| `MT1_N_CATS` | 5 | MT1 scoring categories (composite, dir, range, acc, conf) |
+| `MT1_DIRECT_ELITES` | 25 | MT1 direct elite slots (5 categories × 5) |
+| `MT1_ELITE_POOL` | 28 | MT1 total pool (25 direct + 3 wavg blends) |
+| `MT1_SCALE_DOLLARS` | $10,000 | tanh(out[1]) × scale = dollar P&L prediction |
+| `MT1_FLOOR_COLD` | $250 | Cold-start floor for per-industry rolling buffer |
+| `MT1_ROLLING_DAYS` | 10 | Days in per-industry |actual_d| rolling buffer |
 | `IND_STARTING_CASH` | $25,000 | Per-industry starting capital |
 | `MST_STARTING_CASH` | $300,000 | Master starting capital |
 | `MAX_SINGLE_STOCK_PCT` | 0.60 | Max fraction of industry cash in one stock |
@@ -321,7 +357,7 @@ Version string is defined in `version.py` (`VERSION`) and mirrored as `TRAINER_V
 - `FEATURE` — increment for any new capability or significant improvement; resets `BUILD` to 0.
 - `BUILD` — increment for bug fixes and minor changes within a `FEATURE`.
 
-Current version: **0.1.0.0**
+Current version: **0.2.0.0**
 
 To bump the version, edit `VERSION` in `version.py` and `TRAINER_VERSION` in `training_v4.cpp`, then rebuild the C++ binary.
 

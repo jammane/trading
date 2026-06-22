@@ -224,11 +224,11 @@ def mt1_inputs():
 class TestMT1NN:
     def test_output_shape(self, mt1_inputs):
         out = MT1NN()(mt1_inputs)
-        assert out.shape == (1, 3)
+        assert out.shape == (1, 4)
 
     def test_param_count(self):
         n = sum(p.numel() for p in MT1NN().parameters())
-        assert n == 3399, f"MT1NN param count: expected 3399, got {n}"
+        assert n == 3412, f"MT1NN param count: expected 3412, got {n}"
 
     def test_layer_dims(self):
         m = MT1NN()
@@ -236,12 +236,17 @@ class TestMT1NN:
         assert m.fc2.in_features  == 37 and m.fc2.out_features  == 29
         assert m.fc3.in_features  == 29 and m.fc3.out_features  == 20
         assert m.fc4.in_features  == 20 and m.fc4.out_features  == 12
-        assert m.fc_out.in_features == 12 and m.fc_out.out_features == 3
+        assert m.fc_out.in_features == 12 and m.fc_out.out_features == 4
 
     def test_confidence_after_sigmoid(self, mt1_inputs):
         out = MT1NN()(mt1_inputs)
         conf = torch.sigmoid(out[:, 0])
         assert (conf >= 0).all() and (conf <= 1).all()
+
+    def test_calib_confidence_after_sigmoid(self, mt1_inputs):
+        out = MT1NN()(mt1_inputs)
+        conf4 = torch.sigmoid(out[:, 3])
+        assert (conf4 >= 0).all() and (conf4 <= 1).all()
 
     def test_range_after_softplus(self, mt1_inputs):
         out = MT1NN()(mt1_inputs)
@@ -279,7 +284,7 @@ class TestMT1NN:
 @pytest.fixture
 def mt2_inputs():
     torch.manual_seed(0)
-    return torch.randn(1, 36)
+    return torch.randn(1, 48)
 
 
 class TestMT2NN:
@@ -289,7 +294,7 @@ class TestMT2NN:
 
     def test_param_count(self):
         n = sum(p.numel() for p in MT2NN().parameters())
-        assert n == 33996, f"MT2NN param count: expected 33996, got {n}"
+        assert n == 34572, f"MT2NN param count: expected 34572, got {n}"
 
     def test_output_reshapes_to_12x4(self, mt2_inputs):
         out = MT2NN()(mt2_inputs)
@@ -302,12 +307,12 @@ class TestMT2NN:
 
     def test_fc_branch_dims(self):
         m = MT2NN()
-        assert m.fc1.in_features == 36 and m.fc1.out_features == 36
+        assert m.fc1.in_features == 48 and m.fc1.out_features == 36
         assert m.fc2.in_features == 36 and m.fc2.out_features == 36
 
     def test_lstm_dims(self):
         m = MT2NN()
-        assert m.lstm.input_size  == 3
+        assert m.lstm.input_size  == 4
         assert m.lstm.hidden_size == 36
         assert m.lstm.num_layers  == 2
 
