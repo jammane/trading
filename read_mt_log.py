@@ -54,6 +54,17 @@ assert struct.calcsize(RECORD_FMT_V2) == RECORD_SIZE_V2
 
 
 def parse_log(path):
+    file_size = os.path.getsize(path)
+    data_size = file_size - HEADER_SIZE
+    fits_v1 = data_size > 0 and data_size % RECORD_SIZE_V1 == 0
+    fits_v2 = data_size > 0 and data_size % RECORD_SIZE_V2 == 0
+    if not fits_v1 and not fits_v2:
+        sys.exit(f'ERROR: data size {data_size} not divisible by {RECORD_SIZE_V1} or {RECORD_SIZE_V2}')
+    # Both divide when data_size is a multiple of LCM(168,216)=1512; v2 wins (prefer newer format)
+    v2 = fits_v2
+    rec_size = RECORD_SIZE_V2 if v2 else RECORD_SIZE_V1
+    fmt      = RECORD_FMT_V2  if v2 else RECORD_FMT_V1
+
     with open(path, 'rb') as f:
         hdr = f.read(HEADER_SIZE)
         if len(hdr) < HEADER_SIZE:
@@ -61,15 +72,6 @@ def parse_log(path):
         magic, version, n_ind, _ = struct.unpack('<IIII', hdr)
         if magic != MAGIC:
             sys.exit(f'ERROR: bad magic 0x{magic:08X} (expected 0x{MAGIC:08X})')
-
-        # Auto-detect record size from first record probe
-        probe = f.read(RECORD_SIZE_V2)
-        if len(probe) < RECORD_SIZE_V1:
-            sys.exit('ERROR: file too short for even one record')
-        v2 = len(probe) == RECORD_SIZE_V2
-        rec_size = RECORD_SIZE_V2 if v2 else RECORD_SIZE_V1
-        fmt      = RECORD_FMT_V2  if v2 else RECORD_FMT_V1
-        f.seek(HEADER_SIZE)  # rewind past header to re-read all records uniformly
 
         records = []
         while True:
