@@ -30,6 +30,7 @@ static constexpr int   HIST_DAYS           = 5;
 static constexpr int   HIST_PER_DAY        = 10;
 static constexpr int   HIST_ELITE          = 7;
 static constexpr int   HIST_WAVG           = 3;
+static constexpr int   MT1_RANGE_INJECT    = 5;
 
 // ── Test harness ───────────────────────────────────────────────────────────
 
@@ -93,9 +94,11 @@ static MT1ScoreBreakdown compute_mt1_scores(
     float denom  = fmaxf(fabsf(actual_d), acc_floor);
     float sc_acc = fmaxf(0.f, 1.f - err / denom);
 
-    float d     = err;
-    float ideal = (d <= r) ? (1.f - 0.5f * d / fmaxf(r, 1e-9f)) : r / (d + r);
-    float sc_cfd = 1.f - fabsf(conf4 - ideal);
+    float d      = err;
+    float dor    = (r > 1e-9f) ? d / r : (d > 0.f ? 1e9f : 0.f);
+    float ideal  = 1.f / (1.f + dor * dor);
+    float diff   = conf4 - ideal;
+    float sc_cfd = 1.f - diff * diff;
 
     return {0.50f * sc_dir + 0.33f * sc_rng + 0.17f * sc_acc,
             sc_dir, sc_rng, sc_acc, sc_cfd};
@@ -145,6 +148,12 @@ static void test_constants()
 
     // MT1_FLOOR_COLD / 2 is the cold-start acc_floor
     CHECK(NEAR(MT1_FLOOR_COLD / 2.f, 125.f, 0.001f));
+
+    // Range→confidence injection: top MT1_RANGE_INJECT direct elites → bottom 5 confidence slots
+    CHECK(MT1_RANGE_INJECT == 5);
+    CHECK(MT1_RANGE_INJECT < ELITE_COUNT);                      // fits within direct elites
+    CHECK(ELITE_COUNT - MT1_RANGE_INJECT == 12);                // injection start slot
+    CHECK(ELITE_COUNT - MT1_RANGE_INJECT + MT1_RANGE_INJECT - 1 == ELITE_COUNT - 1);  // fills to slot 16
 }
 
 static void test_pcg32()
@@ -400,35 +409,50 @@ static void test_scores_composite()
 
 static void test_scores_confidence()
 {
-    SUITE("compute_mt1_scores: confidence component");
+    SUITE("compute_mt1_scores: confidence component (ideal=1/(1+(d/r)²), score=1-(conf4-ideal)²)");
 
-    // When actual_d == delta_d (err=0): ideal = 1 - 0*0.5/r = 1.0
-    // conf4=sigmoid(0)=0.5 → sc_cfd = 1 - |0.5 - 1.0| = 0.5
+    // Perfect prediction (d=0): ideal=1.0
+    // conf4=sigmoid(10)≈1.0  → diff≈0  → sc_cfd≈1.0
+    // conf4=sigmoid(0)=0.5   → diff=−0.5 → sc_cfd=1−0.25=0.75
     {
-        float raw4[4] = {0.f, 0.f, 1.f, 0.f};
-        auto s = compute_mt1_scores(0.f, raw4, 1.f, 1e30f);
-        CHECK(NEAR(s.confidence, 0.5f, 0.002f));
+        float raw4_hi[4] = {0.f, 0.f, 1.f, 10.f};  // conf4≈1
+        auto s_hi = compute_mt1_scores(0.f, raw4_hi, 1.f, 1e30f);
+        CHECK(NEAR(s_hi.confidence, 1.f, 0.002f));
+
+        float raw4_lo[4] = {0.f, 0.f, 1.f, 0.f};   // conf4=0.5
+        auto s_lo = compute_mt1_scores(0.f, raw4_lo, 1.f, 1e30f);
+        CHECK(NEAR(s_lo.confidence, 0.75f, 0.002f));
     }
 
-    // When err > r (miss): ideal = r/(d+r)
-    // With err=100, r≈0.693 (softplus(0)*eff_delta=1):
-    // ideal = 0.693/(100+0.693) ≈ 0.00688
-    // conf4=0.5 → sc_cfd = 1 - |0.5 - 0.00688| ≈ 0.507
+    // Error on range boundary (d=r): ideal=1/(1+1)=0.5
+    // conf4=sigmoid(0)=0.5 → diff=0 → sc_cfd=1.0
+    // We need actual_d such that err==r.  Use raw4={0, x, 0, 0}: delta_d=tanh(x)*10000,
+    // r=softplus(0)*max(|delta_d|,1)=ln(2)*1≈0.693.  Set actual_d=0.693+delta_d (err=r).
     {
-        float raw4[4] = {0.f, 0.f, 0.f, 0.f};
-        auto s = compute_mt1_scores(100.f, raw4, 1.f, 1e30f);
-        float r    = log1pf(expf(0.f)) * 1.f;  // softplus(0)*eff_delta=1
-        float ideal = r / (100.f + r);
-        float expected_cfd = 1.f - fabsf(0.5f - ideal);
-        CHECK(NEAR(s.confidence, expected_cfd, 0.002f));
+        float r_val = log1pf(expf(0.f));           // softplus(0)*eff_delta=1 ≈ 0.6931
+        float raw4[4] = {0.f, 0.f, 0.f, 0.f};     // delta_d=0, r=0.6931, conf4=0.5
+        auto s = compute_mt1_scores(r_val, raw4, 1.f, 1e30f);  // actual_d=r → err=r → dor=1
+        CHECK(NEAR(s.confidence, 1.f, 0.002f));  // conf4=0.5==ideal=0.5 → sc_cfd=1
     }
 
-    // sc_cfd always in [0,1]
+    // Large miss (d>>r): ideal≈0; best conf4=0 → sc_cfd=1; neutral conf4=0.5 → sc_cfd≈0.75
+    {
+        // d=100, r≈0.693: dor≈144 → ideal≈0.000048
+        float raw4_lo[4] = {0.f, 0.f, 0.f, -10.f};  // conf4≈0
+        auto s_lo = compute_mt1_scores(100.f, raw4_lo, 1.f, 1e30f);
+        CHECK(NEAR(s_lo.confidence, 1.f, 0.002f));   // conf4≈0 ≈ ideal≈0
+
+        float raw4_mid[4] = {0.f, 0.f, 0.f, 0.f};   // conf4=0.5
+        auto s_mid = compute_mt1_scores(100.f, raw4_mid, 1.f, 1e30f);
+        CHECK(NEAR(s_mid.confidence, 0.75f, 0.002f)); // diff≈−0.5 → 1−0.25=0.75
+    }
+
+    // sc_cfd always in [0,1]: worst case is |diff|=1 → sc_cfd=0
     float raw4_set[][4] = {
-        {10.f, 0.f, 0.f, 10.f},   // conf4≈1
-        {10.f, 0.f, 0.f, -10.f},  // conf4≈0
+        {10.f, 0.f, 0.f, 10.f},   // conf4≈1, perfect pred → ideal≈1 → sc_cfd≈1
+        {10.f, 0.f, 0.f, -10.f},  // conf4≈0, perfect pred → ideal≈1 → sc_cfd≈0
         {10.f, 0.f, 5.f, 0.f},    // conf4=0.5, hit case
-        {0.f,  0.f, 0.f, 0.f},    // all boundaries
+        {0.f,  0.f, 0.f, 0.f},    // boundaries
     };
     float actuals[] = {50.f, 50.f, 5.f, 0.f};
     for (int i = 0; i < 4; i++) {

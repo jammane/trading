@@ -43,6 +43,7 @@ MT1_BLEND_SLOTS      = 200         # composite blend pool size per day
 MT1_RANGE_FLOOR      = 1.0         # $1 — effectively no range floor
 MT1_RANGE_CEIL_MULT  = 4.0         # ceiling = 4 × mean(last 10 |actual−delta|)
 MT1_DIR_BACKFILL     = 0.65        # skip direction pool update when best score < this
+MT1_RANGE_INJECT     = 5           # top range elites → bottom 5 confidence slots (anti-gaming)
 MT1_POOL_NAMES       = ('dir', 'acc', 'rng', 'cfd')
 
 IND_STARTING_CASH     = 25_000.0    # per-industry portfolio starting capital

@@ -117,6 +117,7 @@ static constexpr int   MT1_BLEND_SLOTS     = 200;
 static constexpr float MT1_RANGE_FLOOR     = 1.f;    // $1 — effectively no floor
 static constexpr float MT1_RANGE_CEIL_MULT = 4.f;    // ceiling = 4 × mean(last 10 |actual−delta|)
 static constexpr float MT1_DIR_BACKFILL    = 0.65f;  // skip direction pool update when best score < this
+static constexpr int   MT1_RANGE_INJECT    = 5;      // top range elites → bottom 5 confidence slots (anti-gaming)
 static constexpr int   HIST_WINDOW         = 15;
 
 static constexpr float IND_STARTING_CASH   = 25000.0f;
@@ -538,6 +539,10 @@ struct MT1Scratch {
     float*   reinject_buf;
     int      reinject_count{0};
 
+    // Range→confidence anti-gaming injection: top range elites overwrite bottom confidence slots
+    float*   rng_inject_buf;
+    int      rng_inject_count{0};
+
     // Best composite model weights (saved periodically as comp_0.bin)
     float*   comp0_buf;
 
@@ -557,13 +562,14 @@ struct MT1Scratch {
         new_elites   = new float[ep]();
         mut_buf      = new float[MT1NN_PARAMS]();
         blend_hist   = new float[hp]();
-        reinject_buf = new float[(size_t)MT1_REINJECT * MT1NN_PARAMS]();
-        comp0_buf    = new float[MT1NN_PARAMS]();
+        reinject_buf    = new float[(size_t)MT1_REINJECT      * MT1NN_PARAMS]();
+        rng_inject_buf  = new float[(size_t)MT1_RANGE_INJECT  * MT1NN_PARAMS]();
+        comp0_buf       = new float[MT1NN_PARAMS]();
     }
     ~MT1Scratch() {
         for (int p = 0; p < 4; p++) { delete[] comp_elites[p]; delete[] pool_hist[p]; }
         delete[] new_elites; delete[] mut_buf;
-        delete[] blend_hist; delete[] reinject_buf; delete[] comp0_buf;
+        delete[] blend_hist; delete[] reinject_buf; delete[] rng_inject_buf; delete[] comp0_buf;
     }
     float* comp_elite(int pool, int slot) { return comp_elites[pool] + (size_t)slot * MT1NN_PARAMS; }
     float* new_elite(int slot)            { return new_elites         + (size_t)slot * MT1NN_PARAMS; }
@@ -573,7 +579,8 @@ struct MT1Scratch {
     float* blend_hist_slot(int day, int pos) {
         return blend_hist + ((size_t)(day * HIST_PER_DAY + pos)) * MT1NN_PARAMS;
     }
-    float* reinject(int k) { return reinject_buf + (size_t)k * MT1NN_PARAMS; }
+    float* reinject(int k)    { return reinject_buf   + (size_t)k * MT1NN_PARAMS; }
+    float* rng_inject(int k)  { return rng_inject_buf + (size_t)k * MT1NN_PARAMS; }
 };
 
 struct MT1Result {
@@ -2083,9 +2090,11 @@ static MT1ScoreBreakdown compute_mt1_scores(
     float denom  = fmaxf(fabsf(actual_d), acc_floor);
     float sc_acc = fmaxf(0.f, 1.f - err / denom);
 
-    float d     = err;
-    float ideal = (d <= r) ? (1.f - 0.5f * d / fmaxf(r, 1e-9f)) : r / (d + r);
-    float sc_cfd = 1.f - fabsf(conf4 - ideal);
+    float d      = err;
+    float dor    = (r > 1e-9f) ? d / r : (d > 0.f ? 1e9f : 0.f);
+    float ideal  = 1.f / (1.f + dor * dor);
+    float diff   = conf4 - ideal;
+    float sc_cfd = 1.f - diff * diff;
 
     return {0.50f * sc_dir + 0.33f * sc_rng + 0.17f * sc_acc, sc_dir, sc_rng, sc_acc, sc_cfd};
 }
@@ -2239,6 +2248,22 @@ static MT1CompResult step_mt1_component(
                    scratch.comp_elite(pool_id, ELITE_COUNT + k), MT1NN_PARAMS * sizeof(float));
         head = (head + 1) % HIST_DAYS;
         if (count < HIST_DAYS) count++;
+    }
+
+    // Range pool: snapshot top elites for confidence cross-injection
+    if (pool_id == 2) {
+        scratch.rng_inject_count = std::min(MT1_RANGE_INJECT, ELITE_COUNT);
+        for (int k = 0; k < scratch.rng_inject_count; k++)
+            memcpy(scratch.rng_inject(k),
+                   scratch.comp_elite(2, k), MT1NN_PARAMS * sizeof(float));
+    }
+
+    // Confidence pool: overwrite bottom 5 direct elites with top range elites (anti-gaming)
+    if (pool_id == 3 && scratch.rng_inject_count > 0) {
+        int start = ELITE_COUNT - scratch.rng_inject_count;  // 17-5 = 12
+        for (int k = 0; k < scratch.rng_inject_count; k++)
+            memcpy(scratch.comp_elite(3, start + k),
+                   scratch.rng_inject(k), MT1NN_PARAMS * sizeof(float));
     }
 
     return {best_cat, slot0_cat, mean_cat, min_cat};
@@ -2834,6 +2859,16 @@ static void save_mt1_all(const std::string& dir, int ind_i, const MT1Scratch& sc
                    (size_t)scratch.reinject_count * MT1NN_PARAMS, fri);
         fclose(fri);
     }
+    // Range-inject buffer (top range elites for confidence cross-injection)
+    snprintf(path, sizeof(path), "%s/mt1_%s_rng_inject.bin", dir.c_str(), ind);
+    FILE* frni = fopen(path, "wb");
+    if (frni) {
+        fwrite(&scratch.rng_inject_count, sizeof(int), 1, frni);
+        if (scratch.rng_inject_count > 0)
+            fwrite(scratch.rng_inject_buf, sizeof(float),
+                   (size_t)scratch.rng_inject_count * MT1NN_PARAMS, frni);
+        fclose(frni);
+    }
     // Composite best (production model)
     snprintf(path, sizeof(path), "%s/mt1_%s_comp_0.bin", dir.c_str(), ind);
     save_bin(path, scratch.comp0_buf, MT1NN_PARAMS);
@@ -2906,6 +2941,21 @@ static void load_or_init_mt1(const std::string& dir, const std::string& load_dir
         if (fread(&cnt, sizeof(int), 1, f) == 1 && cnt > 0 && cnt <= MT1_REINJECT) {
             fread(scratch.reinject_buf, sizeof(float), (size_t)cnt * MT1NN_PARAMS, f);
             scratch.reinject_count = cnt;
+        }
+        fclose(f);
+        break;
+    }
+
+    // Range-inject buffer
+    for (const std::string* sd : {&load_dir, &dir}) {
+        if (sd->empty()) continue;
+        snprintf(path, sizeof(path), "%s/mt1_%s_rng_inject.bin", sd->c_str(), ind);
+        FILE* f = fopen(path, "rb");
+        if (!f) continue;
+        int cnt = 0;
+        if (fread(&cnt, sizeof(int), 1, f) == 1 && cnt > 0 && cnt <= MT1_RANGE_INJECT) {
+            fread(scratch.rng_inject_buf, sizeof(float), (size_t)cnt * MT1NN_PARAMS, f);
+            scratch.rng_inject_count = cnt;
         }
         fclose(f);
         break;
