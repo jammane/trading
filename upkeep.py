@@ -55,6 +55,7 @@ from training_lib import (
     MT1_POOL_NAMES,
     MT1_RANGE_CEIL_MULT,
     MT1_RANGE_FLOOR,
+    MT1_RANGE_INJECT,
     MT1_REINJECT,
     N_SLOTS,
     WAVG_COUNT,
@@ -315,11 +316,10 @@ def _mt1_score_breakdown(out4, actual_d, acc_floor, range_ceiling=None):
     score_acc = max(0.0, 1.0 - err / denom)
 
     d         = err
-    if d <= r:
-        ideal = 1.0 - 0.5 * (d / r) if r > 0.0 else 1.0
-    else:
-        ideal = r / (d + r) if (d + r) > 0.0 else 0.0
-    score_conf = 1.0 - abs(conf4 - ideal)
+    dor       = (d / r) if r > 1e-9 else (1e9 if d > 0.0 else 0.0)
+    ideal     = 1.0 / (1.0 + dor * dor)
+    diff      = conf4 - ideal
+    score_conf = 1.0 - diff * diff
 
     composite = 0.50 * score_dir + 0.33 * score_rng + 0.17 * score_acc
     return composite, score_dir, score_rng, score_acc, score_conf
@@ -603,6 +603,24 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
             _mt1_burst_component(prefix, model_dir, in37_t, actual_d,
                                   acc_floor, range_ceiling,
                                   sigma / (2 ** (burst_num + 1)), pool_id)
+
+        # Range pool: snapshot top elites for confidence cross-injection (anti-gaming)
+        if pool_id == 2:
+            rng_prefix = prefix
+            for k in range(MT1_RANGE_INJECT):
+                src  = os.path.join(model_dir, f'{rng_prefix}_elite_{k}.pt')
+                dst  = os.path.join(model_dir, f'mt1_{industry}_rng_inject_{k}.pt')
+                if os.path.exists(src):
+                    shutil.copy2(src, dst)
+
+        # Confidence pool: overwrite bottom 5 direct elites with top range elites
+        if pool_id == 3:
+            start = ELITE_COUNT - MT1_RANGE_INJECT  # slot 12
+            for k in range(MT1_RANGE_INJECT):
+                src = os.path.join(model_dir, f'mt1_{industry}_rng_inject_{k}.pt')
+                if os.path.exists(src):
+                    dst_slot = start + k
+                    shutil.copy2(src, os.path.join(model_dir, f'{prefix}_elite_{dst_slot}.pt'))
 
     # ── Composite pool ───────────────────────────────────────────────────────────
     # Load ELITE_COUNT direct elites from each component pool (ranks 0–16)
