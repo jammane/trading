@@ -51,6 +51,7 @@ from training_lib import (
     MT1_COMP_ELITE,
     MT1_COMP_MUTS,
     MT1_COMP_SLOTS,
+    MT1_DIR_BACKFILL,
     MT1_POOL_NAMES,
     MT1_RANGE_CEIL_MULT,
     MT1_RANGE_FLOOR,
@@ -300,7 +301,7 @@ def _mt1_score_breakdown(out4, actual_d, acc_floor, range_ceiling=None):
     rng_pct  = F.softplus(out4[2]).item()
     conf4    = torch.sigmoid(out4[3]).item()
 
-    score_dir = 1.0 if (conf >= 0.5) == (actual_d >= 0.0) else 0.0
+    score_dir = conf if actual_d >= 0.0 else (1.0 - conf)
 
     eff_delta = max(abs(delta_d), MT1_RANGE_FLOOR)
     r         = rng_pct * eff_delta
@@ -591,6 +592,10 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
         slot0_cat = scores[0][1]
         log(f"[mt1/{sn(industry)}:{pool_name}] best={best_cat:.4f} slot0={slot0_cat:.4f} "
             f"actual_d=${actual_d:+.1f}")
+
+        if pool_id == 0 and best_cat < MT1_DIR_BACKFILL:
+            log(f"[mt1/{sn(industry)}:dir] best={best_cat:.4f} < {MT1_DIR_BACKFILL} — backfill: keeping yesterday's elites")
+            continue
 
         _select_and_mutate_mt1_component(prefix, model_dir, scores, sigma, reinject_paths)
 

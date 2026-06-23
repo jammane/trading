@@ -116,6 +116,7 @@ static constexpr int   MT1_COMP_MUTS       = MT1_COMP_SLOTS - MT1_COMP_ELITE;   
 static constexpr int   MT1_BLEND_SLOTS     = 200;
 static constexpr float MT1_RANGE_FLOOR     = 1.f;    // $1 — effectively no floor
 static constexpr float MT1_RANGE_CEIL_MULT = 4.f;    // ceiling = 4 × mean(last 10 |actual−delta|)
+static constexpr float MT1_DIR_BACKFILL    = 0.65f;  // skip direction pool update when best score < this
 static constexpr int   HIST_WINDOW         = 15;
 
 static constexpr float IND_STARTING_CASH   = 25000.0f;
@@ -2070,7 +2071,7 @@ static MT1ScoreBreakdown compute_mt1_scores(
     float range_pct = log1pf(expf(raw4[2]));   // softplus
     float conf4     = sigmoidf(raw4[3]);
 
-    float sc_dir = ((conf >= 0.5f) == (actual_d >= 0.f)) ? 1.f : 0.f;
+    float sc_dir = (actual_d >= 0.f) ? conf : (1.f - conf);
 
     float eff_delta = fmaxf(fabsf(delta_d), MT1_RANGE_FLOOR);
     float r         = range_pct * eff_delta;
@@ -2153,6 +2154,11 @@ static MT1CompResult step_mt1_component(
     }
     mean_cat /= MT1_COMP_SLOTS;
     float slot0_cat = cat_sc[0];  // pre-selection slot 0
+
+    // Direction backfill: if the best model on this day scored < 0.65, the day's signal
+    // is too weak (near-random). Keep yesterday's elites on disk by returning early.
+    if (pool_id == 0 && best_cat < MT1_DIR_BACKFILL)
+        return {best_cat, slot0_cat, mean_cat, min_cat};
 
     // Score history candidates
     int n_hist = scratch.pool_hist_count[pool_id] * HIST_PER_DAY;

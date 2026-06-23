@@ -81,7 +81,7 @@ static MT1ScoreBreakdown compute_mt1_scores(
     float range_pct = log1pf(expf(raw4[2]));                // softplus
     float conf4     = 1.f / (1.f + expf(-raw4[3]));
 
-    float sc_dir = ((conf >= 0.5f) == (actual_d >= 0.f)) ? 1.f : 0.f;
+    float sc_dir = (actual_d >= 0.f) ? conf : (1.f - conf);
 
     float eff_delta = fmaxf(fabsf(delta_d), MT1_RANGE_FLOOR);
     float r         = range_pct * eff_delta;
@@ -196,35 +196,58 @@ static void test_scores_direction()
 
     float acc_floor = 125.f;
 
-    // conf > 0.5, actual_d > 0 → correct
+    // High conf, actual positive → sc_dir = conf ≈ 1.0
     {
         float raw4[4] = {10.f, 0.f, 0.f, 0.f};
         auto s = compute_mt1_scores(100.f, raw4, acc_floor, 1e30f);
-        CHECK(s.direction == 1.f);
+        CHECK(NEAR(s.direction, 1.f, 0.001f));
     }
-    // conf < 0.5, actual_d > 0 → wrong
+    // Low conf, actual positive → sc_dir = conf ≈ 0.0
     {
         float raw4[4] = {-10.f, 0.f, 0.f, 0.f};
         auto s = compute_mt1_scores(100.f, raw4, acc_floor, 1e30f);
-        CHECK(s.direction == 0.f);
+        CHECK(NEAR(s.direction, 0.f, 0.001f));
     }
-    // conf < 0.5, actual_d < 0 → correct (both negative-direction)
+    // Low conf, actual negative → sc_dir = 1 - conf ≈ 1.0
     {
         float raw4[4] = {-10.f, 0.f, 0.f, 0.f};
         auto s = compute_mt1_scores(-100.f, raw4, acc_floor, 1e30f);
-        CHECK(s.direction == 1.f);
+        CHECK(NEAR(s.direction, 1.f, 0.001f));
     }
-    // conf > 0.5, actual_d < 0 → wrong
+    // High conf, actual negative → sc_dir = 1 - conf ≈ 0.0
     {
         float raw4[4] = {10.f, 0.f, 0.f, 0.f};
         auto s = compute_mt1_scores(-100.f, raw4, acc_floor, 1e30f);
-        CHECK(s.direction == 0.f);
+        CHECK(NEAR(s.direction, 0.f, 0.001f));
     }
-    // Boundary: conf == 0.5 (raw4[0]=0 → sigmoid(0)=0.5), actual_d == 0 → both >=0 → correct
+    // Neutral (conf=0.5) → sc_dir = 0.5 regardless of sign — random baseline
     {
         float raw4[4] = {0.f, 0.f, 0.f, 0.f};
-        auto s = compute_mt1_scores(0.f, raw4, acc_floor, 1e30f);
-        CHECK(s.direction == 1.f);
+        auto s = compute_mt1_scores(100.f, raw4, acc_floor, 1e30f);
+        CHECK(NEAR(s.direction, 0.5f, 0.001f));
+        auto s2 = compute_mt1_scores(-100.f, raw4, acc_floor, 1e30f);
+        CHECK(NEAR(s2.direction, 0.5f, 0.001f));
+        auto s3 = compute_mt1_scores(0.f, raw4, acc_floor, 1e30f);
+        CHECK(NEAR(s3.direction, 0.5f, 0.001f));
+    }
+    // Known exact value: sigmoid(log(3)) = 0.75
+    // actual positive → sc_dir = 0.75; actual negative → sc_dir = 0.25
+    {
+        float raw4[4] = {logf(3.f), 0.f, 0.f, 0.f};
+        auto sp = compute_mt1_scores( 100.f, raw4, acc_floor, 1e30f);
+        auto sn = compute_mt1_scores(-100.f, raw4, acc_floor, 1e30f);
+        CHECK(NEAR(sp.direction, 0.75f, 0.001f));
+        CHECK(NEAR(sn.direction, 0.25f, 0.001f));
+    }
+    // sc_dir always in [0, 1]
+    {
+        float raw4[4] = {5.f, 0.f, 0.f, 0.f};
+        auto sp = compute_mt1_scores( 200.f, raw4, acc_floor, 1e30f);
+        auto sn = compute_mt1_scores(-200.f, raw4, acc_floor, 1e30f);
+        CHECK(sp.direction >= 0.f && sp.direction <= 1.f);
+        CHECK(sn.direction >= 0.f && sn.direction <= 1.f);
+        // symmetric: dir(positive) + dir(negative) == 1.0
+        CHECK(NEAR(sp.direction + sn.direction, 1.f, 0.001f));
     }
 }
 
@@ -363,13 +386,12 @@ static void test_scores_composite()
         CHECK(s.composite  >= 0.f && s.composite  <= 1.f);
     }
 
-    // Known numeric case: actual_d=0, delta_d=0, acc_floor=125
-    // sc_dir=1 (both >=0), sc_rng=0 (err=0→m=0), sc_acc=1 (err=0/acc_floor=0)
-    // composite = 0.5 + 0 + 0.17 = 0.67
+    // Known numeric case: actual_d=0, raw4[0]=10 → conf≈1, actual_d>=0 → sc_dir≈1
+    // sc_rng=0 (err=0→m=0), sc_acc=1 (err=0), composite≈0.5+0+0.17=0.67
     {
         float raw4[4] = {10.f, 0.f, 1.f, 0.f};
         auto s = compute_mt1_scores(0.f, raw4, 125.f, 1e30f);
-        CHECK(s.direction == 1.f);
+        CHECK(NEAR(s.direction, 1.f, 0.001f));
         CHECK(s.range     == 0.f);
         CHECK(s.accuracy  == 1.f);
         CHECK(NEAR(s.composite, 0.67f, 0.001f));
@@ -639,7 +661,7 @@ static void test_pool_score_dispatch()
     // In step_mt1_component: switch(pool_id) { 0→direction, 1→accuracy, 2→range, 3→confidence }
     // Verify with a score where all components differ
     float raw4[4] = {10.f, 0.f, 50.f, 0.f};
-    // actual_d=5: sc_dir=1, sc_rng≈0.1, sc_acc=0, sc_cfd varies
+    // actual_d=5: sc_dir=conf≈1 (actual positive), sc_rng≈0.1, sc_acc=0, sc_cfd varies
     auto s = compute_mt1_scores(5.f, raw4, 1.f, 1e30f);
 
     // Scores are distinguishable
