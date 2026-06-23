@@ -363,30 +363,80 @@ def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: 
     _save(fig, out_path)
 
 # ── MT2 SVG ───────────────────────────────────────────────────────────────────
+_MT2_INJ_THRESHOLD = -7.0   # injection fires when ≥75% of pool scores below this
+
+# E[_master_points(U{0,1,2,3}, opt=k)] for k in {0,1,2,3}
+_RANDOM_E_BY_OPT = {0: -1.875, 1: 0.3125, 2: 0.6875, 3: 0.75}
+
+def _mt2_random_score(ideal_pts: float) -> float:
+    """
+    Expected MT2 score for a uniformly-random tier prediction, given a day's ideal pts.
+    Ideal pts encodes the optimal tier distribution (via _optimal_tiers):
+      n_pos positive industries → divided into equal thirds at tiers 1/2/3;
+      remaining (12 - n_pos) industries at tier 0.
+    ideal = n1*1 + n2*2 + n3*3 with n1≈n2≈n3≈n_pos/3, so n_pos ≈ ideal/2.
+    """
+    # Map ideal → n_pos by trying all 13 values and picking the closest
+    best_n, best_diff = 0, float("inf")
+    for n in range(13):
+        if n == 0:   exp = 0.0
+        elif n == 1: exp = 3.0
+        elif n == 2: exp = 5.0
+        else:
+            base = n // 3; rem = n % 3
+            n1 = base + (1 if rem >= 1 else 0)
+            n2 = base + (1 if rem >= 2 else 0)
+            n3 = n - n1 - n2
+            exp = n1 * 1.0 + n2 * 2.0 + n3 * 3.0
+        diff = abs(exp - ideal_pts)
+        if diff < best_diff:
+            best_diff, best_n = diff, n
+    n_pos = best_n
+    n0 = 12 - n_pos
+    if n_pos == 0:
+        return n0 * _RANDOM_E_BY_OPT[0]
+    if n_pos == 1:
+        return n0 * _RANDOM_E_BY_OPT[0] + _RANDOM_E_BY_OPT[3]
+    if n_pos == 2:
+        return n0 * _RANDOM_E_BY_OPT[0] + _RANDOM_E_BY_OPT[2] + _RANDOM_E_BY_OPT[3]
+    base = n_pos // 3; rem = n_pos % 3
+    n1 = base + (1 if rem >= 1 else 0)
+    n2 = base + (1 if rem >= 2 else 0)
+    n3 = n_pos - n1 - n2
+    return (n0 * _RANDOM_E_BY_OPT[0] + n1 * _RANDOM_E_BY_OPT[1]
+            + n2 * _RANDOM_E_BY_OPT[2] + n3 * _RANDOM_E_BY_OPT[3])
+
+
 def plot_mt2(rows: list[dict], pass_num: int, out_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(FIG_W, 9))
     fig.subplots_adjust(bottom=0.13)
 
-    xs_raw = [int(r["day"]) for r in rows]
+    xs_raw     = [int(r["day"]) for r in rows]
     means_raw  = [r["mt2_elite_mean_pts"] for r in rows]
     maxes_raw  = [r["mt2_elite_max_pts"]  for r in rows]
     mins_raw   = [r["mt2_elite_min_pts"]  for r in rows]
     ideals_raw = [r["mt2_ideal_pts"]      for r in rows]
+    random_raw = [_mt2_random_score(r["mt2_ideal_pts"]) for r in rows]
 
-    xs_m, means  = _smooth(xs_raw, means_raw)
-    xs_b, maxes  = _smooth(xs_raw, maxes_raw)
-    xs_n, mins_s = _smooth(xs_raw, mins_raw)
-    xs_i, ideals = _smooth(xs_raw, ideals_raw)
+    xs_m, means   = _smooth(xs_raw, means_raw)
+    xs_b, maxes   = _smooth(xs_raw, maxes_raw)
+    xs_n, mins_s  = _smooth(xs_raw, mins_raw)
+    xs_i, ideals  = _smooth(xs_raw, ideals_raw)
+    xs_r, randoms = _smooth(xs_raw, random_raw)
 
-    ax.plot(xs_m, means,  color="#1f77b4", linewidth=1.5,  alpha=0.90, label="Elite mean")
-    ax.plot(xs_b, maxes,  color="#1f77b4", linewidth=0.75, alpha=0.55, linestyle="--", label="Elite max")
-    ax.plot(xs_n, mins_s, color="#1f77b4", linewidth=0.75, alpha=0.55, linestyle="--", label="Elite min")
-    ax.plot(xs_i, ideals, color="#2ca02c", linewidth=1.8,  alpha=0.90, label="Ideal (slot0 basis)")
+    ax.plot(xs_m, means,   color="#1f77b4", linewidth=1.5,  alpha=0.90, label="Elite mean")
+    ax.plot(xs_b, maxes,   color="#1f77b4", linewidth=0.75, alpha=0.55, linestyle="--", label="Elite max")
+    ax.plot(xs_n, mins_s,  color="#1f77b4", linewidth=0.75, alpha=0.55, linestyle="--", label="Elite min")
+    ax.plot(xs_i, ideals,  color="#2ca02c", linewidth=1.8,  alpha=0.90, label="Ideal (slot0 basis)")
+    ax.plot(xs_r, randoms, color="#d62728", linewidth=0.8,  alpha=0.75, linestyle=":",
+            label="Random baseline (E[score | uniform tier])")
+    ax.axhline(_MT2_INJ_THRESHOLD, color="#ff7f0e", linewidth=0.8, alpha=0.85, linestyle="-",
+               label=f"75% injection threshold ({_MT2_INJ_THRESHOLD:.0f} pts)")
     ax.axhline(0, color="#dddddd", linewidth=0.5, zorder=1)
     _style_ax(ax,
               f"MT2 Allocation Score (Elite Pool) — Pass {pass_num}",
               f"Day (Pass {pass_num})", "Score (pts)")
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.08), ncol=4,
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.10), ncol=3,
               fontsize=9, framealpha=0.95, edgecolor="#cccccc")
     _save(fig, out_path)
 
