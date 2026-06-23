@@ -9,14 +9,16 @@ Usage:
 
 Outputs (git-ignored):
     plots/industry_performance.svg   — StockNN elite portfolio value per industry
-    plots/mt1_performance.svg        — MT1 composite score per industry
+    plots/mt1_performance.svg        — MT1 all 5 component scores per industry (multi-panel)
     plots/mt2_performance.svg        — MT2 allocation score (elite pool stats)
 
 Lines: solid = mean, dashed = max & min  (slot0 excluded per design)
+Zero values in the industry CSV are logging artifacts (worker timing) — shown as gaps.
 """
 
 import argparse
 import csv
+import math
 import struct
 import subprocess
 import sys
@@ -26,6 +28,7 @@ try:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
     import matplotlib.ticker as ticker
     import matplotlib.lines as mlines
 except ImportError:
@@ -38,7 +41,7 @@ LOCAL_LOG_DIR = Path("logs_local")
 PLOT_DIR      = Path("plots")
 
 DAYS_PER_PASS = 1255
-FIG_W, FIG_H  = 16, 9   # 16:9 — matches widescreen laptop aspect ratio
+FIG_W         = 16   # fixed width; height varies per chart
 
 INDUSTRIES = [
     "tech_hardware", "tech_software_ai", "financials", "consumer_discretionary",
@@ -59,13 +62,21 @@ IND_LABEL = {
     "real_estate":            "Real Estate",
     "materials":              "Materials",
 }
-# 12 perceptually distinct colors (matplotlib tab10 + tab20 supplement)
+# 12 perceptually distinct colors
 COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
     "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
     "#bcbd22", "#17becf", "#f0a500", "#00897b",
 ]
 IND_COLOR = dict(zip(INDUSTRIES, COLORS))
+
+MT1_COMP_LABEL = {
+    "composite":  "Composite  (0.50×dir + 0.33×range + 0.17×acc)",
+    "direction":  "Direction  — P(correct sign)",
+    "range":      "Range  — calibration tightness",
+    "accuracy":   "Accuracy  — dollar error vs floor",
+    "confidence": "Confidence  — out[3] vs range-geometry ideal",
+}
 
 # ── Binary log constants (v4, 984 bytes/record) ───────────────────────────────
 MT_LOG_MAGIC   = 0x4D543132  # 'MT12'
@@ -121,7 +132,7 @@ def load_binary_log(path: Path) -> list[dict]:
         actual_day = raw[1]
 
         # raw[2..241] = 240 MT1 floats; raw[242..244] = MT2; raw[245] = injected
-        f = raw[2:242]  # slice of 240 floats
+        f = raw[2:242]
         mt1 = {}
         for ci, comp in enumerate(_COMP_NAMES):
             mt1[comp] = {}
@@ -144,10 +155,14 @@ def load_binary_log(path: Path) -> list[dict]:
     return records
 
 # ── Shared plot helpers ───────────────────────────────────────────────────────
-def _style_ax(ax, title: str, xlabel: str, ylabel: str) -> None:
-    ax.set_title(title, fontsize=14, fontweight="bold", pad=10)
-    ax.set_xlabel(xlabel, fontsize=10)
-    ax.set_ylabel(ylabel, fontsize=10)
+def _nan_zeros(vals: list[float]) -> list[float]:
+    """Replace exact-zero values with NaN — shows gaps instead of spike-to-zero artifacts."""
+    return [v if v != 0.0 else math.nan for v in vals]
+
+def _style_ax(ax, title: str, xlabel: str, ylabel: str, title_size: int = 11) -> None:
+    ax.set_title(title, fontsize=title_size, fontweight="bold", pad=6)
+    ax.set_xlabel(xlabel, fontsize=9)
+    ax.set_ylabel(ylabel, fontsize=9)
     ax.grid(True, alpha=0.2, linewidth=0.5)
     ax.tick_params(labelsize=8)
 
@@ -160,7 +175,7 @@ def _add_pass_dividers(ax, xs: list) -> None:
         ax.axvline(p * DAYS_PER_PASS, color="#cccccc", linewidth=0.6, linestyle=":")
         p += 1
 
-def _industry_legend(ax) -> None:
+def _industry_legend(fig, anchor_ax, ncol: int = 7) -> None:
     handles = [
         mlines.Line2D([], [], color=IND_COLOR[ind], linewidth=1.8, label=IND_LABEL[ind])
         for ind in INDUSTRIES
@@ -169,9 +184,9 @@ def _industry_legend(ax) -> None:
         mlines.Line2D([], [], color="#444444", linewidth=1.8, linestyle="-",  label="─── mean"),
         mlines.Line2D([], [], color="#444444", linewidth=0.9, linestyle="--", label="- - max / min"),
     ]
-    ax.legend(
+    anchor_ax.legend(
         handles=handles, loc="upper center",
-        bbox_to_anchor=(0.5, -0.14), ncol=7,
+        bbox_to_anchor=(0.5, -0.18), ncol=ncol,
         fontsize=8, framealpha=0.95, edgecolor="#cccccc",
     )
 
@@ -182,48 +197,69 @@ def _plot_band(ax, xs, means, maxes, mins, color: str) -> None:
 
 # ── Industry performance SVG ──────────────────────────────────────────────────
 def plot_industry(rows: list[dict], out_path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+    fig, ax = plt.subplots(figsize=(FIG_W, 9))
     fig.subplots_adjust(bottom=0.23)
 
     xs = [csv_x(r) for r in rows]
     for ind in INDUSTRIES:
+        # Replace logging-artifact zeros with NaN so gaps appear instead of drops
         _plot_band(
             ax, xs,
-            means=[r[f"{ind}_elite_mean"] for r in rows],
-            maxes=[r[f"{ind}_elite_max"]  for r in rows],
-            mins= [r[f"{ind}_elite_min"]  for r in rows],
+            means=_nan_zeros([r[f"{ind}_elite_mean"] for r in rows]),
+            maxes=_nan_zeros([r[f"{ind}_elite_max"]  for r in rows]),
+            mins= _nan_zeros([r[f"{ind}_elite_min"]  for r in rows]),
             color=IND_COLOR[ind],
         )
 
     ax.axhline(25_000, color="#aaaaaa", linewidth=0.6, linestyle=":", zorder=1)
     _add_pass_dividers(ax, xs)
-    _style_ax(ax, "Industry Elite Performance (StockNN)", "Training Day", "Portfolio Value ($)")
+    _style_ax(ax, "Industry Elite Performance (StockNN)", "Training Day", "Portfolio Value ($)", title_size=13)
     ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f"${v:,.0f}"))
-    _industry_legend(ax)
+    _industry_legend(fig, ax)
 
     fig.savefig(out_path, format="svg", bbox_inches="tight")
     plt.close(fig)
     print(f"  {out_path}")
 
-# ── MT1 composite SVG ─────────────────────────────────────────────────────────
+# ── MT1 all-components SVG ────────────────────────────────────────────────────
 def plot_mt1(records: list[dict], out_path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
-    fig.subplots_adjust(bottom=0.23)
+    # Layout: composite spans full top row; 4 components fill 2×2 grid below
+    fig = plt.figure(figsize=(FIG_W, 18))
+    gs  = gridspec.GridSpec(
+        3, 2,
+        figure=fig,
+        height_ratios=[1.15, 1, 1],
+        hspace=0.42,
+        wspace=0.22,
+        top=0.95, bottom=0.10, left=0.07, right=0.97,
+    )
+
+    axes = {
+        "composite":  fig.add_subplot(gs[0, :]),     # spans both cols
+        "direction":  fig.add_subplot(gs[1, 0]),
+        "range":      fig.add_subplot(gs[1, 1]),
+        "accuracy":   fig.add_subplot(gs[2, 0]),
+        "confidence": fig.add_subplot(gs[2, 1]),
+    }
 
     xs = [r["x"] for r in records]
-    for i, ind in enumerate(INDUSTRIES):
-        _plot_band(
-            ax, xs,
-            means=[r["mt1"]["composite"]["mean"][i] for r in records],
-            maxes=[r["mt1"]["composite"]["best"][i] for r in records],
-            mins= [r["mt1"]["composite"]["min"][i]  for r in records],
-            color=IND_COLOR[ind],
-        )
+    for comp, ax in axes.items():
+        for i, ind in enumerate(INDUSTRIES):
+            _plot_band(
+                ax, xs,
+                means=[r["mt1"][comp]["mean"][i] for r in records],
+                maxes=[r["mt1"][comp]["best"][i] for r in records],
+                mins= [r["mt1"][comp]["min"][i]  for r in records],
+                color=IND_COLOR[ind],
+            )
+        ax.set_ylim(0, 1)
+        _add_pass_dividers(ax, xs)
+        ylabel = "Score (0 – 1)"
+        xlabel = "Training Day" if comp in ("accuracy", "confidence") else ""
+        _style_ax(ax, MT1_COMP_LABEL[comp], xlabel, ylabel)
 
-    ax.set_ylim(0, 1)
-    _add_pass_dividers(ax, xs)
-    _style_ax(ax, "MT1 Composite Score by Industry", "Training Day", "Score (0 – 1)")
-    _industry_legend(ax)
+    # One shared legend anchored to the bottom of the accuracy panel (bottom-left)
+    _industry_legend(fig, axes["accuracy"], ncol=7)
 
     fig.savefig(out_path, format="svg", bbox_inches="tight")
     plt.close(fig)
@@ -231,7 +267,7 @@ def plot_mt1(records: list[dict], out_path: Path) -> None:
 
 # ── MT2 SVG ───────────────────────────────────────────────────────────────────
 def plot_mt2(rows: list[dict], out_path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+    fig, ax = plt.subplots(figsize=(FIG_W, 9))
     fig.subplots_adjust(bottom=0.13)
 
     xs     = [csv_x(r) for r in rows]
@@ -240,13 +276,13 @@ def plot_mt2(rows: list[dict], out_path: Path) -> None:
     mins   = [r["mt2_elite_min_pts"]  for r in rows]
     ideals = [r["mt2_ideal_pts"]      for r in rows]
 
-    ax.plot(xs, means,  color="#1f77b4", linewidth=1.5, alpha=0.90, label="Elite mean")
-    ax.plot(xs, maxes,  color="#1f77b4", linewidth=0.75, linestyle="--", alpha=0.55, label="Elite max")
-    ax.plot(xs, mins,   color="#1f77b4", linewidth=0.75, linestyle="--", alpha=0.55, label="Elite min")
-    ax.plot(xs, ideals, color="#aaaaaa", linewidth=0.8,  linestyle=":",  alpha=0.85, label="Ideal (slot0 basis)")
+    ax.plot(xs, means,  color="#1f77b4", linewidth=1.5,  alpha=0.90, label="Elite mean")
+    ax.plot(xs, maxes,  color="#1f77b4", linewidth=0.75, alpha=0.55, linestyle="--", label="Elite max")
+    ax.plot(xs, mins,   color="#1f77b4", linewidth=0.75, alpha=0.55, linestyle="--", label="Elite min")
+    ax.plot(xs, ideals, color="#2ca02c", linewidth=1.8,  alpha=0.90, label="Ideal (slot0 basis)")
     ax.axhline(0, color="#dddddd", linewidth=0.5, zorder=1)
     _add_pass_dividers(ax, xs)
-    _style_ax(ax, "MT2 Allocation Score (Elite Pool)", "Training Day", "Score (pts)")
+    _style_ax(ax, "MT2 Allocation Score (Elite Pool)", "Training Day", "Score (pts)", title_size=13)
     ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.08), ncol=4,
               fontsize=9, framealpha=0.95, edgecolor="#cccccc")
 
