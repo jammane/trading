@@ -74,8 +74,9 @@ MT2_LAYOUT = [
     ('fc_out.bias',        (48,)),
 ]
 
-ELITE_POOL     = 20
-MT1_ELITE_POOL = 28   # MT1 uses 25 direct elites (5 cats × 5) + 3 wavg blends
+ELITE_POOL      = 20
+MT1_COMP_ELITE  = 23   # 17 direct + 3 wavg + 3 reinject per component pool
+MT1_POOL_NAMES  = ('dir', 'acc', 'rng', 'cfd')
 
 
 def state_dict_to_arr(state_dict, layer_defs):
@@ -166,10 +167,11 @@ def main():
     print(f'Converting master elite models from {load_dir} → {output_dir}')
     convert_industry('master', load_dir, output_dir, MASTER_LAYER_DEFS, 'master')
 
-    print(f'Converting MT1 elite models from {load_dir} → {output_dir}')
+    print(f'Converting MT1 component pool models from {load_dir} → {output_dir}')
     for ind in industries:
-        convert_industry(f'mt1_{ind}', load_dir, output_dir, MT1_LAYER_DEFS, f'mt1_{ind}',
-                         n_elites=MT1_ELITE_POOL)
+        for pool in MT1_POOL_NAMES:
+            convert_industry(f'mt1_{ind}_{pool}', load_dir, output_dir, MT1_LAYER_DEFS,
+                             f'mt1_{ind}_{pool}', n_elites=MT1_COMP_ELITE)
 
     print(f'Converting MT2 elite models from {load_dir} → {output_dir}')
     convert_mt2(load_dir, output_dir)

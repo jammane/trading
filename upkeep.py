@@ -31,6 +31,7 @@ import gc
 import json
 import math
 import os
+import random
 import shutil
 from collections import defaultdict
 
@@ -41,13 +42,21 @@ from models import MT1NN, MT2NN, StockNN
 from training_lib import (
     ELITE_COUNT,
     ELITE_POOL,
+    HIST_DAYS,
+    HIST_ELITE,
+    HIST_PER_DAY,
+    HIST_WAVG,
     IND_STARTING_CASH,
-    MT1_DIRECT_ELITES,
-    MT1_ELITES_PER_CAT,
-    MT1_ELITE_POOL,
-    MT1_N_CATS,
-    MT1_WAVG_BLENDS,
+    MT1_BLEND_SLOTS,
+    MT1_COMP_ELITE,
+    MT1_COMP_MUTS,
+    MT1_COMP_SLOTS,
+    MT1_POOL_NAMES,
+    MT1_RANGE_CEIL_MULT,
+    MT1_RANGE_FLOOR,
+    MT1_REINJECT,
     N_SLOTS,
+    WAVG_COUNT,
     _master_points,
     _model_path,
     _optimal_tiers,
@@ -64,10 +73,10 @@ from training_lib import (
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 UPKEEP_SIGMA      = 0.004
-MT1_SCALE_DOLLARS = 10000.0          # tanh ceiling for dollar P&L prediction
-MT1_FLOOR_COLD    = 250.0            # rolling-floor cold-start (IND_STARTING_CASH × 0.01)
-MT1_ROLLING_DAYS  = 10              # days in rolling |actual_d| buffer
-MT2_INJ_THRESHOLD = -7.0            # injection fires when ≥75% of pool below this
+MT1_SCALE_DOLLARS = 10000.0   # tanh ceiling for dollar P&L prediction
+MT1_FLOOR_COLD    = 250.0     # acc_floor cold-start (÷2 = $125)
+MT1_ROLLING_DAYS  = 10        # days in rolling buffers
+MT2_INJ_THRESHOLD = -7.0      # injection fires when ≥75% of pool below this
 MT2_INJ_MIN_BELOW = int(N_SLOTS * 0.75)  # 150 of 200
 
 
@@ -153,107 +162,71 @@ def _select_and_mutate(prefix, model_dir, model_class, scores, sigma):
     return elite_slots, elite_vals
 
 
-def _select_and_mutate_mt1(prefix, model_dir, scores_breakdown, sigma,
-                            skip_range_selection=False):
+def _select_and_mutate_mt1_component(prefix, model_dir, scores, sigma,
+                                      reinject_paths=None):
     """
-    Multi-category elite selection for MT1 pool (28 total parent slots).
+    Elite selection + mutation for one MT1 component pool (230 slots).
 
-    scores_breakdown: list of (slot, composite, direction, range_, accuracy, confidence)
-                      for N_SLOTS slots.
-    skip_range_selection: if True, leave range elite slots (10–14) unchanged (p==a edge case).
+    scores:          list of (slot, cat_score) sorted or unsorted.
+    reinject_paths:  list of up to MT1_REINJECT .pt file paths for re-injection models
+                     (written into elite slots 20–22 before mutation).
 
     Slot layout after selection:
-      0–4   composite top-5
-      5–9   direction top-5
-      10–14 range top-5
-      15–19 accuracy top-5
-      20–24 confidence top-5
-      25    wavg of {0,5,10,15,20}         — top-1 from each category
-      26    wavg of {0,1,5,6,10,11,15,16,20,21}  — top-2 from each
-      27    wavg of {0,1,2,5,6,7,10,11,12,15,16,17,20,21,22}  — top-3 from each
-      28–199 mutations, round-robin over 28 parents
+      0–16   direct elites (ELITE_COUNT)
+      17–19  wavg blends   (WAVG_COUNT: top-5, top-10, top-15)
+      20–22  re-injection slots (MT1_REINJECT) — copied from reinject_paths unchanged
+      23–229 mutations (MT1_COMP_MUTS=207, round-robin over all 23 parents)
     """
-    n = len(scores_breakdown)
+    sorted_scores = sorted(scores, key=lambda x: x[1], reverse=True)
+    top_slots = [s for s, _ in sorted_scores[:ELITE_COUNT]]
+    while len(top_slots) < ELITE_COUNT:
+        top_slots.append(top_slots[0])
 
-    # Build sorted index lists per category (position in scores_breakdown)
-    by_comp = sorted(range(n), key=lambda i: scores_breakdown[i][1], reverse=True)
-    by_dir  = sorted(range(n), key=lambda i: scores_breakdown[i][2], reverse=True)
-    by_rng  = sorted(range(n), key=lambda i: scores_breakdown[i][3], reverse=True)
-    by_acc  = sorted(range(n), key=lambda i: scores_breakdown[i][4], reverse=True)
-    by_conf = sorted(range(n), key=lambda i: scores_breakdown[i][5], reverse=True)
-    cats    = [by_comp, by_dir, by_rng, by_acc, by_conf]
+    cache = {s: load_slot_model(prefix, model_dir, s, MT1NN) for s in set(top_slots)}
 
-    # Pick top MT1_ELITES_PER_CAT from each category (preserving per-category order)
-    cat_elites = []
-    for cat in cats:
-        picked = []
-        for i in cat:
-            if len(picked) >= MT1_ELITES_PER_CAT:
-                break
-            picked.append(scores_breakdown[i][0])
-        while len(picked) < MT1_ELITES_PER_CAT:
-            picked.append(picked[0])
-        cat_elites.append(picked)
-
-    # elite_slots_ordered: [comp0..4, dir0..4, rng0..4, acc0..4, conf0..4]
-    elite_slots_ordered = [s for cat in cat_elites for s in cat]
-
-    # Blend lists use explicit slot indices after writing:
-    # slot 25 → top-1 from each cat: slot indices 0,5,10,15,20
-    # slot 26 → top-2 from each cat: 0,1,5,6,10,11,15,16,20,21
-    # slot 27 → top-3 from each cat: 0,1,2,5,6,7,10,11,12,15,16,17,20,21,22
-    blend_source_ranks = [
-        [0, 5, 10, 15, 20],
-        [0, 1, 5, 6, 10, 11, 15, 16, 20, 21],
-        [0, 1, 2, 5, 6, 7, 10, 11, 12, 15, 16, 17, 20, 21, 22],
-    ]
-
-    # Pre-load all needed originals before any writes to avoid clobber
-    cache = {s: load_slot_model(prefix, model_dir, s, MT1NN) for s in set(elite_slots_ordered)}
-
-    # Write direct elites 0–MT1_DIRECT_ELITES-1
-    # If skip_range_selection, preserve slots 10–14 (range category) from disk unchanged
-    for rank, s in enumerate(elite_slots_ordered):
-        if skip_range_selection and 10 <= rank <= 14:
-            continue
+    for rank, s in enumerate(top_slots):
         save_slot_model(prefix, model_dir, rank, cache[s])
 
-    # Compute equal-weight wavg blend states from written elite slots
-    blend_states = []
-    for source_ranks in blend_source_ranks:
-        inv_n  = 1.0 / len(source_ranks)
+    # Wavg blends: equal-weight average of top 5, 10, 15 direct elites
+    for b, k in enumerate([5, 10, 15]):
+        inv_k  = 1.0 / k
         avg_st = None
-        for rank in source_ranks:
+        for rank in range(k):
             m     = load_slot_model(prefix, model_dir, rank, MT1NN)
             state = m.state_dict()
             del m
             if avg_st is None:
-                avg_st = {k: (v.clone().float() * inv_n if torch.is_floating_point(v) else v.clone())
-                          for k, v in state.items()}
+                avg_st = {key: (v.clone().float() * inv_k if torch.is_floating_point(v) else v.clone())
+                          for key, v in state.items()}
             else:
-                for k, v in state.items():
-                    if torch.is_floating_point(v) and k in avg_st:
-                        avg_st[k] = avg_st[k] + v.float() * inv_n
-        blend_states.append(avg_st)
+                for key, v in state.items():
+                    if torch.is_floating_point(v) and key in avg_st:
+                        avg_st[key] = avg_st[key] + v.float() * inv_k
+        wm = MT1NN(); wm.load_state_dict(avg_st)
+        save_slot_model(prefix, model_dir, ELITE_COUNT + b, wm)
+        del wm, avg_st
 
-    # Write wavg blends MT1_DIRECT_ELITES – MT1_ELITE_POOL-1 (slots 25, 26, 27)
-    for L, avg_st in enumerate(blend_states):
-        m = MT1NN()
-        m.load_state_dict(avg_st)
-        save_slot_model(prefix, model_dir, MT1_DIRECT_ELITES + L, m)
-        del m
+    # Re-injection slots 20–22
+    ri_paths = reinject_paths or []
+    for k, ri_path in enumerate(ri_paths[:MT1_REINJECT]):
+        if os.path.exists(ri_path):
+            try:
+                ri_m = MT1NN()
+                ri_m.load_state_dict(torch.load(ri_path, weights_only=True))
+                save_slot_model(prefix, model_dir, ELITE_COUNT + WAVG_COUNT + k, ri_m)
+                del ri_m
+            except Exception:
+                pass
 
-    del cache, blend_states
+    del cache
 
-    # Mutations: round-robin over MT1_ELITE_POOL parents (slots 28–199)
-    for i, slot in enumerate(range(MT1_ELITE_POOL, N_SLOTS)):
-        parent_rank = i % MT1_ELITE_POOL
+    # Mutations: round-robin over all MT1_COMP_ELITE (23) parents
+    for i, slot in enumerate(range(MT1_COMP_ELITE, MT1_COMP_SLOTS)):
+        parent_rank = i % MT1_COMP_ELITE
         parent = load_slot_model(prefix, model_dir, parent_rank, MT1NN)
         child  = _mutate_generic(parent, MT1NN, sigma)
         save_slot_model(prefix, model_dir, slot, child)
         del parent, child
-
-    return elite_slots_ordered
 
 
 # ── MT1 rolling floor ─────────────────────────────────────────────────────────
@@ -279,32 +252,43 @@ def save_mt1_rolling_state(model_dir, state):
         log(f"WARNING: could not save mt1_rolling_state: {e}")
 
 
-def _rolling_floor(ind_state):
-    """Compute floor_d from per-industry rolling buffer dict. Returns MT1_FLOOR_COLD if empty."""
-    buf = ind_state.get('buffer', [])
+def _rolling_acc_floor(ind_state):
+    """Acc floor = mean(last 10 |actual_d|) / 2. Returns MT1_FLOOR_COLD/2 on cold start."""
+    buf = ind_state.get('actual_buf', [])
     if not buf:
-        return MT1_FLOOR_COLD
-    return max(sum(buf) / len(buf), MT1_FLOOR_COLD)
+        return MT1_FLOOR_COLD / 2.0
+    return sum(buf) / len(buf) / 2.0
 
 
-def _rolling_update(ind_state, abs_actual_d):
-    """Append to rolling circular buffer (max MT1_ROLLING_DAYS entries)."""
-    buf  = ind_state.get('buffer', [])
-    buf.append(abs_actual_d)
-    if len(buf) > MT1_ROLLING_DAYS:
-        buf = buf[-MT1_ROLLING_DAYS:]
-    ind_state['buffer'] = buf
+def _rolling_range_ceiling(ind_state):
+    """Range ceiling = MT1_RANGE_CEIL_MULT × mean(last 10 |actual_d - comp0_delta_d|).
+    Returns None (no ceiling) on cold start."""
+    buf = ind_state.get('residual_buf', [])
+    if not buf:
+        return None
+    return MT1_RANGE_CEIL_MULT * sum(buf) / len(buf)
+
+
+def _rolling_update(ind_state, abs_actual_d, comp0_residual):
+    """Update both rolling circular buffers (max MT1_ROLLING_DAYS entries each)."""
+    for key, val in (('actual_buf', abs_actual_d), ('residual_buf', comp0_residual)):
+        buf = ind_state.get(key, [])
+        buf.append(val)
+        if len(buf) > MT1_ROLLING_DAYS:
+            buf = buf[-MT1_ROLLING_DAYS:]
+        ind_state[key] = buf
 
 
 # ── MT1 scoring ────────────────────────────────────────────────────────────────
 
-def _mt1_score_breakdown(out4, actual_d, floor_d):
+def _mt1_score_breakdown(out4, actual_d, acc_floor, range_ceiling=None):
     """
     Score one MT1 slot against the industry's actual dollar P&L.
 
-    out4:     raw logit tensor shape (4,)
-    actual_d: float — actual dollar P&L for the day (actual_frac × portfolio_value)
-    floor_d:  float — rolling floor from 10-day mean |actual_d|, min MT1_FLOOR_COLD
+    out4:          raw logit tensor shape (4,)
+    actual_d:      float — actual dollar P&L (actual_frac × portfolio_value)
+    acc_floor:     float — per-industry adaptive floor for accuracy denom
+    range_ceiling: float or None — cap on range r (None = no ceiling)
     Returns (composite, direction, range_, accuracy, confidence) all in [0.0, 1.0].
 
     Composite = 0.50×direction + 0.33×range + 0.17×accuracy (out[0–2] only).
@@ -316,21 +300,19 @@ def _mt1_score_breakdown(out4, actual_d, floor_d):
     rng_pct  = F.softplus(out4[2]).item()
     conf4    = torch.sigmoid(out4[3]).item()
 
-    # Direction
     score_dir = 1.0 if (conf >= 0.5) == (actual_d >= 0.0) else 0.0
 
-    # Range (calibration method: reward range tightness that still covers actual)
-    eff_delta = max(abs(delta_d), floor_d)
-    r         = rng_pct * eff_delta          # range in dollars
+    eff_delta = max(abs(delta_d), MT1_RANGE_FLOOR)
+    r         = rng_pct * eff_delta
+    if range_ceiling is not None:
+        r = min(r, range_ceiling)
     err       = abs(actual_d - delta_d)
     m         = err / r if r > 0.0 else float('inf')
     score_rng = m if m < 1.0 else 0.0
 
-    # Accuracy (dollar-denominated, floor prevents div-by-zero when actual ≈ 0)
-    denom     = max(abs(actual_d), floor_d)
+    denom     = max(abs(actual_d), acc_floor)
     score_acc = max(0.0, 1.0 - err / denom)
 
-    # Confidence (grades out[3] against ideal derived from range geometry)
     d         = err
     if d <= r:
         ideal = 1.0 - 0.5 * (d / r) if r > 0.0 else 1.0
@@ -363,36 +345,43 @@ def _mt1_decode(model, in37_t):
 
 # ── MT1 burst refinement ───────────────────────────────────────────────────────
 
-def _mt1_burst(prefix, model_dir, in37_t, actual_d, floor_d, burst_sigma):
+def _mt1_burst_component(prefix, model_dir, in37_t, actual_d,
+                          acc_floor, range_ceiling, burst_sigma, score_idx):
     """
-    One burst refinement pass for an MT1 pool.
+    One burst refinement pass for one MT1 component pool.
 
-    Generates 280 mutants (10 per MT1_ELITE_POOL=28 parents), scores via composite,
-    merges top-MT1_DIRECT_ELITES with current elites (cap: 2 burst replacements),
-    and regenerates wavg blend slots 25–27. Returns new best composite score.
+    score_idx: 0=direction 1=accuracy 2=range 3=confidence (index into score tuple)
+    Generates 10 mutants per elite (23 parents → 230 mutants), scores on the
+    component-specific score, merges top-ELITE_COUNT with current elites
+    (cap: 2 burst replacements). Regenerates wavg blend slots 17–19.
+    Returns new best component score.
     """
     burst_candidates = []
-    for elite_slot in range(MT1_ELITE_POOL):
+    for elite_slot in range(MT1_COMP_ELITE):
         parent = load_slot_model(prefix, model_dir, elite_slot, MT1NN)
         for _ in range(10):
             child = _mutate_generic(parent, MT1NN, burst_sigma)
             child.eval()
             with torch.inference_mode():
                 out4 = child(in37_t).squeeze(0)
-            comp, *_ = _mt1_score_breakdown(out4, actual_d, floor_d)
-            burst_candidates.append((child, comp))
+            scores = _mt1_score_breakdown(out4, actual_d, acc_floor, range_ceiling)
+            # scores: (composite, dir, rng, acc, conf) — pick component-specific
+            # score_idx 0=dir→[1], 1=acc→[3], 2=rng→[2], 3=cfd→[4]
+            cat_sc = scores[[0, 1, 3, 2, 4][score_idx + 1]]  # offset by 1 (composite is [0])
+            burst_candidates.append((child, cat_sc))
         del parent
     burst_candidates.sort(key=lambda x: x[1], reverse=True)
-    top_burst = burst_candidates[:MT1_DIRECT_ELITES]
+    top_burst = burst_candidates[:ELITE_COUNT]
 
     current_elites = []
-    for rank in range(MT1_DIRECT_ELITES):
+    for rank in range(ELITE_COUNT):
         m = load_slot_model(prefix, model_dir, rank, MT1NN)
         m.eval()
         with torch.inference_mode():
             out4 = m(in37_t).squeeze(0)
-        comp, *_ = _mt1_score_breakdown(out4, actual_d, floor_d)
-        current_elites.append((m, comp))
+        scores = _mt1_score_breakdown(out4, actual_d, acc_floor, range_ceiling)
+        cat_sc = scores[[0, 1, 3, 2, 4][score_idx + 1]]
+        current_elites.append((m, cat_sc))
 
     burst_ids  = {id(m) for m, _ in top_burst}
     all_cands  = current_elites + top_burst
@@ -401,7 +390,7 @@ def _mt1_burst(prefix, model_dir, in37_t, actual_d, floor_d, burst_sigma):
     new_elites  = []
     burst_count = 0
     for cand in all_cands:
-        if len(new_elites) >= MT1_DIRECT_ELITES:
+        if len(new_elites) >= ELITE_COUNT:
             break
         if id(cand[0]) in burst_ids:
             if burst_count >= 2:
@@ -411,39 +400,33 @@ def _mt1_burst(prefix, model_dir, in37_t, actual_d, floor_d, burst_sigma):
 
     prev_best = current_elites[0][1]
     new_best  = new_elites[0][1]
+    label     = MT1_POOL_NAMES[score_idx]
     if new_best > prev_best:
-        log(f"[mt1/{sn(prefix[4:])}] Burst σ={burst_sigma:.5f}: {burst_count} replacement(s), best={new_best:.4f}")
+        log(f"[mt1/{sn(prefix[4:])}:{label}] Burst σ={burst_sigma:.5f}: {burst_count} replacement(s), best={new_best:.4f}")
     else:
-        log(f"[mt1/{sn(prefix[4:])}] Burst σ={burst_sigma:.5f}: best={new_best:.4f} — no improvement")
+        log(f"[mt1/{sn(prefix[4:])}:{label}] Burst σ={burst_sigma:.5f}: best={new_best:.4f} — no improvement")
 
     for rank, (m, _) in enumerate(new_elites):
         save_slot_model(prefix, model_dir, rank, m)
 
-    # Regenerate wavg blend slots 25, 26, 27 using same source ranks as main selection
-    blend_source_ranks = [
-        [0, 5, 10, 15, 20],
-        [0, 1, 5, 6, 10, 11, 15, 16, 20, 21],
-        [0, 1, 2, 5, 6, 7, 10, 11, 12, 15, 16, 17, 20, 21, 22],
-    ]
-    for L, source_ranks in enumerate(blend_source_ranks):
-        n_src  = len(source_ranks)
-        inv_n  = 1.0 / n_src
+    # Regenerate wavg blend slots 17, 18, 19 (top-5, top-10, top-15)
+    for b, k in enumerate([5, 10, 15]):
+        inv_k  = 1.0 / k
         avg_st = None
-        for rank in source_ranks:
+        for rank in range(k):
             m     = load_slot_model(prefix, model_dir, rank, MT1NN)
             state = m.state_dict()
             del m
             if avg_st is None:
-                avg_st = {kk: (v.clone().float() * inv_n if torch.is_floating_point(v) else v.clone())
+                avg_st = {kk: (v.clone().float() * inv_k if torch.is_floating_point(v) else v.clone())
                           for kk, v in state.items()}
             else:
                 for kk, v in state.items():
                     if torch.is_floating_point(v) and kk in avg_st:
-                        avg_st[kk] = avg_st[kk] + v.float() * inv_n
-        wavg_m = MT1NN()
-        wavg_m.load_state_dict(avg_st)
-        save_slot_model(prefix, model_dir, MT1_DIRECT_ELITES + L, wavg_m)
-        del wavg_m, avg_st
+                        avg_st[kk] = avg_st[kk] + v.float() * inv_k
+        wm = MT1NN(); wm.load_state_dict(avg_st)
+        save_slot_model(prefix, model_dir, ELITE_COUNT + b, wm)
+        del wm, avg_st
 
     del burst_candidates, current_elites, top_burst, all_cands, new_elites
     gc.collect()
@@ -525,118 +508,228 @@ def upkeep_industry(industry, symbols, model_dir, primed_portfolio,
 def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP_SIGMA,
                          portfolio_value=None, rolling_state=None):
     """
-    One evolution step for one industry's MT1NN pool, with 4 burst passes.
+    One evolution step for one industry's MT1NN 5-pool system.
+
+    Runs 4 component pools (dir, acc, rng, cfd) then a composite blend pool.
+    Each component pool has MT1_COMP_SLOTS=230 slots; the composite pool generates
+    MT1_BLEND_SLOTS=200 fresh blends from component direct elites each day, scored by
+    composite score. Top MT1_REINJECT=3 composite models are re-injected into component
+    pool elite slots 20-22 the following day.
 
     industry:        industry key (e.g. 'energy')
     model_dir:       directory containing model files
     in37_t:          (1, 37) tensor — this industry's slice of build_master_features output
     actual_perf_i:   float — fractional return (slot0_score / baseline - 1) for today
     sigma:           base mutation sigma
-    portfolio_value: current slot0 industry portfolio value (dollars); defaults to
-                     IND_STARTING_CASH if not supplied
+    portfolio_value: current slot0 industry portfolio value (dollars); defaults to IND_STARTING_CASH
     rolling_state:   mutable dict with per-industry rolling buffer; updated in place.
-                     Caller should load/save with load_mt1_rolling_state/save_mt1_rolling_state.
 
-    File naming: mt1_{industry}_model_{slot}.pt (uses _model_path with prefix 'mt1_{industry}')
+    File naming:
+      Component pools: mt1_{ind}_{dir|acc|rng|cfd}_model_{slot}.pt
+      Composite best:  mt1_{ind}_best.pt
+      Reinject:        mt1_{ind}_comp_reinject_{0..2}.pt
+      Comp history:    mt1_{ind}_comp_hist_{day}_{pos}.pt + mt1_{ind}_comp_hist_meta.json
 
-    Returns (best_mt1_score, slot0_mt1_score, slot0_conf, slot0_delta_t, slot0_range_pct,
-             slot0_conf4).
+    Returns (best_comp_score, best_comp_score, slot0_conf, slot0_delta_t, slot0_range_pct,
+             slot0_conf4) — slot0 is the winning composite model.
     """
     if portfolio_value is None:
         portfolio_value = IND_STARTING_CASH
     if rolling_state is None:
         rolling_state = {}
 
-    actual_d = actual_perf_i * portfolio_value
-    ind_rs   = rolling_state.setdefault(industry, {})
-    floor_d  = _rolling_floor(ind_rs)
-
-    prefix     = f"mt1_{industry}"
-    slot0_path = _model_path(prefix, model_dir, 0)
-    best_path  = os.path.join(model_dir, f"{prefix}_best.pt")
-
-    if not os.path.exists(slot0_path):
-        base = MT1NN()
-        if os.path.exists(best_path):
-            try:
-                base.load_state_dict(torch.load(best_path, weights_only=True))
-                log(f"[mt1/{sn(industry)}] Bootstrapping pool from {prefix}_best.pt")
-            except Exception:
-                log(f"[mt1/{sn(industry)}] Bootstrap failed — using random weights")
-        else:
-            log(f"[mt1/{sn(industry)}] Initializing MT1 pool with random weights")
-        save_slot_model(prefix, model_dir, 0, base)
-        for slot in range(1, N_SLOTS):
-            child = _mutate_generic(base, MT1NN, sigma)
-            save_slot_model(prefix, model_dir, slot, child)
-            del child
-        del base
-    elif not os.path.exists(_model_path(prefix, model_dir, N_SLOTS - 1)):
-        # Partial pool: expand to full N_SLOTS round-robin from existing elites
-        n_existing = sum(1 for s in range(MT1_ELITE_POOL)
-                         if os.path.exists(_model_path(prefix, model_dir, s)))
-        n_parents  = max(n_existing, 1)
-        log(f"[mt1/{sn(industry)}] Expanding MT1 pool from {n_existing} elites to {N_SLOTS} slots")
-        for s in range(n_existing, MT1_ELITE_POOL):
-            base = load_slot_model(prefix, model_dir, 0, MT1NN)
-            save_slot_model(prefix, model_dir, s, base)
-            del base
-        for i, slot in enumerate(range(MT1_ELITE_POOL, N_SLOTS)):
-            parent_rank = i % n_parents
-            parent = load_slot_model(prefix, model_dir, parent_rank, MT1NN)
-            child  = _mutate_generic(parent, MT1NN, sigma)
-            save_slot_model(prefix, model_dir, slot, child)
-            del parent, child
+    actual_d      = actual_perf_i * portfolio_value
+    ind_rs        = rolling_state.setdefault(industry, {})
+    acc_floor     = _rolling_acc_floor(ind_rs)
+    range_ceiling = _rolling_range_ceiling(ind_rs)
 
     in37_t = in37_t.detach()
 
-    # Score all N_SLOTS slots across all 5 MT1 components
-    scores_breakdown = []   # [(slot, composite, dir, rng, acc, conf), ...]
-    for slot in range(N_SLOTS):
-        m = load_slot_model(prefix, model_dir, slot, MT1NN)
-        m.eval()
+    # score_idx into _mt1_score_breakdown() tuple (composite, dir, rng, acc, conf)
+    # MT1_POOL_NAMES = ('dir', 'acc', 'rng', 'cfd')
+    pool_score_idx = [1, 3, 2, 4]  # dir→[1], acc→[3], rng→[2], cfd→[4]
+
+    comp_prefix    = f'mt1_{industry}_comp'
+    reinject_paths = [os.path.join(model_dir, f'{comp_prefix}_reinject_{k}.pt')
+                      for k in range(MT1_REINJECT)]
+
+    # ── Component pools ──────────────────────────────────────────────────────────
+    for pool_id, pool_name in enumerate(MT1_POOL_NAMES):
+        prefix     = f'mt1_{industry}_{pool_name}'
+        slot0_path = _model_path(prefix, model_dir, 0)
+        best_path  = os.path.join(model_dir, f'mt1_{industry}_best.pt')
+
+        if not os.path.exists(slot0_path):
+            base = MT1NN()
+            if os.path.exists(best_path):
+                try:
+                    base.load_state_dict(torch.load(best_path, weights_only=True))
+                    log(f"[mt1/{sn(industry)}:{pool_name}] Bootstrapping from mt1_{industry}_best.pt")
+                except Exception:
+                    log(f"[mt1/{sn(industry)}:{pool_name}] Bootstrap failed — random weights")
+            else:
+                log(f"[mt1/{sn(industry)}:{pool_name}] Initializing with random weights")
+            save_slot_model(prefix, model_dir, 0, base)
+            for slot in range(1, MT1_COMP_SLOTS):
+                child = _mutate_generic(base, MT1NN, sigma)
+                save_slot_model(prefix, model_dir, slot, child)
+                del child
+            del base
+
+        cat_idx = pool_score_idx[pool_id]
+        scores = []
+        for slot in range(MT1_COMP_SLOTS):
+            m = load_slot_model(prefix, model_dir, slot, MT1NN)
+            m.eval()
+            with torch.inference_mode():
+                out4 = m(in37_t).squeeze(0)
+            breakdown = _mt1_score_breakdown(out4, actual_d, acc_floor, range_ceiling)
+            scores.append((slot, breakdown[cat_idx]))
+            del m
+
+        best_cat  = max(sc for _, sc in scores)
+        slot0_cat = scores[0][1]
+        log(f"[mt1/{sn(industry)}:{pool_name}] best={best_cat:.4f} slot0={slot0_cat:.4f} "
+            f"actual_d=${actual_d:+.1f}")
+
+        _select_and_mutate_mt1_component(prefix, model_dir, scores, sigma, reinject_paths)
+
+        for burst_num in range(4):
+            _mt1_burst_component(prefix, model_dir, in37_t, actual_d,
+                                  acc_floor, range_ceiling,
+                                  sigma / (2 ** (burst_num + 1)), pool_id)
+
+    # ── Composite pool ───────────────────────────────────────────────────────────
+    # Load ELITE_COUNT direct elites from each component pool (ranks 0–16)
+    elites_by_pool = []
+    for pool_name in MT1_POOL_NAMES:
+        prefix      = f'mt1_{industry}_{pool_name}'
+        pool_elites = [load_slot_model(prefix, model_dir, rank, MT1NN)
+                       for rank in range(ELITE_COUNT)]
+        elites_by_pool.append(pool_elites)
+
+    # Generate MT1_BLEND_SLOTS composite blends via position-weighted averaging
+    blend_scored = []
+    for _ in range(MT1_BLEND_SLOTS):
+        sources = []
+        for pool_elites in elites_by_pool:
+            r1, r2 = sorted(random.sample(range(ELITE_COUNT), 2))
+            sources.append((r1, pool_elites[r1]))
+            sources.append((r2, pool_elites[r2]))
+        weights = [20 - r for r, _ in sources]
+        w_sum   = sum(weights)
+        weights = [w / w_sum for w in weights]
+        avg_st  = None
+        for wi, (_, m) in zip(weights, sources):
+            state = m.state_dict()
+            if avg_st is None:
+                avg_st = {k: (v.clone().float() * wi if torch.is_floating_point(v) else v.clone())
+                          for k, v in state.items()}
+            else:
+                for k, v in state.items():
+                    if torch.is_floating_point(v) and k in avg_st:
+                        avg_st[k] = avg_st[k] + v.float() * wi
+        bm = MT1NN()
+        bm.load_state_dict(avg_st)
+        bm.eval()
         with torch.inference_mode():
-            out4 = m(in37_t).squeeze(0)
-        comp, dir_, rng_, acc_, conf_ = _mt1_score_breakdown(out4, actual_d, floor_d)
-        scores_breakdown.append((slot, comp, dir_, rng_, acc_, conf_))
-        del m
+            out4 = bm(in37_t).squeeze(0)
+        comp_sc = _mt1_score_breakdown(out4, actual_d, acc_floor, range_ceiling)[0]
+        blend_scored.append((bm, comp_sc))
+        del avg_st
 
-    # Record slot0 outputs before selection (selection may overwrite slot 0)
-    slot0_m = load_slot_model(prefix, model_dir, 0, MT1NN)
-    slot0_conf, slot0_delta_t, slot0_range_pct, slot0_conf4 = _mt1_decode(slot0_m, in37_t)
-    del slot0_m
+    for pool_elites in elites_by_pool:
+        del pool_elites
+    del elites_by_pool
 
-    best_score  = max(bd[1] for bd in scores_breakdown)
-    slot0_score = scores_breakdown[0][1]
+    # Load composite history candidates and score against today's actual_d
+    hist_meta_path  = os.path.join(model_dir, f'{comp_prefix}_hist_meta.json')
+    hist_candidates = []
+    if os.path.exists(hist_meta_path):
+        try:
+            with open(hist_meta_path) as f:
+                hist_meta = json.load(f)
+            h_head = hist_meta.get('head', 0)
+            h_count = hist_meta.get('count', 0)
+            n_days  = min(h_count, HIST_DAYS)
+            for d in range(n_days):
+                day_slot = (h_head - n_days + d) % HIST_DAYS
+                for pos in range(HIST_PER_DAY):
+                    hp = os.path.join(model_dir, f'{comp_prefix}_hist_{day_slot}_{pos}.pt')
+                    if os.path.exists(hp):
+                        try:
+                            hm = MT1NN()
+                            hm.load_state_dict(torch.load(hp, weights_only=True))
+                            hm.eval()
+                            with torch.inference_mode():
+                                out4 = hm(in37_t).squeeze(0)
+                            comp_sc = _mt1_score_breakdown(
+                                out4, actual_d, acc_floor, range_ceiling)[0]
+                            hist_candidates.append((hm, comp_sc))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
-    log(f"[mt1/{sn(industry)}] best={best_score:.4f} slot0={slot0_score:.4f} "
-        f"actual_d=${actual_d:+.1f} floor_d=${floor_d:.1f}")
+    all_candidates = blend_scored + hist_candidates
+    all_candidates.sort(key=lambda x: x[1], reverse=True)
 
-    # Check p==a edge case: if best range score is 0, skip range elite selection
-    best_rng_score = max(bd[3] for bd in scores_breakdown)
-    skip_range = best_rng_score == 0.0
+    best_comp_model = all_candidates[0][0]
+    best_comp_score = all_candidates[0][1]
 
-    _select_and_mutate_mt1(prefix, model_dir, scores_breakdown, sigma,
-                            skip_range_selection=skip_range)
+    log(f"[mt1/{sn(industry)}:comp] best={best_comp_score:.4f} actual_d=${actual_d:+.1f} "
+        f"acc_floor=${acc_floor:.1f} n_hist={len(hist_candidates)}")
 
-    # Update rolling buffer AFTER scoring
-    _rolling_update(ind_rs, abs(actual_d))
+    slot0_conf, slot0_delta_t, slot0_range_pct, slot0_conf4 = _mt1_decode(best_comp_model, in37_t)
+    comp0_delta_d  = slot0_delta_t * MT1_SCALE_DOLLARS
+    comp0_residual = abs(actual_d - comp0_delta_d)
 
-    # 4 burst refinement passes
-    log(f"[mt1/{sn(industry)}] Running 4 burst passes ...")
-    for burst_num in range(4):
-        _mt1_burst(prefix, model_dir, in37_t, actual_d, floor_d,
-                   sigma / (2 ** (burst_num + 1)))
-
-    # Save slot 0 (post-selection best) as the best model for production inference
-    slot0_final = load_slot_model(prefix, model_dir, 0, MT1NN)
+    # Save best composite model as _best.pt for production inference
+    best_path = os.path.join(model_dir, f'mt1_{industry}_best.pt')
     try:
-        torch.save(slot0_final.state_dict(), best_path)
+        torch.save(best_comp_model.state_dict(), best_path)
     except Exception as e:
-        log(f"WARNING: could not save {prefix}_best.pt: {e}")
-    del slot0_final
+        log(f"WARNING: could not save mt1_{industry}_best.pt: {e}")
 
-    return best_score, slot0_score, slot0_conf, slot0_delta_t, slot0_range_pct, slot0_conf4
+    # Save top MT1_REINJECT models for next-day component re-injection
+    for k in range(min(MT1_REINJECT, len(all_candidates))):
+        rp = os.path.join(model_dir, f'{comp_prefix}_reinject_{k}.pt')
+        try:
+            torch.save(all_candidates[k][0].state_dict(), rp)
+        except Exception as e:
+            log(f"WARNING: could not save {comp_prefix}_reinject_{k}: {e}")
+
+    # Save top HIST_PER_DAY composite models to circular history (5 days × 10/day)
+    if os.path.exists(hist_meta_path):
+        try:
+            with open(hist_meta_path) as f:
+                hist_meta = json.load(f)
+        except Exception:
+            hist_meta = {'head': 0, 'count': 0}
+    else:
+        hist_meta = {'head': 0, 'count': 0}
+    h_head  = hist_meta.get('head', 0)
+    h_count = hist_meta.get('count', 0)
+    day_slot = h_head % HIST_DAYS
+    for pos, (hm, _) in enumerate(all_candidates[:HIST_PER_DAY]):
+        hp = os.path.join(model_dir, f'{comp_prefix}_hist_{day_slot}_{pos}.pt')
+        try:
+            torch.save(hm.state_dict(), hp)
+        except Exception as e:
+            log(f"WARNING: could not save comp hist {day_slot}_{pos}: {e}")
+    try:
+        with open(hist_meta_path, 'w') as f:
+            json.dump({'head': (h_head + 1) % HIST_DAYS,
+                       'count': min(h_count + 1, HIST_DAYS)}, f)
+    except Exception as e:
+        log(f"WARNING: could not save {comp_prefix}_hist_meta: {e}")
+
+    _rolling_update(ind_rs, abs(actual_d), comp0_residual)
+
+    del blend_scored, hist_candidates, all_candidates
+    gc.collect()
+
+    return best_comp_score, best_comp_score, slot0_conf, slot0_delta_t, slot0_range_pct, slot0_conf4
 
 
 # ── MT2 upkeep ─────────────────────────────────────────────────────────────────

@@ -18,7 +18,7 @@ import torch
 from models import StockNN, MasterNN, MT1NN, MT2NN
 from prepare_models import (
     STOCK_LAYER_DEFS, MASTER_LAYER_DEFS, MT1_LAYER_DEFS, MT2_LAYOUT,
-    ELITE_POOL, MT1_ELITE_POOL,
+    ELITE_POOL,
 )
 
 
@@ -111,6 +111,25 @@ def convert_mt2(models_dir, output_dir):
         print('  [mt2] mt2_best.pt written (copy of slot 0)')
 
 
+def _convert_mt1_best(ind, models_dir, output_dir):
+    """Convert mt1_{ind}_comp_0.bin (best composite model) to mt1_{ind}_best.pt."""
+    import shutil
+    src = os.path.join(models_dir, f'mt1_{ind}_comp_0.bin')
+    if not os.path.exists(src):
+        print(f'  [mt1/{ind}] mt1_{ind}_comp_0.bin not found — skipping')
+        return
+    try:
+        arr = np.fromfile(src, dtype=np.float32)
+        sd  = arr_to_state_dict(arr, MT1_LAYER_DEFS, MT1NN)
+        m   = MT1NN()
+        m.load_state_dict(sd)
+        dst = os.path.join(output_dir, f'mt1_{ind}_best.pt')
+        torch.save(m.state_dict(), dst)
+        print(f'  [mt1/{ind}] mt1_{ind}_best.pt written from comp_0.bin')
+    except Exception as e:
+        print(f'  [mt1/{ind}] ERROR converting comp_0.bin: {e}')
+
+
 def main():
     parser = argparse.ArgumentParser(description='Convert .bin C++ elite models to .pt for Python stack')
     parser.add_argument('--account', default='acct0', help='Account identifier (e.g. acct0); derives models/ACCOUNT/training as source and output dir')
@@ -133,10 +152,9 @@ def main():
     print(f'Converting master elite models from {models_dir} → {output_dir}')
     convert_industry('master', models_dir, output_dir, MASTER_LAYER_DEFS, MasterNN, 'master')
 
-    print(f'Converting MT1 elite models from {models_dir} → {output_dir}')
+    print(f'Converting MT1 composite best models from {models_dir} → {output_dir}')
     for ind in industries:
-        convert_industry(f'mt1_{ind}', models_dir, output_dir, MT1_LAYER_DEFS, MT1NN, f'mt1_{ind}',
-                         n_elites=MT1_ELITE_POOL)
+        _convert_mt1_best(ind, models_dir, output_dir)
 
     print(f'Converting MT2 elite models from {models_dir} → {output_dir}')
     convert_mt2(models_dir, output_dir)
