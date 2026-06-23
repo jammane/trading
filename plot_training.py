@@ -9,11 +9,15 @@ Usage:
 
 Outputs (git-ignored):
     plots/industry_performance.svg   — StockNN elite portfolio value per industry
-    plots/mt1_performance.svg        — MT1 all 5 component scores per industry (multi-panel)
+                                       (open circles mark hard-floor reset events at $22.5K)
+    plots/mt1_composite.svg          — MT1 composite score per industry
+    plots/mt1_direction.svg          — MT1 direction component
+    plots/mt1_range.svg              — MT1 range component
+    plots/mt1_accuracy.svg           — MT1 accuracy component
+    plots/mt1_confidence.svg         — MT1 confidence component
     plots/mt2_performance.svg        — MT2 allocation score (elite pool stats)
 
 Lines: solid = mean, dashed = max & min  (slot0 excluded per design)
-Zero values in the industry CSV are logging artifacts (worker timing) — shown as gaps.
 """
 
 import argparse
@@ -28,20 +32,21 @@ try:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    import matplotlib.gridspec as gridspec
     import matplotlib.ticker as ticker
     import matplotlib.lines as mlines
 except ImportError:
     sys.exit("matplotlib is required: pip install matplotlib")
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-DROPLET_HOST  = "root@165.22.6.112"
-REMOTE_LOG    = "/root/trading/logs/{account}/training"
-LOCAL_LOG_DIR = Path("logs_local")
-PLOT_DIR      = Path("plots")
+DROPLET_HOST    = "root@165.22.6.112"
+REMOTE_LOG      = "/root/trading/logs/{account}/training"
+LOCAL_LOG_DIR   = Path("logs_local")
+PLOT_DIR        = Path("plots")
 
-DAYS_PER_PASS = 1255
-FIG_W         = 16   # fixed width; height varies per chart
+DAYS_PER_PASS   = 1255
+FIG_W           = 16   # fixed width; height varies per chart
+IND_STARTING_CASH = 25_000.0
+FLOOR_VALUE     = IND_STARTING_CASH * 0.9   # $22,500 — hard-floor reset threshold
 
 INDUSTRIES = [
     "tech_hardware", "tech_software_ai", "financials", "consumer_discretionary",
@@ -70,6 +75,9 @@ COLORS = [
 ]
 IND_COLOR = dict(zip(INDUSTRIES, COLORS))
 
+_COMP_NAMES = ["composite", "direction", "range", "accuracy", "confidence"]
+_STAT_NAMES = ["best", "slot0", "mean", "min"]
+
 MT1_COMP_LABEL = {
     "composite":  "Composite  (0.50×dir + 0.33×range + 0.17×acc)",
     "direction":  "Direction  — P(correct sign)",
@@ -82,12 +90,8 @@ MT1_COMP_LABEL = {
 MT_LOG_MAGIC   = 0x4D543132  # 'MT12'
 RECORD_SIZE_V4 = 984
 HEADER_SIZE    = 16
-# 2×uint32 + 240 floats (5 components × 4 stats × 12 inds) + 3 floats (MT2) + uint8 + 3 pad
 _RECORD_STRUCT = struct.Struct("<II" + "f" * 243 + "Bxxx")
 assert _RECORD_STRUCT.size == RECORD_SIZE_V4, f"struct size mismatch: {_RECORD_STRUCT.size}"
-
-_COMP_NAMES = ["composite", "direction", "range", "accuracy", "confidence"]
-_STAT_NAMES = ["best", "slot0", "mean", "min"]
 
 # ── Download ──────────────────────────────────────────────────────────────────
 def download_logs(host: str, account: str) -> None:
@@ -131,8 +135,7 @@ def load_binary_log(path: Path) -> list[dict]:
         pass_num   = raw[0]
         actual_day = raw[1]
 
-        # raw[2..241] = 240 MT1 floats; raw[242..244] = MT2; raw[245] = injected
-        f = raw[2:242]
+        f = raw[2:242]  # 240 MT1 floats
         mt1 = {}
         for ci, comp in enumerate(_COMP_NAMES):
             mt1[comp] = {}
@@ -156,13 +159,12 @@ def load_binary_log(path: Path) -> list[dict]:
 
 # ── Shared plot helpers ───────────────────────────────────────────────────────
 def _nan_zeros(vals: list[float]) -> list[float]:
-    """Replace exact-zero values with NaN — shows gaps instead of spike-to-zero artifacts."""
     return [v if v != 0.0 else math.nan for v in vals]
 
-def _style_ax(ax, title: str, xlabel: str, ylabel: str, title_size: int = 11) -> None:
-    ax.set_title(title, fontsize=title_size, fontweight="bold", pad=6)
-    ax.set_xlabel(xlabel, fontsize=9)
-    ax.set_ylabel(ylabel, fontsize=9)
+def _style_ax(ax, title: str, xlabel: str, ylabel: str, title_size: int = 13) -> None:
+    ax.set_title(title, fontsize=title_size, fontweight="bold", pad=8)
+    ax.set_xlabel(xlabel, fontsize=10)
+    ax.set_ylabel(ylabel, fontsize=10)
     ax.grid(True, alpha=0.2, linewidth=0.5)
     ax.tick_params(labelsize=8)
 
@@ -175,7 +177,7 @@ def _add_pass_dividers(ax, xs: list) -> None:
         ax.axvline(p * DAYS_PER_PASS, color="#cccccc", linewidth=0.6, linestyle=":")
         p += 1
 
-def _industry_legend(fig, anchor_ax, ncol: int = 7) -> None:
+def _industry_legend(ax, extra_handles: list | None = None) -> None:
     handles = [
         mlines.Line2D([], [], color=IND_COLOR[ind], linewidth=1.8, label=IND_LABEL[ind])
         for ind in INDUSTRIES
@@ -184,9 +186,11 @@ def _industry_legend(fig, anchor_ax, ncol: int = 7) -> None:
         mlines.Line2D([], [], color="#444444", linewidth=1.8, linestyle="-",  label="─── mean"),
         mlines.Line2D([], [], color="#444444", linewidth=0.9, linestyle="--", label="- - max / min"),
     ]
-    anchor_ax.legend(
+    if extra_handles:
+        handles += extra_handles
+    ax.legend(
         handles=handles, loc="upper center",
-        bbox_to_anchor=(0.5, -0.18), ncol=ncol,
+        bbox_to_anchor=(0.5, -0.14), ncol=7,
         fontsize=8, framealpha=0.95, edgecolor="#cccccc",
     )
 
@@ -195,6 +199,11 @@ def _plot_band(ax, xs, means, maxes, mins, color: str) -> None:
     ax.plot(xs, maxes, color=color, linewidth=0.75, linestyle="--", alpha=0.50, zorder=2)
     ax.plot(xs, mins,  color=color, linewidth=0.75, linestyle="--", alpha=0.50, zorder=2)
 
+def _save(fig, out_path: Path) -> None:
+    fig.savefig(out_path, format="svg", bbox_inches="tight")
+    plt.close(fig)
+    print(f"  {out_path}")
+
 # ── Industry performance SVG ──────────────────────────────────────────────────
 def plot_industry(rows: list[dict], out_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(FIG_W, 9))
@@ -202,68 +211,63 @@ def plot_industry(rows: list[dict], out_path: Path) -> None:
 
     xs = [csv_x(r) for r in rows]
     for ind in INDUSTRIES:
-        # Replace logging-artifact zeros with NaN so gaps appear instead of drops
+        raw_means = [r[f"{ind}_elite_mean"] for r in rows]
+        raw_maxes = [r[f"{ind}_elite_max"]  for r in rows]
+        raw_mins  = [r[f"{ind}_elite_min"]  for r in rows]
+
+        # Identify floor-reset days (value == 0.0 is the pre-fix sentinel;
+        # post-fix, elite_mean == IND_STARTING_CASH on reset day but no longer 0)
+        reset_xs = [xs[j] for j, v in enumerate(raw_means) if v == 0.0]
+
         _plot_band(
             ax, xs,
-            means=_nan_zeros([r[f"{ind}_elite_mean"] for r in rows]),
-            maxes=_nan_zeros([r[f"{ind}_elite_max"]  for r in rows]),
-            mins= _nan_zeros([r[f"{ind}_elite_min"]  for r in rows]),
+            means=_nan_zeros(raw_means),
+            maxes=_nan_zeros(raw_maxes),
+            mins= _nan_zeros(raw_mins),
             color=IND_COLOR[ind],
         )
 
-    ax.axhline(25_000, color="#aaaaaa", linewidth=0.6, linestyle=":", zorder=1)
+        if reset_xs:
+            ax.scatter(
+                reset_xs, [FLOOR_VALUE] * len(reset_xs),
+                s=55, facecolors="none", edgecolors=IND_COLOR[ind],
+                linewidths=1.5, zorder=5,
+            )
+
+    ax.axhline(IND_STARTING_CASH, color="#aaaaaa", linewidth=0.6, linestyle=":", zorder=1)
+    ax.axhline(FLOOR_VALUE,        color="#ffaaaa", linewidth=0.6, linestyle=":", zorder=1)
     _add_pass_dividers(ax, xs)
-    _style_ax(ax, "Industry Elite Performance (StockNN)", "Training Day", "Portfolio Value ($)", title_size=13)
+    _style_ax(ax, "Industry Elite Performance (StockNN)", "Training Day", "Portfolio Value ($)")
     ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f"${v:,.0f}"))
-    _industry_legend(fig, ax)
 
-    fig.savefig(out_path, format="svg", bbox_inches="tight")
-    plt.close(fig)
-    print(f"  {out_path}")
-
-# ── MT1 all-components SVG ────────────────────────────────────────────────────
-def plot_mt1(records: list[dict], out_path: Path) -> None:
-    # Layout: composite spans full top row; 4 components fill 2×2 grid below
-    fig = plt.figure(figsize=(FIG_W, 18))
-    gs  = gridspec.GridSpec(
-        3, 2,
-        figure=fig,
-        height_ratios=[1.15, 1, 1],
-        hspace=0.42,
-        wspace=0.22,
-        top=0.95, bottom=0.10, left=0.07, right=0.97,
+    reset_handle = mlines.Line2D(
+        [], [], color="#888888", marker="o", linestyle="none",
+        markersize=6, markerfacecolor="none", markeredgewidth=1.5,
+        label="○  floor reset ($22.5K)",
     )
+    _industry_legend(ax, extra_handles=[reset_handle])
+    _save(fig, out_path)
 
-    axes = {
-        "composite":  fig.add_subplot(gs[0, :]),     # spans both cols
-        "direction":  fig.add_subplot(gs[1, 0]),
-        "range":      fig.add_subplot(gs[1, 1]),
-        "accuracy":   fig.add_subplot(gs[2, 0]),
-        "confidence": fig.add_subplot(gs[2, 1]),
-    }
+# ── MT1 single-component SVG ──────────────────────────────────────────────────
+def plot_mt1_component(records: list[dict], comp: str, out_path: Path) -> None:
+    fig, ax = plt.subplots(figsize=(FIG_W, 9))
+    fig.subplots_adjust(bottom=0.23)
 
     xs = [r["x"] for r in records]
-    for comp, ax in axes.items():
-        for i, ind in enumerate(INDUSTRIES):
-            _plot_band(
-                ax, xs,
-                means=[r["mt1"][comp]["mean"][i] for r in records],
-                maxes=[r["mt1"][comp]["best"][i] for r in records],
-                mins= [r["mt1"][comp]["min"][i]  for r in records],
-                color=IND_COLOR[ind],
-            )
-        ax.set_ylim(0, 1)
-        _add_pass_dividers(ax, xs)
-        ylabel = "Score (0 – 1)"
-        xlabel = "Training Day" if comp in ("accuracy", "confidence") else ""
-        _style_ax(ax, MT1_COMP_LABEL[comp], xlabel, ylabel)
+    for i, ind in enumerate(INDUSTRIES):
+        _plot_band(
+            ax, xs,
+            means=[r["mt1"][comp]["mean"][i] for r in records],
+            maxes=[r["mt1"][comp]["best"][i] for r in records],
+            mins= [r["mt1"][comp]["min"][i]  for r in records],
+            color=IND_COLOR[ind],
+        )
 
-    # One shared legend anchored to the bottom of the accuracy panel (bottom-left)
-    _industry_legend(fig, axes["accuracy"], ncol=7)
-
-    fig.savefig(out_path, format="svg", bbox_inches="tight")
-    plt.close(fig)
-    print(f"  {out_path}")
+    ax.set_ylim(0, 1)
+    _add_pass_dividers(ax, xs)
+    _style_ax(ax, f"MT1 — {MT1_COMP_LABEL[comp]}", "Training Day", "Score (0 – 1)")
+    _industry_legend(ax)
+    _save(fig, out_path)
 
 # ── MT2 SVG ───────────────────────────────────────────────────────────────────
 def plot_mt2(rows: list[dict], out_path: Path) -> None:
@@ -282,13 +286,10 @@ def plot_mt2(rows: list[dict], out_path: Path) -> None:
     ax.plot(xs, ideals, color="#2ca02c", linewidth=1.8,  alpha=0.90, label="Ideal (slot0 basis)")
     ax.axhline(0, color="#dddddd", linewidth=0.5, zorder=1)
     _add_pass_dividers(ax, xs)
-    _style_ax(ax, "MT2 Allocation Score (Elite Pool)", "Training Day", "Score (pts)", title_size=13)
+    _style_ax(ax, "MT2 Allocation Score (Elite Pool)", "Training Day", "Score (pts)")
     ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.08), ncol=4,
               fontsize=9, framealpha=0.95, edgecolor="#cccccc")
-
-    fig.savefig(out_path, format="svg", bbox_inches="tight")
-    plt.close(fig)
-    print(f"  {out_path}")
+    _save(fig, out_path)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
@@ -323,9 +324,10 @@ def main() -> None:
     print(f"  CSV: {len(rows)} rows  |  Binary: {len(records)} MT1 records  |  latest x={max_day}")
 
     print("Generating SVGs...")
-    plot_industry(rows,    PLOT_DIR / "industry_performance.svg")
-    plot_mt1(records,      PLOT_DIR / "mt1_performance.svg")
-    plot_mt2(rows,         PLOT_DIR / "mt2_performance.svg")
+    plot_industry(rows,  PLOT_DIR / "industry_performance.svg")
+    for comp in _COMP_NAMES:
+        plot_mt1_component(records, comp, PLOT_DIR / f"mt1_{comp}.svg")
+    plot_mt2(rows, PLOT_DIR / "mt2_performance.svg")
     print("Done.")
 
 if __name__ == "__main__":
