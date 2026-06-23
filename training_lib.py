@@ -32,12 +32,17 @@ ELITE_POOL            = ELITE_COUNT + WAVG_COUNT   # 20 — all parent slots
 MUTATIONS_PER_PARENT  = 9           # each of the ELITE_POOL parents gets this many children
 # Layout: 0–16 direct elites | 17 w5 | 18 w10 | 19 w15 | 20–199 mutations (9 per parent)
 
-# MT1-specific pool layout (different from StockNN/MasterNN)
-MT1_ELITES_PER_CAT   = 5           # best models per scoring category
-MT1_N_CATS           = 5           # categories: composite, direction, range, accuracy, confidence
-MT1_DIRECT_ELITES    = MT1_N_CATS * MT1_ELITES_PER_CAT   # 25 direct elite slots
-MT1_WAVG_BLENDS      = 3           # cross-category wavg blend slots (top-1/2/3 from each cat)
-MT1_ELITE_POOL       = MT1_DIRECT_ELITES + MT1_WAVG_BLENDS   # 28 total parent slots
+# MT1: 5 separate pools (4 component + 1 composite blend).
+# Component pools (dir/acc/rng/cfd): 23 elites (17 direct + 3 wavg + 3 re-injected) + 207 mutations = 230 slots.
+# Composite pool: 200 blends/day (no mutation); 5-day history (10/day).
+MT1_REINJECT         = 3           # re-injected composite models per component pool
+MT1_COMP_ELITE       = ELITE_COUNT + WAVG_COUNT + MT1_REINJECT   # 23 = 17+3+3
+MT1_COMP_SLOTS       = 230         # 23 elites + 207 mutations
+MT1_COMP_MUTS        = MT1_COMP_SLOTS - MT1_COMP_ELITE            # 207
+MT1_BLEND_SLOTS      = 200         # composite blend pool size per day
+MT1_RANGE_FLOOR      = 1.0         # $1 — effectively no range floor
+MT1_RANGE_CEIL_MULT  = 4.0         # ceiling = 4 × mean(last 10 |actual−delta|)
+MT1_POOL_NAMES       = ('dir', 'acc', 'rng', 'cfd')
 
 IND_STARTING_CASH     = 25_000.0    # per-industry portfolio starting capital
 MST_STARTING_CASH     = 300_000.0   # master starting capital (12 × IND_STARTING_CASH)
