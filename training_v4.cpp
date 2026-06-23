@@ -1297,7 +1297,8 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                 state.portfolios[s].stop_prices[j] = 0.f;
             }
         }
-        return {baseline, baseline, 0.f, 0.f, 0.f, 0, 0.f, 0.f, 0.f};
+        return {baseline, baseline, 0.f, 0.f, 0.f, 0,
+                IND_STARTING_CASH, IND_STARTING_CASH, IND_STARTING_CASH};
     }
 
     // Zero-trade inaction filter
