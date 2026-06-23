@@ -212,6 +212,8 @@ models/
 logs/
 stock_data/
 data_dump/
+plots/
+logs_local/
 owners/
 state.json
 training_log.csv
