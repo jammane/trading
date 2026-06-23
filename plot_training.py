@@ -3,13 +3,14 @@
 plot_training.py — Download training logs from the droplet and generate SVG progress charts.
 
 Usage:
-    python plot_training.py                       # use existing logs_local/ files
+    python plot_training.py                       # use existing logs_local/ files, latest pass
     python plot_training.py --download            # pull fresh logs first
+    python plot_training.py --pass 2              # display pass 2 (default: latest)
     python plot_training.py --download --account acct0 --host root@165.22.6.112
 
 Outputs (git-ignored):
     plots/industry_performance.svg   — StockNN elite portfolio value per industry
-                                       (open circles mark hard-floor reset events at $22.5K)
+                                       (○ = floor-reset event at $22.5K, ● = reset-to $25K)
     plots/mt1_composite.svg          — MT1 composite score per industry
     plots/mt1_direction.svg          — MT1 direction component
     plots/mt1_range.svg              — MT1 range component
@@ -18,6 +19,8 @@ Outputs (git-ignored):
     plots/mt2_performance.svg        — MT2 allocation score (elite pool stats)
 
 Lines: solid = mean, dashed = max & min  (slot0 excluded per design)
+Each chart shows one pass only; x-axis = day within that pass.
+When more than 100 days are present, values are averaged into ~100 display points.
 """
 
 import argparse
@@ -43,10 +46,11 @@ REMOTE_LOG      = "/root/trading/logs/{account}/training"
 LOCAL_LOG_DIR   = Path("logs_local")
 PLOT_DIR        = Path("plots")
 
-DAYS_PER_PASS   = 1255
-FIG_W           = 16   # fixed width; height varies per chart
+DAYS_PER_PASS     = 1255
+FIG_W             = 16      # fixed width; height varies per chart
+TARGET_POINTS     = 100     # max display points per chart (avg-downsample when exceeded)
 IND_STARTING_CASH = 25_000.0
-FLOOR_VALUE     = IND_STARTING_CASH * 0.9   # $22,500 — hard-floor reset threshold
+FLOOR_VALUE       = IND_STARTING_CASH * 0.9   # $22,500 — hard-floor reset threshold
 
 INDUSTRIES = [
     "tech_hardware", "tech_software_ai", "financials", "consumer_discretionary",
@@ -113,9 +117,6 @@ def load_csv(path: Path) -> list[dict]:
             rows.append({k: float(v.strip()) for k, v in row.items()})
     return rows
 
-def csv_x(row: dict) -> int:
-    return int(row["pass"] - 1) * DAYS_PER_PASS + int(row["day"])
-
 # ── Parse mt_training_log.bin ─────────────────────────────────────────────────
 def load_binary_log(path: Path) -> list[dict]:
     data = path.read_bytes()
@@ -132,7 +133,7 @@ def load_binary_log(path: Path) -> list[dict]:
     offset = HEADER_SIZE
     while offset + RECORD_SIZE_V4 <= len(data):
         raw = _RECORD_STRUCT.unpack_from(data, offset)
-        pass_num   = raw[0]
+        pass_num   = raw[0] + 1   # C++ writes 0-indexed; normalise to match CSV's 1-indexed
         actual_day = raw[1]
 
         f = raw[2:242]  # 240 MT1 floats
@@ -146,7 +147,6 @@ def load_binary_log(path: Path) -> list[dict]:
         records.append({
             "pass":      pass_num,
             "day":       actual_day,
-            "x":         pass_num * DAYS_PER_PASS + actual_day,
             "mt1":       mt1,
             "mt2_best":  raw[242],
             "mt2_slot0": raw[243],
@@ -157,25 +157,105 @@ def load_binary_log(path: Path) -> list[dict]:
 
     return records
 
-# ── Shared plot helpers ───────────────────────────────────────────────────────
-def _nan_zeros(vals: list[float]) -> list[float]:
-    return [v if v != 0.0 else math.nan for v in vals]
+# ── Downsampling ──────────────────────────────────────────────────────────────
+def _smooth_seg(xs: list, ys: list, target: int) -> tuple[list, list]:
+    """Average (xs, ys) into `target` evenly-spaced bins when len > target."""
+    n = len(xs)
+    if n <= target:
+        return list(xs), list(ys)
+    out_xs, out_ys = [], []
+    for k in range(target):
+        lo = int(k * n / target)
+        hi = min(n, int((k + 1) * n / target) + 1)
+        if lo >= hi:
+            hi = lo + 1
+        out_xs.append(sum(xs[lo:hi]) / (hi - lo))
+        out_ys.append(sum(ys[lo:hi]) / (hi - lo))
+    return out_xs, out_ys
 
+def _smooth(xs: list, ys: list) -> tuple[list, list]:
+    """Smooth a simple series (no NaN breaks) to ~TARGET_POINTS."""
+    return _smooth_seg(xs, ys, TARGET_POINTS)
+
+# ── Floor-reset detection ─────────────────────────────────────────────────────
+def _is_reset(mean_v: float, max_v: float, min_v: float) -> bool:
+    # Pre-fix binary: 0.0 is the sentinel returned on a floor-reset day
+    if mean_v == 0.0:
+        return True
+    # Post-fix binary: floor reset returns IND_STARTING_CASH for all three
+    if (mean_v == IND_STARTING_CASH
+            and max_v == IND_STARTING_CASH
+            and min_v == IND_STARTING_CASH):
+        return True
+    return False
+
+# ── Industry display series (floor-reset aware) ───────────────────────────────
+def _build_industry_series(
+    xs: list[int],
+    raw_means: list[float],
+    raw_maxes: list[float],
+    raw_mins:  list[float],
+) -> tuple[tuple[list, list], tuple[list, list], tuple[list, list], list[int]]:
+    """
+    Return (mean_series, max_series, min_series, reset_xs):
+      - On reset days: line extends DOWN to FLOOR_VALUE (open-circle position),
+        then a NaN break, then IND_STARTING_CASH as the first point of the
+        next segment (filled-dot position connecting to the next day).
+      - Each continuous segment is proportionally smoothed to ~TARGET_POINTS.
+    """
+    total_n = len(xs)
+
+    def _split_and_smooth(raw: list[float]) -> tuple[list, list]:
+        reset_xs_set = {
+            xs[j] for j in range(total_n)
+            if _is_reset(raw_means[j], raw_maxes[j], raw_mins[j])
+        }
+        segs: list[tuple[list, list]] = []
+        seg_x: list[float] = []
+        seg_y: list[float] = []
+        for x, v in zip(xs, raw):
+            if x in reset_xs_set:
+                seg_x.append(float(x))
+                seg_y.append(FLOOR_VALUE)   # line drops to open-circle level
+                segs.append((seg_x, seg_y))
+                seg_x = [float(x)]
+                seg_y = [IND_STARTING_CASH] # filled-dot level starts next segment
+            else:
+                seg_x.append(float(x))
+                seg_y.append(v)
+        if seg_x:
+            segs.append((seg_x, seg_y))
+
+        out_xs: list[float] = []
+        out_ys: list[float] = []
+        for i, (sx, sy) in enumerate(segs):
+            seg_target = max(2, round(TARGET_POINTS * len(sx) / total_n))
+            smx, smy = _smooth_seg(sx, sy, seg_target)
+            if i:
+                out_xs.append(math.nan)
+                out_ys.append(math.nan)
+            out_xs.extend(smx)
+            out_ys.extend(smy)
+        return out_xs, out_ys
+
+    reset_xs = [
+        xs[j] for j in range(total_n)
+        if _is_reset(raw_means[j], raw_maxes[j], raw_mins[j])
+    ]
+    return (
+        _split_and_smooth(raw_means),
+        _split_and_smooth(raw_maxes),
+        _split_and_smooth(raw_mins),
+        reset_xs,
+    )
+
+# ── Shared plot helpers ───────────────────────────────────────────────────────
 def _style_ax(ax, title: str, xlabel: str, ylabel: str, title_size: int = 13) -> None:
     ax.set_title(title, fontsize=title_size, fontweight="bold", pad=8)
     ax.set_xlabel(xlabel, fontsize=10)
     ax.set_ylabel(ylabel, fontsize=10)
     ax.grid(True, alpha=0.2, linewidth=0.5)
     ax.tick_params(labelsize=8)
-
-def _add_pass_dividers(ax, xs: list) -> None:
-    if not xs:
-        return
-    max_x = max(xs)
-    p = 1
-    while p * DAYS_PER_PASS < max_x:
-        ax.axvline(p * DAYS_PER_PASS, color="#cccccc", linewidth=0.6, linestyle=":")
-        p += 1
 
 def _industry_legend(ax, extra_handles: list | None = None) -> None:
     handles = [
@@ -205,91 +285,127 @@ def _save(fig, out_path: Path) -> None:
     print(f"  {out_path}")
 
 # ── Industry performance SVG ──────────────────────────────────────────────────
-def plot_industry(rows: list[dict], out_path: Path) -> None:
+def plot_industry(rows: list[dict], pass_num: int, out_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(FIG_W, 9))
     fig.subplots_adjust(bottom=0.23)
 
-    xs = [csv_x(r) for r in rows]
+    xs = [int(r["day"]) for r in rows]
+    has_resets = False
+
     for ind in INDUSTRIES:
         raw_means = [r[f"{ind}_elite_mean"] for r in rows]
         raw_maxes = [r[f"{ind}_elite_max"]  for r in rows]
         raw_mins  = [r[f"{ind}_elite_min"]  for r in rows]
 
-        # Identify floor-reset days (value == 0.0 is the pre-fix sentinel;
-        # post-fix, elite_mean == IND_STARTING_CASH on reset day but no longer 0)
-        reset_xs = [xs[j] for j, v in enumerate(raw_means) if v == 0.0]
+        (mean_xs, mean_ys), (max_xs, max_ys), (min_xs, min_ys), reset_xs = \
+            _build_industry_series(xs, raw_means, raw_maxes, raw_mins)
 
-        _plot_band(
-            ax, xs,
-            means=_nan_zeros(raw_means),
-            maxes=_nan_zeros(raw_maxes),
-            mins= _nan_zeros(raw_mins),
-            color=IND_COLOR[ind],
-        )
+        color = IND_COLOR[ind]
+        _plot_band(ax, mean_xs, mean_ys, max_ys, min_ys, color)
 
         if reset_xs:
+            has_resets = True
+            # Open circle at FLOOR_VALUE (where the reset was triggered)
             ax.scatter(
                 reset_xs, [FLOOR_VALUE] * len(reset_xs),
-                s=55, facecolors="none", edgecolors=IND_COLOR[ind],
+                s=55, facecolors="none", edgecolors=color,
                 linewidths=1.5, zorder=5,
+            )
+            # Filled dot at IND_STARTING_CASH (where portfolios reset to)
+            ax.scatter(
+                reset_xs, [IND_STARTING_CASH] * len(reset_xs),
+                s=30, facecolors=color, edgecolors=color,
+                linewidths=1.0, zorder=5,
             )
 
     ax.axhline(IND_STARTING_CASH, color="#aaaaaa", linewidth=0.6, linestyle=":", zorder=1)
     ax.axhline(FLOOR_VALUE,        color="#ffaaaa", linewidth=0.6, linestyle=":", zorder=1)
-    _add_pass_dividers(ax, xs)
-    _style_ax(ax, "Industry Elite Performance (StockNN)", "Training Day", "Portfolio Value ($)")
+    _style_ax(ax,
+              f"Industry Elite Performance (StockNN) — Pass {pass_num}",
+              f"Day (Pass {pass_num})", "Portfolio Value ($)")
     ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f"${v:,.0f}"))
 
-    reset_handle = mlines.Line2D(
-        [], [], color="#888888", marker="o", linestyle="none",
-        markersize=6, markerfacecolor="none", markeredgewidth=1.5,
-        label="○  floor reset ($22.5K)",
-    )
-    _industry_legend(ax, extra_handles=[reset_handle])
+    extra = []
+    if has_resets:
+        extra = [
+            mlines.Line2D([], [], color="#888888", marker="o", linestyle="none",
+                          markersize=6, markerfacecolor="none", markeredgewidth=1.5,
+                          label="○  floor reset ($22.5K)"),
+            mlines.Line2D([], [], color="#888888", marker="o", linestyle="none",
+                          markersize=5, markerfacecolor="#888888",
+                          label="●  reset-to ($25K)"),
+        ]
+    _industry_legend(ax, extra_handles=extra)
     _save(fig, out_path)
 
 # ── MT1 single-component SVG ──────────────────────────────────────────────────
-def plot_mt1_component(records: list[dict], comp: str, out_path: Path) -> None:
+def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(FIG_W, 9))
     fig.subplots_adjust(bottom=0.23)
 
-    xs = [r["x"] for r in records]
+    xs_raw = [r["day"] for r in records]
     for i, ind in enumerate(INDUSTRIES):
-        _plot_band(
-            ax, xs,
-            means=[r["mt1"][comp]["mean"][i] for r in records],
-            maxes=[r["mt1"][comp]["best"][i] for r in records],
-            mins= [r["mt1"][comp]["min"][i]  for r in records],
-            color=IND_COLOR[ind],
-        )
+        means_raw = [r["mt1"][comp]["mean"][i] for r in records]
+        bests_raw = [r["mt1"][comp]["best"][i] for r in records]
+        mins_raw  = [r["mt1"][comp]["min"][i]  for r in records]
+
+        xs_m, means = _smooth(xs_raw, means_raw)
+        xs_b, bests = _smooth(xs_raw, bests_raw)
+        xs_n, mins_s = _smooth(xs_raw, mins_raw)
+
+        _plot_band(ax, xs_m, means, bests, mins_s, IND_COLOR[ind])
 
     ax.set_ylim(0, 1)
-    _add_pass_dividers(ax, xs)
-    _style_ax(ax, f"MT1 — {MT1_COMP_LABEL[comp]}", "Training Day", "Score (0 – 1)")
+    _style_ax(ax,
+              f"MT1 — {MT1_COMP_LABEL[comp]} — Pass {pass_num}",
+              f"Day (Pass {pass_num})", "Score (0 – 1)")
     _industry_legend(ax)
     _save(fig, out_path)
 
 # ── MT2 SVG ───────────────────────────────────────────────────────────────────
-def plot_mt2(rows: list[dict], out_path: Path) -> None:
+def plot_mt2(rows: list[dict], pass_num: int, out_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(FIG_W, 9))
     fig.subplots_adjust(bottom=0.13)
 
-    xs     = [csv_x(r) for r in rows]
-    means  = [r["mt2_elite_mean_pts"] for r in rows]
-    maxes  = [r["mt2_elite_max_pts"]  for r in rows]
-    mins   = [r["mt2_elite_min_pts"]  for r in rows]
-    ideals = [r["mt2_ideal_pts"]      for r in rows]
+    xs_raw = [int(r["day"]) for r in rows]
+    means_raw  = [r["mt2_elite_mean_pts"] for r in rows]
+    maxes_raw  = [r["mt2_elite_max_pts"]  for r in rows]
+    mins_raw   = [r["mt2_elite_min_pts"]  for r in rows]
+    ideals_raw = [r["mt2_ideal_pts"]      for r in rows]
 
-    ax.plot(xs, means,  color="#1f77b4", linewidth=1.5,  alpha=0.90, label="Elite mean")
-    ax.plot(xs, maxes,  color="#1f77b4", linewidth=0.75, alpha=0.55, linestyle="--", label="Elite max")
-    ax.plot(xs, mins,   color="#1f77b4", linewidth=0.75, alpha=0.55, linestyle="--", label="Elite min")
-    ax.plot(xs, ideals, color="#2ca02c", linewidth=1.8,  alpha=0.90, label="Ideal (slot0 basis)")
+    xs_m, means  = _smooth(xs_raw, means_raw)
+    xs_b, maxes  = _smooth(xs_raw, maxes_raw)
+    xs_n, mins_s = _smooth(xs_raw, mins_raw)
+    xs_i, ideals = _smooth(xs_raw, ideals_raw)
+
+    ax.plot(xs_m, means,  color="#1f77b4", linewidth=1.5,  alpha=0.90, label="Elite mean")
+    ax.plot(xs_b, maxes,  color="#1f77b4", linewidth=0.75, alpha=0.55, linestyle="--", label="Elite max")
+    ax.plot(xs_n, mins_s, color="#1f77b4", linewidth=0.75, alpha=0.55, linestyle="--", label="Elite min")
+    ax.plot(xs_i, ideals, color="#2ca02c", linewidth=1.8,  alpha=0.90, label="Ideal (slot0 basis)")
     ax.axhline(0, color="#dddddd", linewidth=0.5, zorder=1)
-    _add_pass_dividers(ax, xs)
-    _style_ax(ax, "MT2 Allocation Score (Elite Pool)", "Training Day", "Score (pts)")
+    _style_ax(ax,
+              f"MT2 Allocation Score (Elite Pool) — Pass {pass_num}",
+              f"Day (Pass {pass_num})", "Score (pts)")
     ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.08), ncol=4,
               fontsize=9, framealpha=0.95, edgecolor="#cccccc")
     _save(fig, out_path)
+
+# ── Pass helpers ──────────────────────────────────────────────────────────────
+def _pass_max_day(all_rows: list[dict], pass_num: int) -> int:
+    return max((int(r["day"]) for r in all_rows if int(r["pass"]) == pass_num), default=0)
+
+def _is_complete(all_rows: list[dict], pass_num: int) -> bool:
+    return _pass_max_day(all_rows, pass_num) >= DAYS_PER_PASS
+
+def _generate_all(rows: list[dict], records: list[dict], pass_num: int, out_dir: Path) -> None:
+    out_dir.mkdir(exist_ok=True)
+    plot_industry(rows, pass_num, out_dir / "industry_performance.svg")
+    if records:
+        for comp in _COMP_NAMES:
+            plot_mt1_component(records, comp, pass_num, out_dir / f"mt1_{comp}.svg")
+    else:
+        print(f"  (no MT1 records for pass {pass_num} — MT1 activates at day 25)")
+    plot_mt2(rows, pass_num, out_dir / "mt2_performance.svg")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
@@ -297,6 +413,8 @@ def main() -> None:
     ap.add_argument("--download", action="store_true", help="Pull fresh logs from droplet")
     ap.add_argument("--host",    default=DROPLET_HOST, help="Droplet SSH host")
     ap.add_argument("--account", default="acct0",      help="Account (e.g. acct0)")
+    ap.add_argument("--pass",    dest="pass_num", type=int, default=None,
+                    help="Pass to display in plots/ (default: last completed, or pass 1)")
     args = ap.parse_args()
 
     PLOT_DIR.mkdir(exist_ok=True)
@@ -314,20 +432,45 @@ def main() -> None:
             sys.exit(f"Missing {p} — run with --download or copy manually")
 
     print("Parsing logs...")
-    rows    = load_csv(csv_path)
-    records = load_binary_log(bin_path)
-    if not rows:
+    all_rows    = load_csv(csv_path)
+    all_records = load_binary_log(bin_path)
+    if not all_rows:
         sys.exit("training_log.csv is empty")
-    if not records:
+    if not all_records:
         sys.exit("mt_training_log.bin has no records (MT1 activates at day 25)")
-    max_day = max(r["x"] for r in records)
-    print(f"  CSV: {len(rows)} rows  |  Binary: {len(records)} MT1 records  |  latest x={max_day}")
 
-    print("Generating SVGs...")
-    plot_industry(rows,  PLOT_DIR / "industry_performance.svg")
-    for comp in _COMP_NAMES:
-        plot_mt1_component(records, comp, PLOT_DIR / f"mt1_{comp}.svg")
-    plot_mt2(rows, PLOT_DIR / "mt2_performance.svg")
+    all_passes = sorted({int(r["pass"]) for r in all_rows}
+                        | {r["pass"] for r in all_records})
+    completed  = [p for p in all_passes if _is_complete(all_rows, p)]
+
+    # Default: last completed pass, or pass 1 if none are complete
+    if args.pass_num is not None:
+        display_pass = args.pass_num
+        if display_pass not in all_passes:
+            sys.exit(f"Pass {display_pass} not in logs (available: {all_passes})")
+    else:
+        display_pass = completed[-1] if completed else (all_passes[0] if all_passes else 1)
+
+    print(f"  Available passes: {all_passes}  |  completed: {completed or 'none'}  |"
+          f"  display: pass {display_pass}")
+
+    # Archive charts for every completed pass in plots/passN/
+    for p in completed:
+        pdir = PLOT_DIR / f"pass{p}"
+        print(f"Archiving pass {p} → {pdir}/")
+        rows_p = [r for r in all_rows    if int(r["pass"]) == p]
+        recs_p = [r for r in all_records if     r["pass"]  == p]
+        _generate_all(rows_p, recs_p, p, pdir)
+
+    # Generate display charts in plots/
+    print(f"Generating display charts (pass {display_pass}) → {PLOT_DIR}/")
+    rows_d = [r for r in all_rows    if int(r["pass"]) == display_pass]
+    recs_d = [r for r in all_records if     r["pass"]  == display_pass]
+    if not rows_d:
+        sys.exit(f"No CSV rows for pass {display_pass}")
+    max_day = max(int(r["day"]) for r in rows_d)
+    print(f"  {len(rows_d)} CSV rows (day 1–{max_day})  |  {len(recs_d)} MT1 records")
+    _generate_all(rows_d, recs_d, display_pass, PLOT_DIR)
     print("Done.")
 
 if __name__ == "__main__":
