@@ -46,7 +46,7 @@ kubectl create secret generic alpaca-credentials-acct0-prod \
     --from-literal=ALPACA_SECRET_KEY="..." \
     --dry-run=client -o yaml | kubectl apply -f -
 ```
-All 75 pytest tests (including `test_models.py`) run on the droplet where torch is available.
+All 91 pytest tests (including `test_models.py`) run on the droplet where torch is available.
 The pre-commit hook runs the full suite automatically before every `git commit`.
 
 **Lint:**
@@ -202,7 +202,7 @@ Runs all five steps: updates `universe_acct0.py` and regenerates `universe.json`
 
 ## Tests
 
-95 pytest tests across three files in `tests/`:
+91 pytest tests across three files in `tests/`:
 - `test_models.py` — output shapes, output constraints (ReLU/sigmoid/softmax), serialization roundtrip, inject-layer growth dimensions; MT1NN/MT2NN shape + activation + forward tests
 - `test_universe.py` — industry count, symbols per industry, no duplicates, formatting
 - `test_fees.py` — fee constant values, `_sell_net` calculations, FINRA cap boundary
