@@ -339,7 +339,8 @@ def plot_industry(rows: list[dict], pass_num: int, out_path: Path) -> None:
     _save(fig, out_path)
 
 # ── MT1 single-component SVG ──────────────────────────────────────────────────
-def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: Path) -> None:
+def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: Path,
+                       csv_rows: list[dict] | None = None) -> None:
     fig, ax = plt.subplots(figsize=(FIG_W, 9))
     fig.subplots_adjust(bottom=0.23)
 
@@ -376,17 +377,33 @@ def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: 
         ax.axhline(3.0, color="gray", linewidth=0.8, linestyle="--",
                    label="Random baseline (3.0)")
 
-        # Net positive industry percentage on right y-axis
-        net_pos_raw = [
-            100.0 * sum(1 for i in range(n_ind) if r["mt1"]["direction"]["mean"][i] > 3.0) / n_ind
-            for r in records
-        ]
+        # % industries with rising portfolio value day-over-day (right y-axis)
+        if csv_rows:
+            csv_by_day = {int(r["day"]): r for r in csv_rows}
+            net_pos_raw = []
+            for r in records:
+                day = r["day"]
+                row = csv_by_day.get(day)
+                prev_row = csv_by_day.get(day - 1)
+                if row and prev_row:
+                    pct = 100.0 * sum(
+                        1 for ind in INDUSTRIES
+                        if float(row.get(f"{ind}_elite_mean", 0)) > float(prev_row.get(f"{ind}_elite_mean", 0))
+                    ) / n_ind
+                else:
+                    pct = 0.0
+                net_pos_raw.append(pct)
+        else:
+            net_pos_raw = [
+                100.0 * sum(1 for i in range(n_ind) if r["mt1"]["direction"]["mean"][i] > 3.0) / n_ind
+                for r in records
+            ]
         xs_np, net_pos = _smooth(xs_raw, net_pos_raw)
         ax2 = ax.twinx()
         ax2.plot(xs_np, net_pos, color="#808080", linewidth=2.5, zorder=4,
-                 label="% net positive industries")
+                 label="% portfolio up day-over-day")
         ax2.set_ylim(0, 100)
-        ax2.set_ylabel("% net positive industries", fontsize=10, color="#606060")
+        ax2.set_ylabel("% industries up day-over-day", fontsize=10, color="#606060")
         ax2.tick_params(labelsize=8, colors="#606060")
         ax2.spines["right"].set_color("#808080")
     else:
@@ -402,7 +419,7 @@ def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: 
     ]
     if ax2 is not None:
         extra.append(mlines.Line2D([], [], color="#808080", linewidth=2.5,
-                                   label="% net positive industries (right axis)"))
+                                   label="% industries up day-over-day (right axis)"))
     _industry_legend(ax, extra_handles=extra)
     _save(fig, out_path)
 
@@ -543,7 +560,8 @@ def _generate_all(rows: list[dict], records: list[dict], pass_num: int, out_dir:
     plot_industry(rows, pass_num, out_dir / "industry_performance.svg")
     if records:
         for comp in _COMP_NAMES:
-            plot_mt1_component(records, comp, pass_num, out_dir / f"mt1_{comp}.svg")
+            plot_mt1_component(records, comp, pass_num, out_dir / f"mt1_{comp}.svg",
+                               csv_rows=rows)
     else:
         print(f"  (no MT1 records for pass {pass_num} — MT1 activates at day 25)")
     plot_mt2(rows, pass_num, out_dir / "mt2_performance.svg")

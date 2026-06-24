@@ -105,23 +105,19 @@ static constexpr int   ELITE_POOL          = 20;   // industry + MT2
 static constexpr int   MUTATIONS_PER_PARENT = 9;
 
 // MT1: 5 separate pools (4 component + 1 composite blend).
-// Component pools (dir/acc/rng/cfd): 23 elites (17 direct + 3 wavg + 3 re-injected)
-//   + 207 mutations = 230 slots each.  History: 5 days × 10 models (reuses HIST_* constants).
-// Composite pool: 200 blends/day (no mutation); 5-day history (10/day); re-injection into
-//   component pools each day (top 3 composite → component slots 20–22).
-static constexpr int   MT1_REINJECT        = 3;
-static constexpr int   MT1_COMP_ELITE      = ELITE_COUNT + WAVG_COUNT + MT1_REINJECT; // 23
-static constexpr int   MT1_COMP_SLOTS      = 230;
-static constexpr int   MT1_COMP_MUTS       = MT1_COMP_SLOTS - MT1_COMP_ELITE;         // 207
+// Component pools (dir/acc/rng/cfd): uniform 200 slots each.
+//   Slot layout: 0-16 direct elites | 17-19 wavg | 20-24 injected | 25-199 mutations (7/parent).
+//   Injection cascade: composite→dir, composite→rng, dir→acc, rng→cfd.
+// Composite pool: 200 blends/day (no mutation); 5-day history (10/day).
+static constexpr int   MT1_COMP_INJECT     = 5;      // injection slots per pool (cascade sources)
+static constexpr int   MT1_RANGE_INJECT    = 5;      // range→confidence injection count
+static constexpr int   MT1_COMP_PARENTS    = ELITE_COUNT + WAVG_COUNT + MT1_COMP_INJECT; // 25
+static constexpr int   MT1_COMP_CHILDREN   = 7;      // mutations per parent
+static constexpr int   MT1_COMP_SLOTS      = MT1_COMP_PARENTS * (MT1_COMP_CHILDREN + 1); // 200
 static constexpr int   MT1_BLEND_SLOTS     = 200;
 static constexpr float MT1_RANGE_FLOOR     = 1.f;    // $1 — effectively no floor
-static constexpr float MT1_RANGE_CEIL_MULT = 4.f;    // ceiling = 4 × mean(last 10 |actual−delta|)
+static constexpr float MT1_RANGE_CEIL_MULT = 4.f;    // ceiling = 4 × max(mean, today) |actual−comp0_delta|
 static constexpr float MT1_DIR_BACKFILL    = 0.65f;  // skip direction pool update when best score < this
-static constexpr int   MT1_RANGE_INJECT    = 5;      // top range elites → bottom 5 confidence slots (anti-gaming)
-static constexpr int   MT1_COMP_INJECT     = 5;      // top composite → additive elite slots 23–27 in dir/acc/rng
-static constexpr int   MT1_COMP_ELITE_EXT  = MT1_COMP_ELITE + MT1_COMP_INJECT;           // 28
-static constexpr int   MT1_COMP_MUTS_EXT   = MT1_COMP_ELITE_EXT * 9;                     // 252
-static constexpr int   MT1_COMP_SLOTS_EXT  = MT1_COMP_ELITE_EXT + MT1_COMP_MUTS_EXT;     // 280
 static constexpr int   MT1_DIR_DAYS        = 5;   // direction pool: score each model over last N days, sum
 static constexpr int   HIST_WINDOW         = 15;
 
@@ -523,12 +519,12 @@ struct MasterScratch {
 // ── MT1/MT2 structures ──────────────────────────────────────────────────────────
 
 struct MT1Scratch {
-    // 4 component pool elite buffers [MT1_COMP_ELITE × MT1NN_PARAMS each]
-    // pool: 0=dir  1=acc  2=rng  3=cfd
+    // 4 component pool elite buffers [MT1_COMP_PARENTS × MT1NN_PARAMS each]
+    // pool: 0=dir  1=acc  2=rng  3=cfd (uniform 200-slot layout for all pools)
     float*   comp_elites[4];
-    float*   new_elites;           // scratch [MT1_COMP_ELITE_EXT × MT1NN_PARAMS]
+    float*   new_elites;           // scratch [MT1_COMP_PARENTS × MT1NN_PARAMS]
     float*   mut_buf;              // [MT1NN_PARAMS]
-    uint64_t mut_seeds[MT1_COMP_MUTS_EXT];  // 252 (max across all pool types)
+    uint64_t mut_seeds[MT1_COMP_PARENTS * MT1_COMP_CHILDREN];  // 175 mutations
 
     // Component pool 5-day histories [HIST_DAYS × HIST_PER_DAY × MT1NN_PARAMS each]
     float*   pool_hist[4];
@@ -540,17 +536,16 @@ struct MT1Scratch {
     int      blend_hist_head{0};
     int      blend_hist_count{0};
 
-    // Re-injection: top MT1_REINJECT composite models written to component slots 20–22 next day
-    float*   reinject_buf;
-    int      reinject_count{0};
-
-    // Range→confidence anti-gaming injection: top range elites overwrite bottom confidence slots
-    float*   rng_inject_buf;
-    int      rng_inject_count{0};
-
-    // Composite→component additive injection: top composite elites appended as slots 23–27 in dir/acc/rng
+    // Injection cascade buffers (populated after each pool step, applied next day)
+    // composite top-5 → direction slots 20–24 AND range slots 20–24
     float*   comp_inject_buf;
     int      comp_inject_count{0};
+    // direction top-5 → accuracy slots 20–24
+    float*   dir_inject_buf;
+    int      dir_inject_count{0};
+    // range top-5 → confidence slots 20–24
+    float*   rng_inject_buf;
+    int      rng_inject_count{0};
 
     // Best composite model weights (saved periodically as comp_0.bin)
     float*   comp0_buf;
@@ -568,7 +563,7 @@ struct MT1Scratch {
     int      rolling_count{0};
 
     MT1Scratch() {
-        size_t ep  = (size_t)MT1_COMP_ELITE_EXT * MT1NN_PARAMS;  // allocate for max pool size
+        size_t ep  = (size_t)MT1_COMP_PARENTS * MT1NN_PARAMS;
         size_t hp  = (size_t)HIST_DAYS * HIST_PER_DAY * MT1NN_PARAMS;
         for (int p = 0; p < 4; p++) {
             comp_elites[p] = new float[ep]();
@@ -577,16 +572,16 @@ struct MT1Scratch {
         new_elites      = new float[ep]();
         mut_buf         = new float[MT1NN_PARAMS]();
         blend_hist      = new float[hp]();
-        reinject_buf    = new float[(size_t)MT1_REINJECT      * MT1NN_PARAMS]();
-        rng_inject_buf  = new float[(size_t)MT1_RANGE_INJECT  * MT1NN_PARAMS]();
-        comp_inject_buf = new float[(size_t)MT1_COMP_INJECT   * MT1NN_PARAMS]();
+        comp_inject_buf = new float[(size_t)MT1_COMP_INJECT  * MT1NN_PARAMS]();
+        dir_inject_buf  = new float[(size_t)MT1_COMP_INJECT  * MT1NN_PARAMS]();
+        rng_inject_buf  = new float[(size_t)MT1_RANGE_INJECT * MT1NN_PARAMS]();
         comp0_buf       = new float[MT1NN_PARAMS]();
     }
     ~MT1Scratch() {
         for (int p = 0; p < 4; p++) { delete[] comp_elites[p]; delete[] pool_hist[p]; }
         delete[] new_elites; delete[] mut_buf;
-        delete[] blend_hist; delete[] reinject_buf; delete[] rng_inject_buf;
-        delete[] comp_inject_buf; delete[] comp0_buf;
+        delete[] blend_hist; delete[] comp_inject_buf; delete[] dir_inject_buf;
+        delete[] rng_inject_buf; delete[] comp0_buf;
     }
     float* comp_elite(int pool, int slot) { return comp_elites[pool] + (size_t)slot * MT1NN_PARAMS; }
     float* new_elite(int slot)            { return new_elites         + (size_t)slot * MT1NN_PARAMS; }
@@ -596,9 +591,9 @@ struct MT1Scratch {
     float* blend_hist_slot(int day, int pos) {
         return blend_hist + ((size_t)(day * HIST_PER_DAY + pos)) * MT1NN_PARAMS;
     }
-    float* reinject(int k)     { return reinject_buf    + (size_t)k * MT1NN_PARAMS; }
-    float* rng_inject(int k)   { return rng_inject_buf  + (size_t)k * MT1NN_PARAMS; }
     float* comp_inject(int k)  { return comp_inject_buf + (size_t)k * MT1NN_PARAMS; }
+    float* dir_inject(int k)   { return dir_inject_buf  + (size_t)k * MT1NN_PARAMS; }
+    float* rng_inject(int k)   { return rng_inject_buf  + (size_t)k * MT1NN_PARAMS; }
 
     void push_dir_day(const float* f37, float ad) {
         memcpy(dir_day_buf[dir_day_head].feat37, f37, 37 * sizeof(float));
@@ -1718,8 +1713,12 @@ static void build_master_features(const float ind_val_hist[][IND_HIST_CAP],
         const float* h = ind_val_hist[i];
         float* feat = out444 + i * 37;
 
-        // 18 delta lookbacks
+        // 18 delta lookbacks (lt==12 → t=25 replaced with raw current portfolio value)
         for (int lt = 0; lt < 18; lt++) {
+            if (lt == 12) {
+                feat[lt] = hist_at(h, hist_count, 0);  // current portfolio value (scale anchor)
+                continue;
+            }
             int t  = LOOKBACKS[lt];
             float vt  = hist_at(h, hist_count, t);
             float vt1 = hist_at(h, hist_count, t + 1);
@@ -2138,16 +2137,24 @@ static MT1CompResult step_mt1_component(
     float actual_d, const float in37[37], int actual_day, float sigma,
     float acc_floor, float range_ceiling)
 {
-    // Per-pool sizes: dir/acc/rng use extended 280-slot pool; cfd stays at 230
-    const bool     pool_ext   = (pool_id != 3);
-    const int      pool_elite = pool_ext ? MT1_COMP_ELITE_EXT : MT1_COMP_ELITE;
-    const int      pool_slots = pool_ext ? MT1_COMP_SLOTS_EXT : MT1_COMP_SLOTS;
-    const int      pool_muts  = pool_ext ? MT1_COMP_MUTS_EXT  : MT1_COMP_MUTS;
+    // All pools: uniform 200 slots — 25 parents × (7 children + 1 parent)
+    const int pool_elite = MT1_COMP_PARENTS;        // 25
+    const int pool_slots = MT1_COMP_SLOTS;          // 200
+    const int pool_muts  = pool_slots - pool_elite; // 175
 
-    // Load re-injection models into elite slots 20–22 (slots ELITE_COUNT+WAVG_COUNT .. MT1_COMP_ELITE-1)
-    for (int k = 0; k < scratch.reinject_count; k++)
-        memcpy(scratch.comp_elite(pool_id, ELITE_COUNT + WAVG_COUNT + k),
-               scratch.reinject(k), MT1NN_PARAMS * sizeof(float));
+    // Load injection models into slots 20–24 from cascade source (populated previous day)
+    {
+        const float* inject_src;
+        switch (pool_id) {
+            case 0:  inject_src = scratch.comp_inject_buf; break;  // direction  ← composite
+            case 1:  inject_src = scratch.dir_inject_buf;  break;  // accuracy   ← direction
+            case 2:  inject_src = scratch.comp_inject_buf; break;  // range      ← composite
+            default: inject_src = scratch.rng_inject_buf;  break;  // confidence ← range
+        }
+        for (int k = 0; k < MT1_COMP_INJECT; k++)
+            memcpy(scratch.comp_elite(pool_id, ELITE_COUNT + WAVG_COUNT + k),
+                   inject_src + (size_t)k * MT1NN_PARAMS, MT1NN_PARAMS * sizeof(float));
+    }
 
     // Deterministic mutation seeds (per day + industry + pool)
     {
@@ -2171,12 +2178,10 @@ static MT1CompResult step_mt1_component(
         }
     };
 
-    // Score all pool_slots on the pool-specific component score
-    float cat_sc[MT1_COMP_SLOTS_EXT] = {};  // allocate for max pool size
+    // Score all pool_slots with per-pool culls and pool-specific scoring formulas
+    float cat_sc[MT1_COMP_SLOTS];
     float out4[4];
 
-    // All pools: 5-day summed scoring using shared dir_day_buf; today's score is doubled.
-    // Direction pool (pool_id==0) additionally tracks binary correct count for backfill.
     int dir_max_correct = 0;
     if (scratch.dir_day_count > 0) {
         for (int slot = 0; slot < pool_slots; slot++) {
@@ -2187,48 +2192,86 @@ static MT1CompResult step_mt1_component(
                 get_weights(slot, scratch.mut_buf);
                 wptr = scratch.mut_buf;
             }
+
             float total_sum = 0.f;
-            int   n_correct = 0;
-            for (int di = 0; di < scratch.dir_day_count; di++) {
+            bool  culled    = false;
+            int   n_correct = 0, conf_crossings = 0, market_flips = 0;
+            bool  prev_conf_pos_valid = false, prev_conf_pos = false;
+            bool  prev_act_pos_valid  = false, prev_act_pos  = false;
+
+            for (int di = 0; di < scratch.dir_day_count && !culled; di++) {
                 const auto& e = scratch.dir_day(di);
                 bool is_today = (di == scratch.dir_day_count - 1);
                 mt1_forward(wptr, e.feat37, out4);
+
+                float conf      = 1.f / (1.f + expf(-out4[0]));
+                float delta_d   = tanhf(out4[1]) * MT1_SCALE_DOLLARS;
+                float range_pct = log1pf(expf(out4[2]));
+                float eff_delta = fmaxf(fabsf(delta_d), MT1_RANGE_FLOOR);
+                float r_raw     = range_pct * eff_delta;
+
+                // Range ceiling cull: range (id=2) and confidence (id=3) pools, live slots only
+                if ((pool_id == 2 || pool_id == 3) && range_ceiling < 1e30f)
+                    if (r_raw > range_ceiling) { culled = true; break; }
+
+                // Direction alignment cull: accuracy pool (id=1) only, live slots only
+                if (pool_id == 1)
+                    if ((conf >= 0.5f) != (delta_d >= 0.f)) { culled = true; break; }
+
                 float day_score;
                 if (pool_id == 0) {
-                    float conf       = 1.f / (1.f + std::exp(-out4[0]));
-                    bool  actual_pos = (e.actual_d >= 0.f);
-                    day_score = actual_pos ? conf : (1.f - conf);
-                    n_correct += ((conf >= 0.5f) == actual_pos) ? 1 : 0;
+                    bool conf_pos = (conf >= 0.5f), act_pos = (e.actual_d >= 0.f);
+                    day_score  = act_pos ? conf : (1.f - conf);
+                    n_correct += (conf_pos == act_pos) ? 1 : 0;
+                    if (prev_conf_pos_valid && conf_pos != prev_conf_pos) conf_crossings++;
+                    if (prev_act_pos_valid  && act_pos  != prev_act_pos)  market_flips++;
+                    prev_conf_pos = conf_pos; prev_conf_pos_valid = true;
+                    prev_act_pos  = act_pos;  prev_act_pos_valid  = true;
+                } else if (pool_id == 1) {
+                    // Accuracy pool: continuous scoring, no hard floor
+                    float err = fabsf(e.actual_d - delta_d);
+                    day_score = 1.f / (err + 1.f);
                 } else {
                     auto sb = compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling);
-                    switch (pool_id) {
-                        case 1: day_score = sb.accuracy;    break;
-                        case 2: day_score = sb.range;       break;
-                        default: day_score = sb.confidence; break;
-                    }
+                    day_score = (pool_id == 2) ? sb.range : sb.confidence;
                 }
                 total_sum += is_today ? day_score * 2.f : day_score;
             }
-            cat_sc[slot] = total_sum;
-            if (n_correct > dir_max_correct) dir_max_correct = n_correct;
+
+            // Direction flip cull: direction pool (id=0) only, after full window
+            if (!culled && pool_id == 0 && scratch.dir_day_count >= 2) {
+                int required = (market_flips + 1) / 2;  // ceil(market_flips / 2)
+                if (conf_crossings < required) culled = true;
+            }
+
+            cat_sc[slot] = culled ? -1e30f : total_sum;
+            if (!culled && n_correct > dir_max_correct) dir_max_correct = n_correct;
+        }
+    } else {
+        memset(cat_sc, 0, sizeof(cat_sc));
+    }
+
+    // Pool statistics (exclude culled slots)
+    float mean_cat = 0.f, best_cat = -1e30f, min_cat = 1e30f;
+    int   live_count = 0;
+    for (int s = 0; s < pool_slots; s++) {
+        if (cat_sc[s] > -1e29f) {
+            mean_cat += cat_sc[s];
+            if (cat_sc[s] > best_cat) best_cat = cat_sc[s];
+            if (cat_sc[s] < min_cat)  min_cat  = cat_sc[s];
+            live_count++;
         }
     }
+    if (live_count > 0) mean_cat /= live_count;
+    if (best_cat < -1e29f) best_cat = 0.f;
+    if (min_cat  >  9e29f) min_cat  = 0.f;
+    float slot0_cat = cat_sc[0] > -1e29f ? cat_sc[0] : 0.f;
 
-    // Pool statistics
-    float mean_cat = 0.f, best_cat = cat_sc[0], min_cat = cat_sc[0];
-    for (int s = 0; s < pool_slots; s++) {
-        mean_cat += cat_sc[s];
-        if (cat_sc[s] > best_cat) best_cat = cat_sc[s];
-        if (cat_sc[s] < min_cat)  min_cat  = cat_sc[s];
-    }
-    mean_cat /= pool_slots;
-    float slot0_cat = cat_sc[0];  // pre-selection slot 0
-
-    // Direction backfill: skip update unless the best model got ≥3 of the buffered days correct (binary sign)
+    // Direction backfill: skip update unless best model got ≥3 days correct (binary sign)
     if (pool_id == 0 && dir_max_correct < 3)
         return {best_cat, slot0_cat, mean_cat, min_cat};
 
-    // Score history candidates
+    // Score history candidates (no culling — history is the unconditional safety net)
     int n_hist = scratch.pool_hist_count[pool_id] * HIST_PER_DAY;
     float hist_cat_sc[HIST_DAYS * HIST_PER_DAY] = {};
     {
@@ -2237,29 +2280,27 @@ static MT1CompResult step_mt1_component(
         for (int k = 0; k < n_hist; k++) {
             int abs_pos = (oldest + k) % total;
             float* hw = scratch.pool_hist[pool_id] + (size_t)abs_pos * MT1NN_PARAMS;
-            {
-                float total_sum = 0.f;
-                for (int di = 0; di < scratch.dir_day_count; di++) {
-                    const auto& e = scratch.dir_day(di);
-                    bool is_today = (di == scratch.dir_day_count - 1);
-                    mt1_forward(hw, e.feat37, out4);
-                    float day_score;
-                    if (pool_id == 0) {
-                        float conf      = 1.f / (1.f + std::exp(-out4[0]));
-                        bool actual_pos = (e.actual_d >= 0.f);
-                        day_score = actual_pos ? conf : (1.f - conf);
-                    } else {
-                        auto sb = compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling);
-                        switch (pool_id) {
-                            case 1: day_score = sb.accuracy;    break;
-                            case 2: day_score = sb.range;       break;
-                            default: day_score = sb.confidence; break;
-                        }
-                    }
-                    total_sum += is_today ? day_score * 2.f : day_score;
+            float total_sum = 0.f;
+            for (int di = 0; di < scratch.dir_day_count; di++) {
+                const auto& e = scratch.dir_day(di);
+                bool is_today = (di == scratch.dir_day_count - 1);
+                mt1_forward(hw, e.feat37, out4);
+                float day_score;
+                if (pool_id == 0) {
+                    float conf      = 1.f / (1.f + expf(-out4[0]));
+                    bool actual_pos = (e.actual_d >= 0.f);
+                    day_score = actual_pos ? conf : (1.f - conf);
+                } else if (pool_id == 1) {
+                    float delta_d = tanhf(out4[1]) * MT1_SCALE_DOLLARS;
+                    float err     = fabsf(e.actual_d - delta_d);
+                    day_score = 1.f / (err + 1.f);
+                } else {
+                    auto sb = compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling);
+                    day_score = (pool_id == 2) ? sb.range : sb.confidence;
                 }
-                hist_cat_sc[k] = total_sum;
+                total_sum += is_today ? day_score * 2.f : day_score;
             }
+            hist_cat_sc[k] = total_sum;
         }
     }
 
@@ -2300,15 +2341,15 @@ static MT1CompResult step_mt1_component(
             for (int p = 0; p < MT1NN_PARAMS; p++) dst[p] += scratch.new_elite(e)[p] * inv_k;
     }
 
-    // Re-injection slots (20–22): copy from current comp_elites (loaded from reinject_buf above)
-    for (int k = 0; k < MT1_REINJECT; k++)
+    // Injection slots (20–24): carry forward the models loaded at top of this call
+    for (int k = 0; k < MT1_COMP_INJECT; k++)
         memcpy(scratch.new_elite(ELITE_COUNT + WAVG_COUNT + k),
                scratch.comp_elite(pool_id, ELITE_COUNT + WAVG_COUNT + k),
                MT1NN_PARAMS * sizeof(float));
 
-    // Commit new elite set (base 23 slots; extended slots 23–27 populated by inject below)
+    // Commit all 25 parent slots (elites + wavg + injection)
     memcpy(scratch.comp_elites[pool_id], scratch.new_elites,
-           (size_t)MT1_COMP_ELITE * MT1NN_PARAMS * sizeof(float));
+           (size_t)MT1_COMP_PARENTS * MT1NN_PARAMS * sizeof(float));
 
     // Save top 7 direct elites + 3 wavg blends to 5-day history
     {
@@ -2324,27 +2365,20 @@ static MT1CompResult step_mt1_component(
         if (count < HIST_DAYS) count++;
     }
 
-    // Range pool: snapshot top elites for confidence cross-injection
+    // Direction pool: save top-5 for accuracy pool injection next day
+    if (pool_id == 0) {
+        scratch.dir_inject_count = std::min(MT1_COMP_INJECT, ELITE_COUNT);
+        for (int k = 0; k < scratch.dir_inject_count; k++)
+            memcpy(scratch.dir_inject(k),
+                   scratch.comp_elite(0, k), MT1NN_PARAMS * sizeof(float));
+    }
+
+    // Range pool: save top-5 for confidence pool injection next day
     if (pool_id == 2) {
         scratch.rng_inject_count = std::min(MT1_RANGE_INJECT, ELITE_COUNT);
         for (int k = 0; k < scratch.rng_inject_count; k++)
             memcpy(scratch.rng_inject(k),
                    scratch.comp_elite(2, k), MT1NN_PARAMS * sizeof(float));
-    }
-
-    // Confidence pool: overwrite bottom 5 direct elites with top range elites (anti-gaming)
-    if (pool_id == 3 && scratch.rng_inject_count > 0) {
-        int start = ELITE_COUNT - scratch.rng_inject_count;  // 17-5 = 12
-        for (int k = 0; k < scratch.rng_inject_count; k++)
-            memcpy(scratch.comp_elite(3, start + k),
-                   scratch.rng_inject(k), MT1NN_PARAMS * sizeof(float));
-    }
-
-    // Dir/acc/rng: append composite top-5 as additional elite slots 23–27
-    if (pool_ext && scratch.comp_inject_count > 0) {
-        for (int k = 0; k < scratch.comp_inject_count; k++)
-            memcpy(scratch.comp_elite(pool_id, MT1_COMP_ELITE + k),
-                   scratch.comp_inject(k), MT1NN_PARAMS * sizeof(float));
     }
 
     return {best_cat, slot0_cat, mean_cat, min_cat};
@@ -2457,12 +2491,7 @@ static MT1BlendResult step_mt1_composite(
     mt1_forward(scratch.comp0_buf, in37, raw0);
     float comp0_delta_d = tanhf(raw0[1]) * MT1_SCALE_DOLLARS;
 
-    // Save top 3 to reinject_buf (for next day's component pools — slots 20–22)
-    scratch.reinject_count = std::min(MT1_REINJECT, (int)cands.size());
-    for (int k = 0; k < scratch.reinject_count; k++)
-        get_cand_weights(cands[k], scratch.reinject(k));
-
-    // Save top 5 to comp_inject_buf (for next day's dir/acc/rng additive slots 23–27)
+    // Save top 5 to comp_inject_buf (for next day's direction slots 20–24 and range slots 20–24)
     scratch.comp_inject_count = std::min(MT1_COMP_INJECT, (int)cands.size());
     for (int k = 0; k < scratch.comp_inject_count; k++)
         get_cand_weights(cands[k], scratch.comp_inject(k));
@@ -2503,8 +2532,17 @@ static MT1Result step_mt1(int ind_i, MT1Scratch& scratch,
             sum_a += scratch.rolling_actual[k];
             sum_r += scratch.rolling_residual[k];
         }
-        acc_floor     = sum_a / (float)scratch.rolling_count / 2.f;
-        range_ceiling = MT1_RANGE_CEIL_MULT * sum_r / (float)scratch.rolling_count;
+        acc_floor = sum_a / (float)scratch.rolling_count / 2.f;
+        // Dynamic ceiling: max(4 × mean_residual, 4 × today's comp0 residual)
+        float mean_r = sum_r / (float)scratch.rolling_count;
+        float today_r = 0.f;
+        if (scratch.rolling_count > 0) {
+            float out4_c0[4];
+            mt1_forward(scratch.comp0_buf, in37, out4_c0);
+            float comp0_delta_d = tanhf(out4_c0[1]) * MT1_SCALE_DOLLARS;
+            today_r = fabsf(actual_d - comp0_delta_d);
+        }
+        range_ceiling = MT1_RANGE_CEIL_MULT * fmaxf(mean_r, today_r);
     }
 
     // Record today's data before scoring so direction pool sees the full MT1_DIR_DAYS window
@@ -2925,7 +2963,7 @@ static void save_mt1_all(const std::string& dir, int ind_i, const MT1Scratch& sc
     const char* ind = g_ind_names[ind_i].c_str();
     char path[512];
     for (int p = 0; p < 4; p++) {
-        int n_elites = (p != 3) ? MT1_COMP_ELITE_EXT : MT1_COMP_ELITE;
+        int n_elites = MT1_COMP_PARENTS;
         for (int slot = 0; slot < n_elites; slot++) {
             snprintf(path, sizeof(path), "%s/mt1_%s_%s_elite_%d.bin",
                      dir.c_str(), ind, MT1_POOL_NAMES[p], slot);
@@ -2953,15 +2991,15 @@ static void save_mt1_all(const std::string& dir, int ind_i, const MT1Scratch& sc
                (size_t)HIST_DAYS * HIST_PER_DAY * MT1NN_PARAMS, fch);
         fclose(fch);
     }
-    // Re-injection buffer
-    snprintf(path, sizeof(path), "%s/mt1_%s_comp_reinject.bin", dir.c_str(), ind);
-    FILE* fri = fopen(path, "wb");
-    if (fri) {
-        fwrite(&scratch.reinject_count, sizeof(int), 1, fri);
-        if (scratch.reinject_count > 0)
-            fwrite(scratch.reinject_buf, sizeof(float),
-                   (size_t)scratch.reinject_count * MT1NN_PARAMS, fri);
-        fclose(fri);
+    // Direction-inject buffer (top direction elites for accuracy pool injection)
+    snprintf(path, sizeof(path), "%s/mt1_%s_dir_inject.bin", dir.c_str(), ind);
+    FILE* fdi = fopen(path, "wb");
+    if (fdi) {
+        fwrite(&scratch.dir_inject_count, sizeof(int), 1, fdi);
+        if (scratch.dir_inject_count > 0)
+            fwrite(scratch.dir_inject_buf, sizeof(float),
+                   (size_t)scratch.dir_inject_count * MT1NN_PARAMS, fdi);
+        fclose(fdi);
     }
     // Range-inject buffer (top range elites for confidence cross-injection)
     snprintf(path, sizeof(path), "%s/mt1_%s_rng_inject.bin", dir.c_str(), ind);
@@ -3004,7 +3042,7 @@ static void load_or_init_mt1(const std::string& dir, const std::string& load_dir
     char path[512];
 
     for (int p = 0; p < 4; p++) {
-        int n_elites = (p != 3) ? MT1_COMP_ELITE_EXT : MT1_COMP_ELITE;
+        int n_elites = MT1_COMP_PARENTS;
         for (int slot = 0; slot < n_elites; slot++) {
             float* e = scratch.comp_elite(p, slot);
             bool loaded = false;
@@ -3055,16 +3093,16 @@ static void load_or_init_mt1(const std::string& dir, const std::string& load_dir
         break;
     }
 
-    // Re-injection buffer
+    // Direction-inject buffer (top direction elites for accuracy pool injection)
     for (const std::string* sd : {&load_dir, &dir}) {
         if (sd->empty()) continue;
-        snprintf(path, sizeof(path), "%s/mt1_%s_comp_reinject.bin", sd->c_str(), ind);
+        snprintf(path, sizeof(path), "%s/mt1_%s_dir_inject.bin", sd->c_str(), ind);
         FILE* f = fopen(path, "rb");
         if (!f) continue;
         int cnt = 0;
-        if (fread(&cnt, sizeof(int), 1, f) == 1 && cnt > 0 && cnt <= MT1_REINJECT) {
-            fread(scratch.reinject_buf, sizeof(float), (size_t)cnt * MT1NN_PARAMS, f);
-            scratch.reinject_count = cnt;
+        if (fread(&cnt, sizeof(int), 1, f) == 1 && cnt > 0 && cnt <= MT1_COMP_INJECT) {
+            fread(scratch.dir_inject_buf, sizeof(float), (size_t)cnt * MT1NN_PARAMS, f);
+            scratch.dir_inject_count = cnt;
         }
         fclose(f);
         break;

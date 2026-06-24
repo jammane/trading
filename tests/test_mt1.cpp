@@ -16,10 +16,11 @@
 
 static constexpr int   ELITE_COUNT         = 17;
 static constexpr int   WAVG_COUNT          = 3;
-static constexpr int   MT1_REINJECT        = 3;
-static constexpr int   MT1_COMP_ELITE      = ELITE_COUNT + WAVG_COUNT + MT1_REINJECT;  // 23
-static constexpr int   MT1_COMP_SLOTS      = 230;
-static constexpr int   MT1_COMP_MUTS       = MT1_COMP_SLOTS - MT1_COMP_ELITE;          // 207
+static constexpr int   MT1_COMP_INJECT     = 5;
+static constexpr int   MT1_RANGE_INJECT    = 5;
+static constexpr int   MT1_COMP_PARENTS    = ELITE_COUNT + WAVG_COUNT + MT1_COMP_INJECT; // 25
+static constexpr int   MT1_COMP_CHILDREN   = 7;
+static constexpr int   MT1_COMP_SLOTS      = MT1_COMP_PARENTS * (MT1_COMP_CHILDREN + 1); // 200
 static constexpr int   MT1_BLEND_SLOTS     = 200;
 static constexpr float MT1_RANGE_FLOOR     = 1.f;
 static constexpr float MT1_RANGE_CEIL_MULT = 4.f;
@@ -30,11 +31,6 @@ static constexpr int   HIST_DAYS           = 5;
 static constexpr int   HIST_PER_DAY        = 10;
 static constexpr int   HIST_ELITE          = 7;
 static constexpr int   HIST_WAVG           = 3;
-static constexpr int   MT1_RANGE_INJECT    = 5;
-static constexpr int   MT1_COMP_INJECT     = 5;
-static constexpr int   MT1_COMP_ELITE_EXT  = MT1_COMP_ELITE + MT1_COMP_INJECT;            // 28
-static constexpr int   MT1_COMP_MUTS_EXT   = MT1_COMP_ELITE_EXT * 9;                      // 252
-static constexpr int   MT1_COMP_SLOTS_EXT  = MT1_COMP_ELITE_EXT + MT1_COMP_MUTS_EXT;      // 280
 static constexpr int   MT1_DIR_DAYS        = 5;
 
 // ── Test harness ───────────────────────────────────────────────────────────
@@ -136,47 +132,31 @@ static void test_constants()
 {
     SUITE("constants: compile-time arithmetic");
 
-    CHECK(MT1_COMP_ELITE == ELITE_COUNT + WAVG_COUNT + MT1_REINJECT);
-    CHECK(MT1_COMP_ELITE == 23);
-    CHECK(MT1_COMP_SLOTS == 230);
-    CHECK(MT1_COMP_MUTS  == MT1_COMP_SLOTS - MT1_COMP_ELITE);
-    CHECK(MT1_COMP_MUTS  == 207);
-    CHECK(MT1_BLEND_SLOTS == 200);
+    // Uniform pool: 25 parents × 8 (7 children + 1 parent) = 200 slots
+    CHECK(MT1_COMP_PARENTS  == ELITE_COUNT + WAVG_COUNT + MT1_COMP_INJECT);
+    CHECK(MT1_COMP_PARENTS  == 25);
+    CHECK(MT1_COMP_CHILDREN == 7);
+    CHECK(MT1_COMP_SLOTS    == MT1_COMP_PARENTS * (MT1_COMP_CHILDREN + 1));
+    CHECK(MT1_COMP_SLOTS    == 200);
+    CHECK(MT1_BLEND_SLOTS   == 200);
     CHECK(HIST_DAYS == 5);
     CHECK(HIST_PER_DAY == 10);
     CHECK(HIST_ELITE + HIST_WAVG == HIST_PER_DAY);   // 7+3 == 10
 
-    // Wavg blend slots are 17, 18, 19
+    // Slot layout: elites 0–16, wavg 17–19, injection 20–24, mutations 25–199
     CHECK(ELITE_COUNT               == 17);
-    CHECK(ELITE_COUNT + 0           == 17);  // wavg slot 0
-    CHECK(ELITE_COUNT + WAVG_COUNT  == 20);  // first reinject slot
-    CHECK(MT1_COMP_ELITE - 1        == 22);  // last reinject slot
+    CHECK(ELITE_COUNT + WAVG_COUNT  == 20);  // first injection slot
+    CHECK(ELITE_COUNT + WAVG_COUNT + MT1_COMP_INJECT - 1 == 24);  // last injection slot
 
     // MT1_FLOOR_COLD / 2 is the cold-start acc_floor
     CHECK(NEAR(MT1_FLOOR_COLD / 2.f, 125.f, 0.001f));
 
-    // Range→confidence injection: top MT1_RANGE_INJECT direct elites → bottom 5 confidence slots
+    // Injection cascade counts
+    CHECK(MT1_COMP_INJECT  == 5);
     CHECK(MT1_RANGE_INJECT == 5);
-    CHECK(MT1_RANGE_INJECT < ELITE_COUNT);
-    CHECK(ELITE_COUNT - MT1_RANGE_INJECT == 12);                // injection start slot
-
-    // Composite→dir/acc/rng additive injection: slots 23–27 (beyond existing 23-slot base)
-    CHECK(MT1_COMP_INJECT == 5);
-    CHECK(MT1_COMP_ELITE_EXT == 28);
-    CHECK(MT1_COMP_MUTS_EXT  == 252);
-    CHECK(MT1_COMP_SLOTS_EXT == 280);
-    CHECK(MT1_COMP_MUTS_EXT  == MT1_COMP_ELITE_EXT * 9);       // 9 mutations per parent
-    CHECK(MT1_COMP_SLOTS_EXT == MT1_COMP_ELITE_EXT + MT1_COMP_MUTS_EXT);
-    // cfd pool stays at original size
-    CHECK(MT1_COMP_SLOTS == 230);
-    CHECK(MT1_COMP_ELITE == 23);
-    // Injected slots start immediately after existing elite range
-    CHECK(MT1_COMP_ELITE + MT1_COMP_INJECT - 1 == MT1_COMP_ELITE_EXT - 1);  // last injected = slot 27
 
     // Direction pool: multi-day scoring window
     CHECK(MT1_DIR_DAYS == 5);
-    // Backfill threshold scales: at full buffer, 0.65*5=3.25 (need 4/5 correct to avoid backfill)
-    CHECK(MT1_DIR_DAYS * 1 == 5);   // max possible sum = MT1_DIR_DAYS
     CHECK(MT1_DIR_DAYS > 1);        // must be multi-day
 }
 
@@ -552,44 +532,45 @@ static void test_blend_weights()
 
 static void test_mutation_parent_assignment()
 {
-    SUITE("component pool: mutation parent round-robin");
+    SUITE("component pool: mutation parent round-robin (7 children × 25 parents)");
 
-    // Slots 0..MT1_COMP_ELITE-1 are elites (no mutation)
-    // Slot s >= MT1_COMP_ELITE: mut_i = s - MT1_COMP_ELITE, parent = mut_i % MT1_COMP_ELITE
+    // Slots 0..MT1_COMP_PARENTS-1 are parents (elites + wavg + inject, no mutation)
+    // Slot s >= MT1_COMP_PARENTS: mut_i = s - MT1_COMP_PARENTS, parent = mut_i % MT1_COMP_PARENTS
     auto parent_of = [](int slot) -> int {
-        if (slot < MT1_COMP_ELITE) return slot;  // is an elite
-        int mut_i = slot - MT1_COMP_ELITE;
-        return mut_i % MT1_COMP_ELITE;
+        if (slot < MT1_COMP_PARENTS) return slot;  // is a parent
+        int mut_i = slot - MT1_COMP_PARENTS;
+        return mut_i % MT1_COMP_PARENTS;
     };
 
     // First mutation slot → parent 0
-    CHECK(parent_of(MT1_COMP_ELITE) == 0);
+    CHECK(parent_of(MT1_COMP_PARENTS) == 0);
     // Second → parent 1
-    CHECK(parent_of(MT1_COMP_ELITE + 1) == 1);
-    // 23rd mutation slot (index 22) → parent 22 (last elite)
-    CHECK(parent_of(MT1_COMP_ELITE + 22) == 22);
-    // 24th mutation slot (index 23) → wraps to parent 0
-    CHECK(parent_of(MT1_COMP_ELITE + MT1_COMP_ELITE) == 0);
-    // Last slot overall: slot MT1_COMP_SLOTS-1 = 229
-    // mut_i = 229 - 23 = 206, parent = 206 % 23 = 206 - 8*23 = 206-184 = 22
-    CHECK(parent_of(MT1_COMP_SLOTS - 1) == (MT1_COMP_MUTS - 1) % MT1_COMP_ELITE);
+    CHECK(parent_of(MT1_COMP_PARENTS + 1) == 1);
+    // 25th mutation slot (index 24) → parent 24 (last parent)
+    CHECK(parent_of(MT1_COMP_PARENTS + 24) == 24);
+    // 26th mutation slot (index 25) → wraps to parent 0
+    CHECK(parent_of(MT1_COMP_PARENTS + MT1_COMP_PARENTS) == 0);
+    // Last slot overall: slot 199, mut_i = 199-25 = 174, parent = 174 % 25 = 24
+    CHECK(parent_of(MT1_COMP_SLOTS - 1) == (MT1_COMP_SLOTS - 1 - MT1_COMP_PARENTS) % MT1_COMP_PARENTS);
+    CHECK(parent_of(MT1_COMP_SLOTS - 1) == 24);
 
-    // Total mutations = MT1_COMP_MUTS = 207
+    // Total mutations = MT1_COMP_SLOTS - MT1_COMP_PARENTS = 175
     int mutation_count = 0;
-    for (int s = MT1_COMP_ELITE; s < MT1_COMP_SLOTS; s++) mutation_count++;
-    CHECK(mutation_count == MT1_COMP_MUTS);
+    for (int s = MT1_COMP_PARENTS; s < MT1_COMP_SLOTS; s++) mutation_count++;
+    CHECK(mutation_count == 175);
+    CHECK(mutation_count == MT1_COMP_PARENTS * MT1_COMP_CHILDREN);
 
-    // Every parent (0..22) is used at least once
-    bool used[MT1_COMP_ELITE] = {};
-    for (int s = MT1_COMP_ELITE; s < MT1_COMP_SLOTS; s++)
-        used[(s - MT1_COMP_ELITE) % MT1_COMP_ELITE] = true;
-    for (int p = 0; p < MT1_COMP_ELITE; p++)
+    // Every parent (0..24) is used at least once
+    bool used[MT1_COMP_PARENTS] = {};
+    for (int s = MT1_COMP_PARENTS; s < MT1_COMP_SLOTS; s++)
+        used[(s - MT1_COMP_PARENTS) % MT1_COMP_PARENTS] = true;
+    for (int p = 0; p < MT1_COMP_PARENTS; p++)
         CHECK(used[p]);
 }
 
 static void test_elite_slot_layout()
 {
-    SUITE("component pool: elite slot layout (17 direct + 3 wavg + 3 reinject)");
+    SUITE("component pool: elite slot layout (17 direct + 3 wavg + 5 injection)");
 
     // Direct elites: slots 0..ELITE_COUNT-1 = 0..16
     CHECK(ELITE_COUNT == 17);
@@ -598,14 +579,16 @@ static void test_elite_slot_layout()
         int slot = ELITE_COUNT + b;
         CHECK(slot >= 17 && slot <= 19);
     }
-    // Re-injection slots: ELITE_COUNT + WAVG_COUNT + 0..MT1_REINJECT-1 = 20, 21, 22
-    for (int k = 0; k < MT1_REINJECT; k++) {
+    // Injection slots: ELITE_COUNT + WAVG_COUNT + 0..MT1_COMP_INJECT-1 = 20..24
+    for (int k = 0; k < MT1_COMP_INJECT; k++) {
         int slot = ELITE_COUNT + WAVG_COUNT + k;
-        CHECK(slot >= 20 && slot <= 22);
+        CHECK(slot >= 20 && slot <= 24);
     }
-    // Last reinject slot is MT1_COMP_ELITE - 1 = 22
-    CHECK(ELITE_COUNT + WAVG_COUNT + MT1_REINJECT - 1 == MT1_COMP_ELITE - 1);
-    CHECK(ELITE_COUNT + WAVG_COUNT + MT1_REINJECT - 1 == 22);
+    // Last injection slot = 24 = MT1_COMP_PARENTS - 1
+    CHECK(ELITE_COUNT + WAVG_COUNT + MT1_COMP_INJECT - 1 == 24);
+    CHECK(ELITE_COUNT + WAVG_COUNT + MT1_COMP_INJECT - 1 == MT1_COMP_PARENTS - 1);
+    // Mutations start at slot 25
+    CHECK(MT1_COMP_PARENTS == 25);
 }
 
 static void test_rolling_buffers()
@@ -738,8 +721,8 @@ static void test_blend_slots_count()
     CHECK(HIST_DAYS * HIST_PER_DAY == 50);
     // Max candidates per composite step: 200 blends + 50 history = 250
     CHECK(MT1_BLEND_SLOTS + HIST_DAYS * HIST_PER_DAY == 250);
-    // Top 3 saved as reinject (written into component elite slots 20-22)
-    CHECK(MT1_REINJECT == 3);
+    // Top 5 saved as comp_inject (composite→direction + range slots 20–24)
+    CHECK(MT1_COMP_INJECT == 5);
     // Top 10 saved to composite history
     CHECK(HIST_PER_DAY == 10);
 }

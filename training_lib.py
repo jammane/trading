@@ -35,19 +35,15 @@ MUTATIONS_PER_PARENT  = 9           # each of the ELITE_POOL parents gets this m
 # MT1: 5 separate pools (4 component + 1 composite blend).
 # Component pools (dir/acc/rng/cfd): 23 elites (17 direct + 3 wavg + 3 re-injected) + 207 mutations = 230 slots.
 # Composite pool: 200 blends/day (no mutation); 5-day history (10/day).
-MT1_REINJECT         = 3           # re-injected composite models per component pool
-MT1_COMP_ELITE       = ELITE_COUNT + WAVG_COUNT + MT1_REINJECT   # 23 = 17+3+3
-MT1_COMP_SLOTS       = 230         # 23 elites + 207 mutations
-MT1_COMP_MUTS        = MT1_COMP_SLOTS - MT1_COMP_ELITE            # 207
-MT1_BLEND_SLOTS      = 200         # composite blend pool size per day
-MT1_RANGE_FLOOR      = 1.0         # $1 — effectively no range floor
-MT1_RANGE_CEIL_MULT  = 4.0         # ceiling = 4 × mean(last 10 |actual−delta|)
-MT1_DIR_BACKFILL     = 0.65        # skip direction pool update when best score < this
-MT1_RANGE_INJECT     = 5           # top range elites → bottom 5 confidence slots (anti-gaming)
-MT1_COMP_INJECT      = 5           # top composite → additive elite slots 23–27 in dir/acc/rng
-MT1_COMP_ELITE_EXT   = MT1_COMP_ELITE + MT1_COMP_INJECT   # 28
-MT1_COMP_MUTS_EXT    = MT1_COMP_ELITE_EXT * 9              # 252
-MT1_COMP_SLOTS_EXT   = MT1_COMP_ELITE_EXT + MT1_COMP_MUTS_EXT  # 280
+MT1_COMP_INJECT      = 5            # injection slots per pool (cascade sources)
+MT1_RANGE_INJECT     = 5            # range→confidence injection count
+MT1_COMP_PARENTS     = ELITE_COUNT + WAVG_COUNT + MT1_COMP_INJECT  # 25
+MT1_COMP_CHILDREN    = 7            # mutations per parent
+MT1_COMP_SLOTS       = MT1_COMP_PARENTS * (MT1_COMP_CHILDREN + 1)  # 200
+MT1_BLEND_SLOTS      = 200          # composite blend pool size per day
+MT1_RANGE_FLOOR      = 1.0          # $1 — effectively no range floor
+MT1_RANGE_CEIL_MULT  = 4.0          # ceiling = 4 × max(mean, today) |actual−comp0_delta|
+MT1_DIR_BACKFILL     = 0.65         # skip direction pool update when best score < this
 MT1_DIR_DAYS         = 5            # direction pool: score each model over last N days, sum
 MT1_POOL_NAMES       = ('dir', 'acc', 'rng', 'cfd')
 
@@ -618,6 +614,9 @@ def build_master_features(ind_value_history, industry_list):
     for ind in industry_list:
         hist = ind_value_history.get(ind, [])
         for t in MASTER_LOOKBACKS:
+            if t == 25:
+                features.append(_mst_hist_at(hist, 0))  # current portfolio value (scale anchor)
+                continue
             v_now  = _mst_hist_at(hist, t)
             v_prev = _mst_hist_at(hist, t + 1)
             denom  = abs(v_prev) if abs(v_prev) > 1e-9 else 1e-9

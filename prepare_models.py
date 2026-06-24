@@ -74,9 +74,9 @@ MT2_LAYOUT = [
     ('fc_out.bias',        (48,)),
 ]
 
-ELITE_POOL      = 20
-MT1_COMP_ELITE  = 23   # 17 direct + 3 wavg + 3 reinject per component pool
-MT1_POOL_NAMES  = ('dir', 'acc', 'rng', 'cfd')
+ELITE_POOL       = 20
+MT1_COMP_PARENTS = 25  # 17 direct + 3 wavg + 5 injection per component pool
+MT1_POOL_NAMES   = ('dir', 'acc', 'rng', 'cfd')
 
 
 def state_dict_to_arr(state_dict, layer_defs):
@@ -171,7 +171,7 @@ def main():
     for ind in industries:
         for pool in MT1_POOL_NAMES:
             convert_industry(f'mt1_{ind}_{pool}', load_dir, output_dir, MT1_LAYER_DEFS,
-                             f'mt1_{ind}_{pool}', n_elites=MT1_COMP_ELITE)
+                             f'mt1_{ind}_{pool}', n_elites=MT1_COMP_PARENTS)
 
     print(f'Converting MT2 elite models from {load_dir} → {output_dir}')
     convert_mt2(load_dir, output_dir)
