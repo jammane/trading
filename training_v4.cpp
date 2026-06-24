@@ -2124,6 +2124,7 @@ static MT1ScoreBreakdown compute_mt1_scores(
     float ideal  = 1.f / (1.f + dor * dor);
     float diff   = conf4 - ideal;
     float sc_cfd = 1.f - diff * diff;
+    if (err > r) sc_cfd = 0.5f + 0.25f * sc_cfd;  // compress outside-range to [0.5, 0.75]
 
     return {0.50f * sc_dir + 0.33f * sc_rng + 0.17f * sc_acc, sc_dir, sc_rng, sc_acc, sc_cfd};
 }

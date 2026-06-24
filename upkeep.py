@@ -324,6 +324,8 @@ def _mt1_score_breakdown(out4, actual_d, acc_floor, range_ceiling=None):
     ideal     = 1.0 / (1.0 + dor * dor)
     diff      = conf4 - ideal
     score_conf = 1.0 - diff * diff
+    if err > r:
+        score_conf = 0.5 + 0.25 * score_conf  # compress outside-range to [0.5, 0.75]
 
     composite = 0.50 * score_dir + 0.33 * score_rng + 0.17 * score_acc
     return composite, score_dir, score_rng, score_acc, score_conf

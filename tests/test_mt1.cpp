@@ -104,6 +104,7 @@ static MT1ScoreBreakdown compute_mt1_scores(
     float ideal  = 1.f / (1.f + dor * dor);
     float diff   = conf4 - ideal;
     float sc_cfd = 1.f - diff * diff;
+    if (err > r) sc_cfd = 0.5f + 0.25f * sc_cfd;  // compress outside-range to [0.5, 0.75]
 
     return {0.50f * sc_dir + 0.33f * sc_rng + 0.17f * sc_acc,
             sc_dir, sc_rng, sc_acc, sc_cfd};
@@ -458,22 +459,24 @@ static void test_scores_confidence()
         CHECK(NEAR(s.confidence, 1.f, 0.002f));  // conf4=0.5==ideal=0.5 → sc_cfd=1
     }
 
-    // Large miss (d>>r): ideal≈0; best conf4=0 → sc_cfd=1; neutral conf4=0.5 → sc_cfd≈0.75
+    // Large miss (d>>r, err>r): scores compressed to [0.5, 0.75]
+    // d=100, r≈0.693: dor≈144 → ideal≈0.000048
+    // conf4≈0: diff≈0 → raw sc_cfd≈1.0 → compressed: 0.5+0.25*1.0=0.75
+    // conf4=0.5: diff≈0.5 → raw sc_cfd=0.75 → compressed: 0.5+0.25*0.75=0.6875
     {
-        // d=100, r≈0.693: dor≈144 → ideal≈0.000048
         float raw4_lo[4] = {0.f, 0.f, 0.f, -10.f};  // conf4≈0
         auto s_lo = compute_mt1_scores(100.f, raw4_lo, 1.f, 1e30f);
-        CHECK(NEAR(s_lo.confidence, 1.f, 0.002f));   // conf4≈0 ≈ ideal≈0
+        CHECK(NEAR(s_lo.confidence, 0.75f, 0.002f));   // compressed: 0.5+0.25*1.0
 
         float raw4_mid[4] = {0.f, 0.f, 0.f, 0.f};   // conf4=0.5
         auto s_mid = compute_mt1_scores(100.f, raw4_mid, 1.f, 1e30f);
-        CHECK(NEAR(s_mid.confidence, 0.75f, 0.002f)); // diff≈−0.5 → 1−0.25=0.75
+        CHECK(NEAR(s_mid.confidence, 0.6875f, 0.002f)); // compressed: 0.5+0.25*0.75
     }
 
-    // sc_cfd always in [0,1]: worst case is |diff|=1 → sc_cfd=0
+    // sc_cfd always in [0,1]: outside-range cases compress to [0.5,0.75], still in [0,1]
     float raw4_set[][4] = {
-        {10.f, 0.f, 0.f, 10.f},   // conf4≈1, perfect pred → ideal≈1 → sc_cfd≈1
-        {10.f, 0.f, 0.f, -10.f},  // conf4≈0, perfect pred → ideal≈1 → sc_cfd≈0
+        {10.f, 0.f, 0.f, 10.f},   // conf4≈1, perfect pred (d=0) → inside range → sc_cfd≈1
+        {10.f, 0.f, 0.f, -10.f},  // conf4≈0, big miss (err>r) → compressed → sc_cfd∈[0.5,0.75]
         {10.f, 0.f, 5.f, 0.f},    // conf4=0.5, hit case
         {0.f,  0.f, 0.f, 0.f},    // boundaries
     };

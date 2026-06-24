@@ -377,9 +377,25 @@ def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: 
         ax.axhline(3.0, color="orange", linewidth=0.8, linestyle=":",
                    label="Backfill threshold (3/5 correct ≈ 3.0)")
         ylabel = "5-day sum score (0 – 5)"
+
+        # Net positive industry percentage on right y-axis
+        net_pos_raw = [
+            100.0 * sum(1 for i in range(n_ind) if r["mt1"]["direction"]["mean"][i] > 2.5) / n_ind
+            for r in records
+        ]
+        xs_np, net_pos = _smooth(xs_raw, net_pos_raw)
+        ax2 = ax.twinx()
+        ax2.plot(xs_np, net_pos, color="#808080", linewidth=2.5, zorder=4,
+                 label="% net positive industries")
+        ax2.set_ylim(0, 100)
+        ax2.set_ylabel("% net positive industries", fontsize=10, color="#606060")
+        ax2.tick_params(labelsize=8, colors="#606060")
+        ax2.spines["right"].set_color("#808080")
     else:
         ax.set_ylim(0, 1)
         ylabel = "Score (0 – 1)"
+        ax2 = None
+
     _style_ax(ax,
               f"MT1 — {MT1_COMP_LABEL[comp]} — Pass {pass_num}",
               f"Day (Pass {pass_num})", ylabel)
@@ -388,6 +404,9 @@ def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: 
         mlines.Line2D([], [], color="black", linewidth=1.8, linestyle=(0, (2, 2)), label="All-ind mean (max)"),
         mlines.Line2D([], [], color="black", linewidth=1.8, linestyle=(0, (1, 2)), label="All-ind mean (min)"),
     ]
+    if ax2 is not None:
+        extra.append(mlines.Line2D([], [], color="#808080", linewidth=2.5,
+                                   label="% net positive industries (right axis)"))
     _industry_legend(ax, extra_handles=extra)
     _save(fig, out_path)
 
