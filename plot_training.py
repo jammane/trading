@@ -370,17 +370,15 @@ def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: 
     ax.plot(xs_an, all_mins,  color="black", linewidth=1.8, linestyle=(0, (1, 2)),
             zorder=5, label="All-ind mean (min)")
 
+    ax.set_ylim(0, 6)
+    ylabel = "5-day sum score (0 – 6)"
     if comp == "direction":
-        ax.set_ylim(0, 5)
-        ax.axhline(2.5, color="gray", linewidth=0.8, linestyle="--",
-                   label="Random baseline (2.5)")
-        ax.axhline(3.0, color="orange", linewidth=0.8, linestyle=":",
-                   label="Backfill threshold (3/5 correct ≈ 3.0)")
-        ylabel = "5-day sum score (0 – 5)"
+        ax.axhline(3.0, color="gray", linewidth=0.8, linestyle="--",
+                   label="Random baseline (3.0)")
 
         # Net positive industry percentage on right y-axis
         net_pos_raw = [
-            100.0 * sum(1 for i in range(n_ind) if r["mt1"]["direction"]["mean"][i] > 2.5) / n_ind
+            100.0 * sum(1 for i in range(n_ind) if r["mt1"]["direction"]["mean"][i] > 3.0) / n_ind
             for r in records
         ]
         xs_np, net_pos = _smooth(xs_raw, net_pos_raw)
@@ -392,8 +390,6 @@ def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: 
         ax2.tick_params(labelsize=8, colors="#606060")
         ax2.spines["right"].set_color("#808080")
     else:
-        ax.set_ylim(0, 1)
-        ylabel = "Score (0 – 1)"
         ax2 = None
 
     _style_ax(ax,

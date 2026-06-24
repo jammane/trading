@@ -352,29 +352,43 @@ def _mt1_decode(model, in37_t):
 
 # ── MT1 burst refinement ───────────────────────────────────────────────────────
 
-def _mt1_burst_component(prefix, model_dir, in37_t, actual_d,
+def _mt1_burst_component(prefix, model_dir, dir_hist, actual_d,
                           acc_floor, range_ceiling, burst_sigma, score_idx):
     """
     One burst refinement pass for one MT1 component pool.
 
-    score_idx: 0=direction 1=accuracy 2=range 3=confidence (index into score tuple)
+    score_idx: 0=direction 1=accuracy 2=range 3=confidence
+    Uses 5-day summed scoring from dir_hist; today (last entry) is doubled.
     Generates 10 mutants per elite (23 parents → 230 mutants), scores on the
     component-specific score, merges top-ELITE_COUNT with current elites
     (cap: 2 burst replacements). Regenerates wavg blend slots 17–19.
-    Returns new best component score.
     """
+    # breakdown tuple: (composite, dir, rng, acc, conf) → pick component score
+    _sc_idx = [1, 3, 2, 4][score_idx]
+
+    def _score_multiday(m):
+        total = 0.0
+        with torch.inference_mode():
+            for di, (feat_t, ad) in enumerate(dir_hist):
+                is_today = (di == len(dir_hist) - 1)
+                out4 = m(feat_t).squeeze(0)
+                if score_idx == 0:
+                    conf = torch.sigmoid(out4[0]).item()
+                    actual_pos = (ad >= 0.0)
+                    day_score = conf if actual_pos else (1.0 - conf)
+                else:
+                    bd = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)
+                    day_score = bd[_sc_idx]
+                total += day_score * 2.0 if is_today else day_score
+        return total
+
     burst_candidates = []
     for elite_slot in range(MT1_COMP_ELITE):
         parent = load_slot_model(prefix, model_dir, elite_slot, MT1NN)
         for _ in range(10):
             child = _mutate_generic(parent, MT1NN, burst_sigma)
             child.eval()
-            with torch.inference_mode():
-                out4 = child(in37_t).squeeze(0)
-            scores = _mt1_score_breakdown(out4, actual_d, acc_floor, range_ceiling)
-            # scores: (composite, dir, rng, acc, conf) — pick component-specific
-            # score_idx 0=dir→[1], 1=acc→[3], 2=rng→[2], 3=cfd→[4]
-            cat_sc = scores[[0, 1, 3, 2, 4][score_idx + 1]]  # offset by 1 (composite is [0])
+            cat_sc = _score_multiday(child)
             burst_candidates.append((child, cat_sc))
         del parent
     burst_candidates.sort(key=lambda x: x[1], reverse=True)
@@ -384,10 +398,7 @@ def _mt1_burst_component(prefix, model_dir, in37_t, actual_d,
     for rank in range(ELITE_COUNT):
         m = load_slot_model(prefix, model_dir, rank, MT1NN)
         m.eval()
-        with torch.inference_mode():
-            out4 = m(in37_t).squeeze(0)
-        scores = _mt1_score_breakdown(out4, actual_d, acc_floor, range_ceiling)
-        cat_sc = scores[[0, 1, 3, 2, 4][score_idx + 1]]
+        cat_sc = _score_multiday(m)
         current_elites.append((m, cat_sc))
 
     burst_ids  = {id(m) for m, _ in top_burst}
@@ -603,34 +614,31 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
         cat_idx = pool_score_idx[pool_id]
         scores = []
 
-        if pool_id == 0 and dir_hist:
-            # Direction pool: score = conf if actual_d>=0 else 1-conf; sum over last MT1_DIR_DAYS days.
-            # Also track max binary-correct count across slots for the backfill check.
-            dir_max_correct = 0
+        # All pools: 5-day summed scoring using shared dir_hist; today's score is doubled.
+        # Direction pool (pool_id==0) also tracks binary correct count for backfill check.
+        dir_max_correct = 0
+        if dir_hist:
             for slot in range(pool_slots):
                 m = load_slot_model(prefix, model_dir, slot, MT1NN)
                 m.eval()
-                dir_sum = 0.0
+                total_sum = 0.0
                 n_correct = 0
                 with torch.inference_mode():
-                    for feat_t, ad in dir_hist:
+                    for di, (feat_t, ad) in enumerate(dir_hist):
+                        is_today = (di == len(dir_hist) - 1)
                         out4 = m(feat_t).squeeze(0)
-                        conf = torch.sigmoid(out4[0]).item()
-                        actual_pos = (ad >= 0.0)
-                        dir_sum += conf if actual_pos else (1.0 - conf)
-                        n_correct += 1 if (conf >= 0.5) == actual_pos else 0
-                scores.append((slot, dir_sum))
+                        if pool_id == 0:
+                            conf = torch.sigmoid(out4[0]).item()
+                            actual_pos = (ad >= 0.0)
+                            day_score = conf if actual_pos else (1.0 - conf)
+                            n_correct += 1 if (conf >= 0.5) == actual_pos else 0
+                        else:
+                            breakdown = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)
+                            day_score = breakdown[cat_idx]
+                        total_sum += day_score * 2.0 if is_today else day_score
+                scores.append((slot, total_sum))
                 if n_correct > dir_max_correct:
                     dir_max_correct = n_correct
-                del m
-        else:
-            for slot in range(pool_slots):
-                m = load_slot_model(prefix, model_dir, slot, MT1NN)
-                m.eval()
-                with torch.inference_mode():
-                    out4 = m(in37_t).squeeze(0)
-                breakdown = _mt1_score_breakdown(out4, actual_d, acc_floor, range_ceiling)
-                scores.append((slot, breakdown[cat_idx]))
                 del m
 
         best_cat  = max(sc for _, sc in scores)
@@ -645,7 +653,7 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
         _select_and_mutate_mt1_component(prefix, model_dir, scores, sigma, reinject_paths)
 
         for burst_num in range(4):
-            _mt1_burst_component(prefix, model_dir, in37_t, actual_d,
+            _mt1_burst_component(prefix, model_dir, dir_hist, actual_d,
                                   acc_floor, range_ceiling,
                                   sigma / (2 ** (burst_num + 1)), pool_id)
 

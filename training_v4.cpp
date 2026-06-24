@@ -2175,10 +2175,10 @@ static MT1CompResult step_mt1_component(
     float cat_sc[MT1_COMP_SLOTS_EXT] = {};  // allocate for max pool size
     float out4[4];
 
-    int dir_max_correct = 0;  // max binary-correct count across slots (for backfill check)
-    if (pool_id == 0 && scratch.dir_day_count > 0) {
-        // Direction pool: score = conf if actual_d>=0 else 1-conf; sum over last MT1_DIR_DAYS days.
-        // Separate binary correct count tracked for the backfill check (not for selection ranking).
+    // All pools: 5-day summed scoring using shared dir_day_buf; today's score is doubled.
+    // Direction pool (pool_id==0) additionally tracks binary correct count for backfill.
+    int dir_max_correct = 0;
+    if (scratch.dir_day_count > 0) {
         for (int slot = 0; slot < pool_slots; slot++) {
             const float* wptr;
             if (slot < pool_elite) {
@@ -2187,34 +2187,30 @@ static MT1CompResult step_mt1_component(
                 get_weights(slot, scratch.mut_buf);
                 wptr = scratch.mut_buf;
             }
-            float dir_sum = 0.f;
+            float total_sum = 0.f;
             int   n_correct = 0;
             for (int di = 0; di < scratch.dir_day_count; di++) {
                 const auto& e = scratch.dir_day(di);
+                bool is_today = (di == scratch.dir_day_count - 1);
                 mt1_forward(wptr, e.feat37, out4);
-                float conf       = 1.f / (1.f + std::exp(-out4[0]));
-                bool  actual_pos = (e.actual_d >= 0.f);
-                dir_sum  += actual_pos ? conf : (1.f - conf);
-                n_correct += ((conf >= 0.5f) == actual_pos) ? 1 : 0;
+                float day_score;
+                if (pool_id == 0) {
+                    float conf       = 1.f / (1.f + std::exp(-out4[0]));
+                    bool  actual_pos = (e.actual_d >= 0.f);
+                    day_score = actual_pos ? conf : (1.f - conf);
+                    n_correct += ((conf >= 0.5f) == actual_pos) ? 1 : 0;
+                } else {
+                    auto sb = compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling);
+                    switch (pool_id) {
+                        case 1: day_score = sb.accuracy;    break;
+                        case 2: day_score = sb.range;       break;
+                        default: day_score = sb.confidence; break;
+                    }
+                }
+                total_sum += is_today ? day_score * 2.f : day_score;
             }
-            cat_sc[slot] = dir_sum;
+            cat_sc[slot] = total_sum;
             if (n_correct > dir_max_correct) dir_max_correct = n_correct;
-        }
-    } else {
-        for (int slot = 0; slot < pool_slots; slot++) {
-            if (slot < pool_elite) {
-                mt1_forward(scratch.comp_elite(pool_id, slot), in37, out4);
-            } else {
-                get_weights(slot, scratch.mut_buf);
-                mt1_forward(scratch.mut_buf, in37, out4);
-            }
-            auto sb = compute_mt1_scores(actual_d, out4, acc_floor, range_ceiling);
-            switch (pool_id) {
-                case 0: cat_sc[slot] = sb.direction;  break;
-                case 1: cat_sc[slot] = sb.accuracy;   break;
-                case 2: cat_sc[slot] = sb.range;      break;
-                default: cat_sc[slot] = sb.confidence; break;
-            }
         }
     }
 
@@ -2241,25 +2237,28 @@ static MT1CompResult step_mt1_component(
         for (int k = 0; k < n_hist; k++) {
             int abs_pos = (oldest + k) % total;
             float* hw = scratch.pool_hist[pool_id] + (size_t)abs_pos * MT1NN_PARAMS;
-            if (pool_id == 0 && scratch.dir_day_count > 0) {
-                float dir_sum = 0.f;
+            {
+                float total_sum = 0.f;
                 for (int di = 0; di < scratch.dir_day_count; di++) {
                     const auto& e = scratch.dir_day(di);
+                    bool is_today = (di == scratch.dir_day_count - 1);
                     mt1_forward(hw, e.feat37, out4);
-                    float conf      = 1.f / (1.f + std::exp(-out4[0]));
-                    bool actual_pos = (e.actual_d >= 0.f);
-                    dir_sum += actual_pos ? conf : (1.f - conf);
+                    float day_score;
+                    if (pool_id == 0) {
+                        float conf      = 1.f / (1.f + std::exp(-out4[0]));
+                        bool actual_pos = (e.actual_d >= 0.f);
+                        day_score = actual_pos ? conf : (1.f - conf);
+                    } else {
+                        auto sb = compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling);
+                        switch (pool_id) {
+                            case 1: day_score = sb.accuracy;    break;
+                            case 2: day_score = sb.range;       break;
+                            default: day_score = sb.confidence; break;
+                        }
+                    }
+                    total_sum += is_today ? day_score * 2.f : day_score;
                 }
-                hist_cat_sc[k] = dir_sum;
-            } else {
-                mt1_forward(hw, in37, out4);
-                auto sb = compute_mt1_scores(actual_d, out4, acc_floor, range_ceiling);
-                switch (pool_id) {
-                    case 0: hist_cat_sc[k] = sb.direction;  break;
-                    case 1: hist_cat_sc[k] = sb.accuracy;   break;
-                    case 2: hist_cat_sc[k] = sb.range;      break;
-                    default: hist_cat_sc[k] = sb.confidence; break;
-                }
+                hist_cat_sc[k] = total_sum;
             }
         }
     }
