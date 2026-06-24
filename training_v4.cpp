@@ -2174,8 +2174,10 @@ static MT1CompResult step_mt1_component(
     float cat_sc[MT1_COMP_SLOTS_EXT] = {};  // allocate for max pool size
     float out4[4];
 
+    int dir_max_correct = 0;  // max binary-correct count across slots (for backfill check)
     if (pool_id == 0 && scratch.dir_day_count > 0) {
-        // Direction pool: sum scores over last MT1_DIR_DAYS days (range 0..dir_day_count)
+        // Direction pool: score = conf if actual_d>=0 else 1-conf; sum over last MT1_DIR_DAYS days.
+        // Separate binary correct count tracked for the backfill check (not for selection ranking).
         for (int slot = 0; slot < pool_slots; slot++) {
             const float* wptr;
             if (slot < pool_elite) {
@@ -2185,13 +2187,17 @@ static MT1CompResult step_mt1_component(
                 wptr = scratch.mut_buf;
             }
             float dir_sum = 0.f;
+            int   n_correct = 0;
             for (int di = 0; di < scratch.dir_day_count; di++) {
                 const auto& e = scratch.dir_day(di);
                 mt1_forward(wptr, e.feat37, out4);
-                float conf = 1.f / (1.f + std::exp(-out4[0]));
-                dir_sum += ((conf >= 0.5f) == (e.actual_d >= 0.f)) ? 1.f : 0.f;
+                float conf       = 1.f / (1.f + std::exp(-out4[0]));
+                bool  actual_pos = (e.actual_d >= 0.f);
+                dir_sum  += actual_pos ? conf : (1.f - conf);
+                n_correct += ((conf >= 0.5f) == actual_pos) ? 1 : 0;
             }
             cat_sc[slot] = dir_sum;
+            if (n_correct > dir_max_correct) dir_max_correct = n_correct;
         }
     } else {
         for (int slot = 0; slot < pool_slots; slot++) {
@@ -2221,10 +2227,8 @@ static MT1CompResult step_mt1_component(
     mean_cat /= pool_slots;
     float slot0_cat = cat_sc[0];  // pre-selection slot 0
 
-    // Direction backfill: if the best model on this day scored < 0.65, the day's signal
-    // is too weak (near-random). Keep yesterday's elites on disk by returning early.
-    // Backfill threshold scales with how many days are in the buffer (ramps from 0.65 to 3.25)
-    if (pool_id == 0 && best_cat < MT1_DIR_BACKFILL * (float)scratch.dir_day_count)
+    // Direction backfill: skip update unless the best model got ≥3 of the buffered days correct (binary sign)
+    if (pool_id == 0 && dir_max_correct < 3)
         return {best_cat, slot0_cat, mean_cat, min_cat};
 
     // Score history candidates
@@ -2241,8 +2245,9 @@ static MT1CompResult step_mt1_component(
                 for (int di = 0; di < scratch.dir_day_count; di++) {
                     const auto& e = scratch.dir_day(di);
                     mt1_forward(hw, e.feat37, out4);
-                    float conf = 1.f / (1.f + std::exp(-out4[0]));
-                    dir_sum += ((conf >= 0.5f) == (e.actual_d >= 0.f)) ? 1.f : 0.f;
+                    float conf      = 1.f / (1.f + std::exp(-out4[0]));
+                    bool actual_pos = (e.actual_d >= 0.f);
+                    dir_sum += actual_pos ? conf : (1.f - conf);
                 }
                 hist_cat_sc[k] = dir_sum;
             } else {

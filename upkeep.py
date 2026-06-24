@@ -602,17 +602,24 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
         scores = []
 
         if pool_id == 0 and dir_hist:
-            # Direction pool: sum binary correct/wrong over last MT1_DIR_DAYS days (range 0..len(dir_hist))
+            # Direction pool: score = conf if actual_d>=0 else 1-conf; sum over last MT1_DIR_DAYS days.
+            # Also track max binary-correct count across slots for the backfill check.
+            dir_max_correct = 0
             for slot in range(pool_slots):
                 m = load_slot_model(prefix, model_dir, slot, MT1NN)
                 m.eval()
                 dir_sum = 0.0
+                n_correct = 0
                 with torch.inference_mode():
                     for feat_t, ad in dir_hist:
                         out4 = m(feat_t).squeeze(0)
                         conf = torch.sigmoid(out4[0]).item()
-                        dir_sum += 1.0 if (conf >= 0.5) == (ad >= 0.0) else 0.0
+                        actual_pos = (ad >= 0.0)
+                        dir_sum += conf if actual_pos else (1.0 - conf)
+                        n_correct += 1 if (conf >= 0.5) == actual_pos else 0
                 scores.append((slot, dir_sum))
+                if n_correct > dir_max_correct:
+                    dir_max_correct = n_correct
                 del m
         else:
             for slot in range(pool_slots):
@@ -629,9 +636,8 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
         log(f"[mt1/{sn(industry)}:{pool_name}] best={best_cat:.4f} slot0={slot0_cat:.4f} "
             f"actual_d=${actual_d:+.1f}")
 
-        dir_backfill_thresh = MT1_DIR_BACKFILL * len(dir_hist) if pool_id == 0 and dir_hist else MT1_DIR_BACKFILL
-        if pool_id == 0 and best_cat < dir_backfill_thresh:
-            log(f"[mt1/{sn(industry)}:dir] best={best_cat:.4f} < {dir_backfill_thresh:.2f} — backfill: keeping yesterday's elites")
+        if pool_id == 0 and dir_hist and dir_max_correct < 3:
+            log(f"[mt1/{sn(industry)}:dir] max_correct={dir_max_correct}/{len(dir_hist)} < 3 — backfill: keeping yesterday's elites")
             continue
 
         _select_and_mutate_mt1_component(prefix, model_dir, scores, sigma, reinject_paths)
