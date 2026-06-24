@@ -44,6 +44,10 @@ MT1_RANGE_FLOOR      = 1.0         # $1 — effectively no range floor
 MT1_RANGE_CEIL_MULT  = 4.0         # ceiling = 4 × mean(last 10 |actual−delta|)
 MT1_DIR_BACKFILL     = 0.65        # skip direction pool update when best score < this
 MT1_RANGE_INJECT     = 5           # top range elites → bottom 5 confidence slots (anti-gaming)
+MT1_COMP_INJECT      = 5           # top composite → additive elite slots 23–27 in dir/acc/rng
+MT1_COMP_ELITE_EXT   = MT1_COMP_ELITE + MT1_COMP_INJECT   # 28
+MT1_COMP_MUTS_EXT    = MT1_COMP_ELITE_EXT * 9              # 252
+MT1_COMP_SLOTS_EXT   = MT1_COMP_ELITE_EXT + MT1_COMP_MUTS_EXT  # 280
 MT1_POOL_NAMES       = ('dir', 'acc', 'rng', 'cfd')
 
 IND_STARTING_CASH     = 25_000.0    # per-industry portfolio starting capital

@@ -31,6 +31,10 @@ static constexpr int   HIST_PER_DAY        = 10;
 static constexpr int   HIST_ELITE          = 7;
 static constexpr int   HIST_WAVG           = 3;
 static constexpr int   MT1_RANGE_INJECT    = 5;
+static constexpr int   MT1_COMP_INJECT     = 5;
+static constexpr int   MT1_COMP_ELITE_EXT  = MT1_COMP_ELITE + MT1_COMP_INJECT;            // 28
+static constexpr int   MT1_COMP_MUTS_EXT   = MT1_COMP_ELITE_EXT * 9;                      // 252
+static constexpr int   MT1_COMP_SLOTS_EXT  = MT1_COMP_ELITE_EXT + MT1_COMP_MUTS_EXT;      // 280
 
 // ── Test harness ───────────────────────────────────────────────────────────
 
@@ -151,9 +155,21 @@ static void test_constants()
 
     // Range→confidence injection: top MT1_RANGE_INJECT direct elites → bottom 5 confidence slots
     CHECK(MT1_RANGE_INJECT == 5);
-    CHECK(MT1_RANGE_INJECT < ELITE_COUNT);                      // fits within direct elites
+    CHECK(MT1_RANGE_INJECT < ELITE_COUNT);
     CHECK(ELITE_COUNT - MT1_RANGE_INJECT == 12);                // injection start slot
-    CHECK(ELITE_COUNT - MT1_RANGE_INJECT + MT1_RANGE_INJECT - 1 == ELITE_COUNT - 1);  // fills to slot 16
+
+    // Composite→dir/acc/rng additive injection: slots 23–27 (beyond existing 23-slot base)
+    CHECK(MT1_COMP_INJECT == 5);
+    CHECK(MT1_COMP_ELITE_EXT == 28);
+    CHECK(MT1_COMP_MUTS_EXT  == 252);
+    CHECK(MT1_COMP_SLOTS_EXT == 280);
+    CHECK(MT1_COMP_MUTS_EXT  == MT1_COMP_ELITE_EXT * 9);       // 9 mutations per parent
+    CHECK(MT1_COMP_SLOTS_EXT == MT1_COMP_ELITE_EXT + MT1_COMP_MUTS_EXT);
+    // cfd pool stays at original size
+    CHECK(MT1_COMP_SLOTS == 230);
+    CHECK(MT1_COMP_ELITE == 23);
+    // Injected slots start immediately after existing elite range
+    CHECK(MT1_COMP_ELITE + MT1_COMP_INJECT - 1 == MT1_COMP_ELITE_EXT - 1);  // last injected = slot 27
 }
 
 static void test_pcg32()

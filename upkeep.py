@@ -49,8 +49,11 @@ from training_lib import (
     IND_STARTING_CASH,
     MT1_BLEND_SLOTS,
     MT1_COMP_ELITE,
+    MT1_COMP_ELITE_EXT,
+    MT1_COMP_INJECT,
     MT1_COMP_MUTS,
     MT1_COMP_SLOTS,
+    MT1_COMP_SLOTS_EXT,
     MT1_DIR_BACKFILL,
     MT1_POOL_NAMES,
     MT1_RANGE_CEIL_MULT,
@@ -570,16 +573,18 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
                     log(f"[mt1/{sn(industry)}:{pool_name}] Bootstrap failed — random weights")
             else:
                 log(f"[mt1/{sn(industry)}:{pool_name}] Initializing with random weights")
+            pool_slots = MT1_COMP_SLOTS_EXT if pool_id != 3 else MT1_COMP_SLOTS
             save_slot_model(prefix, model_dir, 0, base)
-            for slot in range(1, MT1_COMP_SLOTS):
+            for slot in range(1, pool_slots):
                 child = _mutate_generic(base, MT1NN, sigma)
                 save_slot_model(prefix, model_dir, slot, child)
                 del child
             del base
 
+        pool_slots = MT1_COMP_SLOTS_EXT if pool_id != 3 else MT1_COMP_SLOTS
         cat_idx = pool_score_idx[pool_id]
         scores = []
-        for slot in range(MT1_COMP_SLOTS):
+        for slot in range(pool_slots):
             m = load_slot_model(prefix, model_dir, slot, MT1NN)
             m.eval()
             with torch.inference_mode():
@@ -621,6 +626,13 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
                 if os.path.exists(src):
                     dst_slot = start + k
                     shutil.copy2(src, os.path.join(model_dir, f'{prefix}_elite_{dst_slot}.pt'))
+
+        # Dir/acc/rng: populate additive elite slots 23–27 with yesterday's composite top-5
+        if pool_id != 3:
+            for k in range(MT1_COMP_INJECT):
+                src = os.path.join(model_dir, f'mt1_{industry}_comp_inject_{k}.pt')
+                if os.path.exists(src):
+                    shutil.copy2(src, os.path.join(model_dir, f'{prefix}_elite_{MT1_COMP_ELITE + k}.pt'))
 
     # ── Composite pool ───────────────────────────────────────────────────────────
     # Load ELITE_COUNT direct elites from each component pool (ranks 0–16)
@@ -714,13 +726,21 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
     except Exception as e:
         log(f"WARNING: could not save mt1_{industry}_best.pt: {e}")
 
-    # Save top MT1_REINJECT models for next-day component re-injection
+    # Save top MT1_REINJECT models for next-day component re-injection (slots 20–22)
     for k in range(min(MT1_REINJECT, len(all_candidates))):
         rp = os.path.join(model_dir, f'{comp_prefix}_reinject_{k}.pt')
         try:
             torch.save(all_candidates[k][0].state_dict(), rp)
         except Exception as e:
             log(f"WARNING: could not save {comp_prefix}_reinject_{k}: {e}")
+
+    # Save top MT1_COMP_INJECT models for next-day dir/acc/rng additive injection (slots 23–27)
+    for k in range(min(MT1_COMP_INJECT, len(all_candidates))):
+        cp = os.path.join(model_dir, f'mt1_{industry}_comp_inject_{k}.pt')
+        try:
+            torch.save(all_candidates[k][0].state_dict(), cp)
+        except Exception as e:
+            log(f"WARNING: could not save mt1_{industry}_comp_inject_{k}: {e}")
 
     # Save top HIST_PER_DAY composite models to circular history (5 days × 10/day)
     if os.path.exists(hist_meta_path):
