@@ -48,6 +48,7 @@ MT1_COMP_INJECT      = 5           # top composite â†’ additive elite slots 23â€
 MT1_COMP_ELITE_EXT   = MT1_COMP_ELITE + MT1_COMP_INJECT   # 28
 MT1_COMP_MUTS_EXT    = MT1_COMP_ELITE_EXT * 9              # 252
 MT1_COMP_SLOTS_EXT   = MT1_COMP_ELITE_EXT + MT1_COMP_MUTS_EXT  # 280
+MT1_DIR_DAYS         = 5            # direction pool: score each model over last N days, sum
 MT1_POOL_NAMES       = ('dir', 'acc', 'rng', 'cfd')
 
 IND_STARTING_CASH     = 25_000.0    # per-industry portfolio starting capital

@@ -35,6 +35,7 @@ static constexpr int   MT1_COMP_INJECT     = 5;
 static constexpr int   MT1_COMP_ELITE_EXT  = MT1_COMP_ELITE + MT1_COMP_INJECT;            // 28
 static constexpr int   MT1_COMP_MUTS_EXT   = MT1_COMP_ELITE_EXT * 9;                      // 252
 static constexpr int   MT1_COMP_SLOTS_EXT  = MT1_COMP_ELITE_EXT + MT1_COMP_MUTS_EXT;      // 280
+static constexpr int   MT1_DIR_DAYS        = 5;
 
 // ── Test harness ───────────────────────────────────────────────────────────
 
@@ -170,6 +171,12 @@ static void test_constants()
     CHECK(MT1_COMP_ELITE == 23);
     // Injected slots start immediately after existing elite range
     CHECK(MT1_COMP_ELITE + MT1_COMP_INJECT - 1 == MT1_COMP_ELITE_EXT - 1);  // last injected = slot 27
+
+    // Direction pool: multi-day scoring window
+    CHECK(MT1_DIR_DAYS == 5);
+    // Backfill threshold scales: at full buffer, 0.65*5=3.25 (need 4/5 correct to avoid backfill)
+    CHECK(MT1_DIR_DAYS * 1 == 5);   // max possible sum = MT1_DIR_DAYS
+    CHECK(MT1_DIR_DAYS > 1);        // must be multi-day
 }
 
 static void test_pcg32()

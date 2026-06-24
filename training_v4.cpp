@@ -122,6 +122,7 @@ static constexpr int   MT1_COMP_INJECT     = 5;      // top composite → additi
 static constexpr int   MT1_COMP_ELITE_EXT  = MT1_COMP_ELITE + MT1_COMP_INJECT;           // 28
 static constexpr int   MT1_COMP_MUTS_EXT   = MT1_COMP_ELITE_EXT * 9;                     // 252
 static constexpr int   MT1_COMP_SLOTS_EXT  = MT1_COMP_ELITE_EXT + MT1_COMP_MUTS_EXT;     // 280
+static constexpr int   MT1_DIR_DAYS        = 5;   // direction pool: score each model over last N days, sum
 static constexpr int   HIST_WINDOW         = 15;
 
 static constexpr float IND_STARTING_CASH   = 25000.0f;
@@ -554,6 +555,12 @@ struct MT1Scratch {
     // Best composite model weights (saved periodically as comp_0.bin)
     float*   comp0_buf;
 
+    // Multi-day direction scoring buffer (last MT1_DIR_DAYS entries of features + actual_d)
+    struct DirDayEntry { float feat37[37]; float actual_d; };
+    DirDayEntry  dir_day_buf[MT1_DIR_DAYS]{};
+    int          dir_day_head{0};
+    int          dir_day_count{0};
+
     // Rolling per-industry circular buffers
     float    rolling_actual  [MT1_ROLLING_DAYS]{};  // |actual_d|           → acc floor
     float    rolling_residual[MT1_ROLLING_DAYS]{};  // |actual_d−comp0_δd| → range ceiling
@@ -592,6 +599,17 @@ struct MT1Scratch {
     float* reinject(int k)     { return reinject_buf    + (size_t)k * MT1NN_PARAMS; }
     float* rng_inject(int k)   { return rng_inject_buf  + (size_t)k * MT1NN_PARAMS; }
     float* comp_inject(int k)  { return comp_inject_buf + (size_t)k * MT1NN_PARAMS; }
+
+    void push_dir_day(const float* f37, float ad) {
+        memcpy(dir_day_buf[dir_day_head].feat37, f37, 37 * sizeof(float));
+        dir_day_buf[dir_day_head].actual_d = ad;
+        dir_day_head = (dir_day_head + 1) % MT1_DIR_DAYS;
+        if (dir_day_count < MT1_DIR_DAYS) dir_day_count++;
+    }
+    const DirDayEntry& dir_day(int k) const {
+        int oldest = (dir_day_head - dir_day_count + MT1_DIR_DAYS) % MT1_DIR_DAYS;
+        return dir_day_buf[(oldest + k) % MT1_DIR_DAYS];
+    }
 };
 
 struct MT1Result {
@@ -2152,22 +2170,44 @@ static MT1CompResult step_mt1_component(
         }
     };
 
-    // Score all pool_slots (280 for dir/acc/rng, 230 for cfd) on the pool-specific component score
+    // Score all pool_slots on the pool-specific component score
     float cat_sc[MT1_COMP_SLOTS_EXT] = {};  // allocate for max pool size
     float out4[4];
-    for (int slot = 0; slot < pool_slots; slot++) {
-        if (slot < pool_elite) {
-            mt1_forward(scratch.comp_elite(pool_id, slot), in37, out4);
-        } else {
-            get_weights(slot, scratch.mut_buf);
-            mt1_forward(scratch.mut_buf, in37, out4);
+
+    if (pool_id == 0 && scratch.dir_day_count > 0) {
+        // Direction pool: sum scores over last MT1_DIR_DAYS days (range 0..dir_day_count)
+        for (int slot = 0; slot < pool_slots; slot++) {
+            const float* wptr;
+            if (slot < pool_elite) {
+                wptr = scratch.comp_elite(pool_id, slot);
+            } else {
+                get_weights(slot, scratch.mut_buf);
+                wptr = scratch.mut_buf;
+            }
+            float dir_sum = 0.f;
+            for (int di = 0; di < scratch.dir_day_count; di++) {
+                const auto& e = scratch.dir_day(di);
+                mt1_forward(wptr, e.feat37, out4);
+                float conf = 1.f / (1.f + std::exp(-out4[0]));
+                dir_sum += ((conf >= 0.5f) == (e.actual_d >= 0.f)) ? 1.f : 0.f;
+            }
+            cat_sc[slot] = dir_sum;
         }
-        auto sb = compute_mt1_scores(actual_d, out4, acc_floor, range_ceiling);
-        switch (pool_id) {
-            case 0: cat_sc[slot] = sb.direction;  break;
-            case 1: cat_sc[slot] = sb.accuracy;   break;
-            case 2: cat_sc[slot] = sb.range;      break;
-            default: cat_sc[slot] = sb.confidence; break;
+    } else {
+        for (int slot = 0; slot < pool_slots; slot++) {
+            if (slot < pool_elite) {
+                mt1_forward(scratch.comp_elite(pool_id, slot), in37, out4);
+            } else {
+                get_weights(slot, scratch.mut_buf);
+                mt1_forward(scratch.mut_buf, in37, out4);
+            }
+            auto sb = compute_mt1_scores(actual_d, out4, acc_floor, range_ceiling);
+            switch (pool_id) {
+                case 0: cat_sc[slot] = sb.direction;  break;
+                case 1: cat_sc[slot] = sb.accuracy;   break;
+                case 2: cat_sc[slot] = sb.range;      break;
+                default: cat_sc[slot] = sb.confidence; break;
+            }
         }
     }
 
@@ -2183,7 +2223,8 @@ static MT1CompResult step_mt1_component(
 
     // Direction backfill: if the best model on this day scored < 0.65, the day's signal
     // is too weak (near-random). Keep yesterday's elites on disk by returning early.
-    if (pool_id == 0 && best_cat < MT1_DIR_BACKFILL)
+    // Backfill threshold scales with how many days are in the buffer (ramps from 0.65 to 3.25)
+    if (pool_id == 0 && best_cat < MT1_DIR_BACKFILL * (float)scratch.dir_day_count)
         return {best_cat, slot0_cat, mean_cat, min_cat};
 
     // Score history candidates
@@ -2195,13 +2236,24 @@ static MT1CompResult step_mt1_component(
         for (int k = 0; k < n_hist; k++) {
             int abs_pos = (oldest + k) % total;
             float* hw = scratch.pool_hist[pool_id] + (size_t)abs_pos * MT1NN_PARAMS;
-            mt1_forward(hw, in37, out4);
-            auto sb = compute_mt1_scores(actual_d, out4, acc_floor, range_ceiling);
-            switch (pool_id) {
-                case 0: hist_cat_sc[k] = sb.direction;  break;
-                case 1: hist_cat_sc[k] = sb.accuracy;   break;
-                case 2: hist_cat_sc[k] = sb.range;      break;
-                default: hist_cat_sc[k] = sb.confidence; break;
+            if (pool_id == 0 && scratch.dir_day_count > 0) {
+                float dir_sum = 0.f;
+                for (int di = 0; di < scratch.dir_day_count; di++) {
+                    const auto& e = scratch.dir_day(di);
+                    mt1_forward(hw, e.feat37, out4);
+                    float conf = 1.f / (1.f + std::exp(-out4[0]));
+                    dir_sum += ((conf >= 0.5f) == (e.actual_d >= 0.f)) ? 1.f : 0.f;
+                }
+                hist_cat_sc[k] = dir_sum;
+            } else {
+                mt1_forward(hw, in37, out4);
+                auto sb = compute_mt1_scores(actual_d, out4, acc_floor, range_ceiling);
+                switch (pool_id) {
+                    case 0: hist_cat_sc[k] = sb.direction;  break;
+                    case 1: hist_cat_sc[k] = sb.accuracy;   break;
+                    case 2: hist_cat_sc[k] = sb.range;      break;
+                    default: hist_cat_sc[k] = sb.confidence; break;
+                }
             }
         }
     }
@@ -2435,6 +2487,9 @@ static MT1Result step_mt1(int ind_i, MT1Scratch& scratch,
         acc_floor     = sum_a / (float)scratch.rolling_count / 2.f;
         range_ceiling = MT1_RANGE_CEIL_MULT * sum_r / (float)scratch.rolling_count;
     }
+
+    // Record today's data before scoring so direction pool sees the full MT1_DIR_DAYS window
+    scratch.push_dir_day(in37, actual_d);
 
     // Step 4 component pools (dir, acc, rng, cfd)
     MT1CompResult cr[4];
@@ -2909,6 +2964,15 @@ static void save_mt1_all(const std::string& dir, int ind_i, const MT1Scratch& sc
                    (size_t)scratch.comp_inject_count * MT1NN_PARAMS, fci);
         fclose(fci);
     }
+    // Direction day buffer (multi-day scoring window)
+    snprintf(path, sizeof(path), "%s/mt1_%s_dir_hist.bin", dir.c_str(), ind);
+    FILE* fdh = fopen(path, "wb");
+    if (fdh) {
+        int meta[2] = {scratch.dir_day_head, scratch.dir_day_count};
+        fwrite(meta, sizeof(int), 2, fdh);
+        fwrite(scratch.dir_day_buf, sizeof(MT1Scratch::DirDayEntry), MT1_DIR_DAYS, fdh);
+        fclose(fdh);
+    }
     // Composite best (production model)
     snprintf(path, sizeof(path), "%s/mt1_%s_comp_0.bin", dir.c_str(), ind);
     save_bin(path, scratch.comp0_buf, MT1NN_PARAMS);
@@ -3012,6 +3076,24 @@ static void load_or_init_mt1(const std::string& dir, const std::string& load_dir
         if (fread(&cnt, sizeof(int), 1, f) == 1 && cnt > 0 && cnt <= MT1_COMP_INJECT) {
             fread(scratch.comp_inject_buf, sizeof(float), (size_t)cnt * MT1NN_PARAMS, f);
             scratch.comp_inject_count = cnt;
+        }
+        fclose(f);
+        break;
+    }
+
+    // Direction day buffer (multi-day scoring window)
+    for (const std::string* sd : {&load_dir, &dir}) {
+        if (sd->empty()) continue;
+        snprintf(path, sizeof(path), "%s/mt1_%s_dir_hist.bin", sd->c_str(), ind);
+        FILE* f = fopen(path, "rb");
+        if (!f) continue;
+        int meta[2] = {};
+        if (fread(meta, sizeof(int), 2, f) == 2 &&
+            meta[1] >= 0 && meta[1] <= MT1_DIR_DAYS &&
+            meta[0] >= 0 && meta[0] < MT1_DIR_DAYS) {
+            scratch.dir_day_head  = meta[0];
+            scratch.dir_day_count = meta[1];
+            fread(scratch.dir_day_buf, sizeof(MT1Scratch::DirDayEntry), MT1_DIR_DAYS, f);
         }
         fclose(f);
         break;
