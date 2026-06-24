@@ -55,6 +55,7 @@ from training_lib import (
     MT1_COMP_SLOTS,
     MT1_COMP_SLOTS_EXT,
     MT1_DIR_BACKFILL,
+    MT1_DIR_DAYS,
     MT1_POOL_NAMES,
     MT1_RANGE_CEIL_MULT,
     MT1_RANGE_FLOOR,
@@ -557,6 +558,21 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
     reinject_paths = [os.path.join(model_dir, f'{comp_prefix}_reinject_{k}.pt')
                       for k in range(MT1_REINJECT)]
 
+    # ── Direction day buffer (multi-day scoring) ─────────────────────────────────
+    dir_hist_path = os.path.join(model_dir, f'mt1_{industry}_dir_hist.json')
+    dir_hist_raw: list[dict] = []
+    if os.path.exists(dir_hist_path):
+        with open(dir_hist_path) as _f:
+            dir_hist_raw = json.load(_f)
+    # Append today and trim to last MT1_DIR_DAYS entries
+    dir_hist_raw.append({'feat37': in37_t.squeeze(0).tolist(), 'actual_d': float(actual_d)})
+    dir_hist_raw = dir_hist_raw[-MT1_DIR_DAYS:]
+    with open(dir_hist_path, 'w') as _f:
+        json.dump(dir_hist_raw, _f)
+    # Pre-convert to tensors for scoring
+    dir_hist = [(torch.tensor(e['feat37'], dtype=torch.float32).unsqueeze(0), e['actual_d'])
+                for e in dir_hist_raw]
+
     # ── Component pools ──────────────────────────────────────────────────────────
     for pool_id, pool_name in enumerate(MT1_POOL_NAMES):
         prefix     = f'mt1_{industry}_{pool_name}'
@@ -584,22 +600,38 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
         pool_slots = MT1_COMP_SLOTS_EXT if pool_id != 3 else MT1_COMP_SLOTS
         cat_idx = pool_score_idx[pool_id]
         scores = []
-        for slot in range(pool_slots):
-            m = load_slot_model(prefix, model_dir, slot, MT1NN)
-            m.eval()
-            with torch.inference_mode():
-                out4 = m(in37_t).squeeze(0)
-            breakdown = _mt1_score_breakdown(out4, actual_d, acc_floor, range_ceiling)
-            scores.append((slot, breakdown[cat_idx]))
-            del m
+
+        if pool_id == 0 and dir_hist:
+            # Direction pool: sum binary correct/wrong over last MT1_DIR_DAYS days (range 0..len(dir_hist))
+            for slot in range(pool_slots):
+                m = load_slot_model(prefix, model_dir, slot, MT1NN)
+                m.eval()
+                dir_sum = 0.0
+                with torch.inference_mode():
+                    for feat_t, ad in dir_hist:
+                        out4 = m(feat_t).squeeze(0)
+                        conf = torch.sigmoid(out4[0]).item()
+                        dir_sum += 1.0 if (conf >= 0.5) == (ad >= 0.0) else 0.0
+                scores.append((slot, dir_sum))
+                del m
+        else:
+            for slot in range(pool_slots):
+                m = load_slot_model(prefix, model_dir, slot, MT1NN)
+                m.eval()
+                with torch.inference_mode():
+                    out4 = m(in37_t).squeeze(0)
+                breakdown = _mt1_score_breakdown(out4, actual_d, acc_floor, range_ceiling)
+                scores.append((slot, breakdown[cat_idx]))
+                del m
 
         best_cat  = max(sc for _, sc in scores)
         slot0_cat = scores[0][1]
         log(f"[mt1/{sn(industry)}:{pool_name}] best={best_cat:.4f} slot0={slot0_cat:.4f} "
             f"actual_d=${actual_d:+.1f}")
 
-        if pool_id == 0 and best_cat < MT1_DIR_BACKFILL:
-            log(f"[mt1/{sn(industry)}:dir] best={best_cat:.4f} < {MT1_DIR_BACKFILL} — backfill: keeping yesterday's elites")
+        dir_backfill_thresh = MT1_DIR_BACKFILL * len(dir_hist) if pool_id == 0 and dir_hist else MT1_DIR_BACKFILL
+        if pool_id == 0 and best_cat < dir_backfill_thresh:
+            log(f"[mt1/{sn(industry)}:dir] best={best_cat:.4f} < {dir_backfill_thresh:.2f} — backfill: keeping yesterday's elites")
             continue
 
         _select_and_mutate_mt1_component(prefix, model_dir, scores, sigma, reinject_paths)
