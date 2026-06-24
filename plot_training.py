@@ -84,7 +84,7 @@ _STAT_NAMES = ["best", "slot0", "mean", "min"]
 
 MT1_COMP_LABEL = {
     "composite":  "Composite  (0.50×dir + 0.33×range + 0.17×acc)",
-    "direction":  "Direction  — P(correct sign)",
+    "direction":  "Direction  — 5-day sum  (conf if up, 1−conf if down)",
     "range":      "Range  — calibration tightness",
     "accuracy":   "Accuracy  — dollar error vs floor",
     "confidence": "Confidence  — out[3] vs range-geometry ideal",
@@ -355,10 +355,19 @@ def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: 
 
         _plot_band(ax, xs_m, means, bests, mins_s, IND_COLOR[ind])
 
-    ax.set_ylim(0, 1)
+    if comp == "direction":
+        ax.set_ylim(0, 5)
+        ax.axhline(2.5, color="gray", linewidth=0.8, linestyle="--",
+                   label="Random baseline (2.5)")
+        ax.axhline(3.0, color="orange", linewidth=0.8, linestyle=":",
+                   label="Backfill threshold (3/5 correct ≈ 3.0)")
+        ylabel = "5-day sum score (0 – 5)"
+    else:
+        ax.set_ylim(0, 1)
+        ylabel = "Score (0 – 1)"
     _style_ax(ax,
               f"MT1 — {MT1_COMP_LABEL[comp]} — Pass {pass_num}",
-              f"Day (Pass {pass_num})", "Score (0 – 1)")
+              f"Day (Pass {pass_num})", ylabel)
     _industry_legend(ax)
     _save(fig, out_path)
 
