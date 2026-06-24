@@ -356,11 +356,19 @@ def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: 
 
         _plot_band(ax, xs_m, means, bests, mins_s, IND_COLOR[ind])
 
-    # All-industry mean: average of each industry's per-day mean score
+    # All-industry mean/max/min: average across industries of each per-day stat
     all_means_raw = [sum(r["mt1"][comp]["mean"]) / n_ind for r in records]
+    all_bests_raw = [sum(r["mt1"][comp]["best"]) / n_ind for r in records]
+    all_mins_raw  = [sum(r["mt1"][comp]["min"])  / n_ind for r in records]
     xs_am, all_means = _smooth(xs_raw, all_means_raw)
+    xs_ab, all_bests = _smooth(xs_raw, all_bests_raw)
+    xs_an, all_mins  = _smooth(xs_raw, all_mins_raw)
     ax.plot(xs_am, all_means, color="black", linewidth=2.5, linestyle=(0, (4, 2)),
-            zorder=5, label="All-industry mean")
+            zorder=5, label="All-ind mean (mean)")
+    ax.plot(xs_ab, all_bests, color="black", linewidth=1.8, linestyle=(0, (2, 2)),
+            zorder=5, label="All-ind mean (max)")
+    ax.plot(xs_an, all_mins,  color="black", linewidth=1.8, linestyle=(0, (1, 2)),
+            zorder=5, label="All-ind mean (min)")
 
     if comp == "direction":
         ax.set_ylim(0, 5)
@@ -375,8 +383,11 @@ def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: 
     _style_ax(ax,
               f"MT1 — {MT1_COMP_LABEL[comp]} — Pass {pass_num}",
               f"Day (Pass {pass_num})", ylabel)
-    extra = [mlines.Line2D([], [], color="black", linewidth=2.5,
-                           linestyle=(0, (4, 2)), label="All-industry mean")]
+    extra = [
+        mlines.Line2D([], [], color="black", linewidth=2.5, linestyle=(0, (4, 2)), label="All-ind mean (mean)"),
+        mlines.Line2D([], [], color="black", linewidth=1.8, linestyle=(0, (2, 2)), label="All-ind mean (max)"),
+        mlines.Line2D([], [], color="black", linewidth=1.8, linestyle=(0, (1, 2)), label="All-ind mean (min)"),
+    ]
     _industry_legend(ax, extra_handles=extra)
     _save(fig, out_path)
 
