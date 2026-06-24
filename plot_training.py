@@ -344,6 +344,7 @@ def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: 
     fig.subplots_adjust(bottom=0.23)
 
     xs_raw = [r["day"] for r in records]
+    n_ind = len(INDUSTRIES)
     for i, ind in enumerate(INDUSTRIES):
         means_raw = [r["mt1"][comp]["mean"][i] for r in records]
         bests_raw = [r["mt1"][comp]["best"][i] for r in records]
@@ -354,6 +355,12 @@ def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: 
         xs_n, mins_s = _smooth(xs_raw, mins_raw)
 
         _plot_band(ax, xs_m, means, bests, mins_s, IND_COLOR[ind])
+
+    # All-industry mean: average of each industry's per-day mean score
+    all_means_raw = [sum(r["mt1"][comp]["mean"]) / n_ind for r in records]
+    xs_am, all_means = _smooth(xs_raw, all_means_raw)
+    ax.plot(xs_am, all_means, color="black", linewidth=2.5, linestyle=(0, (4, 2)),
+            zorder=5, label="All-industry mean")
 
     if comp == "direction":
         ax.set_ylim(0, 5)
@@ -368,7 +375,9 @@ def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: 
     _style_ax(ax,
               f"MT1 — {MT1_COMP_LABEL[comp]} — Pass {pass_num}",
               f"Day (Pass {pass_num})", ylabel)
-    _industry_legend(ax)
+    extra = [mlines.Line2D([], [], color="black", linewidth=2.5,
+                           linestyle=(0, (4, 2)), label="All-industry mean")]
+    _industry_legend(ax, extra_handles=extra)
     _save(fig, out_path)
 
 # ── MT2 SVG ───────────────────────────────────────────────────────────────────
