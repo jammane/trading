@@ -715,9 +715,14 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
         bm = MT1NN()
         bm.load_state_dict(avg_st)
         bm.eval()
+        total_sum = 0.0
         with torch.inference_mode():
-            out4 = bm(in37_t).squeeze(0)
-        comp_sc = _mt1_score_breakdown(out4, actual_d, acc_floor, range_ceiling)[0]
+            for di, (feat_t, ad) in enumerate(dir_hist):
+                is_today = (di == len(dir_hist) - 1)
+                out4 = bm(feat_t).squeeze(0)
+                day_sc = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)[0]
+                total_sum += day_sc * 2.0 if is_today else day_sc
+        comp_sc = total_sum
         blend_scored.append((bm, comp_sc))
         del avg_st
 
@@ -744,10 +749,14 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
                             hm = MT1NN()
                             hm.load_state_dict(torch.load(hp, weights_only=True))
                             hm.eval()
+                            total_sum = 0.0
                             with torch.inference_mode():
-                                out4 = hm(in37_t).squeeze(0)
-                            comp_sc = _mt1_score_breakdown(
-                                out4, actual_d, acc_floor, range_ceiling)[0]
+                                for di, (feat_t, ad) in enumerate(dir_hist):
+                                    is_today = (di == len(dir_hist) - 1)
+                                    out4 = hm(feat_t).squeeze(0)
+                                    day_sc = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)[0]
+                                    total_sum += day_sc * 2.0 if is_today else day_sc
+                            comp_sc = total_sum
                             hist_candidates.append((hm, comp_sc))
                         except Exception:
                             pass

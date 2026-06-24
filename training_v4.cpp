@@ -2395,8 +2395,15 @@ static MT1BlendResult step_mt1_composite(
 
     for (int b = 0; b < MT1_BLEND_SLOTS; b++) {
         gen_mt1_blend(b, ind_i, actual_day, scratch, scratch.mut_buf);
-        mt1_forward(scratch.mut_buf, in37, out4);
-        blend_sc[b] = compute_mt1_scores(actual_d, out4, acc_floor, range_ceiling).composite;
+        float total_sum = 0.f;
+        for (int di = 0; di < scratch.dir_day_count; di++) {
+            const auto& e  = scratch.dir_day(di);
+            bool is_today  = (di == scratch.dir_day_count - 1);
+            mt1_forward(scratch.mut_buf, e.feat37, out4);
+            float day_sc = compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling).composite;
+            total_sum += is_today ? day_sc * 2.f : day_sc;
+        }
+        blend_sc[b] = total_sum;
         mean_sc += blend_sc[b];
         if (blend_sc[b] > best_sc) best_sc = blend_sc[b];
         if (blend_sc[b] < min_sc)  min_sc  = blend_sc[b];
@@ -2412,8 +2419,15 @@ static MT1BlendResult step_mt1_composite(
         for (int k = 0; k < n_hist; k++) {
             int abs_pos = (oldest + k) % total;
             float* hw = scratch.blend_hist + (size_t)abs_pos * MT1NN_PARAMS;
-            mt1_forward(hw, in37, out4);
-            hist_sc[k] = compute_mt1_scores(actual_d, out4, acc_floor, range_ceiling).composite;
+            float total_sum = 0.f;
+            for (int di = 0; di < scratch.dir_day_count; di++) {
+                const auto& e  = scratch.dir_day(di);
+                bool is_today  = (di == scratch.dir_day_count - 1);
+                mt1_forward(hw, e.feat37, out4);
+                float day_sc = compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling).composite;
+                total_sum += is_today ? day_sc * 2.f : day_sc;
+            }
+            hist_sc[k] = total_sum;
         }
     }
 
