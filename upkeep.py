@@ -48,19 +48,16 @@ from training_lib import (
     HIST_WAVG,
     IND_STARTING_CASH,
     MT1_BLEND_SLOTS,
-    MT1_COMP_ELITE,
-    MT1_COMP_ELITE_EXT,
+    MT1_COMP_CHILDREN,
     MT1_COMP_INJECT,
-    MT1_COMP_MUTS,
+    MT1_COMP_PARENTS,
     MT1_COMP_SLOTS,
-    MT1_COMP_SLOTS_EXT,
     MT1_DIR_BACKFILL,
     MT1_DIR_DAYS,
     MT1_POOL_NAMES,
     MT1_RANGE_CEIL_MULT,
     MT1_RANGE_FLOOR,
     MT1_RANGE_INJECT,
-    MT1_REINJECT,
     N_SLOTS,
     WAVG_COUNT,
     _master_points,
@@ -168,20 +165,17 @@ def _select_and_mutate(prefix, model_dir, model_class, scores, sigma):
     return elite_slots, elite_vals
 
 
-def _select_and_mutate_mt1_component(prefix, model_dir, scores, sigma,
-                                      reinject_paths=None):
+def _select_and_mutate_mt1_component(prefix, model_dir, scores, sigma):
     """
-    Elite selection + mutation for one MT1 component pool (230 slots).
+    Elite selection + mutation for one MT1 component pool (200 slots).
 
-    scores:          list of (slot, cat_score) sorted or unsorted.
-    reinject_paths:  list of up to MT1_REINJECT .pt file paths for re-injection models
-                     (written into elite slots 20–22 before mutation).
+    scores: list of (slot, cat_score) — culled slots have score=-1e30.
 
     Slot layout after selection:
       0–16   direct elites (ELITE_COUNT)
       17–19  wavg blends   (WAVG_COUNT: top-5, top-10, top-15)
-      20–22  re-injection slots (MT1_REINJECT) — copied from reinject_paths unchanged
-      23–229 mutations (MT1_COMP_MUTS=207, round-robin over all 23 parents)
+      20–24  injection slots (MT1_COMP_INJECT) — loaded by upkeep_mt1_industry before call
+      25–199 mutations (MT1_COMP_CHILDREN=7 per parent, round-robin over 25 parents)
     """
     sorted_scores = sorted(scores, key=lambda x: x[1], reverse=True)
     top_slots = [s for s, _ in sorted_scores[:ELITE_COUNT]]
@@ -212,23 +206,13 @@ def _select_and_mutate_mt1_component(prefix, model_dir, scores, sigma,
         save_slot_model(prefix, model_dir, ELITE_COUNT + b, wm)
         del wm, avg_st
 
-    # Re-injection slots 20–22
-    ri_paths = reinject_paths or []
-    for k, ri_path in enumerate(ri_paths[:MT1_REINJECT]):
-        if os.path.exists(ri_path):
-            try:
-                ri_m = MT1NN()
-                ri_m.load_state_dict(torch.load(ri_path, weights_only=True))
-                save_slot_model(prefix, model_dir, ELITE_COUNT + WAVG_COUNT + k, ri_m)
-                del ri_m
-            except Exception:
-                pass
+    # Injection slots 20–24: already written by upkeep_mt1_industry before this call
 
     del cache
 
-    # Mutations: round-robin over all MT1_COMP_ELITE (23) parents
-    for i, slot in enumerate(range(MT1_COMP_ELITE, MT1_COMP_SLOTS)):
-        parent_rank = i % MT1_COMP_ELITE
+    # Mutations: 7 children per parent, round-robin over MT1_COMP_PARENTS (25) parents
+    for i, slot in enumerate(range(MT1_COMP_PARENTS, MT1_COMP_SLOTS)):
+        parent_rank = i % MT1_COMP_PARENTS
         parent = load_slot_model(prefix, model_dir, parent_rank, MT1NN)
         child  = _mutate_generic(parent, MT1NN, sigma)
         save_slot_model(prefix, model_dir, slot, child)
@@ -266,13 +250,14 @@ def _rolling_acc_floor(ind_state):
     return sum(buf) / len(buf) / 2.0
 
 
-def _rolling_range_ceiling(ind_state):
-    """Range ceiling = MT1_RANGE_CEIL_MULT × mean(last 10 |actual_d - comp0_delta_d|).
+def _rolling_range_ceiling(ind_state, today_residual=0.0):
+    """Range ceiling = max(4 × mean_residual, 4 × today_residual).
     Returns None (no ceiling) on cold start."""
     buf = ind_state.get('residual_buf', [])
     if not buf:
         return None
-    return MT1_RANGE_CEIL_MULT * sum(buf) / len(buf)
+    mean_r = sum(buf) / len(buf)
+    return MT1_RANGE_CEIL_MULT * max(mean_r, today_residual)
 
 
 def _rolling_update(ind_state, abs_actual_d, comp0_residual):
@@ -359,31 +344,59 @@ def _mt1_burst_component(prefix, model_dir, dir_hist, actual_d,
 
     score_idx: 0=direction 1=accuracy 2=range 3=confidence
     Uses 5-day summed scoring from dir_hist; today (last entry) is doubled.
-    Generates 10 mutants per elite (23 parents → 230 mutants), scores on the
-    component-specific score, merges top-ELITE_COUNT with current elites
-    (cap: 2 burst replacements). Regenerates wavg blend slots 17–19.
+    Applies same culls as main scoring (range ceiling for pool 2/3,
+    alignment for pool 1). Generates 10 mutants per MT1_COMP_PARENTS (25)
+    parent elites, merges top-ELITE_COUNT with current elites (cap: 2 replacements).
     """
     # breakdown tuple: (composite, dir, rng, acc, conf) → pick component score
     _sc_idx = [1, 3, 2, 4][score_idx]
 
     def _score_multiday(m):
         total = 0.0
+        culled = False
+        prev_conf_pos, prev_act_pos = None, None
+        conf_crossings, market_flips = 0, 0
         with torch.inference_mode():
             for di, (feat_t, ad) in enumerate(dir_hist):
+                if culled:
+                    break
                 is_today = (di == len(dir_hist) - 1)
                 out4 = m(feat_t).squeeze(0)
+                conf    = torch.sigmoid(out4[0]).item()
+                delta_d = torch.tanh(out4[1]).item() * MT1_SCALE_DOLLARS
+                rng_pct = F.softplus(out4[2]).item()
+                r_raw   = rng_pct * max(abs(delta_d), MT1_RANGE_FLOOR)
+                if (score_idx == 2 or score_idx == 3) and range_ceiling is not None:
+                    if r_raw > range_ceiling:
+                        culled = True; break
+                if score_idx == 1:
+                    if (conf >= 0.5) != (delta_d >= 0.0):
+                        culled = True; break
                 if score_idx == 0:
-                    conf = torch.sigmoid(out4[0]).item()
-                    actual_pos = (ad >= 0.0)
-                    day_score = conf if actual_pos else (1.0 - conf)
+                    conf_pos = conf >= 0.5
+                    act_pos  = ad >= 0.0
+                    day_score = conf if act_pos else (1.0 - conf)
+                    if prev_conf_pos is not None and conf_pos != prev_conf_pos:
+                        conf_crossings += 1
+                    if prev_act_pos is not None and act_pos != prev_act_pos:
+                        market_flips += 1
+                    prev_conf_pos = conf_pos
+                    prev_act_pos  = act_pos
+                elif score_idx == 1:
+                    err = abs(ad - delta_d)
+                    day_score = 1.0 / (err + 1.0)
                 else:
                     bd = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)
                     day_score = bd[_sc_idx]
                 total += day_score * 2.0 if is_today else day_score
-        return total
+        if not culled and score_idx == 0 and len(dir_hist) >= 2:
+            required = (market_flips + 1) // 2
+            if conf_crossings < required:
+                culled = True
+        return -1e30 if culled else total
 
     burst_candidates = []
-    for elite_slot in range(MT1_COMP_ELITE):
+    for elite_slot in range(MT1_COMP_PARENTS):
         parent = load_slot_model(prefix, model_dir, elite_slot, MT1NN)
         for _ in range(10):
             child = _mutate_generic(parent, MT1NN, burst_sigma)
@@ -529,10 +542,9 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
     One evolution step for one industry's MT1NN 5-pool system.
 
     Runs 4 component pools (dir, acc, rng, cfd) then a composite blend pool.
-    Each component pool has MT1_COMP_SLOTS=230 slots; the composite pool generates
+    Each component pool has MT1_COMP_SLOTS=200 slots (uniform); the composite pool generates
     MT1_BLEND_SLOTS=200 fresh blends from component direct elites each day, scored by
-    composite score. Top MT1_REINJECT=3 composite models are re-injected into component
-    pool elite slots 20-22 the following day.
+    composite score. Injection cascade: composite→dir, composite→rng, dir→acc, rng→cfd.
 
     industry:        industry key (e.g. 'energy')
     model_dir:       directory containing model files
@@ -545,7 +557,7 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
     File naming:
       Component pools: mt1_{ind}_{dir|acc|rng|cfd}_model_{slot}.pt
       Composite best:  mt1_{ind}_best.pt
-      Reinject:        mt1_{ind}_comp_reinject_{0..2}.pt
+      Dir inject:      mt1_{ind}_dir_inject_{0..4}.pt
       Comp history:    mt1_{ind}_comp_hist_{day}_{pos}.pt + mt1_{ind}_comp_hist_meta.json
 
     Returns (best_comp_score, best_comp_score, slot0_conf, slot0_delta_t, slot0_range_pct,
@@ -556,20 +568,30 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
     if rolling_state is None:
         rolling_state = {}
 
-    actual_d      = actual_perf_i * portfolio_value
-    ind_rs        = rolling_state.setdefault(industry, {})
-    acc_floor     = _rolling_acc_floor(ind_rs)
-    range_ceiling = _rolling_range_ceiling(ind_rs)
+    actual_d   = actual_perf_i * portfolio_value
+    ind_rs     = rolling_state.setdefault(industry, {})
+    acc_floor  = _rolling_acc_floor(ind_rs)
 
     in37_t = in37_t.detach()
 
-    # score_idx into _mt1_score_breakdown() tuple (composite, dir, rng, acc, conf)
-    # MT1_POOL_NAMES = ('dir', 'acc', 'rng', 'cfd')
-    pool_score_idx = [1, 3, 2, 4]  # dir→[1], acc→[3], rng→[2], cfd→[4]
+    comp_prefix = f'mt1_{industry}_comp'
 
-    comp_prefix    = f'mt1_{industry}_comp'
-    reinject_paths = [os.path.join(model_dir, f'{comp_prefix}_reinject_{k}.pt')
-                      for k in range(MT1_REINJECT)]
+    # Dynamic range ceiling: max(4 × mean_residual, 4 × today's comp0 residual)
+    today_residual = 0.0
+    best_path = os.path.join(model_dir, f'mt1_{industry}_best.pt')
+    if os.path.exists(best_path) and ind_rs.get('residual_buf'):
+        try:
+            comp0_m = MT1NN()
+            comp0_m.load_state_dict(torch.load(best_path, weights_only=True))
+            comp0_m.eval()
+            with torch.inference_mode():
+                out4_c0 = comp0_m(in37_t).squeeze(0)
+            comp0_delta_d  = torch.tanh(out4_c0[1]).item() * MT1_SCALE_DOLLARS
+            today_residual = abs(actual_d - comp0_delta_d)
+            del comp0_m
+        except Exception:
+            pass
+    range_ceiling = _rolling_range_ceiling(ind_rs, today_residual)
 
     # ── Direction day buffer (multi-day scoring) ─────────────────────────────────
     dir_hist_path = os.path.join(model_dir, f'mt1_{industry}_dir_hist.json')
@@ -590,7 +612,6 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
     for pool_id, pool_name in enumerate(MT1_POOL_NAMES):
         prefix     = f'mt1_{industry}_{pool_name}'
         slot0_path = _model_path(prefix, model_dir, 0)
-        best_path  = os.path.join(model_dir, f'mt1_{industry}_best.pt')
 
         if not os.path.exists(slot0_path):
             base = MT1NN()
@@ -602,47 +623,95 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
                     log(f"[mt1/{sn(industry)}:{pool_name}] Bootstrap failed — random weights")
             else:
                 log(f"[mt1/{sn(industry)}:{pool_name}] Initializing with random weights")
-            pool_slots = MT1_COMP_SLOTS_EXT if pool_id != 3 else MT1_COMP_SLOTS
             save_slot_model(prefix, model_dir, 0, base)
-            for slot in range(1, pool_slots):
+            for slot in range(1, MT1_COMP_SLOTS):
                 child = _mutate_generic(base, MT1NN, sigma)
                 save_slot_model(prefix, model_dir, slot, child)
                 del child
             del base
 
-        pool_slots = MT1_COMP_SLOTS_EXT if pool_id != 3 else MT1_COMP_SLOTS
-        cat_idx = pool_score_idx[pool_id]
-        scores = []
+        # Load injection models into slots 20–24 from cascade source before scoring/selection
+        inject_slot_base = ELITE_COUNT + WAVG_COUNT  # slot 20
+        if pool_id == 0:
+            inject_src_pattern = f'mt1_{industry}_comp_inject_{{}}.pt'
+        elif pool_id == 1:
+            inject_src_pattern = f'mt1_{industry}_dir_inject_{{}}.pt'
+        elif pool_id == 2:
+            inject_src_pattern = f'mt1_{industry}_comp_inject_{{}}.pt'
+        else:
+            inject_src_pattern = f'mt1_{industry}_rng_inject_{{}}.pt'
+        for k in range(MT1_COMP_INJECT):
+            src = os.path.join(model_dir, inject_src_pattern.format(k))
+            if os.path.exists(src):
+                try:
+                    inj_m = MT1NN()
+                    inj_m.load_state_dict(torch.load(src, weights_only=True))
+                    save_slot_model(prefix, model_dir, inject_slot_base + k, inj_m)
+                    del inj_m
+                except Exception:
+                    pass
 
-        # All pools: 5-day summed scoring using shared dir_hist; today's score is doubled.
-        # Direction pool (pool_id==0) also tracks binary correct count for backfill check.
+        scores = []
         dir_max_correct = 0
         if dir_hist:
-            for slot in range(pool_slots):
+            for slot in range(MT1_COMP_SLOTS):
                 m = load_slot_model(prefix, model_dir, slot, MT1NN)
                 m.eval()
                 total_sum = 0.0
+                culled    = False
                 n_correct = 0
+                prev_conf_pos, prev_act_pos = None, None
+                conf_crossings, market_flips = 0, 0
                 with torch.inference_mode():
                     for di, (feat_t, ad) in enumerate(dir_hist):
+                        if culled:
+                            break
                         is_today = (di == len(dir_hist) - 1)
                         out4 = m(feat_t).squeeze(0)
+                        conf    = torch.sigmoid(out4[0]).item()
+                        delta_d = torch.tanh(out4[1]).item() * MT1_SCALE_DOLLARS
+                        rng_pct = F.softplus(out4[2]).item()
+                        r_raw   = rng_pct * max(abs(delta_d), MT1_RANGE_FLOOR)
+                        # Range ceiling cull: range and confidence pools
+                        if (pool_id == 2 or pool_id == 3) and range_ceiling is not None:
+                            if r_raw > range_ceiling:
+                                culled = True; break
+                        # Direction alignment cull: accuracy pool only
+                        if pool_id == 1:
+                            if (conf >= 0.5) != (delta_d >= 0.0):
+                                culled = True; break
                         if pool_id == 0:
-                            conf = torch.sigmoid(out4[0]).item()
-                            actual_pos = (ad >= 0.0)
-                            day_score = conf if actual_pos else (1.0 - conf)
-                            n_correct += 1 if (conf >= 0.5) == actual_pos else 0
+                            conf_pos = conf >= 0.5
+                            act_pos  = ad >= 0.0
+                            day_score = conf if act_pos else (1.0 - conf)
+                            n_correct += 1 if conf_pos == act_pos else 0
+                            if prev_conf_pos is not None and conf_pos != prev_conf_pos:
+                                conf_crossings += 1
+                            if prev_act_pos is not None and act_pos != prev_act_pos:
+                                market_flips += 1
+                            prev_conf_pos = conf_pos
+                            prev_act_pos  = act_pos
+                        elif pool_id == 1:
+                            err = abs(ad - delta_d)
+                            day_score = 1.0 / (err + 1.0)
                         else:
                             breakdown = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)
-                            day_score = breakdown[cat_idx]
+                            day_score = breakdown[2 if pool_id == 2 else 4]
                         total_sum += day_score * 2.0 if is_today else day_score
-                scores.append((slot, total_sum))
-                if n_correct > dir_max_correct:
+                # Direction flip cull after full window
+                if not culled and pool_id == 0 and len(dir_hist) >= 2:
+                    required = (market_flips + 1) // 2
+                    if conf_crossings < required:
+                        culled = True
+                score = -1e30 if culled else total_sum
+                scores.append((slot, score))
+                if not culled and n_correct > dir_max_correct:
                     dir_max_correct = n_correct
                 del m
 
-        best_cat  = max(sc for _, sc in scores)
-        slot0_cat = scores[0][1]
+        live_scores = [sc for _, sc in scores if sc > -1e29]
+        best_cat  = max(live_scores) if live_scores else 0.0
+        slot0_cat = scores[0][1] if scores[0][1] > -1e29 else 0.0
         log(f"[mt1/{sn(industry)}:{pool_name}] best={best_cat:.4f} slot0={slot0_cat:.4f} "
             f"actual_d=${actual_d:+.1f}")
 
@@ -650,37 +719,28 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
             log(f"[mt1/{sn(industry)}:dir] max_correct={dir_max_correct}/{len(dir_hist)} < 3 — backfill: keeping yesterday's elites")
             continue
 
-        _select_and_mutate_mt1_component(prefix, model_dir, scores, sigma, reinject_paths)
+        _select_and_mutate_mt1_component(prefix, model_dir, scores, sigma)
 
         for burst_num in range(4):
             _mt1_burst_component(prefix, model_dir, dir_hist, actual_d,
                                   acc_floor, range_ceiling,
                                   sigma / (2 ** (burst_num + 1)), pool_id)
 
-        # Range pool: snapshot top elites for confidence cross-injection (anti-gaming)
-        if pool_id == 2:
-            rng_prefix = prefix
-            for k in range(MT1_RANGE_INJECT):
-                src  = os.path.join(model_dir, f'{rng_prefix}_elite_{k}.pt')
-                dst  = os.path.join(model_dir, f'mt1_{industry}_rng_inject_{k}.pt')
+        # Direction pool: save top-5 for accuracy pool injection next day
+        if pool_id == 0:
+            for k in range(MT1_COMP_INJECT):
+                src = os.path.join(model_dir, f'{prefix}_elite_{k}.pt')
+                dst = os.path.join(model_dir, f'mt1_{industry}_dir_inject_{k}.pt')
                 if os.path.exists(src):
                     shutil.copy2(src, dst)
 
-        # Confidence pool: overwrite bottom 5 direct elites with top range elites
-        if pool_id == 3:
-            start = ELITE_COUNT - MT1_RANGE_INJECT  # slot 12
+        # Range pool: save top-5 for confidence pool injection next day
+        if pool_id == 2:
             for k in range(MT1_RANGE_INJECT):
-                src = os.path.join(model_dir, f'mt1_{industry}_rng_inject_{k}.pt')
+                src = os.path.join(model_dir, f'{prefix}_elite_{k}.pt')
+                dst = os.path.join(model_dir, f'mt1_{industry}_rng_inject_{k}.pt')
                 if os.path.exists(src):
-                    dst_slot = start + k
-                    shutil.copy2(src, os.path.join(model_dir, f'{prefix}_elite_{dst_slot}.pt'))
-
-        # Dir/acc/rng: populate additive elite slots 23–27 with yesterday's composite top-5
-        if pool_id != 3:
-            for k in range(MT1_COMP_INJECT):
-                src = os.path.join(model_dir, f'mt1_{industry}_comp_inject_{k}.pt')
-                if os.path.exists(src):
-                    shutil.copy2(src, os.path.join(model_dir, f'{prefix}_elite_{MT1_COMP_ELITE + k}.pt'))
+                    shutil.copy2(src, dst)
 
     # ── Composite pool ───────────────────────────────────────────────────────────
     # Load ELITE_COUNT direct elites from each component pool (ranks 0–16)
@@ -777,21 +837,12 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
     comp0_residual = abs(actual_d - comp0_delta_d)
 
     # Save best composite model as _best.pt for production inference
-    best_path = os.path.join(model_dir, f'mt1_{industry}_best.pt')
     try:
         torch.save(best_comp_model.state_dict(), best_path)
     except Exception as e:
         log(f"WARNING: could not save mt1_{industry}_best.pt: {e}")
 
-    # Save top MT1_REINJECT models for next-day component re-injection (slots 20–22)
-    for k in range(min(MT1_REINJECT, len(all_candidates))):
-        rp = os.path.join(model_dir, f'{comp_prefix}_reinject_{k}.pt')
-        try:
-            torch.save(all_candidates[k][0].state_dict(), rp)
-        except Exception as e:
-            log(f"WARNING: could not save {comp_prefix}_reinject_{k}: {e}")
-
-    # Save top MT1_COMP_INJECT models for next-day dir/acc/rng additive injection (slots 23–27)
+    # Save top MT1_COMP_INJECT models for next-day direction + range injection (slots 20–24)
     for k in range(min(MT1_COMP_INJECT, len(all_candidates))):
         cp = os.path.join(model_dir, f'mt1_{industry}_comp_inject_{k}.pt')
         try:
