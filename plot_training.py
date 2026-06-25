@@ -377,6 +377,19 @@ def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: 
         ax.axhline(3.0, color="gray", linewidth=0.8, linestyle="--",
                    label="Random baseline (3.0)")
 
+        # Mean n_correct_dbl across all industries (primary sort key denominator)
+        # Plotted on left axis (same 0-6 scale as scores). Triangle markers.
+        cdb_raw = [
+            sum(r["mt1_dir_correct_dbl"]) / n_ind
+            for r in records
+        ]
+        xs_cdb, cdb_vals = _smooth(xs_raw, cdb_raw)
+        # Choose markevery so ~12-15 triangles appear regardless of series length
+        markevery = max(1, len(xs_cdb) // 14)
+        ax.plot(xs_cdb, cdb_vals, color="#e06000", linewidth=2.2,
+                marker="^", markersize=6, markevery=markevery,
+                zorder=6, label="Mean correct predictions (today×2)")
+
         # % industries with rising portfolio value day-over-day (right y-axis)
         if csv_rows:
             csv_by_day = {int(r["day"]): r for r in csv_rows}
@@ -417,6 +430,10 @@ def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: 
         mlines.Line2D([], [], color="black", linewidth=1.8, linestyle=(0, (2, 2)), label="All-ind mean (max)"),
         mlines.Line2D([], [], color="black", linewidth=1.8, linestyle=(0, (1, 2)), label="All-ind mean (min)"),
     ]
+    if comp == "direction":
+        extra.append(mlines.Line2D([], [], color="#e06000", linewidth=2.2,
+                                   marker="^", markersize=6,
+                                   label="Mean correct predictions (today×2)"))
     if ax2 is not None:
         extra.append(mlines.Line2D([], [], color="#808080", linewidth=2.5,
                                    label="% industries up day-over-day (right axis)"))
