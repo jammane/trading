@@ -2189,6 +2189,9 @@ static MT1CompResult step_mt1_component(
     float out4[4];
 
     int dir_max_correct = 0;
+    // Direction pool: correct-prediction count with today doubled (primary sort key)
+    int dir_correct_dbl[MT1_COMP_SLOTS] = {};
+
     if (scratch.dir_day_count > 0) {
         for (int slot = 0; slot < pool_slots; slot++) {
             const float* wptr;
@@ -2201,7 +2204,7 @@ static MT1CompResult step_mt1_component(
 
             float total_sum = 0.f;
             bool  culled    = false;
-            int   n_correct = 0, conf_crossings = 0, market_flips = 0;
+            int   n_correct = 0, n_correct_dbl = 0, conf_crossings = 0, market_flips = 0;
             bool  prev_conf_pos_valid = false, prev_conf_pos = false;
             bool  prev_act_pos_valid  = false, prev_act_pos  = false;
 
@@ -2228,7 +2231,9 @@ static MT1CompResult step_mt1_component(
                 if (pool_id == 0) {
                     bool conf_pos = (conf >= 0.5f), act_pos = (e.actual_d >= 0.f);
                     day_score  = act_pos ? conf : (1.f - conf);
-                    n_correct += (conf_pos == act_pos) ? 1 : 0;
+                    bool correct = (conf_pos == act_pos);
+                    n_correct     += correct ? 1 : 0;
+                    n_correct_dbl += is_today ? (correct ? 2 : 0) : (correct ? 1 : 0);
                     if (prev_conf_pos_valid && conf_pos != prev_conf_pos) conf_crossings++;
                     if (prev_act_pos_valid  && act_pos  != prev_act_pos)  market_flips++;
                     prev_conf_pos = conf_pos; prev_conf_pos_valid = true;
@@ -2251,6 +2256,7 @@ static MT1CompResult step_mt1_component(
             }
 
             cat_sc[slot] = culled ? -1e30f : total_sum;
+            if (!culled && pool_id == 0) dir_correct_dbl[slot] = n_correct_dbl;
             if (!culled && n_correct > dir_max_correct) dir_max_correct = n_correct;
         }
     } else {
@@ -2280,6 +2286,7 @@ static MT1CompResult step_mt1_component(
     // Score history candidates (no culling — history is the unconditional safety net)
     int n_hist = scratch.pool_hist_count[pool_id] * HIST_PER_DAY;
     float hist_cat_sc[HIST_DAYS * HIST_PER_DAY] = {};
+    int   hist_correct_dbl[HIST_DAYS * HIST_PER_DAY] = {};
     {
         int total = HIST_DAYS * HIST_PER_DAY;
         int oldest = (scratch.pool_hist_head[pool_id] * HIST_PER_DAY - n_hist + total) % total;
@@ -2287,6 +2294,7 @@ static MT1CompResult step_mt1_component(
             int abs_pos = (oldest + k) % total;
             float* hw = scratch.pool_hist[pool_id] + (size_t)abs_pos * MT1NN_PARAMS;
             float total_sum = 0.f;
+            int   hcdb = 0;
             for (int di = 0; di < scratch.dir_day_count; di++) {
                 const auto& e = scratch.dir_day(di);
                 bool is_today = (di == scratch.dir_day_count - 1);
@@ -2295,7 +2303,10 @@ static MT1CompResult step_mt1_component(
                 if (pool_id == 0) {
                     float conf      = 1.f / (1.f + expf(-out4[0]));
                     bool actual_pos = (e.actual_d >= 0.f);
+                    bool conf_pos   = (conf >= 0.5f);
+                    bool correct    = (conf_pos == actual_pos);
                     day_score = actual_pos ? conf : (1.f - conf);
+                    hcdb += is_today ? (correct ? 2 : 0) : (correct ? 1 : 0);
                 } else if (pool_id == 1) {
                     float delta_d = tanhf(out4[1]) * MT1_SCALE_DOLLARS;
                     float err     = fabsf(e.actual_d - delta_d);
@@ -2306,16 +2317,29 @@ static MT1CompResult step_mt1_component(
                 }
                 total_sum += is_today ? day_score * 2.f : day_score;
             }
-            hist_cat_sc[k] = total_sum;
+            hist_cat_sc[k]      = total_sum;
+            hist_correct_dbl[k] = hcdb;
         }
     }
 
-    // Build candidate list and sort by component score
+    // Build candidate list: direction pool sorts by (correct_dbl primary, score secondary).
+    // Encode as correct_dbl*10 + score so a single float comparison works.
+    // cat_sc / hist_cat_sc are kept as raw scores for statistics; only sort key is encoded.
     struct Cand { float score; bool is_hist; int idx; };
     std::vector<Cand> cands;
     cands.reserve(pool_slots + n_hist);
-    for (int s = 0; s < pool_slots; s++) cands.push_back({cat_sc[s], false, s});
-    for (int k = 0; k < n_hist; k++)     cands.push_back({hist_cat_sc[k], true, k});
+    for (int s = 0; s < pool_slots; s++) {
+        float sk = (pool_id == 0 && cat_sc[s] > -1e29f)
+                   ? ((float)dir_correct_dbl[s] * 10.f + cat_sc[s])
+                   : cat_sc[s];
+        cands.push_back({sk, false, s});
+    }
+    for (int k = 0; k < n_hist; k++) {
+        float sk = (pool_id == 0)
+                   ? ((float)hist_correct_dbl[k] * 10.f + hist_cat_sc[k])
+                   : hist_cat_sc[k];
+        cands.push_back({sk, true, k});
+    }
     std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b){ return a.score > b.score; });
 
     // Select top ELITE_COUNT (17) direct elites into new_elites
