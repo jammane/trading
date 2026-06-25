@@ -165,29 +165,50 @@ def _select_and_mutate(prefix, model_dir, model_class, scores, sigma):
     return elite_slots, elite_vals
 
 
-def _select_and_mutate_mt1_component(prefix, model_dir, scores, sigma):
+def _select_and_mutate_mt1_component(prefix, model_dir, scores, sigma,
+                                       hist_models=None):
     """
     Elite selection + mutation for one MT1 component pool (200 slots).
 
-    scores: list of (slot, cat_score) — culled slots have score=-1e30.
+    scores:      list of (slot, cat_score) — culled slots have score=-1e30.
+    hist_models: optional list of (MT1NN, cat_score) for history candidates
+                 (no culling applied — they are unconditional safety-net entries).
 
     Slot layout after selection:
       0–16   direct elites (ELITE_COUNT)
       17–19  wavg blends   (WAVG_COUNT: top-5, top-10, top-15)
-      20–24  injection slots (MT1_COMP_INJECT) — loaded by upkeep_mt1_industry before call
+      20–24  injection slots (MT1_COMP_INJECT) — written by caller after this call
       25–199 mutations (MT1_COMP_CHILDREN=7 per parent, round-robin over 25 parents)
+    Returns (new_elite_models, new_wavg_models) — lists of loaded MT1NN objects for
+    the HIST_ELITE direct elites and HIST_WAVG wavg models (for history saving by caller).
     """
-    sorted_scores = sorted(scores, key=lambda x: x[1], reverse=True)
-    top_slots = [s for s, _ in sorted_scores[:ELITE_COUNT]]
-    while len(top_slots) < ELITE_COUNT:
-        top_slots.append(top_slots[0])
+    # Build combined candidate list: live slots + history candidates
+    # History candidates use sentinel slot indices >= MT1_COMP_SLOTS
+    all_scores = list(scores)  # (slot_idx, score)
+    hist_offset = MT1_COMP_SLOTS
+    if hist_models:
+        for h_idx, (hm, hsc) in enumerate(hist_models):
+            all_scores.append((hist_offset + h_idx, hsc))
 
-    cache = {s: load_slot_model(prefix, model_dir, s, MT1NN) for s in set(top_slots)}
+    sorted_scores = sorted(all_scores, key=lambda x: x[1], reverse=True)
+    top_entries = sorted_scores[:ELITE_COUNT]
+    while len(top_entries) < ELITE_COUNT:
+        top_entries.append(top_entries[0])
 
-    for rank, s in enumerate(top_slots):
-        save_slot_model(prefix, model_dir, rank, cache[s])
+    # Build cache: live slots loaded from disk, history models from hist_models list
+    live_slots_needed = {s for s, _ in top_entries if s < hist_offset}
+    cache = {s: load_slot_model(prefix, model_dir, s, MT1NN) for s in live_slots_needed}
+    hist_cache = {}
+    if hist_models:
+        for h_idx, (hm, _) in enumerate(hist_models):
+            hist_cache[hist_offset + h_idx] = hm
+
+    for rank, (s, _) in enumerate(top_entries):
+        m = cache[s] if s < hist_offset else hist_cache[s]
+        save_slot_model(prefix, model_dir, rank, m)
 
     # Wavg blends: equal-weight average of top 5, 10, 15 direct elites
+    new_wavg_models = []
     for b, k in enumerate([5, 10, 15]):
         inv_k  = 1.0 / k
         avg_st = None
@@ -204,9 +225,10 @@ def _select_and_mutate_mt1_component(prefix, model_dir, scores, sigma):
                         avg_st[key] = avg_st[key] + v.float() * inv_k
         wm = MT1NN(); wm.load_state_dict(avg_st)
         save_slot_model(prefix, model_dir, ELITE_COUNT + b, wm)
-        del wm, avg_st
+        new_wavg_models.append(wm)
+        del avg_st
 
-    # Injection slots 20–24: already written by upkeep_mt1_industry before this call
+    # Injection slots 20–24: written by caller after this call
 
     del cache
 
@@ -217,6 +239,68 @@ def _select_and_mutate_mt1_component(prefix, model_dir, scores, sigma):
         child  = _mutate_generic(parent, MT1NN, sigma)
         save_slot_model(prefix, model_dir, slot, child)
         del parent, child
+
+    # Return top HIST_ELITE elites and HIST_WAVG wavg models for history saving
+    new_elites = [load_slot_model(prefix, model_dir, k, MT1NN) for k in range(HIST_ELITE)]
+    return new_elites, new_wavg_models[:HIST_WAVG]
+
+
+def _load_comp_pool_hist_models(industry, pool_name, model_dir):
+    """Load MT1 component pool history models. Returns list of MT1NN models (may be empty)."""
+    meta_path = os.path.join(model_dir, f'mt1_{industry}_{pool_name}_hist_meta.json')
+    models = []
+    try:
+        with open(meta_path) as f:
+            meta = json.load(f)
+        head  = meta.get('head', 0)
+        count = meta.get('count', 0)
+        n_days = min(count, HIST_DAYS)
+        for d in range(n_days):
+            day_slot = (head - n_days + d) % HIST_DAYS
+            for pos in range(HIST_PER_DAY):
+                hp = os.path.join(model_dir,
+                                  f'mt1_{industry}_{pool_name}_hist_{day_slot}_{pos}.pt')
+                if os.path.exists(hp):
+                    try:
+                        m = MT1NN()
+                        m.load_state_dict(torch.load(hp, weights_only=True))
+                        models.append(m)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return models
+
+
+def _save_comp_pool_hist(industry, pool_name, model_dir, new_elites, new_wavgs):
+    """Save top HIST_ELITE elites + HIST_WAVG wavg models to component pool history."""
+    meta_path = os.path.join(model_dir, f'mt1_{industry}_{pool_name}_hist_meta.json')
+    try:
+        with open(meta_path) as f:
+            meta = json.load(f)
+        head, count = meta.get('head', 0), meta.get('count', 0)
+    except Exception:
+        head, count = 0, 0
+    for k, m in enumerate(new_elites[:HIST_ELITE]):
+        hp = os.path.join(model_dir, f'mt1_{industry}_{pool_name}_hist_{head}_{k}.pt')
+        try:
+            torch.save(m.state_dict(), hp)
+        except Exception:
+            pass
+    for k, m in enumerate(new_wavgs[:HIST_WAVG]):
+        hp = os.path.join(model_dir,
+                          f'mt1_{industry}_{pool_name}_hist_{head}_{HIST_ELITE + k}.pt')
+        try:
+            torch.save(m.state_dict(), hp)
+        except Exception:
+            pass
+    head  = (head + 1) % HIST_DAYS
+    count = min(count + 1, HIST_DAYS)
+    try:
+        with open(meta_path, 'w') as f:
+            json.dump({'head': head, 'count': count}, f)
+    except Exception:
+        pass
 
 
 # ── MT1 rolling floor ─────────────────────────────────────────────────────────
@@ -651,6 +735,9 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
                 except Exception:
                     pass
 
+        # Load history models for this component pool (scored unconditionally, no culling)
+        comp_hist_models_raw = _load_comp_pool_hist_models(industry, pool_name, model_dir)
+
         scores = []
         dir_max_correct = 0
         if dir_hist:
@@ -709,6 +796,46 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
                     dir_max_correct = n_correct
                 del m
 
+        live_count = len([sc for _, sc in scores if sc > -1e29])
+
+        # Score history models (same formula, no culling)
+        hist_with_scores = []
+        if dir_hist and comp_hist_models_raw:
+            for hm in comp_hist_models_raw:
+                hm.eval()
+                total_sum = 0.0
+                n_correct_h = 0
+                prev_conf_pos_h, prev_act_pos_h = None, None
+                conf_crossings_h, market_flips_h = 0, 0
+                with torch.inference_mode():
+                    for di, (feat_t, ad) in enumerate(dir_hist):
+                        is_today = (di == len(dir_hist) - 1)
+                        out4 = hm(feat_t).squeeze(0)
+                        conf    = torch.sigmoid(out4[0]).item()
+                        delta_d = torch.tanh(out4[1]).item() * MT1_SCALE_DOLLARS
+                        rng_pct = F.softplus(out4[2]).item()
+                        # No culling for history candidates
+                        if pool_id == 0:
+                            conf_pos = conf >= 0.5
+                            act_pos  = ad >= 0.0
+                            day_score = conf if act_pos else (1.0 - conf)
+                            n_correct_h += 1 if conf_pos == act_pos else 0
+                            if prev_conf_pos_h is not None and conf_pos != prev_conf_pos_h:
+                                conf_crossings_h += 1
+                            if prev_act_pos_h is not None and act_pos != prev_act_pos_h:
+                                market_flips_h += 1
+                            prev_conf_pos_h = conf_pos
+                            prev_act_pos_h  = act_pos
+                        elif pool_id == 1:
+                            err = abs(ad - delta_d)
+                            day_score = 1.0 / (err + 1.0)
+                        else:
+                            breakdown = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)
+                            day_score = breakdown[2 if pool_id == 2 else 4]
+                        total_sum += day_score * 2.0 if is_today else day_score
+                hist_with_scores.append((hm, total_sum))
+        del comp_hist_models_raw
+
         live_scores = [sc for _, sc in scores if sc > -1e29]
         best_cat  = max(live_scores) if live_scores else 0.0
         slot0_cat = scores[0][1] if scores[0][1] > -1e29 else 0.0
@@ -717,30 +844,91 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
 
         if pool_id == 0 and dir_hist and dir_max_correct < 3:
             log(f"[mt1/{sn(industry)}:dir] max_correct={dir_max_correct}/{len(dir_hist)} < 3 — backfill: keeping yesterday's elites")
+            del hist_with_scores
             continue
 
-        _select_and_mutate_mt1_component(prefix, model_dir, scores, sigma)
+        new_elites, new_wavgs = _select_and_mutate_mt1_component(
+            prefix, model_dir, scores, sigma, hist_models=hist_with_scores)
+        del hist_with_scores
+
+        # Save history for this component pool
+        _save_comp_pool_hist(industry, pool_name, model_dir, new_elites, new_wavgs)
+        del new_elites
 
         for burst_num in range(4):
             _mt1_burst_component(prefix, model_dir, dir_hist, actual_d,
                                   acc_floor, range_ceiling,
                                   sigma / (2 ** (burst_num + 1)), pool_id)
 
-        # Direction pool: save top-5 for accuracy pool injection next day
+        # Blended injection: 1/3 inject_src + 2/3 dest_w5 (wavg-5 of new elites)
+        # If live_count == 0 (all culled), use direct copy instead of blending.
+        # dest_w5 is new_wavgs[0] (the top-5 wavg blend from _select_and_mutate_mt1_component).
+        dest_w5 = new_wavgs[0] if new_wavgs else None
+        del new_wavgs
+
+        # Direction pool: save top-5 for accuracy pool injection next day (blended)
         if pool_id == 0:
             for k in range(MT1_COMP_INJECT):
-                src = os.path.join(model_dir, f'{prefix}_elite_{k}.pt')
-                dst = os.path.join(model_dir, f'mt1_{industry}_dir_inject_{k}.pt')
-                if os.path.exists(src):
-                    shutil.copy2(src, dst)
+                src_path = os.path.join(model_dir, inject_src_pattern.format(k))
+                dst_path = os.path.join(model_dir, f'mt1_{industry}_dir_inject_{k}.pt')
+                elite_path = os.path.join(model_dir, f'{prefix}_elite_{k}.pt')
+                if os.path.exists(elite_path):
+                    try:
+                        elite_m = MT1NN()
+                        elite_m.load_state_dict(torch.load(elite_path, weights_only=True))
+                        if live_count == 0 or dest_w5 is None or not os.path.exists(src_path):
+                            torch.save(elite_m.state_dict(), dst_path)
+                        else:
+                            src_m = MT1NN()
+                            src_m.load_state_dict(torch.load(src_path, weights_only=True))
+                            src_st  = src_m.state_dict()
+                            dst_st  = dest_w5.state_dict()
+                            blend_st = {}
+                            for key in src_st:
+                                vs, vd = src_st[key], dst_st[key]
+                                if torch.is_floating_point(vs):
+                                    blend_st[key] = (1.0/3.0) * vs.float() + (2.0/3.0) * vd.float()
+                                else:
+                                    blend_st[key] = vs.clone()
+                            bm = MT1NN(); bm.load_state_dict(blend_st)
+                            torch.save(bm.state_dict(), dst_path)
+                            del src_m, bm, blend_st
+                        del elite_m
+                    except Exception:
+                        pass
 
-        # Range pool: save top-5 for confidence pool injection next day
+        # Range pool: save top-5 for confidence pool injection next day (blended)
         if pool_id == 2:
             for k in range(MT1_RANGE_INJECT):
-                src = os.path.join(model_dir, f'{prefix}_elite_{k}.pt')
-                dst = os.path.join(model_dir, f'mt1_{industry}_rng_inject_{k}.pt')
-                if os.path.exists(src):
-                    shutil.copy2(src, dst)
+                src_path = os.path.join(model_dir, inject_src_pattern.format(k))
+                dst_path = os.path.join(model_dir, f'mt1_{industry}_rng_inject_{k}.pt')
+                elite_path = os.path.join(model_dir, f'{prefix}_elite_{k}.pt')
+                if os.path.exists(elite_path):
+                    try:
+                        elite_m = MT1NN()
+                        elite_m.load_state_dict(torch.load(elite_path, weights_only=True))
+                        if live_count == 0 or dest_w5 is None or not os.path.exists(src_path):
+                            torch.save(elite_m.state_dict(), dst_path)
+                        else:
+                            src_m = MT1NN()
+                            src_m.load_state_dict(torch.load(src_path, weights_only=True))
+                            src_st  = src_m.state_dict()
+                            dst_st  = dest_w5.state_dict()
+                            blend_st = {}
+                            for key in src_st:
+                                vs, vd = src_st[key], dst_st[key]
+                                if torch.is_floating_point(vs):
+                                    blend_st[key] = (1.0/3.0) * vs.float() + (2.0/3.0) * vd.float()
+                                else:
+                                    blend_st[key] = vs.clone()
+                            bm = MT1NN(); bm.load_state_dict(blend_st)
+                            torch.save(bm.state_dict(), dst_path)
+                            del src_m, bm, blend_st
+                        del elite_m
+                    except Exception:
+                        pass
+
+        del dest_w5
 
     # ── Composite pool ───────────────────────────────────────────────────────────
     # Load ELITE_COUNT direct elites from each component pool (ranks 0–16)
@@ -962,6 +1150,36 @@ def upkeep_mt2(model_dir, mt1_slot0_outputs, actual_perf, industry_list,
     log(f"[mt2] best_pts={best_pts:+.2f} slot0_pts={slot0_pts:+.2f} ideal={ideal_pts} "
         f"tiers(0/1/2/3)={tier_counts[0]}/{tier_counts[1]}/{tier_counts[2]}/{tier_counts[3]}")
 
+    # Load and score MT2 history candidates (no pool_floor filter)
+    mt2_hist_meta_path = os.path.join(model_dir, 'mt2_hist_meta.json')
+    mt2_hist_models = []   # list of (MT2NN, score)
+    try:
+        with open(mt2_hist_meta_path) as _f:
+            mt2_hist_meta = json.load(_f)
+        h_head  = mt2_hist_meta.get('head', 0)
+        h_count = mt2_hist_meta.get('count', 0)
+        n_hist_days = min(h_count, HIST_DAYS)
+        for d in range(n_hist_days):
+            day_slot = (h_head - n_hist_days + d) % HIST_DAYS
+            for pos in range(HIST_PER_DAY):
+                hp = os.path.join(model_dir, f'mt2_hist_{day_slot}_{pos}.pt')
+                if os.path.exists(hp):
+                    try:
+                        hm = MT2NN()
+                        hm.load_state_dict(torch.load(hp, weights_only=True))
+                        hm.eval()
+                        with torch.inference_mode():
+                            h_out = hm(in48_t)
+                        h_tier_preds = h_out.view(12, 4).argmax(dim=1).tolist()
+                        h_tier_map   = {ind: h_tier_preds[i] for i, ind in enumerate(industry_list)}
+                        h_pts        = sum(_master_points(h_tier_map[ind], opt_tiers[ind])
+                                           for ind in industry_list)
+                        mt2_hist_models.append((hm, h_pts))
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
     # Load 10-day post-injection hold counter
     inj_state_path = os.path.join(model_dir, 'mt2_inj_state.json')
     try:
@@ -978,7 +1196,108 @@ def upkeep_mt2(model_dir, mt1_slot0_outputs, actual_perf, industry_list,
 
     injected = False
     if not inject_triggered:
-        _select_and_mutate(prefix, model_dir, MT2NN, pred_scores, sigma)
+        if mt2_hist_models:
+            # History-aware selection: merge history candidates (sentinel idx >= N_SLOTS)
+            # unconditionally (no pool_floor), then run standard elite copy + mutation.
+            score_vals     = [s for _, s in pred_scores]
+            mean_s         = sum(score_vals) / len(score_vals)
+            std_s          = (sum((v - mean_s) ** 2 for v in score_vals) / len(score_vals)) ** 0.5
+            survival_floor = mean_s - std_s
+
+            surviving = [(s, v) for s, v in pred_scores if v >= survival_floor]
+            if not surviving:
+                surviving = list(pred_scores)
+
+            # Add history candidates unconditionally (no floor filter)
+            hist_sentinel_base = N_SLOTS
+            for h_idx, (_, h_pts) in enumerate(mt2_hist_models):
+                surviving.append((hist_sentinel_base + h_idx, h_pts * 1e9 + hist_sentinel_base + h_idx))
+
+            surviving.sort(key=lambda x: x[1], reverse=True)
+            top_elite = surviving[:ELITE_COUNT]
+            while len(top_elite) < ELITE_COUNT:
+                top_elite.append(top_elite[0])
+
+            # Build hist model cache indexed by sentinel slot
+            hist_cache = {hist_sentinel_base + i: hm for i, (hm, _) in enumerate(mt2_hist_models)}
+
+            for rank, (slot, _) in enumerate(top_elite):
+                if slot < N_SLOTS:
+                    m = load_slot_model(prefix, model_dir, slot, MT2NN)
+                    save_slot_model(prefix, model_dir, rank, m)
+                    del m
+                else:
+                    save_slot_model(prefix, model_dir, rank, hist_cache[slot])
+
+            # Wavg blends (top-5, top-10, top-15) from newly-ranked elites on disk
+            for b, k in enumerate([5, 10, 15]):
+                k = min(k, ELITE_COUNT)
+                inv_k  = 1.0 / k
+                avg_st = None
+                for rank in range(k):
+                    wm     = load_slot_model(prefix, model_dir, rank, MT2NN)
+                    state  = wm.state_dict()
+                    del wm
+                    if avg_st is None:
+                        avg_st = {key: (v.clone().float() * inv_k if torch.is_floating_point(v) else v.clone())
+                                  for key, v in state.items()}
+                    else:
+                        for key, v in state.items():
+                            if torch.is_floating_point(v) and key in avg_st:
+                                avg_st[key] = avg_st[key] + v.float() * inv_k
+                wm_blend = MT2NN(); wm_blend.load_state_dict(avg_st)
+                save_slot_model(prefix, model_dir, ELITE_COUNT + b, wm_blend)
+                del wm_blend, avg_st
+
+            del hist_cache
+
+            # Mutations: same pattern as _select_and_mutate
+            n_mut    = N_SLOTS - ELITE_POOL
+            muts_per = max(1, n_mut // ELITE_POOL)
+            child_map_mt2 = defaultdict(list)
+            for i, slot in enumerate(range(ELITE_POOL, N_SLOTS)):
+                child_map_mt2[i // muts_per].append(slot)
+            for parent_rank, child_slots in child_map_mt2.items():
+                parent = load_slot_model(prefix, model_dir, parent_rank, MT2NN)
+                for child_slot in child_slots:
+                    child = _mutate_generic(parent, MT2NN, sigma)
+                    save_slot_model(prefix, model_dir, child_slot, child)
+                    del child
+                del parent
+        else:
+            _select_and_mutate(prefix, model_dir, MT2NN, pred_scores, sigma)
+
+        # Save top HIST_ELITE elites + HIST_WAVG wavg models to MT2 history
+        try:
+            with open(mt2_hist_meta_path) as _f:
+                mt2_hist_meta_out = json.load(_f)
+            h_head_out  = mt2_hist_meta_out.get('head', 0)
+            h_count_out = mt2_hist_meta_out.get('count', 0)
+        except Exception:
+            h_head_out, h_count_out = 0, 0
+        for k in range(HIST_ELITE):
+            hp = os.path.join(model_dir, f'mt2_hist_{h_head_out}_{k}.pt')
+            try:
+                hm_save = load_slot_model(prefix, model_dir, k, MT2NN)
+                torch.save(hm_save.state_dict(), hp)
+                del hm_save
+            except Exception:
+                pass
+        for k in range(HIST_WAVG):
+            hp = os.path.join(model_dir, f'mt2_hist_{h_head_out}_{HIST_ELITE + k}.pt')
+            try:
+                wm_save = load_slot_model(prefix, model_dir, ELITE_COUNT + k, MT2NN)
+                torch.save(wm_save.state_dict(), hp)
+                del wm_save
+            except Exception:
+                pass
+        h_head_out  = (h_head_out + 1) % HIST_DAYS
+        h_count_out = min(h_count_out + 1, HIST_DAYS)
+        try:
+            with open(mt2_hist_meta_path, 'w') as _f:
+                json.dump({'head': h_head_out, 'count': h_count_out}, _f)
+        except Exception as e:
+            log(f"WARNING: could not save mt2_hist_meta.json: {e}")
     else:
         injected = True
         injection_hold = 10
@@ -996,6 +1315,8 @@ def upkeep_mt2(model_dir, mt1_slot0_outputs, actual_perf, industry_list,
             json.dump({'injection_hold': injection_hold}, _f)
     except Exception as e:
         log(f"WARNING: could not save mt2_inj_state.json: {e}")
+
+    del mt2_hist_models
 
     slot0_final = load_slot_model(prefix, model_dir, 0, MT2NN)
     try:
