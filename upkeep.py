@@ -749,14 +749,16 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i,
         comp_hist_models_raw = _load_comp_pool_hist_models(industry, pool_name, model_dir)
 
         scores = []
+        dir_cdb = {}   # slot -> n_correct_dbl (direction pool only)
         dir_max_correct = 0
         if dir_hist:
             for slot in range(MT1_COMP_SLOTS):
                 m = load_slot_model(prefix, model_dir, slot, MT1NN)
                 m.eval()
-                total_sum = 0.0
-                culled    = False
-                n_correct = 0
+                total_sum     = 0.0
+                culled        = False
+                n_correct     = 0
+                n_correct_dbl = 0  # today counts double
                 prev_conf_pos, prev_act_pos = None, None
                 conf_crossings, market_flips = 0, 0
                 with torch.inference_mode():
@@ -781,7 +783,9 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i,
                             conf_pos = conf >= 0.5
                             act_pos  = ad >= 0.0
                             day_score = conf if act_pos else (1.0 - conf)
-                            n_correct += 1 if conf_pos == act_pos else 0
+                            correct   = conf_pos == act_pos
+                            n_correct     += 1 if correct else 0
+                            n_correct_dbl += (2 if correct else 0) if is_today else (1 if correct else 0)
                             if prev_conf_pos is not None and conf_pos != prev_conf_pos:
                                 conf_crossings += 1
                             if prev_act_pos is not None and act_pos != prev_act_pos:
@@ -802,6 +806,8 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i,
                         culled = True
                 score = -1e30 if culled else total_sum
                 scores.append((slot, score))
+                if pool_id == 0 and not culled:
+                    dir_cdb[slot] = n_correct_dbl
                 if not culled and n_correct > dir_max_correct:
                     dir_max_correct = n_correct
                 del m
@@ -813,8 +819,9 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i,
         if dir_hist and comp_hist_models_raw:
             for hm in comp_hist_models_raw:
                 hm.eval()
-                total_sum = 0.0
+                total_sum   = 0.0
                 n_correct_h = 0
+                hcdb        = 0   # n_correct_dbl for this history model
                 prev_conf_pos_h, prev_act_pos_h = None, None
                 conf_crossings_h, market_flips_h = 0, 0
                 with torch.inference_mode():
@@ -829,7 +836,9 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i,
                             conf_pos = conf >= 0.5
                             act_pos  = ad >= 0.0
                             day_score = conf if act_pos else (1.0 - conf)
-                            n_correct_h += 1 if conf_pos == act_pos else 0
+                            correct_h = conf_pos == act_pos
+                            n_correct_h += 1 if correct_h else 0
+                            hcdb += (2 if correct_h else 0) if is_today else (1 if correct_h else 0)
                             if prev_conf_pos_h is not None and conf_pos != prev_conf_pos_h:
                                 conf_crossings_h += 1
                             if prev_act_pos_h is not None and act_pos != prev_act_pos_h:
@@ -843,7 +852,8 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i,
                             breakdown = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)
                             day_score = breakdown[2 if pool_id == 2 else 4]
                         total_sum += day_score * 2.0 if is_today else day_score
-                hist_with_scores.append((hm, total_sum))
+                hist_sort_key = hcdb * 10.0 + total_sum if pool_id == 0 else total_sum
+                hist_with_scores.append((hm, hist_sort_key))
         del comp_hist_models_raw
 
         live_scores = [sc for _, sc in scores if sc > -1e29]
@@ -857,8 +867,16 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i,
             del hist_with_scores
             continue
 
+        # Direction pool: encode (correct_dbl * 10 + score) so correct count is primary sort key.
+        # Pass encoded sort_scores to selection; keep raw scores for stats/logging above.
+        if pool_id == 0:
+            sort_scores = [(sl, dir_cdb.get(sl, 0) * 10.0 + sc if sc > -1e29 else sc)
+                           for sl, sc in scores]
+        else:
+            sort_scores = scores
+
         new_elites, new_wavgs = _select_and_mutate_mt1_component(
-            prefix, model_dir, scores, pool_sigmas[pool_id], hist_models=hist_with_scores)
+            prefix, model_dir, sort_scores, pool_sigmas[pool_id], hist_models=hist_with_scores)
         del hist_with_scores
 
         # Save history for this component pool
