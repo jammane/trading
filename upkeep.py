@@ -75,7 +75,12 @@ from training_lib import (
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-UPKEEP_SIGMA      = 0.004
+UPKEEP_SIGMA      = 0.004   # StockNN (industry models)
+UPKEEP_DIR_SIGMA  = 0.006   # MT1 direction pool
+UPKEEP_RNG_SIGMA  = 0.004   # MT1 range pool (stable; ceiling cull handles exploration)
+UPKEEP_ACC_SIGMA  = 0.006   # MT1 accuracy pool (noisy until industry stabilizes)
+UPKEEP_CFD_SIGMA  = 0.003   # MT1 confidence pool (most stable; fine-tune only)
+UPKEEP_MT2_SIGMA  = 0.002   # MT2 (over-perturbed at 0.006; needs 3× reduction)
 MT1_SCALE_DOLLARS = 10000.0   # tanh ceiling for dollar P&L prediction
 MT1_FLOOR_COLD    = 250.0     # acc_floor cold-start (÷2 = $125)
 MT1_ROLLING_DAYS  = 10        # days in rolling buffers
@@ -620,7 +625,9 @@ def upkeep_industry(industry, symbols, model_dir, primed_portfolio,
 
 # ── MT1 upkeep ─────────────────────────────────────────────────────────────────
 
-def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP_SIGMA,
+def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i,
+                         dir_sigma=UPKEEP_DIR_SIGMA, rng_sigma=UPKEEP_RNG_SIGMA,
+                         acc_sigma=UPKEEP_ACC_SIGMA, cfd_sigma=UPKEEP_CFD_SIGMA,
                          portfolio_value=None, rolling_state=None):
     """
     One evolution step for one industry's MT1NN 5-pool system.
@@ -634,7 +641,7 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
     model_dir:       directory containing model files
     in37_t:          (1, 37) tensor — this industry's slice of build_master_features output
     actual_perf_i:   float — fractional return (slot0_score / baseline - 1) for today
-    sigma:           base mutation sigma
+    dir/rng/acc/cfd_sigma: per-component mutation sigma (defaults match analysis recommendations)
     portfolio_value: current slot0 industry portfolio value (dollars); defaults to IND_STARTING_CASH
     rolling_state:   mutable dict with per-industry rolling buffer; updated in place.
 
@@ -692,6 +699,9 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
     dir_hist = [(torch.tensor(e['feat37'], dtype=torch.float32).unsqueeze(0), e['actual_d'])
                 for e in dir_hist_raw]
 
+    # Per-pool sigmas: MT1_POOL_NAMES order is dir=0, acc=1, rng=2, cfd=3
+    pool_sigmas = [dir_sigma, acc_sigma, rng_sigma, cfd_sigma]
+
     # ── Component pools ──────────────────────────────────────────────────────────
     for pool_id, pool_name in enumerate(MT1_POOL_NAMES):
         prefix     = f'mt1_{industry}_{pool_name}'
@@ -709,7 +719,7 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
                 log(f"[mt1/{sn(industry)}:{pool_name}] Initializing with random weights")
             save_slot_model(prefix, model_dir, 0, base)
             for slot in range(1, MT1_COMP_SLOTS):
-                child = _mutate_generic(base, MT1NN, sigma)
+                child = _mutate_generic(base, MT1NN, pool_sigmas[pool_id])
                 save_slot_model(prefix, model_dir, slot, child)
                 del child
             del base
@@ -848,7 +858,7 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
             continue
 
         new_elites, new_wavgs = _select_and_mutate_mt1_component(
-            prefix, model_dir, scores, sigma, hist_models=hist_with_scores)
+            prefix, model_dir, scores, pool_sigmas[pool_id], hist_models=hist_with_scores)
         del hist_with_scores
 
         # Save history for this component pool
@@ -858,7 +868,7 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
         for burst_num in range(4):
             _mt1_burst_component(prefix, model_dir, dir_hist, actual_d,
                                   acc_floor, range_ceiling,
-                                  sigma / (2 ** (burst_num + 1)), pool_id)
+                                  pool_sigmas[pool_id] / (2 ** (burst_num + 1)), pool_id)
 
         # Blended injection: 1/3 inject_src + 2/3 dest_w5 (wavg-5 of new elites)
         # If live_count == 0 (all culled), use direct copy instead of blending.
@@ -1074,7 +1084,7 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i, sigma=UPKEEP
 # ── MT2 upkeep ─────────────────────────────────────────────────────────────────
 
 def upkeep_mt2(model_dir, mt1_slot0_outputs, actual_perf, industry_list,
-               sigma=UPKEEP_SIGMA):
+               sigma=UPKEEP_MT2_SIGMA):
     """
     One evolution step for the MT2NN cross-industry allocator pool.
 
