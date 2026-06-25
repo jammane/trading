@@ -90,12 +90,17 @@ MT1_COMP_LABEL = {
     "confidence": "Confidence  — out[3] vs range-geometry ideal",
 }
 
-# ── Binary log constants (v4, 984 bytes/record) ───────────────────────────────
+# ── Binary log constants ──────────────────────────────────────────────────────
 MT_LOG_MAGIC   = 0x4D543132  # 'MT12'
-RECORD_SIZE_V4 = 984
 HEADER_SIZE    = 16
-_RECORD_STRUCT = struct.Struct("<II" + "f" * 243 + "Bxxx")
-assert _RECORD_STRUCT.size == RECORD_SIZE_V4, f"struct size mismatch: {_RECORD_STRUCT.size}"
+# v3/bin-version-3: 984 bytes — 5 comp stats × 4 stats × 12 ind + 3 MT2 floats + 1 byte
+RECORD_SIZE_V4 = 984
+_RECORD_STRUCT_V4 = struct.Struct("<II" + "f" * 243 + "Bxxx")
+assert _RECORD_STRUCT_V4.size == RECORD_SIZE_V4
+# v4/bin-version-4: 1032 bytes — adds mt1_dir_correct_dbl[12] before MT2 fields
+RECORD_SIZE_V5 = 1032
+_RECORD_STRUCT_V5 = struct.Struct("<II" + "f" * 255 + "Bxxx")
+assert _RECORD_STRUCT_V5.size == RECORD_SIZE_V5
 
 # ── Download ──────────────────────────────────────────────────────────────────
 def download_logs(host: str, account: str) -> None:
@@ -126,17 +131,25 @@ def load_binary_log(path: Path) -> list[dict]:
     magic, version, n_ind, _ = struct.unpack_from("<IIII", data, 0)
     if magic != MT_LOG_MAGIC:
         sys.exit(f"{path}: bad magic {magic:#010x} (expected {MT_LOG_MAGIC:#010x})")
-    if version != 3:
-        sys.exit(f"{path}: log version {version} — this tool requires v3 (984-byte records)")
+    if version not in (3, 4):
+        sys.exit(f"{path}: unsupported log version {version} (expected 3 or 4)")
+
+    # Pick record format by binary version number
+    if version == 4:
+        rec_size   = RECORD_SIZE_V5
+        rec_struct = _RECORD_STRUCT_V5
+    else:
+        rec_size   = RECORD_SIZE_V4
+        rec_struct = _RECORD_STRUCT_V4
 
     records = []
     offset = HEADER_SIZE
-    while offset + RECORD_SIZE_V4 <= len(data):
-        raw = _RECORD_STRUCT.unpack_from(data, offset)
+    while offset + rec_size <= len(data):
+        raw = rec_struct.unpack_from(data, offset)
         pass_num   = raw[0] + 1   # C++ writes 0-indexed; normalise to match CSV's 1-indexed
         actual_day = raw[1]
 
-        f = raw[2:242]  # 240 MT1 floats
+        f = raw[2:242]  # 240 MT1 floats (unchanged across versions)
         mt1 = {}
         for ci, comp in enumerate(_COMP_NAMES):
             mt1[comp] = {}
@@ -144,16 +157,31 @@ def load_binary_log(path: Path) -> list[dict]:
                 base = ci * 48 + si * 12
                 mt1[comp][stat] = list(f[base : base + 12])
 
+        if version == 4:
+            # V5 layout: mt1_dir_correct_dbl[12] at raw[242:254], MT2 at 254+
+            mt1_dir_cdb = list(raw[242:254])
+            mt2_best    = raw[254]
+            mt2_slot0   = raw[255]
+            mt2_ideal   = raw[256]
+            mt2_inj     = raw[257]
+        else:
+            mt1_dir_cdb = [0.0] * 12
+            mt2_best    = raw[242]
+            mt2_slot0   = raw[243]
+            mt2_ideal   = raw[244]
+            mt2_inj     = raw[245]
+
         records.append({
-            "pass":      pass_num,
-            "day":       actual_day,
-            "mt1":       mt1,
-            "mt2_best":  raw[242],
-            "mt2_slot0": raw[243],
-            "mt2_ideal": raw[244],
-            "mt2_inj":   raw[245],
+            "pass":               pass_num,
+            "day":                actual_day,
+            "mt1":                mt1,
+            "mt1_dir_correct_dbl": mt1_dir_cdb,
+            "mt2_best":           mt2_best,
+            "mt2_slot0":          mt2_slot0,
+            "mt2_ideal":          mt2_ideal,
+            "mt2_inj":            mt2_inj,
         })
-        offset += RECORD_SIZE_V4
+        offset += rec_size
 
     return records
 
