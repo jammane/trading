@@ -623,6 +623,9 @@ struct MT2Scratch {
     float*   new_elites;  // [ELITE_POOL × MT2NN_PARAMS]
     float*   wavg_buf;    // [3 × MT2NN_PARAMS]
     float*   mut_buf;     // [MT2NN_PARAMS]
+    float*   hist_buf;    // [HIST_DAYS * HIST_PER_DAY * MT2NN_PARAMS]
+    int      hist_head{0};
+    int      hist_count{0};
     uint64_t mut_seeds[N_SLOTS - ELITE_POOL];
 
     MT2Scratch() {
@@ -631,11 +634,13 @@ struct MT2Scratch {
         new_elites = new float[ep]();
         wavg_buf   = new float[3 * MT2NN_PARAMS]();
         mut_buf    = new float[MT2NN_PARAMS]();
+        hist_buf   = new float[(size_t)HIST_DAYS * HIST_PER_DAY * MT2NN_PARAMS]();
     }
-    ~MT2Scratch() { delete[] elite_buf; delete[] new_elites; delete[] wavg_buf; delete[] mut_buf; }
-    float* elite(int i)     { return elite_buf  + (size_t)i * MT2NN_PARAMS; }
-    float* new_elite(int i) { return new_elites + (size_t)i * MT2NN_PARAMS; }
-    float* wavg(int i)      { return wavg_buf   + (size_t)i * MT2NN_PARAMS; }
+    ~MT2Scratch() { delete[] elite_buf; delete[] new_elites; delete[] wavg_buf; delete[] mut_buf; delete[] hist_buf; }
+    float* elite(int i)       { return elite_buf  + (size_t)i * MT2NN_PARAMS; }
+    float* new_elite(int i)   { return new_elites + (size_t)i * MT2NN_PARAMS; }
+    float* wavg(int i)        { return wavg_buf   + (size_t)i * MT2NN_PARAMS; }
+    float* hist(int d, int p) { return hist_buf   + ((size_t)(d * HIST_PER_DAY + p)) * MT2NN_PARAMS; }
 };
 
 // ── Fee helpers ─────────────────────────────────────────────────────────────────
@@ -2143,8 +2148,9 @@ static MT1CompResult step_mt1_component(
     const int pool_muts  = pool_slots - pool_elite; // 175
 
     // Load injection models into slots 20–24 from cascade source (populated previous day)
+    // inject_src is hoisted to function scope so the carry-forward step can blend against it
+    const float* inject_src;
     {
-        const float* inject_src;
         switch (pool_id) {
             case 0:  inject_src = scratch.comp_inject_buf; break;  // direction  ← composite
             case 1:  inject_src = scratch.dir_inject_buf;  break;  // accuracy   ← direction
@@ -2341,11 +2347,24 @@ static MT1CompResult step_mt1_component(
             for (int p = 0; p < MT1NN_PARAMS; p++) dst[p] += scratch.new_elite(e)[p] * inv_k;
     }
 
-    // Injection slots (20–24): carry forward the models loaded at top of this call
-    for (int k = 0; k < MT1_COMP_INJECT; k++)
-        memcpy(scratch.new_elite(ELITE_COUNT + WAVG_COUNT + k),
-               scratch.comp_elite(pool_id, ELITE_COUNT + WAVG_COUNT + k),
-               MT1NN_PARAMS * sizeof(float));
+    // Injection slots (20–24): blended injection (1/3 source + 2/3 dest_w5),
+    // or direct injection if the destination pool was fully culled (live_count == 0).
+    {
+        // dest_w5 = wavg blend of top-5 direct elites (slot ELITE_COUNT, i.e. slot 17)
+        const float* dest_w5 = scratch.new_elite(ELITE_COUNT);
+        for (int k = 0; k < MT1_COMP_INJECT; k++) {
+            const float* src = inject_src + (size_t)k * MT1NN_PARAMS;
+            float* dst = scratch.new_elite(ELITE_COUNT + WAVG_COUNT + k);
+            if (live_count == 0) {
+                // Destination pool fully culled — direct injection
+                memcpy(dst, src, MT1NN_PARAMS * sizeof(float));
+            } else {
+                // Blend: 1/3 injection source + 2/3 destination w5
+                for (int p = 0; p < MT1NN_PARAMS; p++)
+                    dst[p] = (1.f/3.f) * src[p] + (2.f/3.f) * dest_w5[p];
+            }
+        }
+    }
 
     // Commit all 25 parent slots (elites + wavg + injection)
     memcpy(scratch.comp_elites[pool_id], scratch.new_elites,
@@ -2709,6 +2728,30 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
         pred_scores[slot] = pts * 1e9f + port_val;
     }
 
+    // ── Score history candidates ─────────────────────────────────────────────────
+    int n_hist_mt2 = scratch.hist_count * HIST_PER_DAY;
+    std::vector<float> hist_sc_mt2(n_hist_mt2, 0.f);
+    {
+        int total_h = HIST_DAYS * HIST_PER_DAY;
+        for (int h = 0; h < n_hist_mt2; h++) {
+            int oldest  = (scratch.hist_head * HIST_PER_DAY - n_hist_mt2 + total_h) % total_h;
+            int abs_pos = (oldest + h) % total_h;
+            const float* W = scratch.hist_buf + (size_t)abs_pos * MT2NN_PARAMS;
+            mt2_forward(W, in48, out48);
+            float pts_h = 0.f;
+            for (int i = 0; i < N_IND; i++) {
+                const float* lg = out48 + i * 4; int best = 0;
+                for (int k = 1; k < 4; k++) if (lg[k] > lg[best]) best = k;
+                int pred = best, opt = opt_tier[i];
+                if (opt == 0) { if (pred > 0) pts_h += -2.f - 0.25f * pred; }
+                else if (pred == 0) { pts_h -= (float)opt; }
+                else if (pred <= opt) { pts_h += (float)pred; }
+                else { pts_h += (float)opt - 0.25f * (float)(pred - opt); }
+            }
+            hist_sc_mt2[h] = pts_h * 1e9f;  // no port_val tiebreak for history
+        }
+    }
+
     int tier_counts[4] = {};
     for (int i = 0; i < N_IND; i++) tier_counts[slot_tiers[0][i]]++;
     int best_slot_idx = (int)(std::max_element(pred_scores, pred_scores + N_SLOTS) - pred_scores);
@@ -2763,6 +2806,9 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
         for (int s = 0; s < N_SLOTS; s++)
             if (pred_scores[s] >= pool_floor) surviving.push_back({pred_scores[s], s});
         if (surviving.empty()) surviving.push_back({pred_scores[0], 0});
+        // Add history candidates unconditionally (no pool_floor filter)
+        for (int h = 0; h < n_hist_mt2; h++)
+            surviving.push_back({hist_sc_mt2[h], N_SLOTS + h});  // idx >= N_SLOTS → history
         std::sort(surviving.begin(), surviving.end(),
                   [](const auto& a, const auto& b){ return a.first > b.first; });
         int n_top = std::min((int)surviving.size(), ELITE_COUNT);
@@ -2779,10 +2825,14 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
         normalize_weights(src_val, w15, n15);
 
         MasterPortfolio new_mports[ELITE_POOL];
+        // For history slots we have no live portfolio — use slot0_own as starting point
+        auto get_mport = [&](int sl) -> const MasterPortfolio& {
+            return (sl < N_SLOTS) ? state.portfolios[sl] : slot0_own;
+        };
         const MasterPortfolio* mp5[5], *mp10[10], *mp15[15];
-        for (int k=0;k<n5;k++)  mp5[k]  = &state.portfolios[src_rank[k]];
-        for (int k=0;k<n10;k++) mp10[k] = &state.portfolios[src_rank[k]];
-        for (int k=0;k<n15;k++) mp15[k] = &state.portfolios[src_rank[k]];
+        for (int k=0;k<n5;k++)  mp5[k]  = &get_mport(src_rank[k]);
+        for (int k=0;k<n10;k++) mp10[k] = &get_mport(src_rank[k]);
+        for (int k=0;k<n15;k++) mp15[k] = &get_mport(src_rank[k]);
         MasterPortfolio wp5={}, wp10={}, wp15={};
         wavg_mst_portfolio(mp5,  w5,  n5,  wp5);
         wavg_mst_portfolio(mp10, w10, n10, wp10);
@@ -2790,14 +2840,24 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
 
         for (int k = 0; k < n_top; k++) {
             int slot = src_rank[k];
-            if (slot < ELITE_POOL) {
+            if (slot >= N_SLOTS) {
+                // History model — copy weights from hist_buf
+                int h = slot - N_SLOTS;
+                int total_h = HIST_DAYS * HIST_PER_DAY;
+                int oldest  = (scratch.hist_head * HIST_PER_DAY - n_hist_mt2 + total_h) % total_h;
+                int abs_pos = (oldest + h) % total_h;
+                memcpy(scratch.new_elite(k), scratch.hist_buf + (size_t)abs_pos * MT2NN_PARAMS,
+                       MT2NN_PARAMS * sizeof(float));
+                new_mports[k] = slot0_own;  // history models start from slot0's portfolio
+            } else if (slot < ELITE_POOL) {
                 memcpy(scratch.new_elite(k), scratch.elite(slot), MT2NN_PARAMS * sizeof(float));
+                new_mports[k] = state.portfolios[slot];
             } else {
                 int mut_i = slot - ELITE_POOL, parent = mut_i / MUTATIONS_PER_PARENT;
                 memcpy(scratch.new_elite(k), scratch.elite(parent), MT2NN_PARAMS * sizeof(float));
                 apply_gaussian(scratch.new_elite(k), MT2NN_PARAMS, sigma, scratch.mut_seeds[mut_i]);
+                new_mports[k] = state.portfolios[slot];
             }
-            new_mports[k] = state.portfolios[slot];
         }
         for (int k = n_top; k < ELITE_COUNT; k++) {
             memcpy(scratch.new_elite(k), scratch.new_elite(0), MT2NN_PARAMS * sizeof(float));
@@ -2834,6 +2894,19 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
     }
 
     state.portfolios[0] = slot0_own;
+
+    // ── Save top HIST_ELITE direct elites + HIST_WAVG wavg blends to MT2 history ─
+    {
+        int& head  = scratch.hist_head;
+        int& count = scratch.hist_count;
+        for (int k = 0; k < HIST_ELITE; k++)
+            memcpy(scratch.hist(head, k), scratch.elite(k), MT2NN_PARAMS * sizeof(float));
+        for (int k = 0; k < HIST_WAVG; k++)
+            memcpy(scratch.hist(head, HIST_ELITE + k), scratch.elite(ELITE_COUNT + k),
+                   MT2NN_PARAMS * sizeof(float));
+        head = (head + 1) % HIST_DAYS;
+        if (count < HIST_DAYS) count++;
+    }
 
     float elite_max_pts = -1e9f, elite_min_pts = 1e9f, elite_mean_pts = 0.f;
     for (int s = 0; s < ELITE_COUNT; s++) {
@@ -3164,19 +3237,29 @@ static void load_or_init_mt1(const std::string& dir, const std::string& load_dir
     }
 }
 
-static void save_mt2_elites(const std::string& dir, const float* elite_buf) {
+static void save_mt2_elites(const std::string& dir, MT2Scratch& scratch) {
     for (int slot = 0; slot < ELITE_POOL; slot++) {
         char p[512]; snprintf(p, sizeof(p), "%s/mt2_elite_%d.bin", dir.c_str(), slot);
-        if (!save_bin(p, elite_buf + (size_t)slot * MT2NN_PARAMS, MT2NN_PARAMS))
+        if (!save_bin(p, scratch.elite_buf + (size_t)slot * MT2NN_PARAMS, MT2NN_PARAMS))
             log_msg(std::string("WARNING: could not save ") + p);
+    }
+    // Save MT2 history
+    char hp[512]; snprintf(hp, sizeof(hp), "%s/mt2_hist.bin", dir.c_str());
+    FILE* hf = fopen(hp, "wb");
+    if (hf) {
+        int meta[2] = {scratch.hist_head, scratch.hist_count};
+        fwrite(meta, sizeof(int), 2, hf);
+        fwrite(scratch.hist_buf, sizeof(float),
+               (size_t)HIST_DAYS * HIST_PER_DAY * MT2NN_PARAMS, hf);
+        fclose(hf);
     }
 }
 
 static void load_or_init_mt2(const std::string& dir, const std::string& load_dir,
-                               float* elite_buf) {
+                               MT2Scratch& scratch) {
     PCG32 rng; rng.seed(0xCAFED00DBEEF1234ULL);
     for (int slot = 0; slot < ELITE_POOL; slot++) {
-        float* e = elite_buf + (size_t)slot * MT2NN_PARAMS;
+        float* e = scratch.elite_buf + (size_t)slot * MT2NN_PARAMS;
         bool loaded = false;
         if (!load_dir.empty()) {
             char p[512]; snprintf(p, sizeof(p), "%s/mt2_elite_%d.bin", load_dir.c_str(), slot);
@@ -3187,6 +3270,27 @@ static void load_or_init_mt2(const std::string& dir, const std::string& load_dir
             loaded = load_bin(p, e, MT2NN_PARAMS);
         }
         if (!loaded) init_mt2_weights(e, rng);
+    }
+    // Load MT2 history
+    {
+        char hp[512];
+        const std::string& hdir = load_dir.empty() ? dir : load_dir;
+        snprintf(hp, sizeof(hp), "%s/mt2_hist.bin", hdir.c_str());
+        FILE* hf = fopen(hp, "rb");
+        if (!hf && !load_dir.empty()) {
+            snprintf(hp, sizeof(hp), "%s/mt2_hist.bin", dir.c_str());
+            hf = fopen(hp, "rb");
+        }
+        if (hf) {
+            int meta[2] = {};
+            if (fread(meta, sizeof(int), 2, hf) == 2) {
+                scratch.hist_head  = std::max(0, std::min(meta[0], HIST_DAYS - 1));
+                scratch.hist_count = std::max(0, std::min(meta[1], HIST_DAYS));
+                fread(scratch.hist_buf, sizeof(float),
+                      (size_t)HIST_DAYS * HIST_PER_DAY * MT2NN_PARAMS, hf);
+            }
+            fclose(hf);
+        }
     }
 }
 
@@ -3464,7 +3568,7 @@ int main(int argc, char* argv[]) {
         // Load MT1 elites (12 per-industry × 4 component pools + composite) and MT2 once at pass start
         for (int i = 0; i < N_IND; i++)
             load_or_init_mt1(output_dir, load_dir, i, mt1_scratches[i]);
-        load_or_init_mt2(output_dir, load_dir, mt2_scratch->elite_buf);
+        load_or_init_mt2(output_dir, load_dir, *mt2_scratch);
         // Init MT2 portfolio state
         mst->portfolios[0].cash = MST_STARTING_CASH;
         for (int i = 0; i < N_IND; i++) mst->portfolios[0].holdings[i] = 0.f;
@@ -3615,7 +3719,7 @@ int main(int argc, char* argv[]) {
                 log_msg("Saving MT1/MT2 elites to " + output_dir + " ...");
                 for (int i = 0; i < N_IND; i++)
                     save_mt1_all(output_dir, i, mt1_scratches[i]);
-                save_mt2_elites(output_dir, mt2_scratch->elite_buf);
+                save_mt2_elites(output_dir, *mt2_scratch);
             }
         }
 
@@ -3624,7 +3728,7 @@ int main(int argc, char* argv[]) {
             log_msg("Pass " + std::to_string(pass+1) + " complete — saving MT1/MT2 elites");
             for (int i = 0; i < N_IND; i++)
                 save_mt1_all(output_dir, i, mt1_scratches[i]);
-            save_mt2_elites(output_dir, mt2_scratch->elite_buf);
+            save_mt2_elites(output_dir, *mt2_scratch);
         }
     }
 
