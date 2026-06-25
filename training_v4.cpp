@@ -3,7 +3,7 @@
 // Run:   ./build/training_v4_cpp --output models [--load-dir DIR] [--start-day N] [--stop-day N]
 //        [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F] [--workers N]
 
-#define TRAINER_VERSION "0.2.1.0"
+#define TRAINER_VERSION "0.2.1.1"
 
 #include <algorithm>
 #include <atomic>
@@ -2539,7 +2539,8 @@ static MT1BlendResult step_mt1_composite(
 
 static MT1Result step_mt1(int ind_i, MT1Scratch& scratch,
                            float actual_d, const float in37[37],
-                           int actual_day, float sigma) {
+                           int actual_day,
+                           float dir_sigma, float rng_sigma, float acc_sigma, float cfd_sigma) {
     if (actual_day < MT1_START_DAY) return {};
 
     // Adaptive per-industry floors from rolling buffers
@@ -2567,10 +2568,11 @@ static MT1Result step_mt1(int ind_i, MT1Scratch& scratch,
     // Record today's data before scoring so direction pool sees the full MT1_DIR_DAYS window
     scratch.push_dir_day(in37, actual_d);
 
-    // Step 4 component pools (dir, acc, rng, cfd)
+    // Step 4 component pools (dir=0, acc=1, rng=2, cfd=3) with per-pool sigmas
+    const float comp_sigmas[4] = {dir_sigma, acc_sigma, rng_sigma, cfd_sigma};
     MT1CompResult cr[4];
     for (int p = 0; p < 4; p++)
-        cr[p] = step_mt1_component(p, ind_i, scratch, actual_d, in37, actual_day, sigma,
+        cr[p] = step_mt1_component(p, ind_i, scratch, actual_d, in37, actual_day, comp_sigmas[p],
                                     acc_floor, range_ceiling);
 
     // Step composite blend pool
@@ -3444,6 +3446,7 @@ static void print_usage(const char* prog) {
     fprintf(stderr,
         "Usage: %s --account ACCT [--start-day N] [--stop-day N]\n"
         "          [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F]\n"
+        "          [--dir-sigma F] [--rng-sigma F] [--acc-sigma F] [--cfd-sigma F] [--mt2-sigma F]\n"
         "          [--workers N] [--master-only] [--preserve-stock-data] [--no-save]\n"
         "       %s --output DIR [--load-dir DIR] ...  (diagnostic/override)\n", prog, prog);
 }
@@ -3453,6 +3456,7 @@ int main(int argc, char* argv[]) {
     std::string output_dir, load_dir, account;
     int  start_day = -1, stop_day = -1, passes = 1, num_workers = 2;
     float sigma = 0.01f, master_sigma = -1.f, sigma_decay = 0.5f;
+    float dir_sigma = -1.f, rng_sigma = -1.f, acc_sigma = -1.f, cfd_sigma = -1.f, mt2_sigma_arg = -1.f;
     bool master_only = false, preserve_stock = false;
 
     for (int a = 1; a < argc; a++) {
@@ -3466,6 +3470,11 @@ int main(int argc, char* argv[]) {
         else if (arg == "--sigma"    && a+1<argc) { sigma    = atof(argv[++a]); }
         else if (arg == "--master-sigma"&&a+1<argc){master_sigma=atof(argv[++a]);}
         else if (arg == "--sigma-decay"&&a+1<argc){sigma_decay=atof(argv[++a]);}
+        else if (arg == "--dir-sigma" && a+1<argc) { dir_sigma    = atof(argv[++a]); }
+        else if (arg == "--rng-sigma" && a+1<argc) { rng_sigma    = atof(argv[++a]); }
+        else if (arg == "--acc-sigma" && a+1<argc) { acc_sigma    = atof(argv[++a]); }
+        else if (arg == "--cfd-sigma" && a+1<argc) { cfd_sigma    = atof(argv[++a]); }
+        else if (arg == "--mt2-sigma" && a+1<argc) { mt2_sigma_arg= atof(argv[++a]); }
         else if (arg == "--workers"  && a+1<argc) { num_workers=atoi(argv[++a]);}
         else if (arg == "--master-only") master_only = true;
         else if (arg == "--preserve-stock-data") preserve_stock = true;
@@ -3483,7 +3492,13 @@ int main(int argc, char* argv[]) {
         log_dir = output_dir;  // diagnostic: co-locate logs with models
     }
     if (output_dir.empty()) { print_usage(argv[0]); return 1; }
-    if (master_sigma < 0.f) master_sigma = sigma;
+    if (master_sigma  < 0.f) master_sigma  = sigma;
+    // Per-component defaults: dir/acc keep master_sigma; rng=2/3, cfd=1/2, mt2=1/3
+    if (dir_sigma     < 0.f) dir_sigma     = master_sigma;
+    if (rng_sigma     < 0.f) rng_sigma     = master_sigma * (2.f / 3.f);
+    if (acc_sigma     < 0.f) acc_sigma     = master_sigma;
+    if (cfd_sigma     < 0.f) cfd_sigma     = master_sigma * 0.5f;
+    if (mt2_sigma_arg < 0.f) mt2_sigma_arg = master_sigma / 3.f;
 
     log_msg(std::string("training_v4_cpp v") + TRAINER_VERSION +
             "  account=" + (account.empty() ? "(diagnostic)" : account));
@@ -3549,11 +3564,22 @@ int main(int argc, char* argv[]) {
 
     // ── Multi-pass loop ─────────────────────────────────────────────────────
     for (int pass = 0; pass < passes; pass++) {
-        float cur_sigma     = sigma        * powf(sigma_decay, (float)pass);
-        float cur_mst_sigma = master_sigma * powf(sigma_decay, (float)pass);
+        float decay         = powf(sigma_decay, (float)pass);
+        float cur_sigma     = sigma        * decay;
+        float cur_mst_sigma = master_sigma * decay;  // composite blends
+        float cur_dir_sigma = dir_sigma    * decay;
+        float cur_rng_sigma = rng_sigma    * decay;
+        float cur_acc_sigma = acc_sigma    * decay;
+        float cur_cfd_sigma = cfd_sigma    * decay;
+        float cur_mt2_sigma = mt2_sigma_arg* decay;
         log_msg("===== PASS " + std::to_string(pass+1) + "/" + std::to_string(passes) +
-                " | sigma=" + std::to_string(cur_sigma).substr(0,8) +
-                " | master_sigma=" + std::to_string(cur_mst_sigma).substr(0,8) + " =====");
+                " | sigma=" + std::to_string(cur_sigma).substr(0,6) +
+                " | mst=" + std::to_string(cur_mst_sigma).substr(0,6) +
+                " | dir=" + std::to_string(cur_dir_sigma).substr(0,6) +
+                " | rng=" + std::to_string(cur_rng_sigma).substr(0,6) +
+                " | acc=" + std::to_string(cur_acc_sigma).substr(0,6) +
+                " | cfd=" + std::to_string(cur_cfd_sigma).substr(0,6) +
+                " | mt2=" + std::to_string(cur_mt2_sigma).substr(0,6) + " =====");
 
         // Init portfolios; industry elites are loaded per-day inside step_industry
         for (int i = 0; i < N_IND; i++) {
@@ -3644,7 +3670,9 @@ int main(int argc, char* argv[]) {
                     const float* in37 = today444 + i * 37;
                     float actual_d_i  = results[i].slot0_score - results[i].baseline;
                     mt1_res[i] = step_mt1(i, mt1_scratches[i], actual_d_i,
-                                          in37, actual_day, cur_mst_sigma);
+                                          in37, actual_day,
+                                          cur_dir_sigma, cur_rng_sigma,
+                                          cur_acc_sigma, cur_cfd_sigma);
                 }
             }
 
@@ -3661,7 +3689,7 @@ int main(int argc, char* argv[]) {
                     in48[i*4 + 3] = mt1_res[i].slot0_conf4;
                 }
                 master_res = step_mt2(*mst, *mt2_scratch, in48, actual_perf,
-                                      actual_day, total_days, cur_mst_sigma, &mt2_injected);
+                                      actual_day, total_days, cur_mt2_sigma, &mt2_injected);
             }
 
             // Append today's best-slot industry values to rolling ind_val_hist buffer

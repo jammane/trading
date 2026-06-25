@@ -198,7 +198,7 @@ def train_mt_one_day_prod(industries, model_dir, ind_value_history,
             mt1_slot0_outputs[ind] = (0.5, 0.0, 0.02)
 
     try:
-        upkeep_mt2(model_dir, mt1_slot0_outputs, norm_stats, actual_perf, industry_list)
+        upkeep_mt2(model_dir, mt1_slot0_outputs, actual_perf, industry_list)
     except Exception as e:
         print(f"Error in upkeep_mt2: {e}")
 
