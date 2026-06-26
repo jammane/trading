@@ -608,11 +608,15 @@ def _mst_window(history, n_days):
     pad    = max(0, n_days - len(history))
     return [oldest] * pad + list(history[-n_days:])
 
-def build_master_features(ind_value_history, industry_list):
-    """Build (1, 444) input tensor. 37 features × 12 industries = 444."""
+def build_master_features(mkt_val_history, industry_list):
+    """Build (1, 444) input tensor. 37 features × 12 industries = 444.
+
+    mkt_val_history: {ind: [cumulative_market_index_values]} — equal-weight close-to-close
+    cumulative product starting at IND_STARTING_CASH. Matches C++ mkt_val_hist.
+    """
     features = []
     for ind in industry_list:
-        hist = ind_value_history.get(ind, [])
+        hist = mkt_val_history.get(ind, [])
         for t in MASTER_LOOKBACKS:
             if t == 25:
                 features.append(_mst_hist_at(hist, 0))  # current portfolio value (scale anchor)

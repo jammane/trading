@@ -309,6 +309,8 @@ def _plot_band(ax, xs, means, maxes, mins, color: str) -> None:
 
 def _save(fig, out_path: Path) -> None:
     fig.savefig(out_path, format="svg", bbox_inches="tight")
+    png_path = out_path.with_suffix(".png")
+    fig.savefig(png_path, format="png", bbox_inches="tight", dpi=120)
     plt.close(fig)
     print(f"  {out_path}")
 
@@ -593,6 +595,53 @@ def plot_mt2(rows: list[dict], pass_num: int, out_path: Path) -> None:
               fontsize=9, framealpha=0.95, edgecolor="#cccccc")
     _save(fig, out_path)
 
+# ── Market data graphs ────────────────────────────────────────────────────────
+def plot_market_cumulative(rows: list[dict], pass_num: int, out_path: Path) -> None:
+    """Cumulative equal-weight market return index per industry (what MT1/MT2 features are based on)."""
+    has_col = rows and f"{INDUSTRIES[0]}_mkt_val" in rows[0]
+    if not has_col:
+        print(f"  (no mkt_val columns in CSV — skipping {out_path.name})")
+        return
+    fig, ax = plt.subplots(figsize=(FIG_W, 9))
+    fig.subplots_adjust(bottom=0.23)
+    xs = [int(r["day"]) for r in rows]
+    for ind in INDUSTRIES:
+        col = f"{ind}_mkt_val"
+        ys_raw = [r[col] for r in rows]
+        xs_s, ys_s = _smooth(xs, ys_raw)
+        ax.plot(xs_s, ys_s, color=IND_COLOR[ind], linewidth=1.4, alpha=0.85, label=IND_LABEL[ind])
+    ax.axhline(IND_STARTING_CASH, color="#aaaaaa", linewidth=0.6, linestyle=":", zorder=1)
+    ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f"${v:,.0f}"))
+    _style_ax(ax,
+              f"Market Cumulative Index per Industry — Pass {pass_num}",
+              f"Day (Pass {pass_num})", "Index Value ($)")
+    _industry_legend(ax)
+    _save(fig, out_path)
+
+
+def plot_market_daily_return(rows: list[dict], pass_num: int, out_path: Path) -> None:
+    """Daily equal-weight market close-to-close return per industry (actual_d basis for MT1)."""
+    has_col = rows and f"{INDUSTRIES[0]}_mkt_ret" in rows[0]
+    if not has_col:
+        print(f"  (no mkt_ret columns in CSV — skipping {out_path.name})")
+        return
+    fig, ax = plt.subplots(figsize=(FIG_W, 9))
+    fig.subplots_adjust(bottom=0.23)
+    xs = [int(r["day"]) for r in rows]
+    for ind in INDUSTRIES:
+        col = f"{ind}_mkt_ret"
+        ys_raw = [r[col] * 100.0 for r in rows]  # convert to percent
+        xs_s, ys_s = _smooth(xs, ys_raw)
+        ax.plot(xs_s, ys_s, color=IND_COLOR[ind], linewidth=1.2, alpha=0.70, label=IND_LABEL[ind])
+    ax.axhline(0.0, color="#aaaaaa", linewidth=0.6, linestyle=":", zorder=1)
+    ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f"{v:.2f}%"))
+    _style_ax(ax,
+              f"Market Daily Close-to-Close Return per Industry — Pass {pass_num}",
+              f"Day (Pass {pass_num})", "Return (%)")
+    _industry_legend(ax)
+    _save(fig, out_path)
+
+
 # ── Pass helpers ──────────────────────────────────────────────────────────────
 def _pass_max_day(all_rows: list[dict], pass_num: int) -> int:
     return max((int(r["day"]) for r in all_rows if int(r["pass"]) == pass_num), default=0)
@@ -610,6 +659,8 @@ def _generate_all(rows: list[dict], records: list[dict], pass_num: int, out_dir:
     else:
         print(f"  (no MT1 records for pass {pass_num} — MT1 activates at day 25)")
     plot_mt2(rows, pass_num, out_dir / "mt2_performance.svg")
+    plot_market_cumulative(rows, pass_num, out_dir / "market_cumulative.svg")
+    plot_market_daily_return(rows, pass_num, out_dir / "market_daily_return.svg")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
