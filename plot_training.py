@@ -101,6 +101,10 @@ assert _RECORD_STRUCT_V4.size == RECORD_SIZE_V4
 RECORD_SIZE_V5 = 1032
 _RECORD_STRUCT_V5 = struct.Struct("<II" + "f" * 255 + "Bxxx")
 assert _RECORD_STRUCT_V5.size == RECORD_SIZE_V5
+# v5/bin-version-5: 1044 bytes — adds mt1_dir_injected[12] collapse injection flags
+RECORD_SIZE_V6 = 1044
+_RECORD_STRUCT_V6 = struct.Struct("<II" + "f" * 255 + "Bxxx" + "12B")
+assert _RECORD_STRUCT_V6.size == RECORD_SIZE_V6
 
 # ── Download ──────────────────────────────────────────────────────────────────
 def download_logs(host: str, account: str) -> None:
@@ -131,11 +135,14 @@ def load_binary_log(path: Path) -> list[dict]:
     magic, version, n_ind, _ = struct.unpack_from("<IIII", data, 0)
     if magic != MT_LOG_MAGIC:
         sys.exit(f"{path}: bad magic {magic:#010x} (expected {MT_LOG_MAGIC:#010x})")
-    if version not in (3, 4):
-        sys.exit(f"{path}: unsupported log version {version} (expected 3 or 4)")
+    if version not in (3, 4, 5):
+        sys.exit(f"{path}: unsupported log version {version} (expected 3, 4, or 5)")
 
     # Pick record format by binary version number
-    if version == 4:
+    if version == 5:
+        rec_size   = RECORD_SIZE_V6
+        rec_struct = _RECORD_STRUCT_V6
+    elif version == 4:
         rec_size   = RECORD_SIZE_V5
         rec_struct = _RECORD_STRUCT_V5
     else:
@@ -157,29 +164,40 @@ def load_binary_log(path: Path) -> list[dict]:
                 base = ci * 48 + si * 12
                 mt1[comp][stat] = list(f[base : base + 12])
 
-        if version == 4:
+        if version == 5:
+            # V6 layout: same as V5 + mt1_dir_injected[12] at raw[258:270]
+            mt1_dir_cdb      = list(raw[242:254])
+            mt2_best         = raw[254]
+            mt2_slot0        = raw[255]
+            mt2_ideal        = raw[256]
+            mt2_inj          = raw[257]
+            mt1_dir_injected = list(raw[258:270])
+        elif version == 4:
             # V5 layout: mt1_dir_correct_dbl[12] at raw[242:254], MT2 at 254+
-            mt1_dir_cdb = list(raw[242:254])
-            mt2_best    = raw[254]
-            mt2_slot0   = raw[255]
-            mt2_ideal   = raw[256]
-            mt2_inj     = raw[257]
+            mt1_dir_cdb      = list(raw[242:254])
+            mt2_best         = raw[254]
+            mt2_slot0        = raw[255]
+            mt2_ideal        = raw[256]
+            mt2_inj          = raw[257]
+            mt1_dir_injected = [0] * 12
         else:
-            mt1_dir_cdb = [0.0] * 12
-            mt2_best    = raw[242]
-            mt2_slot0   = raw[243]
-            mt2_ideal   = raw[244]
-            mt2_inj     = raw[245]
+            mt1_dir_cdb      = [0.0] * 12
+            mt2_best         = raw[242]
+            mt2_slot0        = raw[243]
+            mt2_ideal        = raw[244]
+            mt2_inj          = raw[245]
+            mt1_dir_injected = [0] * 12
 
         records.append({
-            "pass":               pass_num,
-            "day":                actual_day,
-            "mt1":                mt1,
+            "pass":                pass_num,
+            "day":                 actual_day,
+            "mt1":                 mt1,
             "mt1_dir_correct_dbl": mt1_dir_cdb,
-            "mt2_best":           mt2_best,
-            "mt2_slot0":          mt2_slot0,
-            "mt2_ideal":          mt2_ideal,
-            "mt2_inj":            mt2_inj,
+            "mt1_dir_injected":    mt1_dir_injected,
+            "mt2_best":            mt2_best,
+            "mt2_slot0":           mt2_slot0,
+            "mt2_ideal":           mt2_ideal,
+            "mt2_inj":             mt2_inj,
         })
         offset += rec_size
 
@@ -204,6 +222,13 @@ def _smooth_seg(xs: list, ys: list, target: int) -> tuple[list, list]:
 def _smooth(xs: list, ys: list) -> tuple[list, list]:
     """Smooth a simple series (no NaN breaks) to ~TARGET_POINTS."""
     return _smooth_seg(xs, ys, TARGET_POINTS)
+
+def _nearest_y(xs_smooth: list, ys_smooth: list, day: float) -> float | None:
+    """Return the y-value in the smoothed series closest in x to `day`."""
+    if not xs_smooth:
+        return None
+    idx = min(range(len(xs_smooth)), key=lambda k: abs(xs_smooth[k] - day))
+    return ys_smooth[idx]
 
 # ── Floor-reset detection ─────────────────────────────────────────────────────
 def _is_reset(mean_v: float, max_v: float, min_v: float) -> bool:
@@ -309,8 +334,6 @@ def _plot_band(ax, xs, means, maxes, mins, color: str) -> None:
 
 def _save(fig, out_path: Path) -> None:
     fig.savefig(out_path, format="svg", bbox_inches="tight")
-    png_path = out_path.with_suffix(".png")
-    fig.savefig(png_path, format="png", bbox_inches="tight", dpi=120)
     plt.close(fig)
     print(f"  {out_path}")
 
@@ -376,6 +399,16 @@ def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: 
 
     xs_raw = [r["day"] for r in records]
     n_ind = len(INDUSTRIES)
+
+    # Injection days per industry (direction component only)
+    inj_days_by_ind: list[list[int]] = [[] for _ in INDUSTRIES]
+    if comp == "direction":
+        for r in records:
+            for i in range(len(INDUSTRIES)):
+                if r.get("mt1_dir_injected", [0] * len(INDUSTRIES))[i]:
+                    inj_days_by_ind[i].append(r["day"])
+
+    star_added = False
     for i, ind in enumerate(INDUSTRIES):
         means_raw = [r["mt1"][comp]["mean"][i] for r in records]
         bests_raw = [r["mt1"][comp]["best"][i] for r in records]
@@ -386,6 +419,14 @@ def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: 
         xs_n, mins_s = _smooth(xs_raw, mins_raw)
 
         _plot_band(ax, xs_m, means, bests, mins_s, IND_COLOR[ind])
+
+        if comp == "direction":
+            for day in inj_days_by_ind[i]:
+                y_val = _nearest_y(xs_m, means, day)
+                if y_val is not None:
+                    ax.plot([day], [y_val], marker="*", color=IND_COLOR[ind],
+                            markersize=12, zorder=7, linestyle="none")
+                    star_added = True
 
     # All-industry mean/max/min: average across industries of each per-day stat
     all_means_raw = [sum(r["mt1"][comp]["mean"]) / n_ind for r in records]
@@ -469,6 +510,10 @@ def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: 
         extra.append(mlines.Line2D([], [], color="#e06000", linewidth=2.2,
                                    marker="^", markersize=6,
                                    label="Mean correct direction calls (0–6, today×2)"))
+        if star_added:
+            extra.append(mlines.Line2D([], [], color="#555555", linewidth=0,
+                                       marker="*", markersize=10,
+                                       label="★ collapse injection"))
     if ax2 is not None:
         extra.append(mlines.Line2D([], [], color="#808080", linewidth=2.5,
                                    label="% industries mkt_ret > 0 (right axis)"))
