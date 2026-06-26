@@ -119,6 +119,9 @@ static constexpr float MT1_RANGE_FLOOR     = 1.f;    // $1 — effectively no fl
 static constexpr float MT1_RANGE_CEIL_MULT = 4.f;    // ceiling = 4 × max(mean, today) |actual−comp0_delta|
 static constexpr float MT1_DIR_BACKFILL    = 0.65f;  // skip direction pool update when best score < this
 static constexpr int   MT1_DIR_DAYS        = 5;   // direction pool: score each model over last N days, sum
+static constexpr int   MT1_DIR_QUALIFY      = 1;   // min correct_dbl for a live slot to count as qualified
+static constexpr int   MT1_DIR_STREAK_TRIP  = 5;   // consecutive collapse days before injection fires
+static constexpr int   MT1_DIR_COOLDOWN_LEN = 10;  // cooldown days after injection before re-injection allowed
 static constexpr int   HIST_WINDOW         = 15;
 
 static constexpr float IND_STARTING_CASH   = 25000.0f;
@@ -557,6 +560,8 @@ struct MT1Scratch {
     DirDayEntry  dir_day_buf[MT1_DIR_DAYS]{};
     int          dir_day_head{0};
     int          dir_day_count{0};
+    int          dir_streak{0};    // consecutive collapse days for this industry
+    int          dir_cooldown{0};  // remaining cooldown days after injection
 
     // Rolling per-industry circular buffers
     float    rolling_actual  [MT1_ROLLING_DAYS]{};  // |actual_d|           → acc floor
@@ -2291,8 +2296,22 @@ static MT1CompResult step_mt1_component(
     }
 
     // Direction backfill: skip update unless best model got ≥3 days correct (binary sign)
-    if (pool_id == 0 && dir_max_correct < 3)
+    if (pool_id == 0 && dir_max_correct < 3) {
+        scratch.dir_streak++;
         return {best_cat, slot0_cat, mean_cat, min_cat, mean_cdb};
+    }
+
+    // Direction collapse streak: increment if too few live slots qualify (partial collapse)
+    if (pool_id == 0) {
+        int n_qual = 0;
+        for (int s = 0; s < pool_slots; s++)
+            if (cat_sc[s] > -1e29f && dir_correct_dbl[s] >= MT1_DIR_QUALIFY)
+                n_qual++;
+        if (n_qual < ELITE_COUNT)
+            scratch.dir_streak++;
+        else
+            scratch.dir_streak = 0;
+    }
 
     // Score history candidates (no culling — history is the unconditional safety net)
     int n_hist = scratch.pool_hist_count[pool_id] * HIST_PER_DAY;
@@ -2576,6 +2595,8 @@ static MT1Result step_mt1(int ind_i, MT1Scratch& scratch,
                            float actual_d, const float in37[37],
                            int actual_day,
                            float dir_sigma, float rng_sigma, float acc_sigma, float cfd_sigma) {
+    // Record today's data unconditionally so direction pool has a full window when selection starts
+    scratch.push_dir_day(in37, actual_d);
     if (actual_day < MT1_START_DAY) return {};
 
     // Adaptive per-industry floors from rolling buffers
@@ -2599,9 +2620,6 @@ static MT1Result step_mt1(int ind_i, MT1Scratch& scratch,
         }
         range_ceiling = MT1_RANGE_CEIL_MULT * fmaxf(mean_r, today_r);
     }
-
-    // Record today's data before scoring so direction pool sees the full MT1_DIR_DAYS window
-    scratch.push_dir_day(in37, actual_d);
 
     // Step 4 component pools (dir=0, acc=1, rng=2, cfd=3) with per-pool sigmas
     const float comp_sigmas[4] = {dir_sigma, acc_sigma, rng_sigma, cfd_sigma};
@@ -3135,8 +3153,9 @@ static void save_mt1_all(const std::string& dir, int ind_i, const MT1Scratch& sc
     snprintf(path, sizeof(path), "%s/mt1_%s_dir_hist.bin", dir.c_str(), ind);
     FILE* fdh = fopen(path, "wb");
     if (fdh) {
-        int meta[2] = {scratch.dir_day_head, scratch.dir_day_count};
-        fwrite(meta, sizeof(int), 2, fdh);
+        int meta[4] = {scratch.dir_day_head, scratch.dir_day_count,
+                       scratch.dir_streak, scratch.dir_cooldown};
+        fwrite(meta, sizeof(int), 4, fdh);
         fwrite(scratch.dir_day_buf, sizeof(MT1Scratch::DirDayEntry), MT1_DIR_DAYS, fdh);
         fclose(fdh);
     }
@@ -3254,12 +3273,17 @@ static void load_or_init_mt1(const std::string& dir, const std::string& load_dir
         snprintf(path, sizeof(path), "%s/mt1_%s_dir_hist.bin", sd->c_str(), ind);
         FILE* f = fopen(path, "rb");
         if (!f) continue;
-        int meta[2] = {};
-        if (fread(meta, sizeof(int), 2, f) == 2 &&
+        int meta[4] = {};
+        int meta_read = (int)fread(meta, sizeof(int), 4, f);
+        if (meta_read >= 2 &&
             meta[1] >= 0 && meta[1] <= MT1_DIR_DAYS &&
             meta[0] >= 0 && meta[0] < MT1_DIR_DAYS) {
             scratch.dir_day_head  = meta[0];
             scratch.dir_day_count = meta[1];
+            if (meta_read >= 4) {
+                scratch.dir_streak   = meta[2];
+                scratch.dir_cooldown = meta[3];
+            }
             fread(scratch.dir_day_buf, sizeof(MT1Scratch::DirDayEntry), MT1_DIR_DAYS, f);
         }
         fclose(f);
@@ -3335,7 +3359,7 @@ static void load_or_init_mt2(const std::string& dir, const std::string& load_dir
 // ── MT binary log ────────────────────────────────────────────────────────────────
 
 static constexpr uint32_t MT_LOG_MAGIC   = 0x4D543132u;  // 'MT12'
-static constexpr uint32_t MT_LOG_VERSION = 4u;
+static constexpr uint32_t MT_LOG_VERSION = 5u;
 
 static bool write_mt_log_header(FILE* f) {
     uint32_t hdr[4] = {MT_LOG_MAGIC, MT_LOG_VERSION, (uint32_t)N_IND, 0u};
@@ -3360,8 +3384,9 @@ struct MTLogRecord {
     float    mt2_best_pts, mt2_slot0_pts, mt2_ideal_pts;
     uint8_t  mt2_injected;
     uint8_t  pad[3];
+    uint8_t  mt1_dir_injected[N_IND];
 };
-static_assert(sizeof(MTLogRecord) == 1032, "MTLogRecord must be 1032 bytes");
+static_assert(sizeof(MTLogRecord) == 1044, "MTLogRecord must be 1044 bytes");
 
 static void write_mt_log_record(FILE* f, const MTLogRecord& r) {
     fwrite(&r, sizeof(MTLogRecord), 1, f);
@@ -3731,16 +3756,16 @@ int main(int argc, char* argv[]) {
 
             // MT1 step × 12 (actual_day >= MT1_START_DAY)
             // actual_d = (mkt_ret - median_ret) × scale: relative target, always ~50% positive
+            // MT1 step: called for all days; push_dir_day runs unconditionally;
+            // selection/mutation/culling gated at actual_day >= MT1_START_DAY inside step_mt1
             MT1Result mt1_res[N_IND] = {};
-            if (actual_day >= MT1_START_DAY) {
-                for (int i = 0; i < N_IND; i++) {
-                    const float* in37 = today444 + i * 37;
-                    float actual_d_i  = (mkt_ret[i] - median_ret) * MT1_SCALE_DOLLARS;
-                    mt1_res[i] = step_mt1(i, mt1_scratches[i], actual_d_i,
-                                          in37, actual_day,
-                                          cur_dir_sigma, cur_rng_sigma,
-                                          cur_acc_sigma, cur_cfd_sigma);
-                }
+            for (int i = 0; i < N_IND; i++) {
+                const float* in37 = today444 + i * 37;
+                float actual_d_i  = (mkt_ret[i] - median_ret) * MT1_SCALE_DOLLARS;
+                mt1_res[i] = step_mt1(i, mt1_scratches[i], actual_d_i,
+                                      in37, actual_day,
+                                      cur_dir_sigma, cur_rng_sigma,
+                                      cur_acc_sigma, cur_cfd_sigma);
             }
 
             // MT2 step (actual_day >= MASTER_START_DAY)
@@ -3791,6 +3816,44 @@ int main(int argc, char* argv[]) {
             // Log CSV row
             if (csv) write_csv_row(csv, pass, actual_day, results, master_res, mkt_ret, today_mkt_val);
 
+            // MT1 direction collapse injection (fires after MT2 day is complete)
+            bool mt1_dir_inj[N_IND] = {};
+            if (actual_day >= MT1_START_DAY) {
+                for (int ind_i = 0; ind_i < N_IND; ind_i++) {
+                    MT1Scratch& sc = mt1_scratches[ind_i];
+                    if (sc.dir_cooldown > 0) sc.dir_cooldown--;
+                    if (sc.dir_streak >= MT1_DIR_STREAK_TRIP && sc.dir_cooldown == 0) {
+                        PCG32 inj_rng;
+                        inj_rng.seed((uint64_t)actual_day * 199933ULL + (uint64_t)ind_i * 7919ULL);
+                        float inj_tmp[MT1NN_PARAMS];
+                        // 10 mutations: 2 Gaussian perturbations per composite source (slots 20-24)
+                        for (int k = 0; k < MT1_COMP_INJECT; k++) {
+                            const float* src_w = sc.comp_elite(0, ELITE_COUNT + WAVG_COUNT + k);
+                            for (int m = 0; m < 2; m++) {
+                                float* dst = sc.comp_elite(0, k * 2 + m);
+                                memcpy(dst, src_w, MT1NN_PARAMS * sizeof(float));
+                                apply_gaussian(dst, MT1NN_PARAMS, cur_dir_sigma,
+                                               ((uint64_t)inj_rng.next() << 32) | inj_rng.next());
+                            }
+                        }
+                        // 5 median models: 0.5 x composite source + 0.5 x fresh random init
+                        for (int k = 0; k < MT1_COMP_INJECT; k++) {
+                            const float* src_w = sc.comp_elite(0, ELITE_COUNT + WAVG_COUNT + k);
+                            float* dst = sc.comp_elite(0, 10 + k);
+                            init_mt1_weights(inj_tmp, inj_rng);
+                            for (int p = 0; p < MT1NN_PARAMS; p++)
+                                dst[p] = 0.5f * src_w[p] + 0.5f * inj_tmp[p];
+                        }
+                        sc.dir_streak   = 0;
+                        sc.dir_cooldown = MT1_DIR_COOLDOWN_LEN;
+                        mt1_dir_inj[ind_i] = true;
+                        log_msg(std::string("[mt1-dir] ") + IND_SHORT[ind_i] +
+                                " direction collapse injection -- streak reset, cooldown=" +
+                                std::to_string(MT1_DIR_COOLDOWN_LEN));
+                    }
+                }
+            }
+
             // Write MT binary log record (once MT1 is active)
             if (mt_log && actual_day >= MT1_START_DAY) {
                 MTLogRecord rec{};
@@ -3823,6 +3886,8 @@ int main(int argc, char* argv[]) {
                 rec.mt2_slot0_pts  = master_res.elite_mean_pts;  // slot0 pts proxy
                 rec.mt2_ideal_pts  = master_res.ideal_pts;
                 rec.mt2_injected   = mt2_injected ? 1u : 0u;
+                for (int i = 0; i < N_IND; i++)
+                    rec.mt1_dir_injected[i] = mt1_dir_inj[i] ? 1u : 0u;
                 write_mt_log_record(mt_log, rec);
             }
 
