@@ -407,8 +407,8 @@ def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: 
         ax.axhline(3.0, color="gray", linewidth=0.8, linestyle="--",
                    label="Random baseline (3.0)")
 
-        # Mean n_correct_dbl across all industries (primary sort key denominator)
-        # Plotted on left axis (same 0-6 scale as scores). Triangle markers.
+        # Mean n_correct_dbl across all industries (primary sort key denominator).
+        # Scale 0–6: 4 older days × correct + today × 2 × correct. 3.0 = random.
         cdb_raw = [
             sum(r["mt1_dir_correct_dbl"]) / n_ind
             for r in records
@@ -418,35 +418,40 @@ def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: 
         markevery = max(1, len(xs_cdb) // 14)
         ax.plot(xs_cdb, cdb_vals, color="#e06000", linewidth=2.2,
                 marker="^", markersize=6, markevery=markevery,
-                zorder=6, label="Mean correct predictions (today×2)")
+                zorder=6, label="Mean correct direction calls (0–6, today×2)")
 
-        # % industries with rising portfolio value day-over-day (right y-axis)
+        # % industries with positive market return (right y-axis).
+        # Uses mkt_ret CSV columns if available; falls back to StockNN portfolio direction.
         if csv_rows:
             csv_by_day = {int(r["day"]): r for r in csv_rows}
+            has_mkt = any(f"{INDUSTRIES[0]}_mkt_ret" in r for r in csv_rows)
             net_pos_raw = []
             for r in records:
                 day = r["day"]
                 row = csv_by_day.get(day)
-                prev_row = csv_by_day.get(day - 1)
-                if row and prev_row:
+                if row and has_mkt:
                     pct = 100.0 * sum(
                         1 for ind in INDUSTRIES
-                        if float(row.get(f"{ind}_elite_mean", 0)) > float(prev_row.get(f"{ind}_elite_mean", 0))
+                        if float(row.get(f"{ind}_mkt_ret", 0)) > 0.0
                     ) / n_ind
+                elif row:
+                    prev_row = csv_by_day.get(day - 1)
+                    pct = 100.0 * sum(
+                        1 for ind in INDUSTRIES
+                        if prev_row and float(row.get(f"{ind}_elite_mean", 0)) > float(prev_row.get(f"{ind}_elite_mean", 0))
+                    ) / n_ind if prev_row else 0.0
                 else:
                     pct = 0.0
                 net_pos_raw.append(pct)
         else:
-            net_pos_raw = [
-                100.0 * sum(1 for i in range(n_ind) if r["mt1"]["direction"]["mean"][i] > 3.0) / n_ind
-                for r in records
-            ]
+            net_pos_raw = [0.0] * len(records)
         xs_np, net_pos = _smooth(xs_raw, net_pos_raw)
         ax2 = ax.twinx()
         ax2.plot(xs_np, net_pos, color="#808080", linewidth=2.5, zorder=4,
-                 label="% portfolio up day-over-day")
+                 label="% industries up today")
+        ax2.axhline(50.0, color="#cccccc", linewidth=0.6, linestyle=":", zorder=1)
         ax2.set_ylim(0, 100)
-        ax2.set_ylabel("% industries up day-over-day", fontsize=10, color="#606060")
+        ax2.set_ylabel("% industries mkt_ret > 0", fontsize=10, color="#606060")
         ax2.tick_params(labelsize=8, colors="#606060")
         ax2.spines["right"].set_color("#808080")
     else:
@@ -463,10 +468,10 @@ def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: 
     if comp == "direction":
         extra.append(mlines.Line2D([], [], color="#e06000", linewidth=2.2,
                                    marker="^", markersize=6,
-                                   label="Mean correct predictions (today×2)"))
+                                   label="Mean correct direction calls (0–6, today×2)"))
     if ax2 is not None:
         extra.append(mlines.Line2D([], [], color="#808080", linewidth=2.5,
-                                   label="% industries up day-over-day (right axis)"))
+                                   label="% industries mkt_ret > 0 (right axis)"))
     _industry_legend(ax, extra_handles=extra)
     _save(fig, out_path)
 
@@ -561,8 +566,9 @@ def _mt2_realistic_random_baseline(rows: list[dict]) -> tuple[float, int, tuple]
 
 
 def plot_mt2(rows: list[dict], pass_num: int, out_path: Path) -> None:
+    import math
     fig, ax = plt.subplots(figsize=(FIG_W, 9))
-    fig.subplots_adjust(bottom=0.13)
+    fig.subplots_adjust(bottom=0.13, right=0.88)
 
     xs_raw    = [int(r["day"]) for r in rows]
     means_raw = [r["mt2_elite_mean_pts"] for r in rows]
@@ -575,24 +581,73 @@ def plot_mt2(rows: list[dict], pass_num: int, out_path: Path) -> None:
     xs_n, mins_s = _smooth(xs_raw, mins_raw)
     xs_i, ideals = _smooth(xs_raw, ideals_raw)
 
-    ax.plot(xs_m, means,  color="#1f77b4", linewidth=1.5,  alpha=0.90, label="Elite mean")
-    ax.plot(xs_b, maxes,  color="#1f77b4", linewidth=0.75, alpha=0.55, linestyle="--", label="Elite max")
-    ax.plot(xs_n, mins_s, color="#1f77b4", linewidth=0.75, alpha=0.55, linestyle="--", label="Elite min")
-    ax.plot(xs_i, ideals, color="#2ca02c", linewidth=1.8,  alpha=0.90, label="Ideal (slot0 basis)")
+    # Left axis: separate colors for max / mean / min + ideal
+    COL_MAX  = "#2ca02c"   # green  — max
+    COL_MEAN = "#1f77b4"   # blue   — mean
+    COL_MIN  = "#d62728"   # red    — min
+    ax.plot(xs_b, maxes,  color=COL_MAX,  linewidth=1.4, alpha=0.85, label="Elite max")
+    ax.plot(xs_m, means,  color=COL_MEAN, linewidth=1.8, alpha=0.90, label="Elite mean")
+    ax.plot(xs_n, mins_s, color=COL_MIN,  linewidth=1.0, alpha=0.75, label="Elite min")
+    ax.plot(xs_i, ideals, color="#000000", linewidth=1.6, alpha=0.85,
+            linestyle=(0, (5, 2)), label="Ideal (optimal allocation)")
 
     rand_score, t0m, assign = _mt2_realistic_random_baseline(rows)
     n0, n1, n2, n3 = assign
-    ax.axhline(rand_score, color="#d62728", linewidth=1.0, alpha=0.90, linestyle="-",
-               label=f"Random baseline (t0m={t0m}: {n0}×T0 {n1}×T1 {n2}×T2 {n3}×T3 → E={rand_score:.2f})")
-
+    ax.axhline(rand_score, color="#888888", linewidth=1.0, alpha=0.80, linestyle="--",
+               label=f"Random baseline → E={rand_score:.2f}")
     ax.axhline(_MT2_INJ_THRESHOLD, color="#ff7f0e", linewidth=0.8, alpha=0.85, linestyle="-",
                label=f"75% injection threshold ({_MT2_INJ_THRESHOLD:.0f} pts)")
     ax.axhline(0, color="#dddddd", linewidth=0.5, zorder=1)
+
+    # Right axis: score/ideal ratio [0,1] — only plotted when ideal > 0
+    def _ratio(score, ideal):
+        if ideal is None or ideal < 0.5:
+            return float("nan")
+        return max(0.0, min(1.0, score / ideal))
+
+    ratio_max_raw  = [_ratio(mx,  id_) for mx,  id_ in zip(maxes_raw,  ideals_raw)]
+    ratio_mean_raw = [_ratio(mn,  id_) for mn,  id_ in zip(means_raw,  ideals_raw)]
+    ratio_min_raw  = [_ratio(mi,  id_) for mi,  id_ in zip(mins_raw,   ideals_raw)]
+
+    def _filter_nan(xs, ys):
+        pairs = [(x, y) for x, y in zip(xs, ys) if not math.isnan(y)]
+        return ([p[0] for p in pairs], [p[1] for p in pairs]) if pairs else ([], [])
+
+    xs_rb, rm_b = _filter_nan(xs_raw, ratio_max_raw)
+    xs_rm, rm_m = _filter_nan(xs_raw, ratio_mean_raw)
+    xs_rn, rm_n = _filter_nan(xs_raw, ratio_min_raw)
+    xs_rb, rm_b = _smooth(xs_rb, rm_b) if xs_rb else ([], [])
+    xs_rm, rm_m = _smooth(xs_rm, rm_m) if xs_rm else ([], [])
+    xs_rn, rm_n = _smooth(xs_rn, rm_n) if xs_rn else ([], [])
+
+    ax2 = ax.twinx()
+    if xs_rb:  ax2.plot(xs_rb, rm_b, color=COL_MAX,  linewidth=1.4, alpha=0.65, linestyle=":")
+    if xs_rm:  ax2.plot(xs_rm, rm_m, color=COL_MEAN, linewidth=1.8, alpha=0.65, linestyle=":")
+    if xs_rn:  ax2.plot(xs_rn, rm_n, color=COL_MIN,  linewidth=1.0, alpha=0.55, linestyle=":")
+    ax2.axhline(1.0, color="#aaaaaa", linewidth=0.5, linestyle=":", alpha=0.5)
+    ax2.axhline(0.0, color="#aaaaaa", linewidth=0.5, linestyle=":", alpha=0.5)
+    ax2.set_ylim(-0.1, 1.2)
+    ax2.set_ylabel("score / ideal  (right axis, dotted)", fontsize=9, color="#555555")
+    ax2.tick_params(labelsize=8, colors="#555555")
+    ax2.spines["right"].set_color("#aaaaaa")
+    ax2.yaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f"{v:.1f}"))
+
     _style_ax(ax,
               f"MT2 Allocation Score (Elite Pool) — Pass {pass_num}",
               f"Day (Pass {pass_num})", "Score (pts)")
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.10), ncol=3,
-              fontsize=9, framealpha=0.95, edgecolor="#cccccc")
+    legend_handles = [
+        mlines.Line2D([], [], color=COL_MAX,  linewidth=1.4, label="Elite max"),
+        mlines.Line2D([], [], color=COL_MEAN, linewidth=1.8, label="Elite mean"),
+        mlines.Line2D([], [], color=COL_MIN,  linewidth=1.0, label="Elite min"),
+        mlines.Line2D([], [], color="#000000", linewidth=1.6, linestyle=(0, (5, 2)), label="Ideal"),
+        mlines.Line2D([], [], color="#888888", linewidth=1.0, linestyle="--",
+                      label=f"Random (t0m={t0m}: {n0}×T0 {n1}×T1 {n2}×T2 {n3}×T3 → {rand_score:.2f})"),
+        mlines.Line2D([], [], color="#ff7f0e", linewidth=0.8, label=f"75% injection ({_MT2_INJ_THRESHOLD:.0f} pts)"),
+        mlines.Line2D([], [], color="#555555", linewidth=1.4, linestyle=":",
+                      label="max/mean/min ÷ ideal  (right axis, only when ideal > 0)"),
+    ]
+    ax.legend(handles=legend_handles, loc="upper center", bbox_to_anchor=(0.5, -0.10),
+              ncol=3, fontsize=9, framealpha=0.95, edgecolor="#cccccc")
     _save(fig, out_path)
 
 # ── Market data graphs ────────────────────────────────────────────────────────
