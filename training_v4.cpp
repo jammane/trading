@@ -3,7 +3,7 @@
 // Run:   ./build/training_v4_cpp --output models [--load-dir DIR] [--start-day N] [--stop-day N]
 //        [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F] [--workers N]
 
-#define TRAINER_VERSION "0.2.1.5"
+#define TRAINER_VERSION "0.2.2.0"
 
 #include <algorithm>
 #include <atomic>
@@ -449,6 +449,8 @@ struct MasterState {
     MasterPortfolio portfolios[N_SLOTS];
     // Per-industry rolling value history: oldest-first, length ind_hist_count (≤ IND_HIST_CAP)
     float           ind_val_hist[N_IND][IND_HIST_CAP];
+    // Parallel market cumulative-return index (starts at IND_STARTING_CASH each pass)
+    float           mkt_val_hist[N_IND][IND_HIST_CAP];
     int             ind_hist_count{0};
     // Consecutive tier-0 counter per slot per industry; slot 0 persists across days
     int             zero_counts[N_SLOTS][N_IND];
@@ -2121,7 +2123,7 @@ static MT1ScoreBreakdown compute_mt1_scores(
     float sc_rng    = (m < 1.f) ? m : 0.f;
 
     float denom  = fmaxf(fabsf(actual_d), acc_floor);
-    float sc_acc = fmaxf(0.f, 1.f - err / denom);
+    float sc_acc = denom / (err + denom);
 
     float d      = err;
     float dor    = (r > 1e-9f) ? d / r : (d > 0.f ? 1e9f : 0.f);
@@ -2239,9 +2241,9 @@ static MT1CompResult step_mt1_component(
                     prev_conf_pos = conf_pos; prev_conf_pos_valid = true;
                     prev_act_pos  = act_pos;  prev_act_pos_valid  = true;
                 } else if (pool_id == 1) {
-                    // Accuracy pool: continuous scoring, no hard floor
+                    // Accuracy pool: proportional to acc_floor (scale-relative, always in (0,1])
                     float err = fabsf(e.actual_d - delta_d);
-                    day_score = 1.f / (err + 1.f);
+                    day_score = acc_floor / (err + acc_floor);
                 } else {
                     auto sb = compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling);
                     day_score = (pool_id == 2) ? sb.range : sb.confidence;
@@ -2319,7 +2321,7 @@ static MT1CompResult step_mt1_component(
                 } else if (pool_id == 1) {
                     float delta_d = tanhf(out4[1]) * MT1_SCALE_DOLLARS;
                     float err     = fabsf(e.actual_d - delta_d);
-                    day_score = 1.f / (err + 1.f);
+                    day_score = acc_floor / (err + acc_floor);
                 } else {
                     auto sb = compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling);
                     day_score = (pool_id == 2) ? sb.range : sb.confidence;
@@ -3419,13 +3421,17 @@ static void warmup_history(IndustryState* ind_states,
 // ── CSV logging ────────────────────────────────────────────────────────────────
 
 static void write_csv_row(FILE* csv, int pass_num, int actual_day,
-                           const IndResult* res, const MasterResult& mst) {
+                           const IndResult* res, const MasterResult& mst,
+                           const float mkt_ret[N_IND], const float mkt_val[N_IND]) {
     fprintf(csv, "%d,%d", pass_num + 1, actual_day + 1);
     for (int i = 0; i < N_IND; i++)
         fprintf(csv, ",%+10.2f,%+10.2f,%+10.2f",
                 res[i].elite_max_val, res[i].elite_min_val, res[i].elite_mean_val);
-    fprintf(csv, ",%+.2f,%+.2f,%+.2f,%+.2f\n",
+    fprintf(csv, ",%+.2f,%+.2f,%+.2f,%+.2f",
             mst.elite_max_pts, mst.elite_min_pts, mst.elite_mean_pts, mst.ideal_pts);
+    for (int i = 0; i < N_IND; i++)
+        fprintf(csv, ",%.6f,%.2f", mkt_ret[i], mkt_val[i]);
+    fprintf(csv, "\n");
     fflush(csv);
 }
 
@@ -3576,7 +3582,11 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < N_IND; i++)
             fprintf(csv, ",%s_elite_max,%s_elite_min,%s_elite_mean",
                     g_ind_names[i].c_str(), g_ind_names[i].c_str(), g_ind_names[i].c_str());
-        fprintf(csv, ",mt2_elite_max_pts,mt2_elite_min_pts,mt2_elite_mean_pts,mt2_ideal_pts\n");
+        fprintf(csv, ",mt2_elite_max_pts,mt2_elite_min_pts,mt2_elite_mean_pts,mt2_ideal_pts");
+        for (int i = 0; i < N_IND; i++)
+            fprintf(csv, ",%s_mkt_ret,%s_mkt_val",
+                    g_ind_names[i].c_str(), g_ind_names[i].c_str());
+        fprintf(csv, "\n");
     }
 
     // Open binary MT log (goes to log_dir, not output_dir)
@@ -3635,6 +3645,7 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < N_IND; i++) mst->portfolios[0].holdings[i] = 0.f;
         for (int s = 1; s < N_SLOTS; s++) mst->portfolios[s] = mst->portfolios[0];
         memset(mst->ind_val_hist, 0, sizeof(mst->ind_val_hist));
+        memset(mst->mkt_val_hist, 0, sizeof(mst->mkt_val_hist));
         mst->ind_hist_count = 0;
         memset(mst->zero_counts, 0, sizeof(mst->zero_counts));
 
@@ -3688,22 +3699,43 @@ int main(int argc, char* argv[]) {
                 for (int j = 0; j < IND_SYMS; j++)
                     update_hist_sym(ind_states[i].hist[j], day_ptr->sym[i][j]);
 
-            // Build 444-feature vector (uses ind_val_hist from BEFORE today)
-            float today444[444];
-            build_master_features(mst->ind_val_hist, mst->ind_hist_count, today444);
+            // Compute equal-weight market close-to-close return per industry
+            float mkt_ret[N_IND] = {};
+            if (fill_ptr != nullptr) {
+                for (int i = 0; i < N_IND; i++) {
+                    float sum = 0.f; int valid = 0;
+                    for (int j = 0; j < IND_SYMS; j++) {
+                        const OHLCV& tod = day_ptr->sym[i][j];
+                        const OHLCV& nxt = fill_ptr->sym[i][j];
+                        if (tod.valid && nxt.valid && tod.close > 1e-3f) {
+                            sum += nxt.close / tod.close - 1.f; valid++;
+                        }
+                    }
+                    mkt_ret[i] = valid > 0 ? sum / valid : 0.f;
+                }
+            }
+            // Median market return (relative direction target: always ~50% positive)
+            float sorted_ret[N_IND];
+            memcpy(sorted_ret, mkt_ret, sizeof(mkt_ret));
+            std::nth_element(sorted_ret, sorted_ret + N_IND/2, sorted_ret + N_IND);
+            float median_ret = sorted_ret[N_IND/2];
 
-            // Compute actual fractional returns from slot0 results
+            // actual_perf for MT2: absolute fractional market return per industry
             float actual_perf[N_IND] = {};
             for (int i = 0; i < N_IND; i++)
-                if (results[i].baseline > 0.f)
-                    actual_perf[i] = results[i].slot0_score / results[i].baseline - 1.f;
+                actual_perf[i] = mkt_ret[i];
+
+            // Build 444-feature vector using cumulative market index (from BEFORE today)
+            float today444[444];
+            build_master_features(mst->mkt_val_hist, mst->ind_hist_count, today444);
 
             // MT1 step × 12 (actual_day >= MT1_START_DAY)
+            // actual_d = (mkt_ret - median_ret) × scale: relative target, always ~50% positive
             MT1Result mt1_res[N_IND] = {};
             if (actual_day >= MT1_START_DAY) {
                 for (int i = 0; i < N_IND; i++) {
                     const float* in37 = today444 + i * 37;
-                    float actual_d_i  = results[i].slot0_score - results[i].baseline;
+                    float actual_d_i  = (mkt_ret[i] - median_ret) * MT1_SCALE_DOLLARS;
                     mt1_res[i] = step_mt1(i, mt1_scratches[i], actual_d_i,
                                           in37, actual_day,
                                           cur_dir_sigma, cur_rng_sigma,
@@ -3727,8 +3759,24 @@ int main(int argc, char* argv[]) {
                                       actual_day, total_days, cur_mt2_sigma, &mt2_injected);
             }
 
-            // Append today's best-slot industry values to rolling ind_val_hist buffer
+            // Append today's values to rolling histories
+            float today_mkt_val[N_IND];
             for (int i = 0; i < N_IND; i++) {
+                // Market cumulative index: prev × (1 + mkt_ret)
+                float prev_mkt = (mst->ind_hist_count > 0)
+                    ? (mst->ind_hist_count < IND_HIST_CAP
+                        ? mst->mkt_val_hist[i][mst->ind_hist_count - 1]
+                        : mst->mkt_val_hist[i][IND_HIST_CAP - 1])
+                    : static_cast<float>(IND_STARTING_CASH);
+                today_mkt_val[i] = prev_mkt * (1.f + mkt_ret[i]);
+                if (mst->ind_hist_count < IND_HIST_CAP) {
+                    mst->mkt_val_hist[i][mst->ind_hist_count] = today_mkt_val[i];
+                } else {
+                    memmove(mst->mkt_val_hist[i], mst->mkt_val_hist[i] + 1,
+                            (IND_HIST_CAP - 1) * sizeof(float));
+                    mst->mkt_val_hist[i][IND_HIST_CAP - 1] = today_mkt_val[i];
+                }
+                // StockNN best-slot portfolio value (kept for reference)
                 float today_v = results[i].baseline + results[i].best_delta;
                 if (mst->ind_hist_count < IND_HIST_CAP) {
                     mst->ind_val_hist[i][mst->ind_hist_count] = today_v;
@@ -3741,7 +3789,7 @@ int main(int argc, char* argv[]) {
             if (mst->ind_hist_count < IND_HIST_CAP) mst->ind_hist_count++;
 
             // Log CSV row
-            if (csv) write_csv_row(csv, pass, actual_day, results, master_res);
+            if (csv) write_csv_row(csv, pass, actual_day, results, master_res, mkt_ret, today_mkt_val);
 
             // Write MT binary log record (once MT1 is active)
             if (mt_log && actual_day >= MT1_START_DAY) {

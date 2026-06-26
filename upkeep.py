@@ -391,7 +391,7 @@ def _mt1_score_breakdown(out4, actual_d, acc_floor, range_ceiling=None):
     score_rng = m if m < 1.0 else 0.0
 
     denom     = max(abs(actual_d), acc_floor)
-    score_acc = max(0.0, 1.0 - err / denom)
+    score_acc = denom / (err + denom)
 
     d         = err
     dor       = (d / r) if r > 1e-9 else (1e9 if d > 0.0 else 0.0)
@@ -473,7 +473,7 @@ def _mt1_burst_component(prefix, model_dir, dir_hist, actual_d,
                     prev_act_pos  = act_pos
                 elif score_idx == 1:
                     err = abs(ad - delta_d)
-                    day_score = 1.0 / (err + 1.0)
+                    day_score = acc_floor / (err + acc_floor)
                 else:
                     bd = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)
                     day_score = bd[_sc_idx]
@@ -625,10 +625,10 @@ def upkeep_industry(industry, symbols, model_dir, primed_portfolio,
 
 # ── MT1 upkeep ─────────────────────────────────────────────────────────────────
 
-def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i,
+def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
                          dir_sigma=UPKEEP_DIR_SIGMA, rng_sigma=UPKEEP_RNG_SIGMA,
                          acc_sigma=UPKEEP_ACC_SIGMA, cfd_sigma=UPKEEP_CFD_SIGMA,
-                         portfolio_value=None, rolling_state=None):
+                         rolling_state=None):
     """
     One evolution step for one industry's MT1NN 5-pool system.
 
@@ -637,13 +637,12 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i,
     MT1_BLEND_SLOTS=200 fresh blends from component direct elites each day, scored by
     composite score. Injection cascade: composite→dir, composite→rng, dir→acc, rng→cfd.
 
-    industry:        industry key (e.g. 'energy')
-    model_dir:       directory containing model files
-    in37_t:          (1, 37) tensor — this industry's slice of build_master_features output
-    actual_perf_i:   float — fractional return (slot0_score / baseline - 1) for today
-    dir/rng/acc/cfd_sigma: per-component mutation sigma (defaults match analysis recommendations)
-    portfolio_value: current slot0 industry portfolio value (dollars); defaults to IND_STARTING_CASH
-    rolling_state:   mutable dict with per-industry rolling buffer; updated in place.
+    industry:  industry key (e.g. 'energy')
+    model_dir: directory containing model files
+    in37_t:    (1, 37) tensor — this industry's slice of build_master_features output
+    actual_d:  float — relative market dollar P&L = (mkt_ret - median_mkt_ret) × MT1_SCALE_DOLLARS
+    dir/rng/acc/cfd_sigma: per-component mutation sigma
+    rolling_state: mutable dict with per-industry rolling buffer; updated in place.
 
     File naming:
       Component pools: mt1_{ind}_{dir|acc|rng|cfd}_model_{slot}.pt
@@ -654,12 +653,9 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_perf_i,
     Returns (best_comp_score, best_comp_score, slot0_conf, slot0_delta_t, slot0_range_pct,
              slot0_conf4) — slot0 is the winning composite model.
     """
-    if portfolio_value is None:
-        portfolio_value = IND_STARTING_CASH
     if rolling_state is None:
         rolling_state = {}
 
-    actual_d   = actual_perf_i * portfolio_value
     ind_rs     = rolling_state.setdefault(industry, {})
     acc_floor  = _rolling_acc_floor(ind_rs)
 
@@ -1358,10 +1354,11 @@ def upkeep_mt2(model_dir, mt1_slot0_outputs, actual_perf, industry_list,
 
 # ── Production inference (MT1 → MT2) ──────────────────────────────────────────
 
-def run_mt_inference(model_dir, industries, ind_value_history, zero_counts, total_cash):
+def run_mt_inference(model_dir, industries, mkt_val_history, zero_counts, total_cash):
     """
     MT1→MT2 inference chain for daily capital allocation in production.
 
+    mkt_val_history: {ind: [cumulative_market_index]} — features for MT1/MT2 input.
     Loads mt1_{ind}_best.pt for each industry and mt2_best.pt, runs the full
     chain, and returns (allocations, tier_map, mt1_outputs).
 
@@ -1374,7 +1371,7 @@ def run_mt_inference(model_dir, industries, ind_value_history, zero_counts, tota
     from training_lib import build_master_features, tiers_to_alloc
 
     industry_list = list(industries.keys())
-    today444 = build_master_features(ind_value_history, industry_list)
+    today444 = build_master_features(mkt_val_history, industry_list)
 
     mt1_outputs: dict = {}
     for i, ind in enumerate(industry_list):
