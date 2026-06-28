@@ -80,12 +80,18 @@ UPKEEP_DIR_SIGMA  = 0.006   # MT1 direction pool
 UPKEEP_RNG_SIGMA  = 0.004   # MT1 range pool (stable; ceiling cull handles exploration)
 UPKEEP_ACC_SIGMA  = 0.006   # MT1 accuracy pool (noisy until industry stabilizes)
 UPKEEP_CFD_SIGMA  = 0.003   # MT1 confidence pool (most stable; fine-tune only)
-UPKEEP_MT2_SIGMA  = 0.002   # MT2 (over-perturbed at 0.006; needs 3× reduction)
+UPKEEP_MT2_SIGMA  = 0.001   # MT2 (v0.2.6.0: 0.002→0.001 to tighten the pool)
 MT1_SCALE_DOLLARS = 10000.0   # tanh ceiling for dollar P&L prediction
 MT1_FLOOR_COLD    = 250.0     # acc_floor cold-start (÷2 = $125)
 MT1_ROLLING_DAYS  = 10        # days in rolling buffers
 MT2_INJ_THRESHOLD = -7.0      # injection fires when ≥75% of pool below this
 MT2_INJ_MIN_BELOW = int(N_SLOTS * 0.75)  # 150 of 200
+
+# Weighted children per parent for MT1 component pools (mirror of C++ kChildren): slot0=13,
+# slots1-4=11/11/10/10, slots5-19=7, injected slots20-24=3. Sums to 175 = MT1_COMP_SLOTS-PARENTS.
+_MT1_CHILDREN     = [13, 11, 11, 10, 10] + [7] * 12 + [7] * 3 + [3] * 5
+MT1_PARENT_OF_MUT = [p for p, c in enumerate(_MT1_CHILDREN) for _ in range(c)]
+assert len(MT1_PARENT_OF_MUT) == MT1_COMP_SLOTS - MT1_COMP_PARENTS, "MT1 children table must sum to 175"
 
 
 
@@ -237,9 +243,11 @@ def _select_and_mutate_mt1_component(prefix, model_dir, scores, sigma,
 
     del cache
 
-    # Mutations: 7 children per parent, round-robin over MT1_COMP_PARENTS (25) parents
+    # Mutations: weighted children per parent (mirror of C++ kChildren) — concentrate breeding on
+    # proven elites (slot0=13, slots1-4=11/11/10/10, slots5-19=7) and starve unproven injected
+    # immigrants (slots 20-24 = 3 each). Sums to 175 = MT1_COMP_SLOTS - MT1_COMP_PARENTS.
     for i, slot in enumerate(range(MT1_COMP_PARENTS, MT1_COMP_SLOTS)):
-        parent_rank = i % MT1_COMP_PARENTS
+        parent_rank = MT1_PARENT_OF_MUT[i]
         parent = load_slot_model(prefix, model_dir, parent_rank, MT1NN)
         child  = _mutate_generic(parent, MT1NN, sigma)
         save_slot_model(prefix, model_dir, slot, child)
@@ -361,6 +369,16 @@ def _rolling_update(ind_state, abs_actual_d, comp0_residual):
 
 # ── MT1 scoring ────────────────────────────────────────────────────────────────
 
+def mt1_win_weight(di, day_count):
+    """Linear scoring-window weight (mirror of C++ mt1_win_weight): today (di=day_count-1) = 2.0,
+    a day MT1_DIR_DAYS-1 steps back = 1.0. Anchored to MT1_DIR_DAYS (absolute age)."""
+    if MT1_DIR_DAYS <= 1:
+        return 2.0
+    age = day_count - 1 - di
+    w = 2.0 - age / (MT1_DIR_DAYS - 1)
+    return 1.0 if w < 1.0 else w
+
+
 def _mt1_score_breakdown(out4, actual_d, acc_floor, range_ceiling=None):
     """
     Score one MT1 slot against the industry's actual dollar P&L.
@@ -371,8 +389,9 @@ def _mt1_score_breakdown(out4, actual_d, acc_floor, range_ceiling=None):
     range_ceiling: float or None — cap on range r (None = no ceiling)
     Returns (composite, direction, range_, accuracy, confidence) all in [0.0, 1.0].
 
-    Composite = 0.50×direction + 0.33×range + 0.17×accuracy (out[0–2] only).
-    Confidence (out[3]) is scored separately and does not enter composite.
+    Composite = equal-weight mean of the four components' secondary [0,1] normalizations
+    against each one's naive baseline (mirror of C++ compute_mt1_scores). The returned
+    direction/range/accuracy/confidence are the RAW component scores (used by the pools).
     """
     conf     = torch.sigmoid(out4[0]).item()
     delta_t  = torch.tanh(out4[1]).item()
@@ -401,7 +420,28 @@ def _mt1_score_breakdown(out4, actual_d, acc_floor, range_ceiling=None):
     if err > r:
         score_conf = 0.5 + 0.25 * score_conf  # compress outside-range to [0.5, 0.75]
 
-    composite = 0.50 * score_dir + 0.33 * score_rng + 0.17 * score_acc
+    # Secondary [0,1] normalization per component vs naive baseline B (ideal=1):
+    #   sec = clamp((raw - B) / (1 - B), 0, 1)  → naive→0, ideal→1.  (mirror of C++)
+    def _c01(x):
+        return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
+
+    b_dir   = 0.5                                          # conf = 0.5, no view
+    sec_dir = _c01((score_dir - b_dir) / max(1.0 - b_dir, 1e-6))
+
+    b_acc   = denom / (abs(actual_d) + denom)              # predict-0 null model
+    sec_acc = _c01((score_acc - b_acc) / max(1.0 - b_acc, 1e-6))
+
+    m_naive = (err / acc_floor) if acc_floor > 1e-9 else (1e9 if err > 0.0 else 0.0)
+    b_rng   = m_naive if m_naive < 1.0 else 0.0            # band = unconditional scale (acc_floor)
+    sec_rng = _c01((score_rng - b_rng) / max(1.0 - b_rng, 1e-6))
+
+    diff0   = 0.5 - ideal                                  # conf4 = 0.5
+    b_cfd   = 1.0 - diff0 * diff0
+    if err > r:
+        b_cfd = 0.5 + 0.25 * b_cfd
+    sec_cfd = _c01((score_conf - b_cfd) / max(1.0 - b_cfd, 1e-6))
+
+    composite = 0.25 * (sec_dir + sec_acc + sec_rng + sec_cfd)
     return composite, score_dir, score_rng, score_acc, score_conf
 
 
@@ -477,7 +517,7 @@ def _mt1_burst_component(prefix, model_dir, dir_hist, actual_d,
                 else:
                     bd = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)
                     day_score = bd[_sc_idx]
-                total += day_score * 2.0 if is_today else day_score
+                total += day_score * mt1_win_weight(di, len(dir_hist))
         if not culled and score_idx == 0 and len(dir_hist) >= 2:
             required = (market_flips + 1) // 2
             if conf_crossings < required:
@@ -720,16 +760,11 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
                 del child
             del base
 
-        # Load injection models into slots 20–24 from cascade source before scoring/selection
+        # Load injection models into slots 20–24 from cascade source before scoring/selection.
+        # All four pools now inject from the (balanced, equal-weight) composite top-5 — mirror of
+        # C++ Change 3. dir_inject/rng_inject sources are no longer used.
         inject_slot_base = ELITE_COUNT + WAVG_COUNT  # slot 20
-        if pool_id == 0:
-            inject_src_pattern = f'mt1_{industry}_comp_inject_{{}}.pt'
-        elif pool_id == 1:
-            inject_src_pattern = f'mt1_{industry}_dir_inject_{{}}.pt'
-        elif pool_id == 2:
-            inject_src_pattern = f'mt1_{industry}_comp_inject_{{}}.pt'
-        else:
-            inject_src_pattern = f'mt1_{industry}_rng_inject_{{}}.pt'
+        inject_src_pattern = f'mt1_{industry}_comp_inject_{{}}.pt'
         for k in range(MT1_COMP_INJECT):
             src = os.path.join(model_dir, inject_src_pattern.format(k))
             if os.path.exists(src):
@@ -794,7 +829,7 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
                         else:
                             breakdown = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)
                             day_score = breakdown[2 if pool_id == 2 else 4]
-                        total_sum += day_score * 2.0 if is_today else day_score
+                        total_sum += day_score * mt1_win_weight(di, len(dir_hist))
                 # Direction flip cull after full window
                 if not culled and pool_id == 0 and len(dir_hist) >= 2:
                     required = (market_flips + 1) // 2
@@ -847,7 +882,7 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
                         else:
                             breakdown = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)
                             day_score = breakdown[2 if pool_id == 2 else 4]
-                        total_sum += day_score * 2.0 if is_today else day_score
+                        total_sum += day_score * mt1_win_weight(di, len(dir_hist))
                 hist_sort_key = hcdb * 10.0 + total_sum if pool_id == 0 else total_sum
                 hist_with_scores.append((hm, hist_sort_key))
         del comp_hist_models_raw
@@ -993,7 +1028,7 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
                 is_today = (di == len(dir_hist) - 1)
                 out4 = bm(feat_t).squeeze(0)
                 day_sc = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)[0]
-                total_sum += day_sc * 2.0 if is_today else day_sc
+                total_sum += day_sc * mt1_win_weight(di, len(dir_hist))
         comp_sc = total_sum
         blend_scored.append((bm, comp_sc))
         del avg_st
@@ -1027,7 +1062,7 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
                                     is_today = (di == len(dir_hist) - 1)
                                     out4 = hm(feat_t).squeeze(0)
                                     day_sc = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)[0]
-                                    total_sum += day_sc * 2.0 if is_today else day_sc
+                                    total_sum += day_sc * mt1_win_weight(di, len(dir_hist))
                             comp_sc = total_sum
                             hist_candidates.append((hm, comp_sc))
                         except Exception:
@@ -1092,7 +1127,17 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
     del blend_scored, hist_candidates, all_candidates
     gc.collect()
 
-    return best_comp_score, best_comp_score, slot0_conf, slot0_delta_t, slot0_range_pct, slot0_conf4
+    # Direction-pool slot0 activations (MT2 direction-feed source; mirror of C++ dir0_*)
+    try:
+        dir0_model = load_slot_model(f'mt1_{industry}_dir', model_dir, 0, MT1NN)
+        d0_conf, d0_delta_t, d0_range_pct, d0_conf4 = _mt1_decode(dir0_model, in37_t)
+        del dir0_model
+    except Exception:
+        d0_conf, d0_delta_t, d0_range_pct, d0_conf4 = (slot0_conf, slot0_delta_t,
+                                                       slot0_range_pct, slot0_conf4)
+
+    return (best_comp_score, best_comp_score, slot0_conf, slot0_delta_t, slot0_range_pct,
+            slot0_conf4, d0_conf, d0_delta_t, d0_range_pct, d0_conf4)
 
 
 # ── MT2 upkeep ─────────────────────────────────────────────────────────────────
@@ -1389,11 +1434,24 @@ def run_mt_inference(model_dir, industries, mkt_val_history, zero_counts, total_
         mt1_outputs[ind] = (conf, delta_t, range_pct, conf4)
         del mt1_m
 
-    # Build in48: raw activations, no normalization
+    # Build in48 for MT2: direction-pool slot0 when MT2_FEED_DIRECTION (mirror of C++), else
+    # composite. Uses mt1_{ind}_dir_best.pt; falls back to composite if absent (convert_weights.py
+    # must emit dir_best for this path to activate — until then it degrades to composite cleanly).
+    from training_lib import MT2_FEED_DIRECTION
     in48 = []
-    for ind in industry_list:
-        conf, delta_t, range_pct, conf4 = mt1_outputs[ind]
-        in48.extend([conf, delta_t, range_pct, conf4])
+    for i, ind in enumerate(industry_list):
+        feed = mt1_outputs[ind]
+        if MT2_FEED_DIRECTION:
+            dpath = os.path.join(model_dir, f"mt1_{ind}_dir_best.pt")
+            if os.path.exists(dpath):
+                try:
+                    dm = MT1NN(); dm.load_state_dict(torch.load(dpath, weights_only=True)); dm.eval()
+                    with torch.no_grad():
+                        feed = _mt1_decode(dm, today444[:, i * 37:(i + 1) * 37])
+                    del dm
+                except Exception:
+                    feed = mt1_outputs[ind]
+        in48.extend(list(feed))
     in48_t = torch.tensor(in48, dtype=torch.float32).unsqueeze(0)   # (1, 48)
 
     mt2_path = os.path.join(model_dir, 'mt2_best.pt')

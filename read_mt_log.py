@@ -21,6 +21,7 @@ RECORD_SIZE_V3  = 792   # added dir/rng/acc component stats (4 stats × 3 compon
 RECORD_SIZE_V4  = 984   # added conf4 component stats (4 stats × 5 components × 12 ind)
 RECORD_SIZE_V5  = 1032  # added mt1_dir_correct_dbl[12] — mean n_correct_dbl for direction pool
 RECORD_SIZE_V6  = 1044  # added mt1_dir_injected[12] — direction collapse injection flags
+RECORD_SIZE_V7  = 1244  # added mt1_slot0_act[12][4] + mt2_consensus flat/wtd
 MAGIC           = 0x4D543132   # 'MT12'
 N_IND           = 12
 
@@ -54,6 +55,8 @@ RECORD_FMT_V3 = '<II' + 'f'*12 * 16 + 'fff' + 'B3x'  # 4 stats × 4 components �
 RECORD_FMT_V4 = '<II' + 'f'*12 * 20 + 'fff' + 'B3x'  # 4 stats × 5 components × 12 ind
 RECORD_FMT_V5 = '<II' + 'f'*12 * 21 + 'fff' + 'B3x'       # + dir_correct_dbl[12]
 RECORD_FMT_V6 = '<II' + 'f'*12 * 21 + 'fff' + 'B3x' + '12B'  # + mt1_dir_injected[12]
+RECORD_FMT_V7 = '<II' + 'f'*12 * 21 + 'fff' + 'B3x' + '12B' + '50f'  # + slot0_act[48] + consensus[2]
+assert struct.calcsize(RECORD_FMT_V7) == RECORD_SIZE_V7
 assert struct.calcsize(RECORD_FMT_V1) == RECORD_SIZE_V1
 assert struct.calcsize(RECORD_FMT_V2) == RECORD_SIZE_V2
 assert struct.calcsize(RECORD_FMT_V3) == RECORD_SIZE_V3
@@ -65,18 +68,21 @@ assert struct.calcsize(RECORD_FMT_V6) == RECORD_SIZE_V6
 def parse_log(path):
     file_size = os.path.getsize(path)
     data_size = file_size - HEADER_SIZE
+    fits_v7 = data_size > 0 and data_size % RECORD_SIZE_V7 == 0
     fits_v6 = data_size > 0 and data_size % RECORD_SIZE_V6 == 0
     fits_v5 = data_size > 0 and data_size % RECORD_SIZE_V5 == 0
     fits_v4 = data_size > 0 and data_size % RECORD_SIZE_V4 == 0
     fits_v3 = data_size > 0 and data_size % RECORD_SIZE_V3 == 0
     fits_v2 = data_size > 0 and data_size % RECORD_SIZE_V2 == 0
     fits_v1 = data_size > 0 and data_size % RECORD_SIZE_V1 == 0
-    if not fits_v1 and not fits_v2 and not fits_v3 and not fits_v4 and not fits_v5 and not fits_v6:
+    if not (fits_v1 or fits_v2 or fits_v3 or fits_v4 or fits_v5 or fits_v6 or fits_v7):
         sys.exit(f'ERROR: data size {data_size} not divisible by any known record size '
                  f'({RECORD_SIZE_V1}, {RECORD_SIZE_V2}, {RECORD_SIZE_V3}, '
-                 f'{RECORD_SIZE_V4}, {RECORD_SIZE_V5}, or {RECORD_SIZE_V6})')
+                 f'{RECORD_SIZE_V4}, {RECORD_SIZE_V5}, {RECORD_SIZE_V6}, or {RECORD_SIZE_V7})')
     # Prefer newest format that fits
-    if fits_v6:
+    if fits_v7:
+        rec_size, fmt, ver = RECORD_SIZE_V7, RECORD_FMT_V7, 7
+    elif fits_v6:
         rec_size, fmt, ver = RECORD_SIZE_V6, RECORD_FMT_V6, 6
     elif fits_v5:
         rec_size, fmt, ver = RECORD_SIZE_V5, RECORD_FMT_V5, 5
@@ -105,7 +111,41 @@ def parse_log(path):
             if len(raw) < rec_size:
                 break
             vals = struct.unpack(fmt, raw)
-            if ver == 6:
+            if ver == 7:
+                rec = {
+                    'pass':                  vals[0],
+                    'day':                   vals[1],
+                    'mt1_best':              list(vals[2:14]),
+                    'mt1_slot0':             list(vals[14:26]),
+                    'mt1_mean':              list(vals[26:38]),
+                    'mt1_min':               list(vals[38:50]),
+                    'mt1_dir_best':          list(vals[50:62]),
+                    'mt1_dir_slot0':         list(vals[62:74]),
+                    'mt1_dir_mean':          list(vals[74:86]),
+                    'mt1_dir_min':           list(vals[86:98]),
+                    'mt1_rng_best':          list(vals[98:110]),
+                    'mt1_rng_slot0':         list(vals[110:122]),
+                    'mt1_rng_mean':          list(vals[122:134]),
+                    'mt1_rng_min':           list(vals[134:146]),
+                    'mt1_acc_best':          list(vals[146:158]),
+                    'mt1_acc_slot0':         list(vals[158:170]),
+                    'mt1_acc_mean':          list(vals[170:182]),
+                    'mt1_acc_min':           list(vals[182:194]),
+                    'mt1_conf4_best':        list(vals[194:206]),
+                    'mt1_conf4_slot0':       list(vals[206:218]),
+                    'mt1_conf4_mean':        list(vals[218:230]),
+                    'mt1_conf4_min':         list(vals[230:242]),
+                    'mt1_dir_correct_dbl':   list(vals[242:254]),
+                    'mt2_best_pts':          vals[254],
+                    'mt2_slot0_pts':         vals[255],
+                    'mt2_ideal_pts':         vals[256],
+                    'mt2_injected':          vals[257],
+                    'mt1_dir_injected':      list(vals[258:270]),
+                    'mt1_slot0_act':         [list(vals[270+i*4:274+i*4]) for i in range(12)],
+                    'mt2_consensus_flat_pts': vals[318],
+                    'mt2_consensus_wtd_pts':  vals[319],
+                }
+            elif ver == 6:
                 rec = {
                     'pass':                  vals[0],
                     'day':                   vals[1],

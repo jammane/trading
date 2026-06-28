@@ -44,7 +44,9 @@ MT1_BLEND_SLOTS      = 200          # composite blend pool size per day
 MT1_RANGE_FLOOR      = 1.0          # $1 — effectively no range floor
 MT1_RANGE_CEIL_MULT  = 4.0          # ceiling = 4 × max(mean, today) |actual−comp0_delta|
 MT1_DIR_BACKFILL     = 0.65         # skip direction pool update when best score < this
-MT1_DIR_DAYS         = 5            # direction pool: score each model over last N days, sum
+MT1_DIR_DAYS         = 10           # scoring window (all pools): linear-weighted last N days (oldest=1.0 → today=2.0)
+MT1_FWD_DAYS         = 10           # prediction horizon: target = cumulative relative return over next N sessions
+MT2_FEED_DIRECTION   = True         # MT2 input from direction-pool slot0 (True) vs composite slot0 (False)
 MT1_POOL_NAMES       = ('dir', 'acc', 'rng', 'cfd')
 
 IND_STARTING_CASH     = 25_000.0    # per-industry portfolio starting capital
