@@ -727,6 +727,38 @@ static void test_blend_slots_count()
     CHECK(HIST_PER_DAY == 10);
 }
 
+// ── Drift study ±1 metric (replica of drift_rel_metric in training_v4.cpp) ──
+
+static inline float drift_rel_metric(float S, float mean, float mx, float mn, float floor) {
+    float spread = (S >= mean) ? (mx - mean) : (mean - mn);
+    spread = fmaxf(spread, floor);
+    return tanhf((S - mean) / spread);
+}
+
+static void test_drift_rel_metric()
+{
+    SUITE("drift_rel_metric");
+    // Track == band mean → exactly 0.
+    CHECK(NEAR(drift_rel_metric(5.0f, 5.0f, 8.0f, 2.0f, 1e-3f), 0.0f, 1e-6f));
+    // Track at band best (one spread above mean) → tanh(1) ≈ 0.7616.
+    CHECK(NEAR(drift_rel_metric(8.0f, 5.0f, 8.0f, 2.0f, 1e-3f), tanhf(1.0f), 1e-5f));
+    // Track at band worst (one spread below mean) → -tanh(1).
+    CHECK(NEAR(drift_rel_metric(2.0f, 5.0f, 8.0f, 2.0f, 1e-3f), -tanhf(1.0f), 1e-5f));
+    // Decisive (3 spreads above) → tanh(3) ≈ 0.995, in (0.99, 1.0).
+    float decisive = drift_rel_metric(14.0f, 5.0f, 8.0f, 2.0f, 1e-3f);  // (14-5)/3 = 3
+    CHECK(decisive > 0.99f && decisive <= 1.0f);
+    CHECK(NEAR(decisive, tanhf(3.0f), 1e-5f));
+    // Bounded in [-1, 1] always (float tanh saturates to ±1 at large args — never beyond).
+    CHECK(drift_rel_metric(-1000.f, 5.f, 8.f, 2.f, 1e-3f) >= -1.0f);
+    CHECK(drift_rel_metric( 1000.f, 5.f, 8.f, 2.f, 1e-3f) <=  1.0f);
+    // Tight band (mx≈mean) must not blow up — floor caps the swing.
+    float tight = drift_rel_metric(5.001f, 5.0f, 5.0f, 5.0f, 1.0f);
+    CHECK(tight > 0.0f && tight < 0.01f);
+    // Asymmetric spreads: below-mean uses the down spread (5-0=5), above uses the up (6-5=1).
+    CHECK(NEAR(drift_rel_metric(0.0f, 5.0f, 6.0f, 0.0f, 1e-3f), -tanhf(1.0f), 1e-5f)); // (0-5)/5 = -1
+    CHECK(NEAR(drift_rel_metric(6.0f, 5.0f, 6.0f, 0.0f, 1e-3f),  tanhf(1.0f), 1e-5f)); // (6-5)/1 = +1
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────
 
 int main()
@@ -748,6 +780,7 @@ int main()
     test_hist_buffer_addressing();
     test_pool_score_dispatch();
     test_blend_slots_count();
+    test_drift_rel_metric();
 
     printf("\n==================\n");
     printf("%d passed, %d failed\n", pass_count, fail_count);
