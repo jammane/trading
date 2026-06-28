@@ -175,44 +175,69 @@ def train_mt_one_day_prod(industries, model_dir, mkt_val_history,
     mkt_ret:         {ind: float} — today's equal-weight close-to-close return per industry.
     mt1_outputs_prev: MT1 slot0 outputs from production inference (optional).
 
-    Returns {ind: (conf, delta, range_hw)} — MT1 slot0 outputs after upkeep.
+    Called for side-effects (return unused). Uses an MT1_FWD_DAYS-session FORWARD target:
+    today's prediction can't be scored until its forward window completes, so predictions are
+    buffered (mt_fwd_buffer.json) and trained MT1_FWD_DAYS sessions later, when the realized
+    cumulative relative return is known. This mirrors the C++ trainer's forward target exactly.
     """
-    from training_lib import build_master_features
+    from training_lib import (build_master_features, MT1_FWD_DAYS, MT2_FEED_DIRECTION)
     from upkeep import MT1_SCALE_DOLLARS
     industry_list = list(industries.keys())
 
-    # Relative direction target: actual_d = (mkt_ret - median_mkt_ret) × scale
-    rets = [mkt_ret.get(ind, 0.0) for ind in industry_list]
-    sorted_rets = sorted(rets)
-    n = len(sorted_rets)
-    median_ret = sorted_rets[n // 2] if n % 2 == 1 else (sorted_rets[n//2 - 1] + sorted_rets[n//2]) / 2.0
-
-    actual_d_by_ind: dict = {}
-    for ind in industry_list:
-        actual_d_by_ind[ind] = (mkt_ret.get(ind, 0.0) - median_ret) * MT1_SCALE_DOLLARS
-
-    # MT2 actual_perf: absolute market return per industry
-    actual_perf: dict = {ind: mkt_ret.get(ind, 0.0) for ind in industry_list}
-
+    # Today's features + current cumulative market index per industry (last history entry)
     today444 = build_master_features(mkt_val_history, industry_list)
+    cur_index = {}
+    for ind in industry_list:
+        h = mkt_val_history.get(ind, [])
+        cur_index[ind] = float(h[-1]) if h else 25000.0  # IND_STARTING_CASH cold-start
 
-    mt1_slot0_outputs: dict = {}
-    for i, ind in enumerate(industry_list):
-        in37_t = today444[:, i * 37:(i + 1) * 37]
+    # Forward-target prediction buffer (persisted across daily runs)
+    buf_path = os.path.join(model_dir, 'mt_fwd_buffer.json')
+    buf = []
+    if os.path.exists(buf_path):
         try:
-            _, _, conf, delta, range_hw = upkeep_mt1_industry(
-                ind, model_dir, in37_t, actual_d_by_ind[ind])
-            mt1_slot0_outputs[ind] = (conf, delta, range_hw)
+            with open(buf_path) as _f:
+                buf = json.load(_f)
+        except Exception:
+            buf = []
+    buf.append({'feat444': today444.squeeze(0).tolist(), 'index': cur_index})
+
+    # Train once the oldest buffered prediction's MT1_FWD_DAYS window has completed
+    if len(buf) > MT1_FWD_DAYS:
+        old = buf.pop(0)
+        old_index = old['index']
+        fwd_ret = {}
+        for ind in industry_list:
+            oi = old_index.get(ind, 0.0)
+            fwd_ret[ind] = (cur_index[ind] / oi - 1.0) if oi else 0.0
+        rets = sorted(fwd_ret.values())
+        n = len(rets)
+        median_fwd = rets[n // 2] if n % 2 == 1 else (rets[n//2 - 1] + rets[n//2]) / 2.0
+        actual_d_by_ind = {ind: (fwd_ret[ind] - median_fwd) * MT1_SCALE_DOLLARS
+                           for ind in industry_list}
+        actual_perf = {ind: fwd_ret[ind] for ind in industry_list}
+        old_feat = torch.tensor(old['feat444'], dtype=torch.float32).unsqueeze(0)
+
+        mt2_inputs: dict = {}
+        for i, ind in enumerate(industry_list):
+            in37_t = old_feat[:, i * 37:(i + 1) * 37]
+            try:
+                (_, _, conf, delta, range_pct, conf4,
+                 d0_conf, d0_delta, d0_range, d0_conf4) = upkeep_mt1_industry(
+                    ind, model_dir, in37_t, actual_d_by_ind[ind])
+                mt2_inputs[ind] = ((d0_conf, d0_delta, d0_range, d0_conf4)
+                                   if MT2_FEED_DIRECTION else (conf, delta, range_pct, conf4))
+            except Exception as e:
+                print(f"Error in upkeep_mt1_industry {ind}: {e}")
+                mt2_inputs[ind] = (0.5, 0.0, 0.02, 0.5)
+        try:
+            upkeep_mt2(model_dir, mt2_inputs, actual_perf, industry_list)
         except Exception as e:
-            print(f"Error in upkeep_mt1_industry {ind}: {e}")
-            mt1_slot0_outputs[ind] = (0.5, 0.0, 0.02)
+            print(f"Error in upkeep_mt2: {e}")
 
-    try:
-        upkeep_mt2(model_dir, mt1_slot0_outputs, actual_perf, industry_list)
-    except Exception as e:
-        print(f"Error in upkeep_mt2: {e}")
-
-    return mt1_slot0_outputs
+    buf = buf[-MT1_FWD_DAYS:]
+    with open(buf_path, 'w') as _f:
+        json.dump(buf, _f)
 
 
 def build_primed_portfolios(trading_client, industries, allocations, zero_counts=None):

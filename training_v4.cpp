@@ -3,7 +3,7 @@
 // Run:   ./build/training_v4_cpp --output models [--load-dir DIR] [--start-day N] [--stop-day N]
 //        [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F] [--workers N]
 
-#define TRAINER_VERSION "0.2.2.3"
+#define TRAINER_VERSION "0.2.6.0"
 
 #include <algorithm>
 #include <atomic>
@@ -118,7 +118,7 @@ static constexpr int   MT1_BLEND_SLOTS     = 200;
 static constexpr float MT1_RANGE_FLOOR     = 1.f;    // $1 — effectively no floor
 static constexpr float MT1_RANGE_CEIL_MULT = 4.f;    // ceiling = 4 × max(mean, today) |actual−comp0_delta|
 static constexpr float MT1_DIR_BACKFILL    = 0.65f;  // skip direction pool update when best score < this
-static constexpr int   MT1_DIR_DAYS        = 5;   // direction pool: score each model over last N days, sum
+static constexpr int   MT1_DIR_DAYS        = 10;  // scoring window (all pools): score each model over last N days, linear-weighted sum (oldest=1.0 → today=2.0)
 static constexpr int   MT1_DIR_QUALIFY      = 1;   // min correct_dbl for a live slot to count as qualified
 static constexpr int   MT1_DIR_STREAK_TRIP  = 5;   // consecutive collapse days before injection fires
 static constexpr int   MT1_DIR_COOLDOWN_LEN = 10;  // cooldown days after injection before re-injection allowed
@@ -150,6 +150,8 @@ static constexpr int HIST_WAVG    = 3;   // wavg slots (17,18,19) saved per day
 // MT1NN: 37→37→29→20→12→4, per-industry preprocessor (12 pools)
 static constexpr int   MT1NN_PARAMS        = 3412;
 static constexpr int   MT1_START_DAY       = 25;
+static constexpr int   MT1_FWD_DAYS        = 10;       // prediction horizon: target = cumulative relative return over next N sessions
+static constexpr bool  MT2_FEED_DIRECTION  = true;     // MT2 input from direction-pool slot0 (true) vs composite slot0 (false)
 static constexpr float MT1_SCALE_DOLLARS   = 10000.f;  // tanh(out[1]) × scale = dollar P&L prediction
 static constexpr float MT1_FLOOR_COLD      = 250.f;    // cold-start floor for rolling buffer
 static constexpr int   MT1_ROLLING_DAYS    = 10;       // days in per-industry |actual_d| buffer
@@ -163,6 +165,8 @@ static constexpr int MT1_OUT_W = 3360;    static constexpr int MT1_OUT_B = 3408;
 // MT2 injection: fire when ≥75% of pool scores below threshold (worst ~15% of days)
 static constexpr float MT2_INJ_THRESHOLD = -7.0f;
 static constexpr int   MT2_INJ_MIN_BELOW = (int)(N_SLOTS * 0.75f);  // 150/200
+// MT2 pool-consensus diagnostic: look-behind window for the reliability-weighted ensemble
+static constexpr int   MT2_LB_DAYS       = 5;
 
 // MT2NN: FC[48→36→36] ‖ LSTM[4→36×2layers] → concat72 → 66→60→54→48
 static constexpr int   MT2NN_PARAMS   = 34572;
@@ -616,7 +620,8 @@ struct MT1Scratch {
 
 struct MT1Result {
     float best_score, slot0_score, mean_score, min_score;
-    float slot0_conf, slot0_delta_t, slot0_range_pct, slot0_conf4;  // decoded raw activations for MT2
+    float slot0_conf, slot0_delta_t, slot0_range_pct, slot0_conf4;  // composite slot0 activations for MT2
+    float dir0_conf, dir0_delta_t, dir0_range_pct, dir0_conf4;      // direction-pool slot0 activations for MT2 (toggle)
     // per-component pool stats (direction, range, accuracy, confidence)
     float best_dir, slot0_dir, mean_dir, min_dir, mean_dir_cdbl;
     float best_rng, slot0_rng, mean_rng, min_rng;
@@ -634,6 +639,11 @@ struct MT2Scratch {
     int      hist_head{0};
     int      hist_count{0};
     uint64_t mut_seeds[N_SLOTS - ELITE_POOL];
+    // Look-behind buffer for the reliability-weighted consensus diagnostic (in-RAM, transient).
+    float    lb_in48[MT2_LB_DAYS][48]{};
+    float    lb_perf[MT2_LB_DAYS][N_IND]{};
+    int      lb_head{0};
+    int      lb_count{0};
 
     MT2Scratch() {
         size_t ep = (size_t)ELITE_POOL * MT2NN_PARAMS;
@@ -909,6 +919,7 @@ struct IndResult {
 
 struct MasterResult {
     float best_pts, elite_max_pts, elite_min_pts, elite_mean_pts, ideal_pts;
+    float consensus_flat_pts, consensus_wtd_pts;  // pool-consensus diagnostic (not fed into training)
 };
 
 // ── Forward declarations (needed because step_industry calls load/save defined later) ──
@@ -2108,6 +2119,16 @@ static const char* const MT1_POOL_NAMES[4] = {"dir", "acc", "rng", "cfd"};
 
 struct MT1ScoreBreakdown { float composite, direction, range, accuracy, confidence; };
 
+// mt1_win_weight: linear scoring-window weight. Today (newest, di=day_count-1) = 2.0;
+// a day MT1_DIR_DAYS-1 steps back = 1.0. Anchored to MT1_DIR_DAYS (absolute age), so a day's
+// weight is fixed by how old it is, not by how full the window is during warmup.
+static inline float mt1_win_weight(int di, int day_count) {
+    if (MT1_DIR_DAYS <= 1) return 2.f;
+    int   age = day_count - 1 - di;                       // 0 = today
+    float w   = 2.f - (float)age / (float)(MT1_DIR_DAYS - 1);
+    return w < 1.f ? 1.f : w;                             // clamp (defensive; age should be < window)
+}
+
 // acc_floor: per-industry adaptive floor for accuracy denom (half the 10-day mean |actual_d|)
 // range_ceiling: 4 × mean(last 10 |actual_d - comp0_delta_d|); 1e30 = no ceiling yet
 static MT1ScoreBreakdown compute_mt1_scores(
@@ -2137,7 +2158,29 @@ static MT1ScoreBreakdown compute_mt1_scores(
     float sc_cfd = 1.f - diff * diff;
     if (err > r) sc_cfd = 0.5f + 0.25f * sc_cfd;  // compress outside-range to [0.5, 0.75]
 
-    return {0.50f * sc_dir + 0.33f * sc_rng + 0.17f * sc_acc, sc_dir, sc_rng, sc_acc, sc_cfd};
+    // Secondary [0,1] normalization per component vs its naive baseline B (ideal=1):
+    //   sec = clamp((raw - B) / (1 - B), 0, 1)  → naive maps to 0, ideal maps to 1.
+    // Equal-weight composite of the four secondaries gives each axis equal influence
+    // (raw confidence ≈1 / range ≈0.85 would otherwise dominate; acc/dir sit near 0.5).
+    auto clamp01 = [](float x){ return fminf(fmaxf(x, 0.f), 1.f); };
+
+    float b_dir   = 0.5f;                                       // conf = 0.5, no directional view
+    float sec_dir = clamp01((sc_dir - b_dir) / fmaxf(1.f - b_dir, 1e-6f));
+
+    float b_acc   = denom / (fabsf(actual_d) + denom);          // predict-0 null model
+    float sec_acc = clamp01((sc_acc - b_acc) / fmaxf(1.f - b_acc, 1e-6f));
+
+    float m_naive = (acc_floor > 1e-9f) ? err / acc_floor : (err > 0.f ? 1e9f : 0.f);
+    float b_rng   = (m_naive < 1.f) ? m_naive : 0.f;            // band = unconditional scale (acc_floor)
+    float sec_rng = clamp01((sc_rng - b_rng) / fmaxf(1.f - b_rng, 1e-6f));
+
+    float diff0   = 0.5f - ideal;                              // conf4 = 0.5 (uninformative)
+    float b_cfd   = 1.f - diff0 * diff0;
+    if (err > r) b_cfd = 0.5f + 0.25f * b_cfd;
+    float sec_cfd = clamp01((sc_cfd - b_cfd) / fmaxf(1.f - b_cfd, 1e-6f));
+
+    float composite = 0.25f * (sec_dir + sec_acc + sec_rng + sec_cfd);
+    return {composite, sc_dir, sc_rng, sc_acc, sc_cfd};
 }
 
 // ── MT1 component pool step ──────────────────────────────────────────────────────
@@ -2158,12 +2201,12 @@ static MT1CompResult step_mt1_component(
     // inject_src is hoisted to function scope so the carry-forward step can blend against it
     const float* inject_src;
     {
-        switch (pool_id) {
-            case 0:  inject_src = scratch.comp_inject_buf; break;  // direction  ← composite
-            case 1:  inject_src = scratch.dir_inject_buf;  break;  // accuracy   ← direction
-            case 2:  inject_src = scratch.comp_inject_buf; break;  // range      ← composite
-            default: inject_src = scratch.rng_inject_buf;  break;  // confidence ← range
-        }
+        // All four pools inject from the (now balanced, equal-weight) composite top-5.
+        // A balanced composite is an all-rounder, so broadcasting it spreads balanced lessons
+        // instead of the direction-bias the old gated composite caused. dir_inject_buf /
+        // rng_inject_buf are no longer used as cascade sources.
+        inject_src = scratch.comp_inject_buf;
+        (void)pool_id;
         for (int k = 0; k < MT1_COMP_INJECT; k++)
             memcpy(scratch.comp_elite(pool_id, ELITE_COUNT + WAVG_COUNT + k),
                    inject_src + (size_t)k * MT1NN_PARAMS, MT1NN_PARAMS * sizeof(float));
@@ -2179,13 +2222,31 @@ static MT1CompResult step_mt1_component(
             scratch.mut_seeds[i] = ((uint64_t)seed_rng.next() << 32) | seed_rng.next();
     }
 
+    // Weighted children per parent: concentrate breeding on proven elites, starve unproven
+    // injected immigrants (slots 20-24). slot0=13, slots1-4=11/11/10/10, slots5-19=7,
+    // injected=3. Sums to 175 = pool_muts. Replaces the old uniform 7-per-parent round-robin.
+    static const int kChildren[MT1_COMP_PARENTS] = {
+        13, 11, 11, 10, 10,                     // slot 0 (prod) + top-4 elites = 55
+        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,     // slots 5-16 direct elites      = 84
+        7, 7, 7,                                // slots 17-19 wavg blends       = 21
+        3, 3, 3, 3, 3                           // slots 20-24 injected          = 15
+    };
+    int parent_of_mut[MT1_COMP_SLOTS - MT1_COMP_PARENTS];   // length pool_muts (175)
+    {
+        int idx = 0;
+        for (int p = 0; p < pool_elite && idx < pool_muts; p++)
+            for (int c = 0; c < kChildren[p] && idx < pool_muts; c++)
+                parent_of_mut[idx++] = p;
+        for (; idx < pool_muts; idx++) parent_of_mut[idx] = idx % pool_elite;  // safety pad
+    }
+
     // get_weights: reconstructs slot weights into dst (elite or mutation)
     auto get_weights = [&](int slot, float* dst) {
         if (slot < pool_elite) {
             memcpy(dst, scratch.comp_elite(pool_id, slot), MT1NN_PARAMS * sizeof(float));
         } else {
             int mut_i  = slot - pool_elite;
-            int parent = mut_i % pool_elite;
+            int parent = parent_of_mut[mut_i];
             memcpy(dst, scratch.comp_elite(pool_id, parent), MT1NN_PARAMS * sizeof(float));
             apply_gaussian(dst, MT1NN_PARAMS, sigma, scratch.mut_seeds[mut_i]);
         }
@@ -2253,7 +2314,7 @@ static MT1CompResult step_mt1_component(
                     auto sb = compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling);
                     day_score = (pool_id == 2) ? sb.range : sb.confidence;
                 }
-                total_sum += is_today ? day_score * 2.f : day_score;
+                total_sum += day_score * mt1_win_weight(di, scratch.dir_day_count);
             }
 
             // Direction flip cull: direction pool (id=0) only, after full window
@@ -2345,7 +2406,7 @@ static MT1CompResult step_mt1_component(
                     auto sb = compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling);
                     day_score = (pool_id == 2) ? sb.range : sb.confidence;
                 }
-                total_sum += is_today ? day_score * 2.f : day_score;
+                total_sum += day_score * mt1_win_weight(di, scratch.dir_day_count);
             }
             hist_cat_sc[k]      = total_sum;
             hist_correct_dbl[k] = hcdb;
@@ -2505,10 +2566,9 @@ static MT1BlendResult step_mt1_composite(
         float total_sum = 0.f;
         for (int di = 0; di < scratch.dir_day_count; di++) {
             const auto& e  = scratch.dir_day(di);
-            bool is_today  = (di == scratch.dir_day_count - 1);
             mt1_forward(scratch.mut_buf, e.feat37, out4);
             float day_sc = compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling).composite;
-            total_sum += is_today ? day_sc * 2.f : day_sc;
+            total_sum += day_sc * mt1_win_weight(di, scratch.dir_day_count);
         }
         blend_sc[b] = total_sum;
         mean_sc += blend_sc[b];
@@ -2529,10 +2589,9 @@ static MT1BlendResult step_mt1_composite(
             float total_sum = 0.f;
             for (int di = 0; di < scratch.dir_day_count; di++) {
                 const auto& e  = scratch.dir_day(di);
-                bool is_today  = (di == scratch.dir_day_count - 1);
                 mt1_forward(hw, e.feat37, out4);
                 float day_sc = compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling).composite;
-                total_sum += is_today ? day_sc * 2.f : day_sc;
+                total_sum += day_sc * mt1_win_weight(di, scratch.dir_day_count);
             }
             hist_sc[k] = total_sum;
         }
@@ -2638,8 +2697,17 @@ static MT1Result step_mt1(int ind_i, MT1Scratch& scratch,
     scratch.rolling_head = (scratch.rolling_head + 1) % MT1_ROLLING_DAYS;
     if (scratch.rolling_count < MT1_ROLLING_DAYS) scratch.rolling_count++;
 
+    // Direction-pool slot0 activations (MT2 direction-feed toggle source)
+    float out4_dir[4];
+    mt1_forward(scratch.comp_elite(0, 0), in37, out4_dir);
+    float dir0_conf      = sigmoidf(out4_dir[0]);
+    float dir0_delta_t   = tanhf(out4_dir[1]);
+    float dir0_range_pct = log1pf(expf(out4_dir[2]));
+    float dir0_conf4     = sigmoidf(out4_dir[3]);
+
     return {br.best_score, br.slot0_score, br.mean_score, br.min_score,
             br.slot0_conf, br.slot0_delta_t, br.slot0_range_pct, br.slot0_conf4,
+            dir0_conf, dir0_delta_t, dir0_range_pct, dir0_conf4,
             cr[0].best, cr[0].slot0, cr[0].mean, cr[0].min_v, cr[0].mean_correct_dbl,
             cr[2].best, cr[2].slot0, cr[2].mean, cr[2].min_v,
             cr[1].best, cr[1].slot0, cr[1].mean, cr[1].min_v,
@@ -2781,6 +2849,85 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
             else { pts += (float)opt - 0.25f * (float)(pred - opt); }
         }
         pred_scores[slot] = pts * 1e9f + port_val;
+    }
+
+    // ── Pool-consensus allocation diagnostic (read-only; never fed into training) ──
+    // Wisdom-of-crowds: rank industries by the pool's mean tier vote, re-tier by the pool's
+    // OWN observed mean tier-0 count (NOT opt_tier — that would leak the realized outcome),
+    // and grade that consensus allocation with the normal pts formula. Two variants:
+    //   flat   = every slot votes equally (all N_SLOTS)
+    //   wtd    = elites weighted by look-behind reliability over the last MT2_LB_DAYS days
+    float consensus_flat_pts = 0.f, consensus_wtd_pts = 0.f;
+    {
+        auto opt_from_perf = [](const float* perf, int* out_tier) {
+            for (int i = 0; i < N_IND; i++) out_tier[i] = 0;
+            int pos_idx[N_IND]; int n_pos = 0;
+            for (int i = 0; i < N_IND; i++) if (perf[i] >= 0.f) pos_idx[n_pos++] = i;
+            std::sort(pos_idx, pos_idx + n_pos, [&perf](int a, int b){ return perf[a] < perf[b]; });
+            if (n_pos == 1) { out_tier[pos_idx[0]] = 3; }
+            else if (n_pos == 2) { out_tier[pos_idx[0]] = 2; out_tier[pos_idx[1]] = 3; }
+            else if (n_pos > 0) {
+                int base = n_pos/3, rem = n_pos%3, n1 = base+(rem>=1?1:0), n2 = base+(rem>=2?1:0);
+                for (int rank = 0; rank < n_pos; rank++) { int ind = pos_idx[rank];
+                    if (rank < n1) out_tier[ind] = 1; else if (rank < n1+n2) out_tier[ind] = 2; else out_tier[ind] = 3; }
+            }
+        };
+        auto score_ct = [&](const int* ct) -> float {
+            float pts = 0.f;
+            for (int i = 0; i < N_IND; i++) { int pred = ct[i], opt = opt_tier[i];
+                if (opt == 0) { if (pred > 0) pts += -2.f - 0.25f*pred; }
+                else if (pred == 0) { pts -= (float)opt; }
+                else if (pred <= opt) { pts += (float)pred; }
+                else { pts += (float)opt - 0.25f*(float)(pred-opt); } }
+            return pts;
+        };
+        float sum_t0 = 0.f;
+        for (int s = 0; s < N_SLOTS; s++) { int c = 0; for (int i = 0; i < N_IND; i++) if (slot_tiers[s][i] == 0) c++; sum_t0 += c; }
+        float mean_t0 = sum_t0 / N_SLOTS;
+        auto build_ct = [&](const float* ord, int* ct) {
+            for (int i = 0; i < N_IND; i++) ct[i] = 0;
+            int idx[N_IND]; for (int i = 0; i < N_IND; i++) idx[i] = i;
+            std::sort(idx, idx + N_IND, [&ord](int a, int b){ return ord[a] > ord[b]; });
+            int n0 = (int)lroundf(mean_t0); if (n0 < 0) n0 = 0; if (n0 > N_IND) n0 = N_IND;
+            int n_pos = N_IND - n0;
+            if (n_pos > 0) { int base = n_pos/3, rem = n_pos%3, n1 = base+(rem>=1?1:0), n2 = base+(rem>=2?1:0), n3 = n_pos-n1-n2;
+                for (int rank = 0; rank < n_pos; rank++) { int ind = idx[rank];
+                    if (rank < n3) ct[ind] = 3; else if (rank < n3+n2) ct[ind] = 2; else ct[ind] = 1; } }
+        };
+        float ord_flat[N_IND] = {};
+        for (int i = 0; i < N_IND; i++) { float s = 0.f; for (int sl = 0; sl < N_SLOTS; sl++) s += slot_tiers[sl][i]; ord_flat[i] = s / N_SLOTS; }
+        int ct_flat[N_IND]; build_ct(ord_flat, ct_flat); consensus_flat_pts = score_ct(ct_flat);
+
+        float ord_wtd[N_IND] = {};
+        if (scratch.lb_count > 0) {
+            float lbpts[ELITE_POOL] = {}, wmin = 1e30f, wsum = 0.f, w[ELITE_POOL] = {};
+            float out48b[48]; int tt[N_IND], ot[N_IND];
+            for (int e = 0; e < ELITE_POOL; e++) {
+                float p = 0.f;
+                for (int d = 0; d < scratch.lb_count; d++) {
+                    mt2_forward(scratch.elite(e), scratch.lb_in48[d], out48b);
+                    for (int i = 0; i < N_IND; i++) { const float* lg = out48b+i*4; int b = 0; for (int k=1;k<4;k++) if (lg[k]>lg[b]) b = k; tt[i] = b; }
+                    opt_from_perf(scratch.lb_perf[d], ot);
+                    for (int i = 0; i < N_IND; i++) { int pred = tt[i], opt = ot[i];
+                        if (opt == 0) { if (pred > 0) p += -2.f-0.25f*pred; }
+                        else if (pred == 0) { p -= (float)opt; }
+                        else if (pred <= opt) { p += (float)pred; }
+                        else { p += (float)opt - 0.25f*(float)(pred-opt); } }
+                }
+                lbpts[e] = p; if (p < wmin) wmin = p;
+            }
+            for (int e = 0; e < ELITE_POOL; e++) { w[e] = lbpts[e] - wmin + 1e-3f; wsum += w[e]; }
+            for (int i = 0; i < N_IND; i++) { float s = 0.f; for (int e = 0; e < ELITE_POOL; e++) s += w[e]*slot_tiers[e][i]; ord_wtd[i] = wsum>0 ? s/wsum : 0.f; }
+        } else {
+            for (int i = 0; i < N_IND; i++) { float s = 0.f; for (int e = 0; e < ELITE_POOL; e++) s += slot_tiers[e][i]; ord_wtd[i] = s / ELITE_POOL; }
+        }
+        int ct_wtd[N_IND]; build_ct(ord_wtd, ct_wtd); consensus_wtd_pts = score_ct(ct_wtd);
+
+        // Push today into the look-behind buffer AFTER using it (keeps weights leak-free).
+        for (int i = 0; i < 48; i++) scratch.lb_in48[scratch.lb_head][i] = in48[i];
+        for (int i = 0; i < N_IND; i++) scratch.lb_perf[scratch.lb_head][i] = actual_perf[i];
+        scratch.lb_head = (scratch.lb_head + 1) % MT2_LB_DAYS;
+        if (scratch.lb_count < MT2_LB_DAYS) scratch.lb_count++;
     }
 
     // ── Score history candidates ─────────────────────────────────────────────────
@@ -2973,7 +3120,8 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
     elite_mean_pts /= ELITE_COUNT;
 
     if (injected_out) *injected_out = injected;
-    return {best_pts_v, elite_max_pts, elite_min_pts, elite_mean_pts, ideal_pts};
+    return {best_pts_v, elite_max_pts, elite_min_pts, elite_mean_pts, ideal_pts,
+            consensus_flat_pts, consensus_wtd_pts};
 }
 
 // ── History update (main thread after workers finish) ────────────────────────────
@@ -3359,7 +3507,7 @@ static void load_or_init_mt2(const std::string& dir, const std::string& load_dir
 // ── MT binary log ────────────────────────────────────────────────────────────────
 
 static constexpr uint32_t MT_LOG_MAGIC   = 0x4D543132u;  // 'MT12'
-static constexpr uint32_t MT_LOG_VERSION = 5u;
+static constexpr uint32_t MT_LOG_VERSION = 6u;
 
 static bool write_mt_log_header(FILE* f) {
     uint32_t hdr[4] = {MT_LOG_MAGIC, MT_LOG_VERSION, (uint32_t)N_IND, 0u};
@@ -3385,8 +3533,11 @@ struct MTLogRecord {
     uint8_t  mt2_injected;
     uint8_t  pad[3];
     uint8_t  mt1_dir_injected[N_IND];
+    float    mt1_slot0_act[N_IND][4];   // V7: raw slot0 activations (conf, delta_t, range_pct, conf4) ×12
+    float    mt2_consensus_flat_pts;    // V7: pool-consensus allocation score (flat vote)
+    float    mt2_consensus_wtd_pts;     // V7: pool-consensus allocation score (look-behind weighted)
 };
-static_assert(sizeof(MTLogRecord) == 1044, "MTLogRecord must be 1044 bytes");
+static_assert(sizeof(MTLogRecord) == 1244, "MTLogRecord must be 1244 bytes");
 
 static void write_mt_log_record(FILE* f, const MTLogRecord& r) {
     fwrite(&r, sizeof(MTLogRecord), 1, f);
@@ -3454,6 +3605,7 @@ static void write_csv_row(FILE* csv, int pass_num, int actual_day,
                 res[i].elite_max_val, res[i].elite_min_val, res[i].elite_mean_val);
     fprintf(csv, ",%+.2f,%+.2f,%+.2f,%+.2f",
             mst.elite_max_pts, mst.elite_min_pts, mst.elite_mean_pts, mst.ideal_pts);
+    fprintf(csv, ",%+.2f,%+.2f", mst.consensus_flat_pts, mst.consensus_wtd_pts);
     for (int i = 0; i < N_IND; i++)
         fprintf(csv, ",%.6f,%.2f", mkt_ret[i], mkt_val[i]);
     fprintf(csv, "\n");
@@ -3514,7 +3666,376 @@ static void print_usage(const char* prog) {
         "          [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F]\n"
         "          [--dir-sigma F] [--rng-sigma F] [--acc-sigma F] [--cfd-sigma F] [--mt2-sigma F]\n"
         "          [--workers N] [--master-only] [--preserve-stock-data] [--no-save]\n"
-        "       %s --output DIR [--load-dir DIR] ...  (diagnostic/override)\n", prog, prog);
+        "       %s --output DIR [--load-dir DIR] ...  (diagnostic/override)\n"
+        "       %s --drift-study --load-dir SEED --drift-scratch DIR  (phase-3 calibration)\n",
+        prog, prog, prog);
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Phase-3 lag/daily drift study   (--drift-study)   — see PHASE3_DRIFT_STUDY.md
+// ────────────────────────────────────────────────────────────────────────────────
+// Offline calibration tool that fixes the look-ahead retrain cadence. For each weekly
+// freeze point it captures an immutable 8-model BAND (composite MT1 + MT2 slots 0-7)
+// as a yardstick, then rolls a daily-upkept TRACK forward over a 6-week belt and scores,
+// each gradable day, how far the track has pulled away from the frozen band (±1 tanh
+// metric, §4). Output = four rolling buckets (week 2/3/4/5 lag), read off drift_log.bin.
+//
+// NON-DESTRUCTIVE: seeds (read-only) from the fully-trained production models via
+// --load-dir and writes ONLY to --drift-scratch; every base/track it generates is
+// throwaway, the seed models are never modified. Sequential-per-base: exactly one base
+// resident at a time (STOCKNN pools make co-residence impossible — §5). Run only on
+// mature models, ~once per codebase increment.
+//
+// STATUS: compile-checked; NOT yet runtime-validated (study is not run until phase 3).
+// ════════════════════════════════════════════════════════════════════════════════
+
+static constexpr int      DRIFT_WEEK_LEN    = 5;                    // business week (sessions)
+static constexpr int      DRIFT_BELT_WEEKS  = 6;                    // weeks 0..5
+static constexpr int      DRIFT_LAG_WEEKS   = 2;                    // weeks 0-1 forward-lag, generate-only
+static constexpr int      DRIFT_BAND_N      = 8;                    // frozen elites per band (slots 0-7)
+static constexpr int      DRIFT_WARMUP_DAYS = 2 * DRIFT_WEEK_LEN;   // 10-session rolling-buffer fill before freeze
+static constexpr int      DRIFT_BELT_DAYS   = DRIFT_BELT_WEEKS * DRIFT_WEEK_LEN; // 30
+static constexpr uint32_t DRIFT_LOG_MAGIC   = 0x44524654u;         // "DRFT"
+static constexpr uint32_t DRIFT_LOG_VERSION = 1u;
+
+// ±1 asymptotic relative metric (§4): 0 = track ties band mean; tanh(1)≈0.76 at band
+// best/worst; →±1 only for decisive (multi-spread) results. floor guards the tight-band
+// (fresh-retrain) case where mx≈mean would blow the ratio up.
+static inline float drift_rel_metric(float S, float mean, float mx, float mn, float floor) {
+    float spread = (S >= mean) ? (mx - mean) : (mean - mn);
+    spread = fmaxf(spread, floor);
+    return tanhf((S - mean) / spread);
+}
+
+// Adaptive MT1 floors for a given day — mirrors the block in step_mt1 so band and track
+// are scored under identical floors (rel stays internally consistent).
+static void drift_mt1_floors(MT1Scratch& sc, const float in37[37], float actual_d,
+                             float* acc_floor, float* range_ceiling) {
+    *acc_floor     = MT1_FLOOR_COLD / 2.f;
+    *range_ceiling = 1e30f;
+    if (sc.rolling_count > 0) {
+        float sum_a = 0.f, sum_r = 0.f;
+        for (int k = 0; k < sc.rolling_count; k++) { sum_a += sc.rolling_actual[k]; sum_r += sc.rolling_residual[k]; }
+        *acc_floor = sum_a / (float)sc.rolling_count / 2.f;
+        float mean_r = sum_r / (float)sc.rolling_count;
+        float out4[4]; mt1_forward(sc.comp0_buf, in37, out4);
+        float comp0_delta_d = tanhf(out4[1]) * MT1_SCALE_DOLLARS;
+        float today_r = fabsf(actual_d - comp0_delta_d);
+        *range_ceiling = MT1_RANGE_CEIL_MULT * fmaxf(mean_r, today_r);
+    }
+}
+
+// Windowed composite score for one MT1 model (mirrors step_mt1_composite blend scoring):
+// linear recency-weighted sum of per-day composite over the trailing dir_day window.
+static float drift_score_mt1_comp(const float* W, MT1Scratch& sc, float acc_floor, float range_ceiling) {
+    float out4[4], total = 0.f;
+    for (int di = 0; di < sc.dir_day_count; di++) {
+        const auto& e = sc.dir_day(di);
+        mt1_forward(W, e.feat37, out4);
+        total += compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling).composite
+                 * mt1_win_weight(di, sc.dir_day_count);
+    }
+    return total;
+}
+
+// Tier-classification pts for one MT2 model (mirrors the step_mt2 grading at lines ~2843).
+static float drift_score_mt2_pts(const float* W, const float in48[48], const float actual_perf[N_IND]) {
+    int opt_tier[N_IND] = {0};
+    {
+        int pos_idx[N_IND]; int n_pos = 0;
+        for (int i = 0; i < N_IND; i++) if (actual_perf[i] >= 0.f) pos_idx[n_pos++] = i;
+        std::sort(pos_idx, pos_idx + n_pos, [&](int a, int b){ return actual_perf[a] < actual_perf[b]; });
+        if (n_pos == 1) { opt_tier[pos_idx[0]] = 3; }
+        else if (n_pos == 2) { opt_tier[pos_idx[0]] = 2; opt_tier[pos_idx[1]] = 3; }
+        else if (n_pos > 0) {
+            int base = n_pos/3, rem = n_pos%3, n1 = base+(rem>=1?1:0), n2 = base+(rem>=2?1:0);
+            for (int r = 0; r < n_pos; r++) { int ind = pos_idx[r];
+                opt_tier[ind] = (r < n1) ? 1 : (r < n1+n2) ? 2 : 3; }
+        }
+    }
+    float out48[48]; mt2_forward(W, in48, out48);
+    int tier[N_IND];
+    for (int i = 0; i < N_IND; i++) { const float* lg = out48 + i*4; int b = 0;
+        for (int k = 1; k < 4; k++) if (lg[k] > lg[b]) b = k; tier[i] = b; }
+    float pts = 0.f;
+    for (int i = 0; i < N_IND; i++) {
+        int pred = tier[i], opt = opt_tier[i];
+        if (opt == 0)            { if (pred > 0) pts += -2.f - 0.25f * pred; }
+        else if (pred == 0)      { pts -= (float)opt; }
+        else if (pred <= opt)    { pts += (float)pred; }
+        else                     { pts += (float)opt - 0.25f * (float)(pred - opt); }
+    }
+    return pts;
+}
+
+struct DriftLogRecord {
+    uint32_t freeze_day;            // base freeze actual_day (provenance)
+    uint32_t calendar_day;          // actual_day of this scored day
+    uint32_t bucket;                // 2..5 = age_week = N-week lag
+    uint32_t pad0;
+    float    mt1_rel[N_IND];        // per-industry composite ±1 rel (track vs 8-band)
+    float    mt2_rel;               // MT2 ±1 rel (track vs 8-band)
+    float    mt2_band_mean, mt2_track;  // diagnostics
+    float    mt1_band_mean[N_IND];
+    float    mt1_track[N_IND];
+};
+static_assert(sizeof(DriftLogRecord) == 16 + 4*N_IND + 12 + 8*N_IND, "DriftLogRecord packing");
+
+static bool write_drift_log_header(FILE* f) {
+    uint32_t h[4] = {DRIFT_LOG_MAGIC, DRIFT_LOG_VERSION, (uint32_t)N_IND, 0u};
+    return fwrite(h, sizeof(uint32_t), 4, f) == 4;
+}
+static void write_drift_log_record(FILE* f, const DriftLogRecord& r) {
+    fwrite(&r, sizeof(DriftLogRecord), 1, f); fflush(f);
+}
+
+// Advance the live track one pipeline day (full upkeep: StockNN×12 + MT1×12 + MT2),
+// mirroring main()'s per-day body. Fills in48/actual_perf for band scoring by the caller.
+// Returns false if today has no forward target (last MT1_FWD_DAYS days — not gradable).
+static bool drift_advance_day(int run_day_num, int actual_day, int total_days,
+                              std::vector<DayData>& all_days,
+                              IndustryState* ind_states, MT1Scratch* mt1_scr,
+                              MT2Scratch& mt2_scr, MasterState& mst, WorkerScratch& wscr,
+                              const std::string& scratch_dir, const std::string& seed_dir,
+                              float sigma, float mt2_sigma,
+                              float out_in48[48], float out_actual_perf[N_IND]) {
+    const DayData* day_ptr  = &all_days[actual_day];
+    const DayData* fill_ptr = (actual_day + 1 < total_days) ? &all_days[actual_day + 1] : nullptr;
+    const DayData* fwd_ptr  = (actual_day + MT1_FWD_DAYS < total_days) ? &all_days[actual_day + MT1_FWD_DAYS] : nullptr;
+    const bool fwd_valid = (fwd_ptr != nullptr);
+
+    bool seq_flags[N_SYMS];
+    PCG32 seq_rng; seq_rng.seed((uint64_t)actual_day * 0xABCDEF01234567ULL);
+    for (int si = 0; si < N_SYMS; si++) seq_flags[si] = (seq_rng.next() & 1);
+
+    // StockNN ×12 (serial — study trades CPU for RAM, §5)
+    for (int i = 0; i < N_IND; i++)
+        step_industry(i, ind_states[i], wscr, scratch_dir, seed_dir, *day_ptr, fill_ptr,
+                      actual_day, total_days, run_day_num, 1 << 30, sigma, false, seq_flags);
+
+    for (int i = 0; i < N_IND; i++)
+        for (int j = 0; j < IND_SYMS; j++)
+            update_hist_sym(ind_states[i].hist[j], day_ptr->sym[i][j]);
+
+    float mkt_ret[N_IND] = {};
+    if (fill_ptr) for (int i = 0; i < N_IND; i++) {
+        float sum = 0.f; int v = 0;
+        for (int j = 0; j < IND_SYMS; j++) { const OHLCV& t = day_ptr->sym[i][j], &n = fill_ptr->sym[i][j];
+            if (t.valid && n.valid && t.close > 1e-3f) { sum += n.close / t.close - 1.f; v++; } }
+        mkt_ret[i] = v > 0 ? sum / v : 0.f;
+    }
+    float fwd_ret[N_IND] = {};
+    if (fwd_valid) for (int i = 0; i < N_IND; i++) {
+        float sum = 0.f; int v = 0;
+        for (int j = 0; j < IND_SYMS; j++) { const OHLCV& t = day_ptr->sym[i][j], &f = fwd_ptr->sym[i][j];
+            if (t.valid && f.valid && t.close > 1e-3f) { sum += f.close / t.close - 1.f; v++; } }
+        fwd_ret[i] = v > 0 ? sum / v : 0.f;
+    }
+    float sorted[N_IND]; memcpy(sorted, fwd_ret, sizeof(fwd_ret));
+    std::nth_element(sorted, sorted + N_IND/2, sorted + N_IND);
+    float median_ret = sorted[N_IND/2];
+    for (int i = 0; i < N_IND; i++) out_actual_perf[i] = fwd_ret[i];
+
+    float today444[444];
+    build_master_features(mst.mkt_val_hist, mst.ind_hist_count, today444);
+
+    if (fwd_valid) for (int i = 0; i < N_IND; i++) {
+        const float* in37 = today444 + i * 37;
+        float actual_d = (fwd_ret[i] - median_ret) * MT1_SCALE_DOLLARS;
+        MT1Result r = step_mt1(i, mt1_scr[i], actual_d, in37, actual_day,
+                               sigma, sigma, sigma, sigma);
+        // Composite feed (study asserts MT2_FEED_DIRECTION==false)
+        out_in48[i*4+0] = r.slot0_conf;     out_in48[i*4+1] = r.slot0_delta_t;
+        out_in48[i*4+2] = r.slot0_range_pct; out_in48[i*4+3] = r.slot0_conf4;
+    }
+
+    if (fwd_valid && actual_day >= MASTER_START_DAY) {
+        bool inj = false;
+        step_mt2(mst, mt2_scr, out_in48, out_actual_perf, actual_day, total_days, mt2_sigma, &inj);
+    }
+
+    // Append rolling market index (mirrors main lines ~3973)
+    for (int i = 0; i < N_IND; i++) {
+        float prev = (mst.ind_hist_count > 0)
+            ? (mst.ind_hist_count < IND_HIST_CAP ? mst.mkt_val_hist[i][mst.ind_hist_count-1]
+                                                 : mst.mkt_val_hist[i][IND_HIST_CAP-1])
+            : (float)IND_STARTING_CASH;
+        float today_v = prev * (1.f + mkt_ret[i]);
+        if (mst.ind_hist_count < IND_HIST_CAP) mst.mkt_val_hist[i][mst.ind_hist_count] = today_v;
+        else { memmove(mst.mkt_val_hist[i], mst.mkt_val_hist[i]+1, (IND_HIST_CAP-1)*sizeof(float));
+               mst.mkt_val_hist[i][IND_HIST_CAP-1] = today_v; }
+    }
+    if (mst.ind_hist_count < IND_HIST_CAP) mst.ind_hist_count++;
+    return fwd_valid;
+}
+
+// Reset all per-base state to the seed and wipe the scratch dir so step_* re-seed from
+// the read-only production models (load_dir) rather than the previous base's track.
+static void drift_reseed(const std::string& scratch_dir, const std::string& seed_dir,
+                         IndustryState* ind_states, MT1Scratch* mt1_scr, MT2Scratch& mt2_scr,
+                         MasterState& mst, std::vector<DayData>& all_days, int run_start) {
+    std::error_code ec;
+    fs::remove_all(scratch_dir, ec);          // throw away previous base's evolved track
+    fs::create_directories(scratch_dir);
+    for (int i = 0; i < N_IND; i++) {
+        ind_states[i].portfolios[0].cash = IND_STARTING_CASH;
+        for (int j = 0; j < IND_SYMS; j++) { ind_states[i].portfolios[0].holdings[j] = 0.f;
+                                             ind_states[i].portfolios[0].stop_prices[j] = 0.f; }
+        ind_states[i].streak = 0;
+        for (int s = 1; s < N_SLOTS; s++) ind_states[i].portfolios[s] = ind_states[i].portfolios[0];
+        for (int j = 0; j < IND_SYMS; j++) ind_states[i].hist[j] = SymHist{};
+        // Reset MT1 rolling/window state IN PLACE (MT1Scratch owns heap buffers — never
+        // reassign it: the implicit copy-assign would shallow-copy and double-free).
+        MT1Scratch& sc = mt1_scr[i];
+        sc.rolling_head = sc.rolling_count = 0;
+        memset(sc.rolling_actual,   0, sizeof(sc.rolling_actual));
+        memset(sc.rolling_residual, 0, sizeof(sc.rolling_residual));
+        memset(sc.dir_day_buf,      0, sizeof(sc.dir_day_buf));
+        sc.dir_day_head = sc.dir_day_count = 0;
+        sc.dir_streak = sc.dir_cooldown = 0;
+        sc.blend_hist_head = sc.blend_hist_count = 0;
+        sc.comp_inject_count = sc.dir_inject_count = sc.rng_inject_count = 0;
+        for (int p = 0; p < 4; p++) { sc.pool_hist_head[p] = 0; sc.pool_hist_count[p] = 0; }
+        load_or_init_mt1(scratch_dir, seed_dir, i, sc);
+    }
+    load_or_init_mt2(scratch_dir, seed_dir, mt2_scr);
+    mt2_scr.hist_head = mt2_scr.hist_count = 0;
+    mt2_scr.lb_head   = mt2_scr.lb_count   = 0;
+    mst.portfolios[0].cash = MST_STARTING_CASH;
+    for (int i = 0; i < N_IND; i++) mst.portfolios[0].holdings[i] = 0.f;
+    for (int s = 1; s < N_SLOTS; s++) mst.portfolios[s] = mst.portfolios[0];
+    memset(mst.ind_val_hist, 0, sizeof(mst.ind_val_hist));
+    memset(mst.mkt_val_hist, 0, sizeof(mst.mkt_val_hist));
+    mst.ind_hist_count = 0;
+    memset(mst.zero_counts, 0, sizeof(mst.zero_counts));
+    warmup_history(ind_states, all_days, run_start);
+}
+
+static int run_drift_study(const std::string& seed_dir, const std::string& scratch_dir,
+                           const std::string& log_dir, std::vector<DayData>& all_days,
+                           int total_days, int win_start, int win_end,
+                           float sigma, float mt2_sigma) {
+    if (MT2_FEED_DIRECTION) {
+        log_msg("ERROR: --drift-study requires MT2_FEED_DIRECTION==false (composite feed). "
+                "Flip the toggle in training_v4.cpp and rebuild before running the study.");
+        return 1;
+    }
+    if (seed_dir.empty() || scratch_dir.empty()) {
+        log_msg("ERROR: --drift-study needs --load-dir SEED and --drift-scratch DIR."); return 1;
+    }
+    // Earliest freeze: needs DRIFT_WARMUP_DAYS of rolling fill before freeze AND the freeze
+    // itself must sit past MT1_START_DAY so the seeded pools are active.
+    int first_freeze = std::max(win_start, std::max(DRIFT_WARMUP_DAYS, MT1_START_DAY) + DRIFT_WARMUP_DAYS);
+    // Latest freeze: the last gradable belt day (freeze + DRIFT_BELT_DAYS) still needs a forward target.
+    int last_freeze  = win_end - DRIFT_BELT_DAYS - MT1_FWD_DAYS;
+    if (first_freeze > last_freeze) {
+        log_msg("ERROR: window too short for the drift belt — need >= "
+                + std::to_string(DRIFT_WARMUP_DAYS + DRIFT_BELT_DAYS + MT1_FWD_DAYS) + " sessions of runway.");
+        return 1;
+    }
+
+    fs::create_directories(log_dir);
+    std::string drift_path = log_dir + "/drift_log.bin";
+    FILE* dlog = fopen(drift_path.c_str(), "wb");
+    if (!dlog) { log_msg("ERROR: cannot open " + drift_path); return 1; }
+    write_drift_log_header(dlog);
+
+    log_msg("===== DRIFT STUDY ===== seed=" + seed_dir + "  scratch=" + scratch_dir +
+            "  freeze " + std::to_string(first_freeze) + ".." + std::to_string(last_freeze) +
+            " step " + std::to_string(DRIFT_WEEK_LEN));
+
+    // One base resident (§5)
+    auto ind_states = std::make_unique<IndustryState[]>(N_IND);
+    auto mt1_scr    = std::make_unique<MT1Scratch[]>(N_IND);
+    auto mt2_scr    = std::make_unique<MT2Scratch>();
+    auto mst        = std::make_unique<MasterState>();
+    auto wscr       = std::make_unique<WorkerScratch>();
+    std::vector<float> mt1_band((size_t)N_IND * DRIFT_BAND_N * MT1NN_PARAMS);
+    std::vector<float> mt2_band((size_t)DRIFT_BAND_N * MT2NN_PARAMS);
+
+    for (int freeze_day = first_freeze; freeze_day <= last_freeze; freeze_day += DRIFT_WEEK_LEN) {
+        int run_start = freeze_day - DRIFT_WARMUP_DAYS;
+        drift_reseed(scratch_dir, seed_dir, ind_states.get(), mt1_scr.get(), *mt2_scr,
+                     *mst, all_days, run_start);
+
+        int run_day_num = 0;
+        float in48[48], actual_perf[N_IND];
+        // Warm-up: fill rolling buffers up to (and including) the freeze day.
+        for (int d = run_start; d <= freeze_day; d++)
+            drift_advance_day(run_day_num++, d, total_days, all_days, ind_states.get(),
+                              mt1_scr.get(), *mt2_scr, *mst, *wscr, scratch_dir, seed_dir,
+                              sigma, mt2_sigma, in48, actual_perf);
+
+        // Freeze the band: composite = most-recent blend_hist top-8; MT2 = elite slots 0-7.
+        for (int i = 0; i < N_IND; i++) {
+            MT1Scratch& sc = mt1_scr[i];
+            int recent = (sc.blend_hist_head - 1 + HIST_DAYS) % HIST_DAYS;  // last day saved
+            for (int b = 0; b < DRIFT_BAND_N; b++)
+                memcpy(&mt1_band[((size_t)i * DRIFT_BAND_N + b) * MT1NN_PARAMS],
+                       sc.blend_hist_slot(recent, b), MT1NN_PARAMS * sizeof(float));
+        }
+        for (int b = 0; b < DRIFT_BAND_N; b++)
+            memcpy(&mt2_band[(size_t)b * MT2NN_PARAMS], mt2_scr->elite(b), MT2NN_PARAMS * sizeof(float));
+
+        // Belt: roll the track forward DRIFT_BELT_DAYS, scoring weeks 2-5.
+        for (int age_day = 0; age_day < DRIFT_BELT_DAYS; age_day++) {
+            int actual_day = freeze_day + 1 + age_day;
+            bool gradable = drift_advance_day(run_day_num++, actual_day, total_days, all_days,
+                                              ind_states.get(), mt1_scr.get(), *mt2_scr, *mst, *wscr,
+                                              scratch_dir, seed_dir, sigma, mt2_sigma, in48, actual_perf);
+            int age_week = age_day / DRIFT_WEEK_LEN;          // 0..5
+            if (age_week < DRIFT_LAG_WEEKS || !gradable) continue;
+
+            DriftLogRecord rec{};
+            rec.freeze_day   = (uint32_t)freeze_day;
+            rec.calendar_day = (uint32_t)actual_day;
+            rec.bucket       = (uint32_t)age_week;
+
+            // MT1 composite: per-industry track (comp0) vs 8-model band, identical floors.
+            for (int i = 0; i < N_IND; i++) {
+                MT1Scratch& sc = mt1_scr[i];
+                const float* in37 = nullptr;  // floors use the freshest dir_day entry's features
+                float actual_d = sc.dir_day_count ? sc.dir_day(sc.dir_day_count - 1).actual_d : 0.f;
+                in37 = sc.dir_day_count ? sc.dir_day(sc.dir_day_count - 1).feat37 : sc.comp0_buf; // safe ptr
+                float acc_floor, range_ceiling;
+                drift_mt1_floors(sc, in37, actual_d, &acc_floor, &range_ceiling);
+                float bmean = 0.f, bmax = -1e30f, bmin = 1e30f;
+                for (int b = 0; b < DRIFT_BAND_N; b++) {
+                    float s = drift_score_mt1_comp(&mt1_band[((size_t)i*DRIFT_BAND_N + b)*MT1NN_PARAMS],
+                                                   sc, acc_floor, range_ceiling);
+                    bmean += s; bmax = fmaxf(bmax, s); bmin = fminf(bmin, s);
+                }
+                bmean /= DRIFT_BAND_N;
+                float track = drift_score_mt1_comp(sc.comp0_buf, sc, acc_floor, range_ceiling);
+                float floor = fmaxf(1e-3f, 0.05f * fabsf(bmean));   // band-width adaptive floor (§4)
+                rec.mt1_rel[i]       = drift_rel_metric(track, bmean, bmax, bmin, floor);
+                rec.mt1_band_mean[i] = bmean;
+                rec.mt1_track[i]     = track;
+            }
+
+            // MT2: track (slot0) vs 8-model band, same in48/actual_perf.
+            {
+                float bmean = 0.f, bmax = -1e30f, bmin = 1e30f;
+                for (int b = 0; b < DRIFT_BAND_N; b++) {
+                    float s = drift_score_mt2_pts(&mt2_band[(size_t)b*MT2NN_PARAMS], in48, actual_perf);
+                    bmean += s; bmax = fmaxf(bmax, s); bmin = fminf(bmin, s);
+                }
+                bmean /= DRIFT_BAND_N;
+                float track = drift_score_mt2_pts(mt2_scr->elite(0), in48, actual_perf);
+                float floor = fmaxf(1e-3f, 0.05f * fabsf(bmean));
+                rec.mt2_rel       = drift_rel_metric(track, bmean, bmax, bmin, floor);
+                rec.mt2_band_mean = bmean;
+                rec.mt2_track     = track;
+            }
+            write_drift_log_record(dlog, rec);
+        }
+        log_msg("[drift] base freeze_day=" + std::to_string(freeze_day) + " done");
+    }
+
+    fclose(dlog);
+    std::error_code ec; fs::remove_all(scratch_dir, ec);   // leave no throwaway models behind
+    log_msg("Drift study complete → " + drift_path);
+    return 0;
 }
 
 int main(int argc, char* argv[]) {
@@ -3524,6 +4045,7 @@ int main(int argc, char* argv[]) {
     float sigma = 0.01f, master_sigma = -1.f, sigma_decay = 0.5f;
     float dir_sigma = -1.f, rng_sigma = -1.f, acc_sigma = -1.f, cfd_sigma = -1.f, mt2_sigma_arg = -1.f;
     bool master_only = false, preserve_stock = false;
+    bool drift_study = false; std::string drift_scratch;
 
     for (int a = 1; a < argc; a++) {
         std::string arg(argv[a]);
@@ -3545,6 +4067,8 @@ int main(int argc, char* argv[]) {
         else if (arg == "--master-only") master_only = true;
         else if (arg == "--preserve-stock-data") preserve_stock = true;
         else if (arg == "--no-save") g_no_save = true;
+        else if (arg == "--drift-study") drift_study = true;
+        else if (arg == "--drift-scratch" && a+1<argc) { drift_scratch = argv[++a]; }
         else if (arg == "--help" || arg == "-h") { print_usage(argv[0]); return 0; }
     }
     // --account derives model and log dirs; --output/--load-dir are diagnostic overrides
@@ -3564,7 +4088,7 @@ int main(int argc, char* argv[]) {
     if (rng_sigma     < 0.f) rng_sigma     = master_sigma * (2.f / 3.f);
     if (acc_sigma     < 0.f) acc_sigma     = master_sigma;
     if (cfd_sigma     < 0.f) cfd_sigma     = master_sigma * 0.5f;
-    if (mt2_sigma_arg < 0.f) mt2_sigma_arg = master_sigma / 3.f;
+    if (mt2_sigma_arg < 0.f) mt2_sigma_arg = master_sigma / 6.f;  // v0.2.6.0: 0.002→0.001 (tighten MT2 pool)
 
     log_msg(std::string("training_v4_cpp v") + TRAINER_VERSION +
             "  account=" + (account.empty() ? "(diagnostic)" : account));
@@ -3593,6 +4117,12 @@ int main(int argc, char* argv[]) {
             "  Training: days " + std::to_string(day_start) +
             "–" + std::to_string(day_end));
 
+    // Phase-3 drift study: separate non-destructive driver (seeds from --load-dir, writes
+    // only to --drift-scratch). Routes here before any training state is allocated.
+    if (drift_study)
+        return run_drift_study(load_dir, drift_scratch, log_dir, all_days, total_days,
+                               day_start, day_end, sigma, mt2_sigma_arg);
+
     // Allocate state on heap
     auto ind_states   = std::make_unique<IndustryState[]>(N_IND);
     auto mst          = std::make_unique<MasterState>();   // portfolio state reused by MT2
@@ -3608,6 +4138,7 @@ int main(int argc, char* argv[]) {
             fprintf(csv, ",%s_elite_max,%s_elite_min,%s_elite_mean",
                     g_ind_names[i].c_str(), g_ind_names[i].c_str(), g_ind_names[i].c_str());
         fprintf(csv, ",mt2_elite_max_pts,mt2_elite_min_pts,mt2_elite_mean_pts,mt2_ideal_pts");
+        fprintf(csv, ",mt2_consensus_flat_pts,mt2_consensus_wtd_pts");
         for (int i = 0; i < N_IND; i++)
             fprintf(csv, ",%s_mkt_ret,%s_mkt_val",
                     g_ind_names[i].c_str(), g_ind_names[i].c_str());
@@ -3724,7 +4255,8 @@ int main(int argc, char* argv[]) {
                 for (int j = 0; j < IND_SYMS; j++)
                     update_hist_sym(ind_states[i].hist[j], day_ptr->sym[i][j]);
 
-            // Compute equal-weight market close-to-close return per industry
+            // Single-day equal-weight market return per industry — used ONLY for the
+            // backward-looking feature index mkt_val_hist and CSV logging (NOT the target).
             float mkt_ret[N_IND] = {};
             if (fill_ptr != nullptr) {
                 for (int i = 0; i < N_IND; i++) {
@@ -3739,16 +4271,37 @@ int main(int argc, char* argv[]) {
                     mkt_ret[i] = valid > 0 ? sum / valid : 0.f;
                 }
             }
-            // Median market return (relative direction target: always ~50% positive)
+
+            // FORWARD prediction target: equal-weight cumulative relative return over the next
+            // MT1_FWD_DAYS sessions (close[t+FWD]/close[t]-1, telescoping). Drives MT1 + MT2.
+            // Only defined when the forward window exists (skip the last MT1_FWD_DAYS days).
+            const DayData* fwd_ptr = (actual_day + MT1_FWD_DAYS < total_days)
+                                       ? &all_days[actual_day + MT1_FWD_DAYS] : nullptr;
+            const bool fwd_valid = (fwd_ptr != nullptr);
+            float fwd_ret[N_IND] = {};
+            if (fwd_valid) {
+                for (int i = 0; i < N_IND; i++) {
+                    float sum = 0.f; int valid = 0;
+                    for (int j = 0; j < IND_SYMS; j++) {
+                        const OHLCV& tod = day_ptr->sym[i][j];
+                        const OHLCV& fwd = fwd_ptr->sym[i][j];
+                        if (tod.valid && fwd.valid && tod.close > 1e-3f) {
+                            sum += fwd.close / tod.close - 1.f; valid++;
+                        }
+                    }
+                    fwd_ret[i] = valid > 0 ? sum / valid : 0.f;
+                }
+            }
+            // Median forward return (relative target: always ~50% positive)
             float sorted_ret[N_IND];
-            memcpy(sorted_ret, mkt_ret, sizeof(mkt_ret));
+            memcpy(sorted_ret, fwd_ret, sizeof(fwd_ret));
             std::nth_element(sorted_ret, sorted_ret + N_IND/2, sorted_ret + N_IND);
             float median_ret = sorted_ret[N_IND/2];
 
-            // actual_perf for MT2: absolute fractional market return per industry
+            // actual_perf for MT2: forward cumulative market return per industry
             float actual_perf[N_IND] = {};
             for (int i = 0; i < N_IND; i++)
-                actual_perf[i] = mkt_ret[i];
+                actual_perf[i] = fwd_ret[i];
 
             // Build 444-feature vector using cumulative market index (from BEFORE today)
             float today444[444];
@@ -3759,26 +4312,37 @@ int main(int argc, char* argv[]) {
             // MT1 step: called for all days; push_dir_day runs unconditionally;
             // selection/mutation/culling gated at actual_day >= MT1_START_DAY inside step_mt1
             MT1Result mt1_res[N_IND] = {};
-            for (int i = 0; i < N_IND; i++) {
-                const float* in37 = today444 + i * 37;
-                float actual_d_i  = (mkt_ret[i] - median_ret) * MT1_SCALE_DOLLARS;
-                mt1_res[i] = step_mt1(i, mt1_scratches[i], actual_d_i,
-                                      in37, actual_day,
-                                      cur_dir_sigma, cur_rng_sigma,
-                                      cur_acc_sigma, cur_cfd_sigma);
+            if (fwd_valid) {
+                for (int i = 0; i < N_IND; i++) {
+                    const float* in37 = today444 + i * 37;
+                    float actual_d_i  = (fwd_ret[i] - median_ret) * MT1_SCALE_DOLLARS;
+                    mt1_res[i] = step_mt1(i, mt1_scratches[i], actual_d_i,
+                                          in37, actual_day,
+                                          cur_dir_sigma, cur_rng_sigma,
+                                          cur_acc_sigma, cur_cfd_sigma);
+                }
             }
 
-            // MT2 step (actual_day >= MASTER_START_DAY)
+            // MT2 step (needs forward target; actual_day >= MASTER_START_DAY)
             MasterResult master_res = {};
             bool mt2_injected = false;
-            if (actual_day >= MASTER_START_DAY) {
-                // Build 48-feature MT2 input from MT1 slot0 raw activations (no normalization)
+            if (fwd_valid && actual_day >= MASTER_START_DAY) {
+                // Build 48-feature MT2 input from MT1 slot0 raw activations (no normalization).
+                // MT2_FEED_DIRECTION selects the direction-pool slot0 (strongest daily signal)
+                // vs the composite slot0; toggle back to composite once MT2 shows a learning curve.
                 float in48[48];
                 for (int i = 0; i < N_IND; i++) {
-                    in48[i*4 + 0] = mt1_res[i].slot0_conf;
-                    in48[i*4 + 1] = mt1_res[i].slot0_delta_t;
-                    in48[i*4 + 2] = mt1_res[i].slot0_range_pct;
-                    in48[i*4 + 3] = mt1_res[i].slot0_conf4;
+                    if (MT2_FEED_DIRECTION) {
+                        in48[i*4 + 0] = mt1_res[i].dir0_conf;
+                        in48[i*4 + 1] = mt1_res[i].dir0_delta_t;
+                        in48[i*4 + 2] = mt1_res[i].dir0_range_pct;
+                        in48[i*4 + 3] = mt1_res[i].dir0_conf4;
+                    } else {
+                        in48[i*4 + 0] = mt1_res[i].slot0_conf;
+                        in48[i*4 + 1] = mt1_res[i].slot0_delta_t;
+                        in48[i*4 + 2] = mt1_res[i].slot0_range_pct;
+                        in48[i*4 + 3] = mt1_res[i].slot0_conf4;
+                    }
                 }
                 master_res = step_mt2(*mst, *mt2_scratch, in48, actual_perf,
                                       actual_day, total_days, cur_mt2_sigma, &mt2_injected);
@@ -3818,7 +4382,7 @@ int main(int argc, char* argv[]) {
 
             // MT1 direction collapse injection (fires after MT2 day is complete)
             bool mt1_dir_inj[N_IND] = {};
-            if (actual_day >= MT1_START_DAY) {
+            if (actual_day >= MT1_START_DAY && fwd_valid) {
                 for (int ind_i = 0; ind_i < N_IND; ind_i++) {
                     MT1Scratch& sc = mt1_scratches[ind_i];
                     if (sc.dir_cooldown > 0) sc.dir_cooldown--;
@@ -3854,8 +4418,8 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            // Write MT binary log record (once MT1 is active)
-            if (mt_log && actual_day >= MT1_START_DAY) {
+            // Write MT binary log record (once MT1 is active; only days with a forward target)
+            if (mt_log && actual_day >= MT1_START_DAY && fwd_valid) {
                 MTLogRecord rec{};
                 rec.pass_num     = (uint32_t)pass;
                 rec.actual_day   = (uint32_t)actual_day;
@@ -3886,8 +4450,15 @@ int main(int argc, char* argv[]) {
                 rec.mt2_slot0_pts  = master_res.elite_mean_pts;  // slot0 pts proxy
                 rec.mt2_ideal_pts  = master_res.ideal_pts;
                 rec.mt2_injected   = mt2_injected ? 1u : 0u;
-                for (int i = 0; i < N_IND; i++)
+                rec.mt2_consensus_flat_pts = master_res.consensus_flat_pts;
+                rec.mt2_consensus_wtd_pts  = master_res.consensus_wtd_pts;
+                for (int i = 0; i < N_IND; i++) {
                     rec.mt1_dir_injected[i] = mt1_dir_inj[i] ? 1u : 0u;
+                    rec.mt1_slot0_act[i][0] = mt1_res[i].slot0_conf;
+                    rec.mt1_slot0_act[i][1] = mt1_res[i].slot0_delta_t;
+                    rec.mt1_slot0_act[i][2] = mt1_res[i].slot0_range_pct;
+                    rec.mt1_slot0_act[i][3] = mt1_res[i].slot0_conf4;
+                }
                 write_mt_log_record(mt_log, rec);
             }
 

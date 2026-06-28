@@ -217,64 +217,101 @@ All model classes are defined in `models.py` (single source of truth) and import
 
 - **`StockNN`** — one instance per industry sector (12 sectors). FC injection architecture: seed day → 14 inject layers → today layer → 2 flat layers → funnel. Output is `(12, 4)` — one row per stock in the sector, columns are `[buy_qty, buy_price_frac, sell_all_price_frac, sell_qty]`.
 - **`MasterNN`** — legacy single cross-sector allocator (444→48). Kept for backward compatibility; superseded by MT1+MT2 in production once MT2 models are available.
-- **`MT1NN`** (37→4, ~3,412 params per slot) — per-industry preprocessor. One independent 200-slot pool per industry. Input: one industry's 37-feature slice of the 444-feature master vector. Outputs (raw logits, activations applied at score time): `sigmoid(out[0])` = direction confidence P(positive return), `tanh(out[1])×$10K` = dollar P&L prediction, `softplus(out[2])` = range as fraction of effective delta, `sigmoid(out[3])` = calibrated confidence. Activates at `actual_day >= 25`. Files: `mt1_{industry}_model_{n}.pt` / `mt1_{industry}_best.pt`.
+- **`MT1NN`** (37→4, ~3,412 params per slot) — per-industry preprocessor. **Five independent 200-slot pools per industry** (composite, direction, accuracy, range, confidence); see "MT1 pools" under MT1 scoring formulas. Input: one industry's 37-feature slice of the 444-feature master vector. Outputs (raw logits, activations applied at score time): `sigmoid(out[0])` = direction confidence P(positive return), `tanh(out[1])×$10K` = dollar P&L prediction, `softplus(out[2])` = range as fraction of effective delta, `sigmoid(out[3])` = calibrated confidence. Activates at `actual_day >= 25`; scored over a 10-day linear-weighted window. Files: `mt1_{industry}_model_{n}.pt` / `mt1_{industry}_best.pt`.
 - **`MT2NN`** (FC+LSTM→48, ~34,572 params per slot) — cross-industry allocator. Replaces `MasterNN`. Input: 48 raw MT1 slot0 activations (4 per industry × 12 industries, no normalization — dollar magnitude IS the allocation signal). Parallel FC branch (48→36→36) + 2-layer LSTM (input=4, hidden=36) → concat 72 → taper (72→66→60→54→48). Activates at `actual_day >= 30`. Files: `mt2_model_{n}.pt` / `mt2_best.pt`.
 
 ### MT1 scoring formulas
 
+Per-day raw outputs and target:
 ```
-conf = sigmoid(out[0]);  delta_t = tanh(out[1]);  delta_d = delta_t × 10000
+conf = sigmoid(out[0]);  delta_d = tanh(out[1]) × $10k
 range_pct = softplus(out[2]);  conf4 = sigmoid(out[3])
 
-# 10-day rolling floor (per industry, cold-start $250):
-floor_d = max(mean(|actual_d| over last 10 days), 250.0)
-actual_d = actual_frac × portfolio_value  (true dollars earned)
-
-# Direction:
-score_dir = 1.0 if (conf>=0.5) == (actual_d>=0) else 0.0
-
-# Range (calibration: reward tightness that still covers actual_d):
-eff_delta = max(|delta_d|, floor_d);  r = range_pct × eff_delta
-m = |actual_d - delta_d| / r
-score_range = m if m < 1.0 else 0.0   # higher=tighter; 0 if miss
-
-# Accuracy (dollar-denominated):
-denom = max(|actual_d|, floor_d)
-score_acc = clamp(1 - |actual_d - delta_d| / denom, 0, 1)
-
-# Confidence (grades out[3] against range geometry ideal):
-d = |actual_d - delta_d|
-ideal = (1 - 0.5×d/r) if d≤r else r/(d+r)    # 1.0→0.5→0 (continuous at boundary)
-score_conf = 1 - |conf4 - ideal|
-
-# Composite:
-mt1_score = 0.50×score_dir + 0.33×score_range + 0.17×score_acc
-
-# Edge case: if all 200 slots have score_range==0 (actual_d==delta_d for all),
-# skip range elite slot reassignment for that day (keep previous day's range elites).
+# Market-based FORWARD target (v0.2.5+): cumulative relative return over the next MT1_FWD_DAYS=10 sessions.
+# fwd_ret[i] = close[t+10]/close[t] − 1 (equal-weight per industry); daily magnitude is noise, but a
+# 10-day-forward magnitude is predictable enough for MT2 to rank industries.
+actual_d = (fwd_ret[i] − median_fwd_ret) × $10k     # forward relative return vs cross-sectional median
+# Trainer skips the last 10 days (no forward data); single-day mkt_ret is kept ONLY for the
+# backward-looking feature index (mkt_val_hist) + CSV. Production upkeep buffers predictions 10
+# sessions (mt_fwd_buffer.json) and trains each when its forward window completes.
 ```
 
-**MT1 elite pool (28 slots):**
-- Slots 0–4: composite elites (slot 0 = production model)
-- Slots 5–9: direction elites
-- Slots 10–14: range elites
-- Slots 15–19: accuracy elites
-- Slots 20–24: confidence elites
-- Slot 25: equal-weight blend of {0,5,10,15,20} (top-1 from each category)
-- Slot 26: equal-weight blend of {0,1,5,6,10,11,15,16,20,21} (top-2 from each)
-- Slot 27: equal-weight blend of {0,1,2,5,6,7,10,11,12,15,16,17,20,21,22} (top-3 from each)
+**Adaptive per-industry floors** (computed each day from 10-day rolling buffers, BEFORE scoring):
+```
+acc_floor     = mean(|actual_d| over last 10d) / 2            # cold-start $125 = MT1_FLOOR_COLD/2
+range_ceiling = 4 × max(mean(|actual_d − comp0_δd|, 10d), today's |actual_d − comp0_δd|)   # no ceiling until buffer has data
+eff_delta floor = MT1_RANGE_FLOOR = $1                        # effectively none
+```
+(The legacy flat `$250` floor is only the cold-start seed; after ~day 35 every floor is per-industry adaptive and sits *below* the typical signal.)
+
+**Per-day component scores** (`compute_mt1_scores`):
+```
+err = |actual_d − delta_d|
+
+# Direction (single-day, continuous):
+sc_dir = conf if actual_d ≥ 0 else (1 − conf)
+
+# Range (reward a tight band that still covers the error):
+eff_delta = max(|delta_d|, $1);  r = min(range_pct × eff_delta, range_ceiling)
+m = err / r;  sc_rng = m if m < 1.0 else 0.0          # higher m = tighter band still covering; 0 if band misses
+
+# Accuracy (scale-relative, smooth, always in (0,1]):
+denom = max(|actual_d|, acc_floor)                    # accuracy POOL uses acc_floor/(err+acc_floor) directly
+sc_acc = denom / (err + denom)
+
+# Confidence (grade conf4 against range geometry ideal):
+dor = err / r;  ideal = 1 / (1 + dor²)
+sc_cfd = 1 − (conf4 − ideal)²
+if err > r:  sc_cfd = 0.5 + 0.25 × sc_cfd             # compress outside-range to [0.5, 0.75]
+
+# Composite (per day): equal-weight mean of the four components' SECONDARY [0,1] normalizations.
+# Each secondary maps its component's naive baseline B → 0 and ideal → 1, so all four contribute
+# equally (raw confidence ≈1 / range ≈0.85 would otherwise dominate; acc/dir sit near 0.5):
+#   sec = clamp((raw − B)/(1 − B), 0, 1)
+#   B_dir = 0.5;  B_acc = denom/(|actual_d|+denom);  B_rng = (err/acc_floor capped <1);
+#   B_cfd = sc_cfd evaluated at conf4 = 0.5
+composite = 0.25×(sec_dir + sec_acc + sec_rng + sec_cfd)
+```
+
+**Scoring window (all pools, `MT1_DIR_DAYS = 10`):** each model is scored over the trailing 10 days,
+summing its per-day score with a linear recency weight (oldest day in window = 1.0 → today = 2.0):
+```
+model_score = Σ_{d in window} weight(age_d) × per_day_score(d)
+weight(age) = 2.0 − age/(MT1_DIR_DAYS−1)     # age 0 = today → 2.0;  age 9 → 1.0   (mt1_win_weight)
+```
+A longer, recency-weighted window reduces score-estimate variance → sharper selection, fewer lucky-model
+promotions. Each pool sums its own per-day score (dir→sc_dir, acc→sc_acc, rng→sc_rng, cfd→sc_cfd,
+composite→composite). The direction pool additionally tracks an integer correct-count (`dir_correct_dbl`,
+today still counted ×2) as a secondary qualify/sort key separate from the continuous sum.
+
+**Per-pool culls (live slots, any day in window):**
+- Range & confidence pools: cull if raw band `range_pct × eff_delta > range_ceiling`.
+- Accuracy pool: cull if direction disagrees with delta sign: `(conf≥0.5) ≠ (delta_d≥0)`.
+- Direction pool: cull if confidence sign-crossings `< ceil(market_flips/2)` over the window; **backfill gate**
+  freezes the pool when no live model gets ≥3 days' direction correct (streak/cooldown collapse-injection guards this).
+
+**MT1 pools — 5 independent 200-slot pools** (composite, direction, accuracy, range, confidence):
+- Component pools (dir/acc/rng/cfd) slot layout: **0–16** direct elites · **17–19** wavg blends · **20–24** injected · **25–199** mutations (175). Mutations use a **weighted children table** (`kChildren` / `MT1_PARENT_OF_MUT`): slot 0 = 13 children, slots 1–4 = 11/11/10/10, slots 5–19 = 7, injected 20–24 = **3 each** — concentrating breeding on proven elites and starving unproven immigrants (injection = 10% of the pool, was 20%).
+- Composite pool: 200 fresh blends scored each day (no persistent mutation slots) + 5-day history (10/day).
+- **Injection** (fills slots 20–24 each day): **all four pools inject from the composite top-5** (`comp_inject`). Since the composite is now a balanced equal-weight all-rounder, broadcasting it spreads balanced lessons instead of direction-bias. (The old chained cascade — dir→acc, rng→cfd — and the `dir_inject`/`rng_inject` buffers are retired/vestigial.)
+- Production model = composite pool slot 0 (`comp0_buf`); its 4 activations feed MT2.
 
 ### Production inference chain (when MT2 models available)
 
 ```
 build_master_features() → today444
   → MT1 slot0 ×12 (slices today444[i*37:(i+1)*37]) → 4 raw activations each
-  → build in48: [conf, delta_t, range_pct, conf4] × 12 (no normalization)
+  → build in48: [conf, delta_t, range_pct, conf4] × 12 (no normalization). Source = direction-pool
+    slot0 when MT2_FEED_DIRECTION=true (v0.2.5+, the strongest daily signal), else composite slot0;
+    toggle back to composite once MT2 shows a learning curve. Allocation path needs convert_weights.py
+    to emit mt1_{ind}_dir_best.pt (else degrades to composite cleanly).
   → MT2 slot0 forward pass → (12,4) logits → argmax per industry → tier map
   → allocation/liquidation (unchanged from MasterNN path)
 ```
 
 `run_master_allocation()` in `production_v2.py` tries MT2 first (`mt2_best.pt` exists), falls back to MasterNN, then equal allocation. MT2 input: 48 raw MT1 activations (no normalization; `mt2_norm_stats.json` no longer used).
+
+**v0.2.6.0 additions:** (1) MT2 mutation sigma lowered 0.002→0.001 (`master_sigma/6`; tighter pool). (2) **Raw slot0 logging** — each industry's slot0 activations `[conf, delta_t, range_pct, conf4]` are written per day to `mt_training_log.bin` (record V7, 1244 bytes, `MT_LOG_VERSION=6`) so any run can be re-graded offline under any target. (3) **Pool-consensus allocation diagnostic** — a wisdom-of-crowds ensemble: rank industries by the pool's mean tier vote, re-tier by the pool's *observed* mean tier-0 count (NOT `opt_tier` — that would leak the realized outcome), grade with the normal pts formula. Two variants — flat (all slots) and look-behind-weighted (elites weighted by reliability over the last `MT2_LB_DAYS=5` days, leak-free because read-only). Logged to the binary log + CSV (`mt2_consensus_flat_pts`, `mt2_consensus_wtd_pts`); plotted as thick purple lines (solid=weighted, dashed=flat) on `mt2_performance.svg`. The MT2 injection already preserves the top-half elites (slots 0–7), so the limit-cycle is regime-driven, not injection-driven; the consensus is the regime-robustness mechanism.
 
 ### Daily upkeep (production_v2.py + upkeep.py)
 
@@ -333,12 +370,16 @@ A `PostToolUse` hook in `.claude/settings.json` auto-updates `CHANGELOG.md` and 
 | `N_SLOTS` | 200 | Total model slots per pool |
 | `ELITE_COUNT` | 17 | Direct elite slots (industry + MT2) |
 | `ELITE_POOL` | 20 | Elites + weighted-average slots (industry + MT2) |
-| `MT1_N_CATS` | 5 | MT1 scoring categories (composite, dir, range, acc, conf) |
-| `MT1_DIRECT_ELITES` | 25 | MT1 direct elite slots (5 categories × 5) |
-| `MT1_ELITE_POOL` | 28 | MT1 total pool (25 direct + 3 wavg blends) |
+| `MT1_COMP_SLOTS` | 200 | Slots per MT1 pool (5 pools: composite, dir, acc, rng, cfd) |
+| `MT1_COMP_PARENTS` | 25 | MT1 parents per pool (17 elites + 3 wavg + 5 injected) |
+| `MT1_COMP_CHILDREN` | 7 | MT1 mutation children per parent (25×7 = 175 mutations) |
+| `MT1_COMP_INJECT` | 5 | Cascade injection slots per pool (slots 20–24) |
 | `MT1_SCALE_DOLLARS` | $10,000 | tanh(out[1]) × scale = dollar P&L prediction |
-| `MT1_FLOOR_COLD` | $250 | Cold-start floor for per-industry rolling buffer |
-| `MT1_ROLLING_DAYS` | 10 | Days in per-industry |actual_d| rolling buffer |
+| `MT1_DIR_DAYS` | 10 | Scoring window (all pools): linear-weighted trailing days, oldest=1.0 → today=2.0 |
+| `MT1_FLOOR_COLD` | $250 | Cold-start seed only; `acc_floor` cold = MT1_FLOOR_COLD/2 = $125, then per-industry adaptive |
+| `MT1_ROLLING_DAYS` | 10 | Days in per-industry |actual_d| / residual rolling buffers (floor + ceiling) |
+| `MT1_RANGE_CEIL_MULT` | 4 | range_ceiling = 4 × max(mean, today) |actual_d − comp0_δd| |
+| `MT1_DIR_STREAK_TRIP` / `_COOLDOWN_LEN` | 5 / 10 | Direction collapse-injection: trip after 5 collapse days, 10-day cooldown |
 | `IND_STARTING_CASH` | $25,000 | Per-industry starting capital |
 | `MST_STARTING_CASH` | $300,000 | Master starting capital |
 | `MAX_SINGLE_STOCK_PCT` | 0.60 | Max fraction of industry cash in one stock |
@@ -357,7 +398,7 @@ Version string is defined in `version.py` (`VERSION`) and mirrored as `TRAINER_V
 - `FEATURE` — increment for any new capability or significant improvement; resets `BUILD` to 0.
 - `BUILD` — increment for bug fixes and minor changes within a `FEATURE`.
 
-Current version: **0.2.0.0**
+Current version: **0.2.6.0**
 
 To bump the version, edit `VERSION` in `version.py` and `TRAINER_VERSION` in `training_v4.cpp`, then rebuild the C++ binary.
 

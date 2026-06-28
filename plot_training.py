@@ -105,6 +105,10 @@ assert _RECORD_STRUCT_V5.size == RECORD_SIZE_V5
 RECORD_SIZE_V6 = 1044
 _RECORD_STRUCT_V6 = struct.Struct("<II" + "f" * 255 + "Bxxx" + "12B")
 assert _RECORD_STRUCT_V6.size == RECORD_SIZE_V6
+# v6/bin-version-6 (V7 record): 1244 bytes — adds mt1_slot0_act[12][4] + mt2_consensus flat/wtd
+RECORD_SIZE_V7 = 1244
+_RECORD_STRUCT_V7 = struct.Struct("<II" + "f" * 255 + "Bxxx" + "12B" + "50f")
+assert _RECORD_STRUCT_V7.size == RECORD_SIZE_V7
 
 # ── Download ──────────────────────────────────────────────────────────────────
 def download_logs(host: str, account: str) -> None:
@@ -135,11 +139,14 @@ def load_binary_log(path: Path) -> list[dict]:
     magic, version, n_ind, _ = struct.unpack_from("<IIII", data, 0)
     if magic != MT_LOG_MAGIC:
         sys.exit(f"{path}: bad magic {magic:#010x} (expected {MT_LOG_MAGIC:#010x})")
-    if version not in (3, 4, 5):
-        sys.exit(f"{path}: unsupported log version {version} (expected 3, 4, or 5)")
+    if version not in (3, 4, 5, 6):
+        sys.exit(f"{path}: unsupported log version {version} (expected 3-6)")
 
     # Pick record format by binary version number
-    if version == 5:
+    if version == 6:
+        rec_size   = RECORD_SIZE_V7
+        rec_struct = _RECORD_STRUCT_V7
+    elif version == 5:
         rec_size   = RECORD_SIZE_V6
         rec_struct = _RECORD_STRUCT_V6
     elif version == 4:
@@ -164,7 +171,17 @@ def load_binary_log(path: Path) -> list[dict]:
                 base = ci * 48 + si * 12
                 mt1[comp][stat] = list(f[base : base + 12])
 
-        if version == 5:
+        if version == 6:
+            # V7 layout: V6 + mt1_slot0_act[12][4] (raw[270:318]) + consensus flat/wtd (318,319)
+            mt1_dir_cdb      = list(raw[242:254])
+            mt2_best         = raw[254]
+            mt2_slot0        = raw[255]
+            mt2_ideal        = raw[256]
+            mt2_inj          = raw[257]
+            mt1_dir_injected = list(raw[258:270])
+            mt2_cons_flat    = raw[318]
+            mt2_cons_wtd     = raw[319]
+        elif version == 5:
             # V6 layout: same as V5 + mt1_dir_injected[12] at raw[258:270]
             mt1_dir_cdb      = list(raw[242:254])
             mt2_best         = raw[254]
@@ -172,6 +189,8 @@ def load_binary_log(path: Path) -> list[dict]:
             mt2_ideal        = raw[256]
             mt2_inj          = raw[257]
             mt1_dir_injected = list(raw[258:270])
+            mt2_cons_flat    = None
+            mt2_cons_wtd     = None
         elif version == 4:
             # V5 layout: mt1_dir_correct_dbl[12] at raw[242:254], MT2 at 254+
             mt1_dir_cdb      = list(raw[242:254])
@@ -180,6 +199,8 @@ def load_binary_log(path: Path) -> list[dict]:
             mt2_ideal        = raw[256]
             mt2_inj          = raw[257]
             mt1_dir_injected = [0] * 12
+            mt2_cons_flat    = None
+            mt2_cons_wtd     = None
         else:
             mt1_dir_cdb      = [0.0] * 12
             mt2_best         = raw[242]
@@ -187,6 +208,8 @@ def load_binary_log(path: Path) -> list[dict]:
             mt2_ideal        = raw[244]
             mt2_inj          = raw[245]
             mt1_dir_injected = [0] * 12
+            mt2_cons_flat    = None
+            mt2_cons_wtd     = None
 
         records.append({
             "pass":                pass_num,
@@ -198,6 +221,8 @@ def load_binary_log(path: Path) -> list[dict]:
             "mt2_slot0":           mt2_slot0,
             "mt2_ideal":           mt2_ideal,
             "mt2_inj":             mt2_inj,
+            "mt2_consensus_flat":  mt2_cons_flat,
+            "mt2_consensus_wtd":   mt2_cons_wtd,
         })
         offset += rec_size
 
@@ -229,6 +254,48 @@ def _nearest_y(xs_smooth: list, ys_smooth: list, day: float) -> float | None:
         return None
     idx = min(range(len(xs_smooth)), key=lambda k: abs(xs_smooth[k] - day))
     return ys_smooth[idx]
+
+def _find_extreme_lows(xs: list, ys: list, window: int = 2) -> list[tuple]:
+    """
+    Find local minima: each point must be lower than all neighbors within ±window
+    and below the overall series mean. Nearby candidates (within window days) are
+    merged, keeping the deepest.
+    Returns list of (x, y) pairs.
+    """
+    n = len(ys)
+    if n < 2 * window + 1:
+        return []
+    series_mean = sum(ys) / n
+    candidates = [
+        i for i in range(window, n - window)
+        if ys[i] == min(ys[i - window : i + window + 1])
+        and ys[i] < ys[i - 1] and ys[i] < ys[i + 1]
+        and ys[i] < series_mean
+    ]
+    # Merge candidates within window days; keep deepest
+    merged, i = [], 0
+    while i < len(candidates):
+        j, group = i + 1, [candidates[i]]
+        while j < len(candidates) and candidates[j] - candidates[i] <= window:
+            group.append(candidates[j]); j += 1
+        merged.append(min(group, key=lambda k: ys[k]))
+        i = j
+    return [(xs[k], ys[k]) for k in merged]
+
+def _linear_trend(pairs: list[tuple]) -> tuple[float, float, float]:
+    """Least-squares linear fit; returns (slope, intercept, R²)."""
+    if len(pairs) < 2:
+        return 0.0, pairs[0][1] if pairs else 0.0, float("nan")
+    xs = [p[0] for p in pairs]; ys = [p[1] for p in pairs]
+    n = len(xs); mx, my = sum(xs) / n, sum(ys) / n
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    den = sum((x - mx) ** 2 for x in xs)
+    slope = num / den if den else 0.0
+    intercept = my - slope * mx
+    ss_res = sum((y - (slope * x + intercept)) ** 2 for x, y in zip(xs, ys))
+    ss_tot = sum((y - my) ** 2 for y in ys)
+    r2 = 1.0 - ss_res / ss_tot if ss_tot else float("nan")
+    return slope, intercept, r2
 
 # ── Floor-reset detection ─────────────────────────────────────────────────────
 def _is_reset(mean_v: float, max_v: float, min_v: float) -> bool:
@@ -442,14 +509,18 @@ def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: 
     ax.plot(xs_an, all_mins,  color="black", linewidth=1.8, linestyle=(0, (1, 2)),
             zorder=5, label="All-ind mean (min)")
 
-    ax.set_ylim(0, 6)
-    ylabel = "5-day sum score (0 – 6)"
+    # 10-day linear-weighted scoring window: weights ramp oldest=1.0 → today=2.0,
+    # summing to MT1_DIR_DAYS(10) × avg(1.5) = 15. Per-day component scores are in [0,1],
+    # so the windowed best/mean/min span [0, 15].
+    ax.set_ylim(0, 15.3)
+    ylabel = "10-day weighted-sum score (0 – 15)"
     if comp == "direction":
-        ax.axhline(3.0, color="gray", linewidth=0.8, linestyle="--",
-                   label="Random baseline (3.0)")
+        # Random model (conf≈0.5 every day) scores 0.5 × 15 = 7.5.
+        ax.axhline(7.5, color="gray", linewidth=0.8, linestyle="--",
+                   label="Random baseline (7.5)")
 
-        # Mean n_correct_dbl across all industries (primary sort key denominator).
-        # Scale 0–6: 4 older days × correct + today × 2 × correct. 3.0 = random.
+        # Mean n_correct_dbl across all industries (integer correct-count, today×2).
+        # 10-day window: 9 older days × correct + today × 2 = max 11; 50% correct ≈ 5.5.
         cdb_raw = [
             sum(r["mt1_dir_correct_dbl"]) / n_ind
             for r in records
@@ -459,7 +530,7 @@ def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: 
         markevery = max(1, len(xs_cdb) // 14)
         ax.plot(xs_cdb, cdb_vals, color="#e06000", linewidth=2.2,
                 marker="^", markersize=6, markevery=markevery,
-                zorder=6, label="Mean correct direction calls (0–6, today×2)")
+                zorder=6, label="Mean correct direction calls (0–11, today×2)")
 
         # % industries with positive market return (right y-axis).
         # Uses mkt_ret CSV columns if available; falls back to StockNN portfolio direction.
@@ -636,6 +707,18 @@ def plot_mt2(rows: list[dict], pass_num: int, out_path: Path) -> None:
     ax.plot(xs_i, ideals, color="#000000", linewidth=1.6, alpha=0.85,
             linestyle=(0, (5, 2)), label="Ideal (optimal allocation)")
 
+    # Pool-consensus allocation (wisdom-of-crowds diagnostic) — thick purple.
+    # Solid = look-behind-weighted vote, dashed = flat vote. Present only in V7+ logs (CSV columns).
+    if rows and "mt2_consensus_wtd_pts" in rows[0]:
+        cons_wtd_raw  = [r["mt2_consensus_wtd_pts"]  for r in rows]
+        cons_flat_raw = [r["mt2_consensus_flat_pts"] for r in rows]
+        xs_cw, cons_wtd  = _smooth(xs_raw, cons_wtd_raw)
+        xs_cf, cons_flat = _smooth(xs_raw, cons_flat_raw)
+        ax.plot(xs_cw, cons_wtd,  color="#7e1ea0", linewidth=2.6, alpha=0.95,
+                label="Consensus (weighted)")
+        ax.plot(xs_cf, cons_flat, color="#7e1ea0", linewidth=2.0, alpha=0.80,
+                linestyle=(0, (5, 2)), label="Consensus (flat)")
+
     rand_score, t0m, assign = _mt2_realistic_random_baseline(rows)
     n0, n1, n2, n3 = assign
     ax.axhline(rand_score, color="#888888", linewidth=1.0, alpha=0.80, linestyle="--",
@@ -677,6 +760,31 @@ def plot_mt2(rows: list[dict], pass_num: int, out_path: Path) -> None:
     ax2.spines["right"].set_color("#aaaaaa")
     ax2.yaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f"{v:.1f}"))
 
+    # Extreme low analysis: detect local minima in the min-line, fit a trend
+    lows = _find_extreme_lows(xs_raw, mins_raw, window=2)
+    low_trend_handle = None
+    if len(lows) >= 2:
+        low_xs = [p[0] for p in lows]
+        low_ys = [p[1] for p in lows]
+        slope, intercept, r2 = _linear_trend(lows)
+        ax.plot(low_xs, low_ys, marker="v", color=COL_MIN, markersize=7,
+                linestyle="none", zorder=8, alpha=0.9)
+        trend_x = [low_xs[0], low_xs[-1]]
+        trend_y = [slope * x + intercept for x in trend_x]
+        ax.plot(trend_x, trend_y, color=COL_MIN, linewidth=1.4,
+                linestyle=(0, (4, 3)), zorder=7, alpha=0.85)
+        intervals = [low_xs[k + 1] - low_xs[k] for k in range(len(low_xs) - 1)]
+        avg_iv = sum(intervals) / len(intervals)
+        min_iv, max_iv = min(intervals), max(intervals)
+        direction = "rising" if slope > 0 else "falling"
+        print(f"  MT2 extreme lows: {len(lows)} detected | interval {avg_iv:.1f} days avg "
+              f"({min_iv}–{max_iv} range) | trend {slope:+.3f} pts/day ({direction}, R²={r2:.2f})")
+        trend_label = (f"Low trend: {slope:+.3f} pts/day  (n={len(lows)}, "
+                       f"avg every {avg_iv:.1f}d, R²={r2:.2f})")
+        low_trend_handle = mlines.Line2D(
+            [], [], color=COL_MIN, linewidth=1.4, linestyle=(0, (4, 3)),
+            marker="v", markersize=7, label=trend_label)
+
     _style_ax(ax,
               f"MT2 Allocation Score (Elite Pool) — Pass {pass_num}",
               f"Day (Pass {pass_num})", "Score (pts)")
@@ -691,6 +799,8 @@ def plot_mt2(rows: list[dict], pass_num: int, out_path: Path) -> None:
         mlines.Line2D([], [], color="#555555", linewidth=1.4, linestyle=":",
                       label="max/mean/min ÷ ideal  (right axis, only when ideal > 0)"),
     ]
+    if low_trend_handle:
+        legend_handles.append(low_trend_handle)
     ax.legend(handles=legend_handles, loc="upper center", bbox_to_anchor=(0.5, -0.10),
               ncol=3, fontsize=9, framealpha=0.95, edgecolor="#cccccc")
     _save(fig, out_path)
