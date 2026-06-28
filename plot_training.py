@@ -799,6 +799,13 @@ def plot_mt2(rows: list[dict], pass_num: int, out_path: Path) -> None:
         mlines.Line2D([], [], color="#555555", linewidth=1.4, linestyle=":",
                       label="max/mean/min ÷ ideal  (right axis, only when ideal > 0)"),
     ]
+    # Consensus purple lines (drawn above) — labelled only when present in the log.
+    if rows and "mt2_consensus_wtd_pts" in rows[0]:
+        legend_handles[4:4] = [
+            mlines.Line2D([], [], color="#7e1ea0", linewidth=2.6, label="Consensus (weighted)"),
+            mlines.Line2D([], [], color="#7e1ea0", linewidth=2.0, linestyle=(0, (5, 2)),
+                          label="Consensus (flat)"),
+        ]
     if low_trend_handle:
         legend_handles.append(low_trend_handle)
     ax.legend(handles=legend_handles, loc="upper center", bbox_to_anchor=(0.5, -0.10),
