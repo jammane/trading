@@ -759,6 +759,46 @@ static void test_drift_rel_metric()
     CHECK(NEAR(drift_rel_metric(6.0f, 5.0f, 6.0f, 0.0f, 1e-3f),  tanhf(1.0f), 1e-5f)); // (6-5)/1 = +1
 }
 
+// ── Direction class-balanced weighting (step_mt1_component, absolute-target retune) ──
+// Replicates the day_weight balancing: normalize so up/down days each carry half the window
+// weight. Key property: a constant-prediction model scores the no-skill baseline dir_W/2
+// regardless of the target's sign skew (so base-rate betting earns no edge).
+static float balanced_dir_total(const int* up, const float* w, const float* day_score, int n) {
+    float w_up = 0.f, w_down = 0.f, W = 0.f;
+    for (int i = 0; i < n; i++) { W += w[i]; if (up[i]) w_up += w[i]; else w_down += w[i]; }
+    bool bal = (w_up > 0.f) && (w_down > 0.f);
+    float total = 0.f;
+    for (int i = 0; i < n; i++) {
+        float dw = bal ? w[i] * (up[i] ? W/(2.f*w_up) : W/(2.f*w_down)) : w[i];
+        total += day_score[i] * dw;
+    }
+    return total;
+}
+
+static void test_direction_balanced_weighting() {
+    SUITE("direction balanced weighting");
+    // Skewed window: 8 up-days, 2 down-days; arbitrary positive recency weights.
+    int   up[10] = {1,1,1,1,1,1,1,1,0,0};
+    float w[10]  = {1.0f,1.1f,1.2f,1.3f,1.4f,1.5f,1.6f,1.7f,1.8f,1.9f};
+    float W = 0.f; for (int i = 0; i < 10; i++) W += w[i];
+
+    // Constant "always up" at confidence c → no-skill baseline W/2 for ANY c (the whole point).
+    const float cs[4] = {0.5f, 0.7f, 0.9f, 0.99f};
+    for (int ci = 0; ci < 4; ci++) { float c = cs[ci];
+        float ds[10]; for (int i = 0; i < 10; i++) ds[i] = up[i] ? c : (1.f - c);
+        CHECK(NEAR(balanced_dir_total(up, w, ds, 10), W / 2.f, 1e-3f));
+    }
+    // Perfect → W, worst → 0.
+    { float ds[10]; for (int i=0;i<10;i++) ds[i]=1.f; CHECK(NEAR(balanced_dir_total(up,w,ds,10), W, 1e-3f)); }
+    { float ds[10]; for (int i=0;i<10;i++) ds[i]=0.f; CHECK(NEAR(balanced_dir_total(up,w,ds,10), 0.f, 1e-3f)); }
+    // Genuine skill (correct on both classes at 0.9) → 0.9·W, strictly above no-skill.
+    { float ds[10]; for (int i=0;i<10;i++) ds[i]=0.9f; float t=balanced_dir_total(up,w,ds,10);
+      CHECK(NEAR(t, 0.9f*W, 1e-3f)); CHECK(t > W/2.f); }
+    // Single-class window (all up) → balancing disabled, plain weighted sum.
+    { int u[3]={1,1,1}; float ww[3]={1.f,1.f,1.f}; float ds[3]={0.8f,0.8f,0.8f};
+      CHECK(NEAR(balanced_dir_total(u, ww, ds, 3), 0.8f*3.f, 1e-3f)); }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────
 
 int main()
@@ -781,6 +821,7 @@ int main()
     test_pool_score_dispatch();
     test_blend_slots_count();
     test_drift_rel_metric();
+    test_direction_balanced_weighting();
 
     printf("\n==================\n");
     printf("%d passed, %d failed\n", pass_count, fail_count);

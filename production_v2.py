@@ -210,10 +210,8 @@ def train_mt_one_day_prod(industries, model_dir, mkt_val_history,
         for ind in industry_list:
             oi = old_index.get(ind, 0.0)
             fwd_ret[ind] = (cur_index[ind] / oi - 1.0) if oi else 0.0
-        rets = sorted(fwd_ret.values())
-        n = len(rets)
-        median_fwd = rets[n // 2] if n % 2 == 1 else (rets[n//2 - 1] + rets[n//2]) / 2.0
-        actual_d_by_ind = {ind: (fwd_ret[ind] - median_fwd) * MT1_SCALE_DOLLARS
+        # MT1 target is the ABSOLUTE own-industry forward return; MT2 relativizes (actual_perf).
+        actual_d_by_ind = {ind: fwd_ret[ind] * MT1_SCALE_DOLLARS
                            for ind in industry_list}
         actual_perf = {ind: fwd_ret[ind] for ind in industry_list}
         old_feat = torch.tensor(old['feat444'], dtype=torch.float32).unsqueeze(0)

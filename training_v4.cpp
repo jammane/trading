@@ -119,7 +119,8 @@ static constexpr float MT1_RANGE_FLOOR     = 1.f;    // $1 — effectively no fl
 static constexpr float MT1_RANGE_CEIL_MULT = 4.f;    // ceiling = 4 × max(mean, today) |actual−comp0_delta|
 static constexpr float MT1_DIR_BACKFILL    = 0.65f;  // skip direction pool update when best score < this
 static constexpr int   MT1_DIR_DAYS        = 10;  // scoring window (all pools): score each model over last N days, linear-weighted sum (oldest=1.0 → today=2.0)
-static constexpr int   MT1_DIR_QUALIFY      = 1;   // min correct_dbl for a live slot to count as qualified
+static constexpr int   MT1_DIR_QUALIFY      = 1;   // (legacy, unused) min correct_dbl for a live slot to qualify
+static constexpr float MT1_DIR_SKILL_FLOOR  = 0.52f; // balanced direction skill_frac floor (0.5 = no skill); gates backfill/qualify under the sign-skewed ABSOLUTE target
 static constexpr int   MT1_DIR_STREAK_TRIP  = 5;   // consecutive collapse days before injection fires
 static constexpr int   MT1_DIR_COOLDOWN_LEN = 10;  // cooldown days after injection before re-injection allowed
 static constexpr int   HIST_WINDOW         = 15;
@@ -2260,6 +2261,28 @@ static MT1CompResult step_mt1_component(
     // Direction pool: correct-prediction count with today doubled (primary sort key)
     int dir_correct_dbl[MT1_COMP_SLOTS] = {};
 
+    // Class-balanced day weights (direction pool only) — see MT1_DIR_SKILL_FLOOR. Normalize so
+    // up-days and down-days each carry half the window weight; then any constant-prediction model
+    // scores exactly the no-skill baseline dir_W/2 regardless of the absolute target's sign skew.
+    // Other pools (and single-class windows) use plain recency weights. skill_frac = total_sum/dir_W.
+    float day_weight[MT1_DIR_DAYS] = {};
+    float dir_W = 0.f;
+    if (scratch.dir_day_count > 0) {
+        float w_up = 0.f, w_down = 0.f;
+        for (int di = 0; di < scratch.dir_day_count; di++) {
+            float w = mt1_win_weight(di, scratch.dir_day_count);
+            dir_W += w;
+            if (scratch.dir_day(di).actual_d >= 0.f) w_up += w; else w_down += w;
+        }
+        bool balance = (pool_id == 0) && (w_up > 0.f) && (w_down > 0.f);
+        for (int di = 0; di < scratch.dir_day_count; di++) {
+            float w = mt1_win_weight(di, scratch.dir_day_count);
+            day_weight[di] = balance
+                ? w * ((scratch.dir_day(di).actual_d >= 0.f) ? dir_W/(2.f*w_up) : dir_W/(2.f*w_down))
+                : w;
+        }
+    }
+
     if (scratch.dir_day_count > 0) {
         for (int slot = 0; slot < pool_slots; slot++) {
             const float* wptr;
@@ -2314,7 +2337,7 @@ static MT1CompResult step_mt1_component(
                     auto sb = compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling);
                     day_score = (pool_id == 2) ? sb.range : sb.confidence;
                 }
-                total_sum += day_score * mt1_win_weight(di, scratch.dir_day_count);
+                total_sum += day_score * day_weight[di];
             }
 
             // Direction flip cull: direction pool (id=0) only, after full window
@@ -2356,17 +2379,20 @@ static MT1CompResult step_mt1_component(
         mean_cdb = sum_cdb / (float)live_count;
     }
 
-    // Direction backfill: skip update unless best model got ≥3 days correct (binary sign)
-    if (pool_id == 0 && dir_max_correct < 3) {
+    // Direction backfill: skip update unless the best model shows real direction SKILL.
+    // Gate on balanced skill_frac = cat_sc/dir_W (0.5 = no skill); raw correct-count is
+    // sign-skew-inflated under the absolute target and would never trip.
+    float dir_best_skill = (dir_W > 0.f) ? (best_cat / dir_W) : 0.f;
+    if (pool_id == 0 && dir_best_skill < MT1_DIR_SKILL_FLOOR) {
         scratch.dir_streak++;
         return {best_cat, slot0_cat, mean_cat, min_cat, mean_cdb};
     }
 
-    // Direction collapse streak: increment if too few live slots qualify (partial collapse)
+    // Direction collapse streak: increment if too few live slots clear the skill floor.
     if (pool_id == 0) {
         int n_qual = 0;
         for (int s = 0; s < pool_slots; s++)
-            if (cat_sc[s] > -1e29f && dir_correct_dbl[s] >= MT1_DIR_QUALIFY)
+            if (cat_sc[s] > -1e29f && dir_W > 0.f && (cat_sc[s] / dir_W) >= MT1_DIR_SKILL_FLOOR)
                 n_qual++;
         if (n_qual < ELITE_COUNT)
             scratch.dir_streak++;
@@ -2406,31 +2432,24 @@ static MT1CompResult step_mt1_component(
                     auto sb = compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling);
                     day_score = (pool_id == 2) ? sb.range : sb.confidence;
                 }
-                total_sum += day_score * mt1_win_weight(di, scratch.dir_day_count);
+                total_sum += day_score * day_weight[di];
             }
             hist_cat_sc[k]      = total_sum;
             hist_correct_dbl[k] = hcdb;
         }
     }
 
-    // Build candidate list: direction pool sorts by (correct_dbl primary, score secondary).
-    // Encode as correct_dbl*10 + score so a single float comparison works.
-    // cat_sc / hist_cat_sc are kept as raw scores for statistics; only sort key is encoded.
+    // Build candidate list. ALL pools (direction included) now sort by their balanced score —
+    // the direction pool's cat_sc is class-balanced skill (no-skill = dir_W/2), so the old
+    // correct_dbl primary key (sign-skew-inflated under the absolute target) is retired.
+    // dir_correct_dbl / hist_correct_dbl remain only for the binary-log diagnostic.
     struct Cand { float score; bool is_hist; int idx; };
     std::vector<Cand> cands;
     cands.reserve(pool_slots + n_hist);
-    for (int s = 0; s < pool_slots; s++) {
-        float sk = (pool_id == 0 && cat_sc[s] > -1e29f)
-                   ? ((float)dir_correct_dbl[s] * 10.f + cat_sc[s])
-                   : cat_sc[s];
-        cands.push_back({sk, false, s});
-    }
-    for (int k = 0; k < n_hist; k++) {
-        float sk = (pool_id == 0)
-                   ? ((float)hist_correct_dbl[k] * 10.f + hist_cat_sc[k])
-                   : hist_cat_sc[k];
-        cands.push_back({sk, true, k});
-    }
+    for (int s = 0; s < pool_slots; s++)
+        cands.push_back({cat_sc[s], false, s});
+    for (int k = 0; k < n_hist; k++)
+        cands.push_back({hist_cat_sc[k], true, k});
     std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b){ return a.score > b.score; });
 
     // Select top ELITE_COUNT (17) direct elites into new_elites
@@ -3831,9 +3850,6 @@ static bool drift_advance_day(int run_day_num, int actual_day, int total_days,
             if (t.valid && f.valid && t.close > 1e-3f) { sum += f.close / t.close - 1.f; v++; } }
         fwd_ret[i] = v > 0 ? sum / v : 0.f;
     }
-    float sorted[N_IND]; memcpy(sorted, fwd_ret, sizeof(fwd_ret));
-    std::nth_element(sorted, sorted + N_IND/2, sorted + N_IND);
-    float median_ret = sorted[N_IND/2];
     for (int i = 0; i < N_IND; i++) out_actual_perf[i] = fwd_ret[i];
 
     float today444[444];
@@ -3841,7 +3857,7 @@ static bool drift_advance_day(int run_day_num, int actual_day, int total_days,
 
     if (fwd_valid) for (int i = 0; i < N_IND; i++) {
         const float* in37 = today444 + i * 37;
-        float actual_d = (fwd_ret[i] - median_ret) * MT1_SCALE_DOLLARS;
+        float actual_d = fwd_ret[i] * MT1_SCALE_DOLLARS;   // absolute (matches main loop)
         MT1Result r = step_mt1(i, mt1_scr[i], actual_d, in37, actual_day,
                                sigma, sigma, sigma, sigma);
         // Composite feed (study asserts MT2_FEED_DIRECTION==false)
@@ -4292,11 +4308,8 @@ int main(int argc, char* argv[]) {
                     fwd_ret[i] = valid > 0 ? sum / valid : 0.f;
                 }
             }
-            // Median forward return (relative target: always ~50% positive)
-            float sorted_ret[N_IND];
-            memcpy(sorted_ret, fwd_ret, sizeof(fwd_ret));
-            std::nth_element(sorted_ret, sorted_ret + N_IND/2, sorted_ret + N_IND);
-            float median_ret = sorted_ret[N_IND/2];
+            // (median removed — MT1 now predicts the ABSOLUTE own-industry forward return;
+            //  cross-sectional relativization is MT2's job via opt_tier on actual_perf below.)
 
             // actual_perf for MT2: forward cumulative market return per industry
             float actual_perf[N_IND] = {};
@@ -4308,14 +4321,15 @@ int main(int argc, char* argv[]) {
             build_master_features(mst->mkt_val_hist, mst->ind_hist_count, today444);
 
             // MT1 step × 12 (actual_day >= MT1_START_DAY)
-            // actual_d = (mkt_ret - median_ret) × scale: relative target, always ~50% positive
+            // actual_d = fwd_ret × scale: ABSOLUTE own-industry forward return (sign-skewed;
+            // direction pool uses class-balanced scoring to stay skill-based — see step_mt1_component)
             // MT1 step: called for all days; push_dir_day runs unconditionally;
             // selection/mutation/culling gated at actual_day >= MT1_START_DAY inside step_mt1
             MT1Result mt1_res[N_IND] = {};
             if (fwd_valid) {
                 for (int i = 0; i < N_IND; i++) {
                     const float* in37 = today444 + i * 37;
-                    float actual_d_i  = (fwd_ret[i] - median_ret) * MT1_SCALE_DOLLARS;
+                    float actual_d_i  = fwd_ret[i] * MT1_SCALE_DOLLARS;
                     mt1_res[i] = step_mt1(i, mt1_scratches[i], actual_d_i,
                                           in37, actual_day,
                                           cur_dir_sigma, cur_rng_sigma,
