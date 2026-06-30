@@ -88,7 +88,7 @@ static MT1ScoreBreakdown compute_mt1_scores(
     float eff_delta = fmaxf(fabsf(delta_d), MT1_RANGE_FLOOR);
     float r         = range_pct * eff_delta;
     if (range_ceiling < 1e30f) r = fminf(r, range_ceiling);
-    float err    = fabsf(actual_d - delta_d);
+    float err    = fabsf(fabsf(actual_d) - fabsf(delta_d));  // signless (matches compute_mt1_scores)
     float m      = (r > 1e-9f) ? err / r : (err > 0.f ? 1e9f : 0.f);
     float sc_rng = (m < 1.f) ? m : 0.f;
 

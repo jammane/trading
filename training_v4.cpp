@@ -2145,7 +2145,7 @@ static MT1ScoreBreakdown compute_mt1_scores(
     float eff_delta = fmaxf(fabsf(delta_d), MT1_RANGE_FLOOR);
     float r         = range_pct * eff_delta;
     if (range_ceiling < 1e30f) r = fminf(r, range_ceiling);
-    float err       = fabsf(actual_d - delta_d);
+    float err       = fabsf(fabsf(actual_d) - fabsf(delta_d));  // signless: magnitude graded independent of sign (direction pool owns sign)
     float m         = (r > 1e-9f) ? err / r : (err > 0.f ? 1e9f : 0.f);
     float sc_rng    = (m < 1.f) ? m : 0.f;
 
@@ -2314,9 +2314,8 @@ static MT1CompResult step_mt1_component(
                 if ((pool_id == 2 || pool_id == 3) && range_ceiling < 1e30f)
                     if (r_raw > range_ceiling) { culled = true; break; }
 
-                // Direction alignment cull: accuracy pool (id=1) only, live slots only
-                if (pool_id == 1)
-                    if ((conf >= 0.5f) != (delta_d >= 0.f)) { culled = true; break; }
+                // (accuracy-pool sign-alignment cull removed — magnitude is graded signless,
+                //  so the delta sign is decoupled and this cull would arbitrarily drop ~half.)
 
                 float day_score;
                 if (pool_id == 0) {
@@ -2331,7 +2330,7 @@ static MT1CompResult step_mt1_component(
                     prev_act_pos  = act_pos;  prev_act_pos_valid  = true;
                 } else if (pool_id == 1) {
                     // Accuracy pool: proportional to acc_floor (scale-relative, always in (0,1])
-                    float err = fabsf(e.actual_d - delta_d);
+                    float err = fabsf(fabsf(e.actual_d) - fabsf(delta_d));
                     day_score = acc_floor / (err + acc_floor);
                 } else {
                     auto sb = compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling);
@@ -2426,7 +2425,7 @@ static MT1CompResult step_mt1_component(
                     hcdb += is_today ? (correct ? 2 : 0) : (correct ? 1 : 0);
                 } else if (pool_id == 1) {
                     float delta_d = tanhf(out4[1]) * MT1_SCALE_DOLLARS;
-                    float err     = fabsf(e.actual_d - delta_d);
+                    float err     = fabsf(fabsf(e.actual_d) - fabsf(delta_d));
                     day_score = acc_floor / (err + acc_floor);
                 } else {
                     auto sb = compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling);
@@ -3861,7 +3860,8 @@ static bool drift_advance_day(int run_day_num, int actual_day, int total_days,
         MT1Result r = step_mt1(i, mt1_scr[i], actual_d, in37, actual_day,
                                sigma, sigma, sigma, sigma);
         // Composite feed (study asserts MT2_FEED_DIRECTION==false)
-        out_in48[i*4+0] = r.slot0_conf;     out_in48[i*4+1] = r.slot0_delta_t;
+        out_in48[i*4+0] = r.slot0_conf;
+        out_in48[i*4+1] = (r.slot0_conf >= 0.5f ? 1.f : -1.f) * fabsf(r.slot0_delta_t);  // signed-magnitude reassembly
         out_in48[i*4+2] = r.slot0_range_pct; out_in48[i*4+3] = r.slot0_conf4;
     }
 
@@ -4344,16 +4344,21 @@ int main(int argc, char* argv[]) {
                 // Build 48-feature MT2 input from MT1 slot0 raw activations (no normalization).
                 // MT2_FEED_DIRECTION selects the direction-pool slot0 (strongest daily signal)
                 // vs the composite slot0; toggle back to composite once MT2 shows a learning curve.
+                // Reassemble the signed magnitude fed to MT2: SIGN from the direction confidence,
+                // |SIZE| from the prediction. Under signless magnitude scoring the raw delta sign
+                // is ungraded noise, so we re-impose sign = (conf >= 0.5 ? + : -).
                 float in48[48];
                 for (int i = 0; i < N_IND; i++) {
                     if (MT2_FEED_DIRECTION) {
-                        in48[i*4 + 0] = mt1_res[i].dir0_conf;
-                        in48[i*4 + 1] = mt1_res[i].dir0_delta_t;
+                        float conf = mt1_res[i].dir0_conf;
+                        in48[i*4 + 0] = conf;
+                        in48[i*4 + 1] = (conf >= 0.5f ? 1.f : -1.f) * fabsf(mt1_res[i].dir0_delta_t);
                         in48[i*4 + 2] = mt1_res[i].dir0_range_pct;
                         in48[i*4 + 3] = mt1_res[i].dir0_conf4;
                     } else {
-                        in48[i*4 + 0] = mt1_res[i].slot0_conf;
-                        in48[i*4 + 1] = mt1_res[i].slot0_delta_t;
+                        float conf = mt1_res[i].slot0_conf;
+                        in48[i*4 + 0] = conf;
+                        in48[i*4 + 1] = (conf >= 0.5f ? 1.f : -1.f) * fabsf(mt1_res[i].slot0_delta_t);
                         in48[i*4 + 2] = mt1_res[i].slot0_range_pct;
                         in48[i*4 + 3] = mt1_res[i].slot0_conf4;
                     }

@@ -405,7 +405,7 @@ def _mt1_score_breakdown(out4, actual_d, acc_floor, range_ceiling=None):
     r         = rng_pct * eff_delta
     if range_ceiling is not None:
         r = min(r, range_ceiling)
-    err       = abs(actual_d - delta_d)
+    err       = abs(abs(actual_d) - abs(delta_d))   # signless: magnitude graded independent of sign (direction owns sign)
     m         = err / r if r > 0.0 else float('inf')
     score_rng = m if m < 1.0 else 0.0
 
@@ -498,9 +498,7 @@ def _mt1_burst_component(prefix, model_dir, dir_hist, actual_d,
                 if (score_idx == 2 or score_idx == 3) and range_ceiling is not None:
                     if r_raw > range_ceiling:
                         culled = True; break
-                if score_idx == 1:
-                    if (conf >= 0.5) != (delta_d >= 0.0):
-                        culled = True; break
+                # (accuracy-pool sign-alignment cull removed — magnitude graded signless)
                 if score_idx == 0:
                     conf_pos = conf >= 0.5
                     act_pos  = ad >= 0.0
@@ -1164,7 +1162,10 @@ def upkeep_mt2(model_dir, mt1_slot0_outputs, actual_perf, industry_list,
     in48 = []
     for ind in industry_list:
         conf, delta_t, range_pct, conf4 = mt1_slot0_outputs.get(ind, (0.5, 0.0, 0.01, 0.5))
-        in48.extend([conf, delta_t, range_pct, conf4])
+        # Signed-magnitude reassembly: sign from direction confidence, |size| from the prediction
+        # (delta_t's own sign is ungraded under signless magnitude scoring).
+        delta_signed = abs(delta_t) if conf >= 0.5 else -abs(delta_t)
+        in48.extend([conf, delta_signed, range_pct, conf4])
     in48_t = torch.tensor(in48, dtype=torch.float32).unsqueeze(0)   # (1, 48)
 
     # Bootstrap pool if slot files don't exist
