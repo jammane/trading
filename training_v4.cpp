@@ -1729,37 +1729,56 @@ static void fill_window(const float* hist, int hist_count, int win, float* windo
 //   [21..36]  16 poly-3 coefs over 4 windows (10,30,60,90 days)
 static void build_master_features(const float ind_val_hist[][IND_HIST_CAP],
                                    int hist_count, float* out444) {
-    static constexpr int LOOKBACKS[18] = {1,2,3,4,5,6,7,8,9,10,15,20,25,30,40,50,60,90};
     static constexpr int POLY3_WINS[4] = {10,30,60,90};
     memset(out444, 0, 444 * sizeof(float));
 
+    // Per-industry 37-feature layout (must stay bit-identical to training_lib.build_master_features):
+    //   [0..9]   10 daily returns (Δt=1, days 1..10 back)
+    //   [10..16] 7 cumulative 10-day bucket returns (Δt=10, coherent decade-resolution series)
+    //   [17]     realized return-volatility (mean |daily return| over trailing 20 days) — the
+    //            scale/uncertainty anchor for the magnitude + range/confidence outputs; supersedes
+    //            the old raw current-level slot (~25k, which dominated the first layer)
+    //   [18..20] poly-2 over 5d, values normalized by current level (dimensionless shape)
+    //   [21..36] poly-3 over {10,30,60,90}, values normalized by current level
+    // Poly value-normalization brings coefs from ~25k down to ~O(1), comparable to the returns.
     for (int i = 0; i < N_IND; i++) {
         const float* h = ind_val_hist[i];
         float* feat = out444 + i * 37;
+        float cur = hist_at(h, hist_count, 0);
+        float cur_denom = fabsf(cur) > 1e-9f ? cur : 1e-9f;
 
-        // 18 delta lookbacks (lt==12 → t=25 replaced with raw current portfolio value)
-        for (int lt = 0; lt < 18; lt++) {
-            if (lt == 12) {
-                feat[lt] = hist_at(h, hist_count, 0);  // current portfolio value (scale anchor)
-                continue;
-            }
-            int t  = LOOKBACKS[lt];
+        for (int lt = 0; lt < 10; lt++) {                 // [0..9] daily returns
+            int t = lt + 1;
             float vt  = hist_at(h, hist_count, t);
             float vt1 = hist_at(h, hist_count, t + 1);
             float denom = fabsf(vt1) > 1e-9f ? vt1 : (vt1 >= 0.f ? 1e-9f : -1e-9f);
             feat[lt] = (vt - vt1) / fabsf(denom);
         }
-
-        // poly-2 over 5-day window
-        float win5[5];
+        for (int k = 1; k <= 7; k++) {                    // [10..16] 10-day bucket returns
+            float va = hist_at(h, hist_count, 10 * (k - 1));
+            float vb = hist_at(h, hist_count, 10 * k);
+            float denom = fabsf(vb) > 1e-9f ? vb : (vb >= 0.f ? 1e-9f : -1e-9f);
+            feat[9 + k] = (va - vb) / fabsf(denom);
+        }
+        {                                                 // [17] realized return-volatility
+            float s = 0.f;
+            for (int d = 1; d <= 20; d++) {
+                float vt  = hist_at(h, hist_count, d);
+                float vt1 = hist_at(h, hist_count, d + 1);
+                float denom = fabsf(vt1) > 1e-9f ? vt1 : (vt1 >= 0.f ? 1e-9f : -1e-9f);
+                s += fabsf((vt - vt1) / fabsf(denom));
+            }
+            feat[17] = s / 20.f;
+        }
+        float win5[5];                                    // [18..20] poly-2, level-normalized
         fill_window(h, hist_count, 5, win5);
+        for (int j = 0; j < 5; j++) win5[j] /= cur_denom;
         polyfit2(win5, 5, feat + 18);
-
-        // poly-3 over 4 windows (10,30,60,90)
-        float polywin[90];
+        float polywin[90];                                // [21..36] poly-3, level-normalized
         for (int wi = 0; wi < 4; wi++) {
             int W = POLY3_WINS[wi];
             fill_window(h, hist_count, W, polywin);
+            for (int j = 0; j < W; j++) polywin[j] /= cur_denom;
             polyfit3(polywin, W, feat + 21 + wi * 4);
         }
     }
