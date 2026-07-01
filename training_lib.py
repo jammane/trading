@@ -616,22 +616,40 @@ def build_master_features(mkt_val_history, industry_list):
     mkt_val_history: {ind: [cumulative_market_index_values]} — equal-weight close-to-close
     cumulative product starting at IND_STARTING_CASH. Matches C++ mkt_val_hist.
     """
+    # Per-industry 37-feature layout — must stay bit-identical to the C++ build_master_features:
+    #   [0..9]   10 daily returns (Δt=1, days 1..10 back)
+    #   [10..16] 7 cumulative 10-day bucket returns (Δt=10)
+    #   [17]     realized return-volatility (mean |daily return| over trailing 20 days) —
+    #            scale/uncertainty anchor; supersedes the old raw current-level slot
+    #   [18..20] poly-2 over 5d, values normalized by current level
+    #   [21..36] poly-3 over {10,30,60,90}, values normalized by current level
     features = []
     for ind in industry_list:
         hist = mkt_val_history.get(ind, [])
-        for t in MASTER_LOOKBACKS:
-            if t == 25:
-                features.append(_mst_hist_at(hist, 0))  # current portfolio value (scale anchor)
-                continue
+        cur = _mst_hist_at(hist, 0)
+        cur_denom = cur if abs(cur) > 1e-9 else 1e-9
+        for t in range(1, 11):                            # [0..9] daily returns
             v_now  = _mst_hist_at(hist, t)
             v_prev = _mst_hist_at(hist, t + 1)
             denom  = abs(v_prev) if abs(v_prev) > 1e-9 else 1e-9
             features.append((v_now - v_prev) / denom)
-        vals5 = _mst_window(hist, 5)
+        for k in range(1, 8):                             # [10..16] 10-day bucket returns
+            va = _mst_hist_at(hist, 10 * (k - 1))
+            vb = _mst_hist_at(hist, 10 * k)
+            denom = abs(vb) if abs(vb) > 1e-9 else 1e-9
+            features.append((va - vb) / denom)
+        s = 0.0                                           # [17] realized return-volatility
+        for d in range(1, 21):
+            v_now  = _mst_hist_at(hist, d)
+            v_prev = _mst_hist_at(hist, d + 1)
+            denom  = abs(v_prev) if abs(v_prev) > 1e-9 else 1e-9
+            s += abs((v_now - v_prev) / denom)
+        features.append(s / 20.0)
+        vals5 = [v / cur_denom for v in _mst_window(hist, 5)]   # [18..20] poly-2, level-normalized
         x5    = np.linspace(0.0, 1.0, 5)
         features.extend(np.polyfit(x5, vals5, 2).tolist())
-        for n in MASTER_POLY3_WINDOWS:
-            vals = _mst_window(hist, n)
+        for n in MASTER_POLY3_WINDOWS:                          # [21..36] poly-3, level-normalized
+            vals = [v / cur_denom for v in _mst_window(hist, n)]
             xn   = np.linspace(0.0, 1.0, n)
             features.extend(np.polyfit(xn, vals, 3).tolist())
     return torch.tensor(features, dtype=torch.float32).unsqueeze(0)
