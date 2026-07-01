@@ -115,6 +115,12 @@ static constexpr int   MT1_COMP_PARENTS    = ELITE_COUNT + WAVG_COUNT + MT1_COMP
 static constexpr int   MT1_COMP_CHILDREN   = 7;      // mutations per parent
 static constexpr int   MT1_COMP_SLOTS      = MT1_COMP_PARENTS * (MT1_COMP_CHILDREN + 1); // 200
 static constexpr int   MT1_BLEND_SLOTS     = 200;
+// Heads/tails pool layout (Increment 2): NO injection slots. The old composite→pool injection
+// existed to propagate one component's learning back to the others; the shared head trunk now
+// does exactly that, so those 5 parent slots are removed and their capacity is redirected into
+// more mutations of the proven elites (see kChildren in step_mt1_pool).
+static constexpr int   HT_PARENTS          = ELITE_COUNT + WAVG_COUNT;      // 20 (17 elites + 3 wavg)
+static constexpr int   HT_MUTS             = MT1_COMP_SLOTS - HT_PARENTS;   // 180 mutations
 static constexpr float MT1_RANGE_FLOOR     = 1.f;    // $1 — effectively no floor
 static constexpr float MT1_RANGE_CEIL_MULT = 4.f;    // ceiling = 4 × max(mean, today) |actual−comp0_delta|
 static constexpr float MT1_DIR_BACKFILL    = 0.65f;  // skip direction pool update when best score < this
@@ -598,7 +604,7 @@ struct MT1Scratch {
     float*   comp_elites[4];
     float*   new_elites;           // scratch [MT1_COMP_PARENTS × MT1NN_PARAMS]
     float*   mut_buf;              // [MT1NN_PARAMS]
-    uint64_t mut_seeds[MT1_COMP_PARENTS * MT1_COMP_CHILDREN];  // 175 mutations
+    uint64_t mut_seeds[HT_MUTS];  // 180 — covers both the component pool (175) and the head/tail pools
 
     // Component pool 5-day histories [HIST_DAYS × HIST_PER_DAY × MT1NN_PARAMS each]
     float*   pool_hist[4];
@@ -2724,6 +2730,315 @@ static MT1CompResult step_mt1_component(
     }
 
     return {best_cat, slot0_cat, mean_cat, min_cat, mean_cdb};
+}
+
+// ── Heads/tails pool step (Increment 2 part 2) ───────────────────────────────────
+// Generic evolutionary selection over ONE head or tail pool. Mirrors step_mt1_component's
+// select / mutate / wavg / history machinery exactly, but is parameterized by param count (P)
+// and a per-model score callback, so the head pool (composite fitness, variable trunk + frozen
+// tails) and the four tail pools (component fitness, frozen trunk + one variable tail) share a
+// single implementation. `score_model(const float* W)` iterates the trailing window internally
+// and returns the windowed score plus (for the direction tail) correct-count keys and a cull
+// flag. NO injection slots — the shared head propagates cross-component learning (what the old
+// composite-to-pool cascade did), so parents = 20 (17 elites + 3 wavg) and the freed capacity
+// goes into more elite mutations (180 total). Unused until Increment 3 wires the block loop.
+struct MT1PoolScore { float score; bool culled; int n_correct; int n_correct_dbl; int today; };
+
+template <typename ScoreFn>
+static MT1CompResult step_mt1_pool(
+    int P, float* elite_buf, float* new_buf, float* mut_buf,
+    float* hist_buf, int& hist_head, int& hist_count,
+    uint64_t* mut_seeds, int ind_i, int actual_day, float sigma, int day_count,
+    bool is_direction, int& dir_streak, ScoreFn score_model)
+{
+    const int pool_elite = HT_PARENTS;              // 20 (no injection slots)
+    const int pool_slots = MT1_COMP_SLOTS;          // 200
+    const int pool_muts  = pool_slots - pool_elite; // 180
+
+    // Deterministic mutation seeds (per day + industry; pool distinguished by its own buffers)
+    {
+        PCG32 seed_rng;
+        seed_rng.seed((uint64_t)actual_day * 987017ULL + (uint64_t)ind_i * 10007ULL + 22222ULL);
+        for (int i = 0; i < pool_muts; i++)
+            mut_seeds[i] = ((uint64_t)seed_rng.next() << 32) | seed_rng.next();
+    }
+
+    // Weighted children table: concentrate breeding on proven elites. With injection removed the
+    // former immigrant children (15) plus the 5 reclaimed parent slots are redistributed here, so
+    // every real parent breeds more. Sums to 180 = pool_muts across 20 parents (avg 9).
+    static const int kChildren[HT_PARENTS] = {
+        16, 13, 13, 12, 12,                     // slot 0 (prod) + top-4 elites = 66
+        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,     // slots 5-16 direct elites     = 96
+        6, 6, 6                                 // slots 17-19 wavg blends       = 18
+    };
+    int parent_of_mut[MT1_COMP_SLOTS - HT_PARENTS];
+    {
+        int idx = 0;
+        for (int p = 0; p < pool_elite && idx < pool_muts; p++)
+            for (int c = 0; c < kChildren[p] && idx < pool_muts; c++)
+                parent_of_mut[idx++] = p;
+        for (; idx < pool_muts; idx++) parent_of_mut[idx] = idx % pool_elite;
+    }
+
+    auto elite = [&](int slot) { return elite_buf + (size_t)slot * P; };
+    auto new_e = [&](int slot) { return new_buf  + (size_t)slot * P; };
+    auto hist_slot = [&](int pos) { return hist_buf + (size_t)pos * P; };
+    auto get_weights = [&](int slot, float* dst) {
+        if (slot < pool_elite) {
+            memcpy(dst, elite(slot), P * sizeof(float));
+        } else {
+            int mut_i  = slot - pool_elite;
+            int parent = parent_of_mut[mut_i];
+            memcpy(dst, elite(parent), P * sizeof(float));
+            apply_gaussian(dst, P, sigma, mut_seeds[mut_i]);
+        }
+    };
+
+    // Score every slot (elites in place, mutations materialized into mut_buf).
+    std::vector<float> cat_sc(pool_slots, 0.f);
+    std::vector<int>   nc(pool_slots, 0), ncd(pool_slots, 0), tdy(pool_slots, 0);
+    int dir_max_correct = 0;
+    if (day_count > 0) {
+        for (int slot = 0; slot < pool_slots; slot++) {
+            const float* wptr;
+            if (slot < pool_elite) wptr = elite(slot);
+            else { get_weights(slot, mut_buf); wptr = mut_buf; }
+            MT1PoolScore r = score_model(wptr);
+            cat_sc[slot] = r.culled ? -1e30f : r.score;
+            if (!r.culled) {
+                nc[slot] = r.n_correct; ncd[slot] = r.n_correct_dbl; tdy[slot] = r.today;
+                if (r.n_correct > dir_max_correct) dir_max_correct = r.n_correct;
+            }
+        }
+    }
+
+    // Pool statistics (exclude culled slots)
+    float mean_cat = 0.f, best_cat = -1e30f, min_cat = 1e30f;
+    int   live_count = 0;
+    for (int s = 0; s < pool_slots; s++)
+        if (cat_sc[s] > -1e29f) {
+            mean_cat += cat_sc[s];
+            if (cat_sc[s] > best_cat) best_cat = cat_sc[s];
+            if (cat_sc[s] < min_cat)  min_cat  = cat_sc[s];
+            live_count++;
+        }
+    if (live_count > 0) mean_cat /= live_count;
+    if (best_cat < -1e29f) best_cat = 0.f;
+    if (min_cat  >  9e29f) min_cat  = 0.f;
+    float slot0_cat = cat_sc[0] > -1e29f ? cat_sc[0] : 0.f;
+
+    float mean_cdb = 0.f;
+    if (is_direction && live_count > 0) {
+        float sum_cdb = 0.f;
+        for (int s = 0; s < pool_slots; s++)
+            if (cat_sc[s] > -1e29f) sum_cdb += (float)ncd[s];
+        mean_cdb = sum_cdb / (float)live_count;
+    }
+
+    // Direction collapse floor: freeze the pool only on genuine collapse.
+    if (is_direction) {
+        if (dir_max_correct < MT1_DIR_MIN_CORRECT) {
+            dir_streak++;
+            return {best_cat, slot0_cat, mean_cat, min_cat, mean_cdb};
+        }
+        dir_streak = 0;
+    }
+
+    // Score history candidates (no culling — history is the unconditional safety net)
+    int n_hist = hist_count * HIST_PER_DAY;
+    std::vector<float> hist_sc(HIST_DAYS * HIST_PER_DAY, 0.f);
+    std::vector<int>   hist_nc(HIST_DAYS * HIST_PER_DAY, 0), hist_td(HIST_DAYS * HIST_PER_DAY, 0);
+    int total_hist = HIST_DAYS * HIST_PER_DAY;
+    int oldest     = (hist_head * HIST_PER_DAY - n_hist + total_hist) % total_hist;
+    for (int k = 0; k < n_hist; k++) {
+        int abs_pos = (oldest + k) % total_hist;
+        MT1PoolScore r = score_model(hist_slot(abs_pos));
+        hist_sc[k] = r.score; hist_nc[k] = r.n_correct; hist_td[k] = r.today;
+    }
+
+    // Build candidate list + elite ORDER (identical selection to step_mt1_component).
+    struct Cand { float score; int n_correct; int today; bool is_hist; int idx; };
+    std::vector<Cand> cands; cands.reserve(pool_slots + n_hist);
+    for (int s = 0; s < pool_slots; s++) cands.push_back({cat_sc[s], nc[s], tdy[s], false, s});
+    for (int k = 0; k < n_hist; k++)     cands.push_back({hist_sc[k], hist_nc[k], hist_td[k], true, k});
+
+    std::vector<int> order; order.reserve(ELITE_COUNT);
+    std::vector<int> by_score(cands.size());
+    for (int i = 0; i < (int)cands.size(); i++) by_score[i] = i;
+    std::sort(by_score.begin(), by_score.end(),
+              [&](int a, int b){ return cands[a].score > cands[b].score; });
+
+    if (!is_direction) {
+        for (int i : by_score) { if ((int)order.size() >= ELITE_COUNT) break; order.push_back(i); }
+    } else {
+        // Direction two-half selection (mirror of step_mt1_component / upkeep.py).
+        std::vector<int> by_correct(cands.size());
+        for (int i = 0; i < (int)cands.size(); i++) by_correct[i] = i;
+        std::sort(by_correct.begin(), by_correct.end(), [&](int a, int b){
+            return cands[a].n_correct != cands[b].n_correct ? cands[a].n_correct > cands[b].n_correct
+                                                            : cands[a].score > cands[b].score; });
+        std::vector<char> taken(cands.size(), 0);
+        int slot0 = by_score.empty() ? -1 : by_score[0];
+        for (int i : by_score) if (cands[i].today) { slot0 = i; break; }
+        if (slot0 >= 0) { order.push_back(slot0); taken[slot0] = 1; }
+        int score_target = 1 + ELITE_COUNT / 2;
+        for (int i : by_score)   { if ((int)order.size() >= score_target) break; if (!taken[i]) { order.push_back(i); taken[i]=1; } }
+        for (int i : by_correct) { if ((int)order.size() >= ELITE_COUNT)   break; if (!taken[i]) { order.push_back(i); taken[i]=1; } }
+        for (int i : by_score)   { if ((int)order.size() >= ELITE_COUNT)   break; if (!taken[i]) { order.push_back(i); taken[i]=1; } }
+    }
+
+    // Assign chosen candidates into new_buf in elite order.
+    for (int rank = 0; rank < (int)order.size(); rank++) {
+        const Cand& c = cands[order[rank]];
+        if (!c.is_hist) get_weights(c.idx, new_e(rank));
+        else            memcpy(new_e(rank), hist_slot((oldest + c.idx) % total_hist), P * sizeof(float));
+    }
+    for (int rank = (int)order.size(); rank < ELITE_COUNT; rank++)
+        memcpy(new_e(rank), new_e(0), P * sizeof(float));
+
+    // Wavg blends (slots 17,18,19): equal-weight average of top 5, 10, 15 direct elites.
+    static constexpr int wavg_k[3] = {5, 10, 15};
+    for (int b = 0; b < WAVG_COUNT; b++) {
+        float* dst  = new_e(ELITE_COUNT + b);
+        int    k    = wavg_k[b];
+        float  inv_k = 1.f / (float)k;
+        memset(dst, 0, P * sizeof(float));
+        for (int e = 0; e < k; e++)
+            for (int p = 0; p < P; p++) dst[p] += new_e(e)[p] * inv_k;
+    }
+
+    // Commit all 20 parent slots (17 elites + 3 wavg; no injection slots).
+    memcpy(elite_buf, new_buf, (size_t)HT_PARENTS * P * sizeof(float));
+
+    // Save top 7 direct elites + 3 wavg blends to 5-day history.
+    for (int k = 0; k < HIST_ELITE; k++)
+        memcpy(hist_slot(hist_head * HIST_PER_DAY + k), elite(k), P * sizeof(float));
+    for (int k = 0; k < HIST_WAVG; k++)
+        memcpy(hist_slot(hist_head * HIST_PER_DAY + HIST_ELITE + k), elite(ELITE_COUNT + k), P * sizeof(float));
+    hist_head = (hist_head + 1) % HIST_DAYS;
+    if (hist_count < HIST_DAYS) hist_count++;
+
+    return {best_cat, slot0_cat, mean_cat, min_cat, mean_cdb};
+}
+
+// Evolve ONE tail pool (comp: 0=dir 1=acc 2=rng 3=cfd) with the head + other 3 tails frozen at
+// their production bests. The frozen-head concat and the frozen tails' raw logits are computed
+// once per window day (head is stationary through the whole tail phase); each candidate tail
+// substitutes only out4[comp]. Direction (comp==0) keeps the class-balanced day weights,
+// two-half selection, flip cull and correct-count collapse floor from step_mt1_component.
+static MT1CompResult step_mt1_tail(
+    int comp, int ind_i, MT1Scratch& scratch,
+    int actual_day, float sigma, float acc_floor, float range_ceiling)
+{
+    const int dc     = scratch.dir_day_count;
+    const bool is_dir = (comp == 0);
+
+    // Class-balanced day weights for direction; plain recency weights otherwise.
+    float day_weight[MT1_DIR_DAYS] = {};
+    if (dc > 0) {
+        float dir_W = 0.f, w_up = 0.f, w_down = 0.f;
+        for (int di = 0; di < dc; di++) {
+            float w = mt1_win_weight(di, dc); dir_W += w;
+            if (scratch.dir_day(di).actual_d >= 0.f) w_up += w; else w_down += w;
+        }
+        bool balance = is_dir && (w_up > 0.f) && (w_down > 0.f);
+        for (int di = 0; di < dc; di++) {
+            float w = mt1_win_weight(di, dc);
+            day_weight[di] = balance
+                ? w * ((scratch.dir_day(di).actual_d >= 0.f) ? dir_W/(2.f*w_up) : dir_W/(2.f*w_down))
+                : w;
+        }
+    }
+
+    // Frozen-head concat + frozen tail raw logits per window day.
+    float concat[MT1_DIR_DAYS][28];
+    float frozen4[MT1_DIR_DAYS][4];
+    for (int di = 0; di < dc; di++) {
+        const auto& e = scratch.dir_day(di);
+        head_forward(scratch.head0_buf, e.feat37, concat[di]);
+        for (int c = 0; c < 4; c++) tail_forward(scratch.tail0_buf[c], concat[di], &frozen4[di][c]);
+    }
+
+    auto score_model = [&](const float* W) -> MT1PoolScore {
+        MT1PoolScore R{0.f, false, 0, 0, 0};
+        if (dc == 0) return R;
+        bool prev_cp_v = false, prev_cp = false, prev_ap_v = false, prev_ap = false;
+        int conf_cross = 0, mkt_flips = 0;
+        for (int di = 0; di < dc; di++) {
+            const auto& e = scratch.dir_day(di);
+            bool is_today = (di == dc - 1);
+            float out4[4] = {frozen4[di][0], frozen4[di][1], frozen4[di][2], frozen4[di][3]};
+            float o1; tail_forward(W, concat[di], &o1); out4[comp] = o1;
+
+            if (comp == 2 || comp == 3) {   // range-ceiling cull (range + confidence tails)
+                float delta_d   = tanhf(out4[1]) * MT1_SCALE_DOLLARS;
+                float eff_delta = fmaxf(fabsf(delta_d), MT1_RANGE_FLOOR);
+                float r_raw     = log1pf(expf(out4[2])) * eff_delta;
+                if (range_ceiling < 1e30f && r_raw > range_ceiling) { R.culled = true; return R; }
+            }
+
+            float ds;
+            if (comp == 0) {
+                float conf = 1.f / (1.f + expf(-out4[0]));
+                bool cp = (conf >= 0.5f), ap = (e.actual_d >= 0.f);
+                ds = ap ? conf : (1.f - conf);
+                bool correct = (cp == ap);
+                R.n_correct     += correct ? 1 : 0;
+                R.n_correct_dbl += is_today ? (correct ? 2 : 0) : (correct ? 1 : 0);
+                if (is_today) R.today = correct ? 1 : 0;
+                if (prev_cp_v && cp != prev_cp) conf_cross++;
+                if (prev_ap_v && ap != prev_ap) mkt_flips++;
+                prev_cp = cp; prev_cp_v = true; prev_ap = ap; prev_ap_v = true;
+            } else if (comp == 1) {
+                float delta_d = tanhf(out4[1]) * MT1_SCALE_DOLLARS;
+                float err     = fabsf(fabsf(e.actual_d) - fabsf(delta_d));
+                ds = acc_floor / (err + acc_floor);
+            } else {
+                auto sb = compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling);
+                ds = (comp == 2) ? sb.range : sb.confidence;
+            }
+            R.score += ds * day_weight[di];
+        }
+        if (comp == 0 && dc >= 2) { int required = mkt_flips / 2; if (conf_cross < required) R.culled = true; }
+        return R;
+    };
+
+    return step_mt1_pool(TAILNN_PARAMS,
+        scratch.tail_elite[comp], scratch.tail_new[comp], scratch.tail_mut,
+        scratch.tail_hist[comp], scratch.tail_hist_head[comp], scratch.tail_hist_count[comp],
+        scratch.mut_seeds, ind_i, actual_day, sigma, dc,
+        is_dir, scratch.dir_streak, score_model);
+}
+
+// Evolve the head (shared trunk) pool with all 4 tails frozen at their production bests.
+// Fitness = windowed composite of head_slot → concat → 4 frozen tails → 4 outputs.
+static MT1CompResult step_mt1_head(
+    int ind_i, MT1Scratch& scratch,
+    int actual_day, float sigma, float acc_floor, float range_ceiling)
+{
+    const int dc = scratch.dir_day_count;
+    float day_weight[MT1_DIR_DAYS] = {};
+    for (int di = 0; di < dc; di++) day_weight[di] = mt1_win_weight(di, dc);
+
+    auto score_model = [&](const float* W) -> MT1PoolScore {
+        MT1PoolScore R{0.f, false, 0, 0, 0};
+        if (dc == 0) return R;
+        float concat28[28], out4[4];
+        for (int di = 0; di < dc; di++) {
+            const auto& e = scratch.dir_day(di);
+            head_forward(W, e.feat37, concat28);
+            for (int c = 0; c < 4; c++) tail_forward(scratch.tail0_buf[c], concat28, &out4[c]);
+            R.score += compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling).composite
+                       * day_weight[di];
+        }
+        return R;
+    };
+
+    return step_mt1_pool(HEADNN_PARAMS,
+        scratch.head_elite, scratch.head_new, scratch.head_mut,
+        scratch.head_hist, scratch.head_hist_head, scratch.head_hist_count,
+        scratch.mut_seeds, ind_i, actual_day, sigma, dc,
+        false, scratch.dir_streak, score_model);
 }
 
 // ── MT1 composite blend-pool step ────────────────────────────────────────────────
