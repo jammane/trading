@@ -228,15 +228,21 @@ class TestMT1NN:
 
     def test_param_count(self):
         n = sum(p.numel() for p in MT1NN().parameters())
-        assert n == 3412, f"MT1NN param count: expected 3412, got {n}"
+        assert n == 2218, f"MT1NN param count: expected 2218, got {n}"
 
     def test_layer_dims(self):
         m = MT1NN()
-        assert m.fc1.in_features  == 37 and m.fc1.out_features  == 37
-        assert m.fc2.in_features  == 37 and m.fc2.out_features  == 29
-        assert m.fc3.in_features  == 29 and m.fc3.out_features  == 20
-        assert m.fc4.in_features  == 20 and m.fc4.out_features  == 12
-        assert m.fc_out.in_features == 12 and m.fc_out.out_features == 4
+        # Block A (vol+poly), B (daily), C (decade), D (fusion taper)
+        assert m.a1.in_features == 20 and m.a1.out_features == 20
+        assert m.a2.in_features == 20 and m.a2.out_features == 20
+        assert m.b1.in_features == 10 and m.b1.out_features == 6
+        assert m.b2.in_features == 6  and m.b2.out_features == 4
+        assert m.c1.in_features == 7  and m.c1.out_features == 5
+        assert m.c2.in_features == 5  and m.c2.out_features == 4
+        assert m.d1.in_features == 28 and m.d1.out_features == 22
+        assert m.d2.in_features == 22 and m.d2.out_features == 16
+        assert m.d3.in_features == 16 and m.d3.out_features == 10
+        assert m.d4.in_features == 10 and m.d4.out_features == 4
 
     def test_confidence_after_sigmoid(self, mt1_inputs):
         out = MT1NN()(mt1_inputs)

@@ -106,38 +106,46 @@ class MT1NN(nn.Module):
     """
     Per-industry preprocessor — one pool per industry (12 total).
 
-    Input: (1, 37) — one industry's slice of the 444-feature vector:
-             18 delta lookbacks + 3 poly-2 coefs + 16 poly-3 coefs
+    Branched FC (one sub-net per feature family, so a mutation stays localized to its
+    block — a friendlier fitness landscape for the evolutionary trainer). Input (1, 37)
+    is the Phase-1c conditioned layout, sliced contiguously:
+      B  x[:, 0:10]   10 daily returns   →  10 → 6 → 4
+      C  x[:, 10:17]  7 decade returns   →   7 → 5 → 4
+      A  x[:, 17:37]  vol + 19 poly coefs → 20 → 20 → 20
+      concat(A20, B4, C4) = 28 → D taper 28 → 22 → 16 → 10 → 4
 
-    FC1:    37 → 37  ReLU  (width = n_inputs)
-    FC2:    37 → 29  ReLU  (taper step ≈ 8)
-    FC3:    29 → 20  ReLU
-    FC4:    20 → 12  ReLU
-    fc_out: 12 →  4  (raw logits decoded at score time)
+    Output (1, 4) raw logits (decoded at score time):
+      out[0] → sigmoid → direction confidence   out[1] → tanh × $10K → dollar P&L
+      out[2] → softplus → range frac            out[3] → sigmoid → calibrated confidence
 
-    Output (1, 4) raw logits:
-      out[0] → sigmoid → P(positive return), direction confidence ∈ [0,1]
-      out[1] → tanh × $10K → expected dollar P&L (ceiling ≈ 5yr max swing)
-      out[2] → softplus → range as % of effective_delta (dimensionless)
-      out[3] → sigmoid → calibrated confidence (how well range covers actual)
-
-    Total params: 3,412
+    Layer names/order MUST match MT1_LAYER_DEFS (prepare_models.py) and the C++
+    MT1_* offsets / mt1_forward. Total params: 2,218.
     """
 
     def __init__(self):
         super().__init__()
-        self.fc1    = nn.Linear(37, 37)
-        self.fc2    = nn.Linear(37, 29)
-        self.fc3    = nn.Linear(29, 20)
-        self.fc4    = nn.Linear(20, 12)
-        self.fc_out = nn.Linear(12,  4)
+        # Block A — level-relative regression (vol + poly)
+        self.a1 = nn.Linear(20, 20); self.a2 = nn.Linear(20, 20)
+        # Block B — daily momentum
+        self.b1 = nn.Linear(10, 6);  self.b2 = nn.Linear(6, 4)
+        # Block C — decade momentum
+        self.c1 = nn.Linear(7, 5);   self.c2 = nn.Linear(5, 4)
+        # Block D — fusion taper
+        self.d1 = nn.Linear(28, 22); self.d2 = nn.Linear(22, 16)
+        self.d3 = nn.Linear(16, 10); self.d4 = nn.Linear(10, 4)
 
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x))
-        x = F.relu(self.fc4(x))
-        return self.fc_out(x)   # (1, 4) raw logits
+        xb = x[:, 0:10]    # daily returns
+        xc = x[:, 10:17]   # decade returns
+        xa = x[:, 17:37]   # vol + poly coefs
+        a = F.relu(self.a2(F.relu(self.a1(xa))))
+        b = F.relu(self.b2(F.relu(self.b1(xb))))
+        c = F.relu(self.c2(F.relu(self.c1(xc))))
+        d = torch.cat([a, b, c], dim=1)   # (batch, 28)
+        d = F.relu(self.d1(d))
+        d = F.relu(self.d2(d))
+        d = F.relu(self.d3(d))
+        return self.d4(d)   # (batch, 4) raw logits
 
 
 class MT2NN(nn.Module):
