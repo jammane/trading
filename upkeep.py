@@ -55,6 +55,7 @@ from training_lib import (
     MT1_DIR_BACKFILL,
     MT1_DIR_DAYS,
     MT1_DIR_SKILL_FLOOR,
+    MT1_DIR_MIN_CORRECT,
     MT1_POOL_NAMES,
     MT1_RANGE_CEIL_MULT,
     MT1_RANGE_FLOOR,
@@ -800,7 +801,9 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
         comp_hist_models_raw = _load_comp_pool_hist_models(industry, pool_name, model_dir)
 
         scores = []
-        dir_cdb = {}   # slot -> n_correct_dbl (direction pool only)
+        dir_cdb = {}         # slot -> n_correct_dbl (direction pool only)
+        dir_ncorr = {}       # slot -> n_correct (direction two-half selection)
+        dir_today = {}       # slot -> 1 if got the most-recent day's direction right
         dir_max_correct = 0
         if dir_hist:
             for slot in range(MT1_COMP_SLOTS):
@@ -810,6 +813,7 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
                 culled        = False
                 n_correct     = 0
                 n_correct_dbl = 0  # today counts double
+                today_correct = 0
                 prev_conf_pos, prev_act_pos = None, None
                 conf_crossings, market_flips = 0, 0
                 with torch.inference_mode():
@@ -834,6 +838,8 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
                             correct   = conf_pos == act_pos
                             n_correct     += 1 if correct else 0
                             n_correct_dbl += (2 if correct else 0) if is_today else (1 if correct else 0)
+                            if is_today:
+                                today_correct = 1 if correct else 0
                             if prev_conf_pos is not None and conf_pos != prev_conf_pos:
                                 conf_crossings += 1
                             if prev_act_pos is not None and act_pos != prev_act_pos:
@@ -855,7 +861,9 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
                 score = -1e30 if culled else total_sum
                 scores.append((slot, score))
                 if pool_id == 0 and not culled:
-                    dir_cdb[slot] = n_correct_dbl
+                    dir_cdb[slot]   = n_correct_dbl
+                    dir_ncorr[slot] = n_correct
+                    dir_today[slot] = today_correct
                 if not culled and n_correct > dir_max_correct:
                     dir_max_correct = n_correct
                 del m
@@ -863,13 +871,14 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
         live_count = len([sc for _, sc in scores if sc > -1e29])
 
         # Score history models (same formula, no culling)
-        hist_with_scores = []
+        hist_cands = []   # (model, score, n_correct, today) — carried for the two-half order
         if dir_hist and comp_hist_models_raw:
             for hm in comp_hist_models_raw:
                 hm.eval()
                 total_sum   = 0.0
                 n_correct_h = 0
                 hcdb        = 0   # n_correct_dbl for this history model
+                today_h     = 0
                 prev_conf_pos_h, prev_act_pos_h = None, None
                 conf_crossings_h, market_flips_h = 0, 0
                 with torch.inference_mode():
@@ -887,6 +896,8 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
                             correct_h = conf_pos == act_pos
                             n_correct_h += 1 if correct_h else 0
                             hcdb += (2 if correct_h else 0) if is_today else (1 if correct_h else 0)
+                            if is_today:
+                                today_h = 1 if correct_h else 0
                             if prev_conf_pos_h is not None and conf_pos != prev_conf_pos_h:
                                 conf_crossings_h += 1
                             if prev_act_pos_h is not None and act_pos != prev_act_pos_h:
@@ -900,8 +911,7 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
                             breakdown = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)
                             day_score = breakdown[2 if pool_id == 2 else 4]
                         total_sum += day_score * (dir_dw[di] if pool_id == 0 else mt1_win_weight(di, len(dir_hist)))
-                hist_sort_key = total_sum   # sort by balanced score (correct_dbl primary key retired)
-                hist_with_scores.append((hm, hist_sort_key))
+                hist_cands.append((hm, total_sum, n_correct_h, today_h))
         del comp_hist_models_raw
 
         live_scores = [sc for _, sc in scores if sc > -1e29]
@@ -910,21 +920,57 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
         log(f"[mt1/{sn(industry)}:{pool_name}] best={best_cat:.4f} slot0={slot0_cat:.4f} "
             f"actual_d=${actual_d:+.1f}")
 
-        # Backfill: skip the direction update unless the best model clears the balanced skill floor
-        # (full 0.52 — production runs on mature models, so no cold-start ramp). Mirrors C++.
-        dir_skill = (best_cat / dir_W) if (pool_id == 0 and dir_W > 0.0) else 1.0
-        if pool_id == 0 and dir_hist and dir_skill < MT1_DIR_SKILL_FLOOR:
-            log(f"[mt1/{sn(industry)}:dir] skill={dir_skill:.3f} < {MT1_DIR_SKILL_FLOOR} — backfill: keeping yesterday's elites")
-            del hist_with_scores
+        # Backfill: skip the direction update only on GENUINE collapse — best model got
+        # < MT1_DIR_MIN_CORRECT of the window's days' direction right (random ~5/10, rarely trips).
+        # Mirror of C++; replaces the unreachable score floor that deadlocked the pool.
+        if pool_id == 0 and dir_hist and dir_max_correct < MT1_DIR_MIN_CORRECT:
+            log(f"[mt1/{sn(industry)}:dir] max_correct={dir_max_correct} < {MT1_DIR_MIN_CORRECT} — backfill: keeping yesterday's elites")
+            del hist_cands
             continue
 
-        # All pools (direction included) sort by their balanced score — the direction pool's score
-        # is class-balanced skill, so the old correct_dbl primary sort key is retired (mirror of C++).
-        sort_scores = scores
+        hist_offset = MT1_COMP_SLOTS
+        if pool_id != 0:
+            sort_scores      = scores   # pure balanced score
+            hist_with_scores = [(hm, sc) for (hm, sc, _, _) in hist_cands]
+        else:
+            # Direction two-half selection (mirror of C++). Unified candidate list keyed by id
+            # (slot, or hist_offset+i), compute the elite ORDER, then encode it as synthetic scores
+            # so the score-sorting helper reproduces the order (no helper change needed).
+            cand = {}   # id -> (score, n_correct, today)
+            for slot, sc in scores:
+                cand[slot] = (sc, dir_ncorr.get(slot, 0), dir_today.get(slot, 0))
+            for i, (_hm, sc, nc, td) in enumerate(hist_cands):
+                cand[hist_offset + i] = (sc, nc, td)
+            ids        = list(cand.keys())
+            by_score   = sorted(ids, key=lambda k: cand[k][0], reverse=True)
+            by_correct = sorted(ids, key=lambda k: (cand[k][1], cand[k][0]), reverse=True)
+            order, taken = [], set()
+            slot0 = by_score[0] if by_score else None
+            for k in by_score:
+                if cand[k][2]:          # got today's direction right
+                    slot0 = k; break
+            if slot0 is not None:
+                order.append(slot0); taken.add(slot0)
+            score_target = 1 + ELITE_COUNT // 2   # slot0 + 8 from the score half
+            for k in by_score:
+                if len(order) >= score_target: break
+                if k not in taken: order.append(k); taken.add(k)
+            for k in by_correct:                  # correct half (viability + diversity)
+                if len(order) >= ELITE_COUNT: break
+                if k not in taken: order.append(k); taken.add(k)
+            for k in by_score:                    # gap-fill
+                if len(order) >= ELITE_COUNT: break
+                if k not in taken: order.append(k); taken.add(k)
+            BIG = 1e9
+            syn = {k: cand[k][0] for k in ids}    # non-elites keep real score
+            for rank, k in enumerate(order):
+                syn[k] = BIG - rank               # elites: big, in order
+            sort_scores      = [(slot, syn[slot]) for slot, _ in scores]
+            hist_with_scores = [(hm, syn[hist_offset + i]) for i, (hm, _sc, _nc, _td) in enumerate(hist_cands)]
 
         new_elites, new_wavgs = _select_and_mutate_mt1_component(
             prefix, model_dir, sort_scores, pool_sigmas[pool_id], hist_models=hist_with_scores)
-        del hist_with_scores
+        del hist_with_scores, hist_cands
 
         # Save history for this component pool
         _save_comp_pool_hist(industry, pool_name, model_dir, new_elites, new_wavgs)
