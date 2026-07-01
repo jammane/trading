@@ -623,6 +623,9 @@ def build_master_features(mkt_val_history, industry_list):
     #            scale/uncertainty anchor; supersedes the old raw current-level slot
     #   [18..20] poly-2 over 5d, values normalized by current level
     #   [21..36] poly-3 over {10,30,60,90}, values normalized by current level
+    # Return features (~0.01) are lifted to ~unit scale so the net has signal variance at init
+    # (info-preserving constant, matches C++ RETURN_SCALE). Poly coefs are already ~O(1).
+    RETURN_SCALE = 100.0
     features = []
     for ind in industry_list:
         hist = mkt_val_history.get(ind, [])
@@ -632,19 +635,19 @@ def build_master_features(mkt_val_history, industry_list):
             v_now  = _mst_hist_at(hist, t)
             v_prev = _mst_hist_at(hist, t + 1)
             denom  = abs(v_prev) if abs(v_prev) > 1e-9 else 1e-9
-            features.append((v_now - v_prev) / denom)
+            features.append(((v_now - v_prev) / denom) * RETURN_SCALE)
         for k in range(1, 8):                             # [10..16] 10-day bucket returns
             va = _mst_hist_at(hist, 10 * (k - 1))
             vb = _mst_hist_at(hist, 10 * k)
             denom = abs(vb) if abs(vb) > 1e-9 else 1e-9
-            features.append((va - vb) / denom)
+            features.append(((va - vb) / denom) * RETURN_SCALE)
         s = 0.0                                           # [17] realized return-volatility
         for d in range(1, 21):
             v_now  = _mst_hist_at(hist, d)
             v_prev = _mst_hist_at(hist, d + 1)
             denom  = abs(v_prev) if abs(v_prev) > 1e-9 else 1e-9
             s += abs((v_now - v_prev) / denom)
-        features.append(s / 20.0)
+        features.append((s / 20.0) * RETURN_SCALE)
         vals5 = [v / cur_denom for v in _mst_window(hist, 5)]   # [18..20] poly-2, level-normalized
         x5    = np.linspace(0.0, 1.0, 5)
         features.extend(np.polyfit(x5, vals5, 2).tolist())

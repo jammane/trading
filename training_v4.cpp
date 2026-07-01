@@ -1730,6 +1730,11 @@ static void fill_window(const float* hist, int hist_count, int win, float* windo
 static void build_master_features(const float ind_val_hist[][IND_HIST_CAP],
                                    int hist_count, float* out444) {
     static constexpr int POLY3_WINS[4] = {10,30,60,90};
+    // Return features are ~0.01 in magnitude; lift them to ~unit scale so the net produces
+    // output variance at init (otherwise tiny logits → conf≈0.5 for every model → the direction
+    // pool has no signal to select and collapses). Information-preserving constant, NOT a
+    // normalization. Applied to feat[0..17]; poly coefs (level-normalized) are already ~O(1).
+    static constexpr float RETURN_SCALE = 100.f;
     memset(out444, 0, 444 * sizeof(float));
 
     // Per-industry 37-feature layout (must stay bit-identical to training_lib.build_master_features):
@@ -1770,6 +1775,7 @@ static void build_master_features(const float ind_val_hist[][IND_HIST_CAP],
             }
             feat[17] = s / 20.f;
         }
+        for (int j = 0; j < 18; j++) feat[j] *= RETURN_SCALE;   // lift returns/vol to ~unit scale
         float win5[5];                                    // [18..20] poly-2, level-normalized
         fill_window(h, hist_count, 5, win5);
         for (int j = 0; j < 5; j++) win5[j] /= cur_denom;
@@ -2358,9 +2364,15 @@ static MT1CompResult step_mt1_component(
                 total_sum += day_score * day_weight[di];
             }
 
-            // Direction flip cull: direction pool (id=0) only, after full window
+            // Direction flip cull — only in genuinely-choppy windows. required = floor(market_flips/2):
+            // at market_flips 0 or 1 (the common case: autocorrelated forward returns rarely flip)
+            // required=0, so confident trend-followers are NOT culled. At market_flips >= 2, absence
+            // of conf crossings really means "not tracking" and is culled. Was ceil(...) — that
+            // culled 0-crossers at market_flips=1 and drove the collapse under the ABSOLUTE target
+            // (A/B: ceil → 35 collapse injections + full culls; cull off → 8). The balanced scoring
+            // additionally penalizes a missed flip via the heavily-weighted minority-class day.
             if (!culled && pool_id == 0 && scratch.dir_day_count >= 2) {
-                int required = (market_flips + 1) / 2;  // ceil(market_flips / 2)
+                int required = market_flips / 2;   // floor(market_flips / 2)
                 if (conf_crossings < required) culled = true;
             }
 
