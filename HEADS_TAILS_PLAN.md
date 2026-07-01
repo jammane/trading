@@ -82,10 +82,20 @@ replay, advance once at block end.
   `load_or_init_mt1` head+tail files, `MTLogRecord` sourcing — those touch the live day-loop, so
   they land with the block loop to keep each commit compilable + isolated.
 
-**Increment 3 — block loop (main). STATUS: TODO.**
-- `training_v4.cpp` `main`: replace day loop with block loop (`MT1_BLOCK_DAYS=25`); snapshot/
-  restore MT1 data-state + StockNN + MT2 portfolio per phase; run T1/H/T2/M. `--passes` wraps.
-  Retire the old branched component/composite pools.
+**Increment 3 — block loop (main). Sub-staged 3A/3B/3C.**
+- 3A — STATUS: DONE (local syntax-check passes; droplet build pending). Foundation, additive/unused:
+  `MT1_BLOCK_DAYS=25`; `MT1DataState` + `snapshot_mt1_data`/`restore_mt1_data` (captures the
+  replay-critical DATA window only — dir_day buffer, rolling floors, streak/cooldown — NOT model
+  pools/histories, which carry evolution forward); `save_mt1_ht`/`load_or_init_mt1_ht` (BREAKING
+  head/tail file format, additive `head_*`/`tail_*` filenames so it coexists with old files until 3C;
+  production bests fall back to elite slot 0 so they are always valid).
+- 3B — STATUS: TODO. `run_mt1_block` driver: snapshot data-state; phase T1 (freeze head0+tail0,
+  evolve 4 tail pools across the block, then set tail0=slot0); restore; phase H (freeze tail0, evolve
+  head, then set head0=slot0); restore; phase T2 (freeze new head0+tail0, evolve tails, set tail0);
+  leave data-state advanced at block end. Floors sourced from the composed head0+tail0 production model.
+- 3C — STATUS: TODO. Rewire `main`'s day loop into the block loop; interleave StockNN + MT2's M phase;
+  wire `save_mt1_ht`/`load_or_init_mt1_ht`; source `MTLogRecord` from tail pools + composed comp0;
+  retire the old branched component/composite pools + `step_mt1`/`step_mt1_component`/`step_mt1_composite`.
 
 **Increment 4 — upkeep block cycle. STATUS: TODO.**
 - `upkeep.py`: daily upkeep evolves tails + MT2 only; block counter (persisted in

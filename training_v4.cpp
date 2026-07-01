@@ -158,6 +158,7 @@ static constexpr int HIST_WAVG    = 3;   // wavg slots (17,18,19) saved per day
 static constexpr int   MT1NN_PARAMS        = 2218;
 static constexpr int   MT1_START_DAY       = 25;
 static constexpr int   MT1_FWD_DAYS        = 10;       // prediction horizon: target = cumulative relative return over next N sessions
+static constexpr int   MT1_BLOCK_DAYS      = 25;       // heads/tails block-alternating training: days per block (T1/H/T2/M phases replay the same block)
 static constexpr bool  MT2_FEED_DIRECTION  = true;     // MT2 input from direction-pool slot0 (true) vs composite slot0 (false)
 static constexpr float MT1_SCALE_DOLLARS   = 10000.f;  // tanh(out[1]) × scale = dollar P&L prediction
 static constexpr float MT1_FLOOR_COLD      = 250.f;    // cold-start floor for rolling buffer
@@ -3966,6 +3967,178 @@ static void load_or_init_mt1(const std::string& dir, const std::string& load_dir
         if (sd->empty()) continue;
         snprintf(path, sizeof(path), "%s/mt1_%s_comp_0.bin", sd->c_str(), ind);
         if (load_bin(path, scratch.comp0_buf, MT1NN_PARAMS)) break;
+    }
+}
+
+// ── Heads/tails: per-phase data-state snapshot/restore (Increment 3A) ─────────────
+// Block-alternating training replays the same MT1_BLOCK_DAYS days once per phase (T1/H/T2).
+// For fitness to be comparable across those replays, every phase must see the identical
+// scoring window (dir_day_buf), adaptive floors (rolling buffers), and collapse counters.
+// Those are DATA (feature+target+floor state), captured here and restored before each replay.
+// The model pools (head/tail elites + their weight histories) are NOT captured — they carry the
+// evolution forward across phases; only the data window is rewound.
+struct MT1DataState {
+    MT1Scratch::DirDayEntry dir_day_buf[MT1_DIR_DAYS];
+    int   dir_day_head, dir_day_count, dir_streak, dir_cooldown;
+    float rolling_actual[MT1_ROLLING_DAYS], rolling_residual[MT1_ROLLING_DAYS];
+    int   rolling_head, rolling_count;
+};
+
+static void snapshot_mt1_data(const MT1Scratch& s, MT1DataState& d) {
+    memcpy(d.dir_day_buf, s.dir_day_buf, sizeof(d.dir_day_buf));
+    d.dir_day_head = s.dir_day_head; d.dir_day_count = s.dir_day_count;
+    d.dir_streak   = s.dir_streak;   d.dir_cooldown  = s.dir_cooldown;
+    memcpy(d.rolling_actual,   s.rolling_actual,   sizeof(d.rolling_actual));
+    memcpy(d.rolling_residual, s.rolling_residual, sizeof(d.rolling_residual));
+    d.rolling_head = s.rolling_head; d.rolling_count = s.rolling_count;
+}
+
+static void restore_mt1_data(MT1Scratch& s, const MT1DataState& d) {
+    memcpy(s.dir_day_buf, d.dir_day_buf, sizeof(d.dir_day_buf));
+    s.dir_day_head = d.dir_day_head; s.dir_day_count = d.dir_day_count;
+    s.dir_streak   = d.dir_streak;   s.dir_cooldown  = d.dir_cooldown;
+    memcpy(s.rolling_actual,   d.rolling_actual,   sizeof(d.rolling_actual));
+    memcpy(s.rolling_residual, d.rolling_residual, sizeof(d.rolling_residual));
+    s.rolling_head = d.rolling_head; s.rolling_count = d.rolling_count;
+}
+
+// ── Heads/tails: model persistence (Increment 3A) ────────────────────────────────
+// BREAKING file format for the head/tail redesign. Additive filenames (head_*/tail_*) so it can
+// coexist with the old branched files until Increment 3C retires the old save/load path.
+//   head:  mt1_{ind}_head_elite_{0..19}.bin, mt1_{ind}_head_hist.bin, mt1_{ind}_head_0.bin
+//   tail:  mt1_{ind}_tail_{name}_elite_{0..19}.bin, _hist.bin, _0.bin  (name = dir/acc/rng/cfd)
+//   data:  mt1_{ind}_ht_dir.bin (dir_day window + streak/cooldown; rolling rebuilds after load)
+static void save_mt1_ht(const std::string& dir, int ind_i, const MT1Scratch& scratch) {
+    const char* ind = g_ind_names[ind_i].c_str();
+    char path[512];
+
+    // Head pool: HT_PARENTS parent slots + history + production best
+    for (int slot = 0; slot < HT_PARENTS; slot++) {
+        snprintf(path, sizeof(path), "%s/mt1_%s_head_elite_%d.bin", dir.c_str(), ind, slot);
+        if (!save_bin(path, scratch.head_elite + (size_t)slot * HEADNN_PARAMS, HEADNN_PARAMS))
+            log_msg(std::string("WARNING: could not save ") + path);
+    }
+    snprintf(path, sizeof(path), "%s/mt1_%s_head_hist.bin", dir.c_str(), ind);
+    if (FILE* f = fopen(path, "wb")) {
+        int meta[2] = {scratch.head_hist_head, scratch.head_hist_count};
+        fwrite(meta, sizeof(int), 2, f);
+        fwrite(scratch.head_hist, sizeof(float),
+               (size_t)HIST_DAYS * HIST_PER_DAY * HEADNN_PARAMS, f);
+        fclose(f);
+    }
+    snprintf(path, sizeof(path), "%s/mt1_%s_head_0.bin", dir.c_str(), ind);
+    save_bin(path, scratch.head0_buf, HEADNN_PARAMS);
+
+    // Tail pools (dir/acc/rng/cfd)
+    for (int c = 0; c < 4; c++) {
+        for (int slot = 0; slot < HT_PARENTS; slot++) {
+            snprintf(path, sizeof(path), "%s/mt1_%s_tail_%s_elite_%d.bin",
+                     dir.c_str(), ind, MT1_POOL_NAMES[c], slot);
+            if (!save_bin(path, scratch.tail_elite[c] + (size_t)slot * TAILNN_PARAMS, TAILNN_PARAMS))
+                log_msg(std::string("WARNING: could not save ") + path);
+        }
+        snprintf(path, sizeof(path), "%s/mt1_%s_tail_%s_hist.bin", dir.c_str(), ind, MT1_POOL_NAMES[c]);
+        if (FILE* f = fopen(path, "wb")) {
+            int meta[2] = {scratch.tail_hist_head[c], scratch.tail_hist_count[c]};
+            fwrite(meta, sizeof(int), 2, f);
+            fwrite(scratch.tail_hist[c], sizeof(float),
+                   (size_t)HIST_DAYS * HIST_PER_DAY * TAILNN_PARAMS, f);
+            fclose(f);
+        }
+        snprintf(path, sizeof(path), "%s/mt1_%s_tail_%s_0.bin", dir.c_str(), ind, MT1_POOL_NAMES[c]);
+        save_bin(path, scratch.tail0_buf[c], TAILNN_PARAMS);
+    }
+
+    // Shared data window (dir_day buffer + streak/cooldown; rolling not persisted — it rebuilds)
+    snprintf(path, sizeof(path), "%s/mt1_%s_ht_dir.bin", dir.c_str(), ind);
+    if (FILE* f = fopen(path, "wb")) {
+        int meta[4] = {scratch.dir_day_head, scratch.dir_day_count,
+                       scratch.dir_streak, scratch.dir_cooldown};
+        fwrite(meta, sizeof(int), 4, f);
+        fwrite(scratch.dir_day_buf, sizeof(MT1Scratch::DirDayEntry), MT1_DIR_DAYS, f);
+        fclose(f);
+    }
+}
+
+static void load_or_init_mt1_ht(const std::string& dir, const std::string& load_dir,
+                                 int ind_i, MT1Scratch& scratch) {
+    const char* ind = g_ind_names[ind_i].c_str();
+    PCG32 rng; rng.seed((uint64_t)(ind_i + 2 * N_IND) * 777777777ULL + 271828182ULL);
+    char path[512];
+
+    auto try_load = [&](const char* fmt_suffix, float* dst, int n, auto... args) -> bool {
+        for (const std::string* sd : {&load_dir, &dir}) {
+            if (sd->empty()) continue;
+            snprintf(path, sizeof(path), fmt_suffix, sd->c_str(), ind, args...);
+            if (load_bin(path, dst, n)) return true;
+        }
+        return false;
+    };
+
+    // Head pool elites
+    for (int slot = 0; slot < HT_PARENTS; slot++) {
+        float* e = scratch.head_elite + (size_t)slot * HEADNN_PARAMS;
+        if (!try_load("%s/mt1_%s_head_elite_%d.bin", e, HEADNN_PARAMS, slot))
+            init_head_weights(e, rng);
+    }
+    // Head history
+    scratch.head_hist_head = 0; scratch.head_hist_count = 0;
+    for (const std::string* sd : {&load_dir, &dir}) {
+        if (sd->empty()) continue;
+        snprintf(path, sizeof(path), "%s/mt1_%s_head_hist.bin", sd->c_str(), ind);
+        FILE* f = fopen(path, "rb"); if (!f) continue;
+        int meta[2] = {};
+        if (fread(meta, sizeof(int), 2, f) == 2) {
+            scratch.head_hist_head  = std::max(0, std::min(meta[0], HIST_DAYS - 1));
+            scratch.head_hist_count = std::max(0, std::min(meta[1], HIST_DAYS));
+        }
+        fread(scratch.head_hist, sizeof(float), (size_t)HIST_DAYS * HIST_PER_DAY * HEADNN_PARAMS, f);
+        fclose(f); break;
+    }
+    // Head production best (fall back to elite slot 0 so it is always valid)
+    if (!try_load("%s/mt1_%s_head_0.bin", scratch.head0_buf, HEADNN_PARAMS))
+        memcpy(scratch.head0_buf, scratch.head_elite, HEADNN_PARAMS * sizeof(float));
+
+    // Tail pools
+    for (int c = 0; c < 4; c++) {
+        for (int slot = 0; slot < HT_PARENTS; slot++) {
+            float* e = scratch.tail_elite[c] + (size_t)slot * TAILNN_PARAMS;
+            if (!try_load("%s/mt1_%s_tail_%s_elite_%d.bin", e, TAILNN_PARAMS, MT1_POOL_NAMES[c], slot))
+                init_tail_weights(e, rng);
+        }
+        scratch.tail_hist_head[c] = 0; scratch.tail_hist_count[c] = 0;
+        for (const std::string* sd : {&load_dir, &dir}) {
+            if (sd->empty()) continue;
+            snprintf(path, sizeof(path), "%s/mt1_%s_tail_%s_hist.bin", sd->c_str(), ind, MT1_POOL_NAMES[c]);
+            FILE* f = fopen(path, "rb"); if (!f) continue;
+            int meta[2] = {};
+            if (fread(meta, sizeof(int), 2, f) == 2) {
+                scratch.tail_hist_head[c]  = std::max(0, std::min(meta[0], HIST_DAYS - 1));
+                scratch.tail_hist_count[c] = std::max(0, std::min(meta[1], HIST_DAYS));
+            }
+            fread(scratch.tail_hist[c], sizeof(float), (size_t)HIST_DAYS * HIST_PER_DAY * TAILNN_PARAMS, f);
+            fclose(f); break;
+        }
+        if (!try_load("%s/mt1_%s_tail_%s_0.bin", scratch.tail0_buf[c], TAILNN_PARAMS, MT1_POOL_NAMES[c]))
+            memcpy(scratch.tail0_buf[c], scratch.tail_elite[c], TAILNN_PARAMS * sizeof(float));
+    }
+
+    // Shared data window
+    for (const std::string* sd : {&load_dir, &dir}) {
+        if (sd->empty()) continue;
+        snprintf(path, sizeof(path), "%s/mt1_%s_ht_dir.bin", sd->c_str(), ind);
+        FILE* f = fopen(path, "rb"); if (!f) continue;
+        int meta[4] = {};
+        int meta_read = (int)fread(meta, sizeof(int), 4, f);
+        if (meta_read >= 2 &&
+            meta[1] >= 0 && meta[1] <= MT1_DIR_DAYS &&
+            meta[0] >= 0 && meta[0] < MT1_DIR_DAYS) {
+            scratch.dir_day_head  = meta[0];
+            scratch.dir_day_count = meta[1];
+            if (meta_read >= 4) { scratch.dir_streak = meta[2]; scratch.dir_cooldown = meta[3]; }
+            fread(scratch.dir_day_buf, sizeof(MT1Scratch::DirDayEntry), MT1_DIR_DAYS, f);
+        }
+        fclose(f); break;
     }
 }
 
