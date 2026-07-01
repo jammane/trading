@@ -41,12 +41,14 @@ MASTER_LAYER_DEFS = [
     ('fc_out',  48, 180),
 ]
 
+# Branched MT1NN — layer order defines the flat .bin layout; must match models.py MT1NN
+# and the C++ MT1_* offsets. (prefix, out_size, in_size). Total 2,218 params.
 MT1_LAYER_DEFS = [
-    ('fc1',    37, 37),
-    ('fc2',    29, 37),
-    ('fc3',    20, 29),
-    ('fc4',    12, 20),
-    ('fc_out',  4, 12),
+    ('a1', 20, 20), ('a2', 20, 20),   # block A: vol + poly
+    ('b1',  6, 10), ('b2',  4,  6),   # block B: daily returns
+    ('c1',  5,  7), ('c2',  4,  5),   # block C: decade returns
+    ('d1', 22, 28), ('d2', 16, 22),   # block D: fusion taper
+    ('d3', 10, 16), ('d4',  4, 10),
 ]
 
 # MT2 layout mirrors C++ binary offsets (FC1, FC2, LSTM L1, LSTM L2, taper1-3, fc_out).

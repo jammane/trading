@@ -120,7 +120,9 @@ static constexpr float MT1_RANGE_CEIL_MULT = 4.f;    // ceiling = 4 × max(mean,
 static constexpr float MT1_DIR_BACKFILL    = 0.65f;  // skip direction pool update when best score < this
 static constexpr int   MT1_DIR_DAYS        = 10;  // scoring window (all pools): score each model over last N days, linear-weighted sum (oldest=1.0 → today=2.0)
 static constexpr int   MT1_DIR_QUALIFY      = 1;   // (legacy, unused) min correct_dbl for a live slot to qualify
-static constexpr float MT1_DIR_SKILL_FLOOR  = 0.52f; // balanced direction skill_frac floor (0.5 = no skill); gates backfill/qualify under the sign-skewed ABSOLUTE target
+static constexpr float MT1_DIR_SKILL_FLOOR  = 0.52f; // full balanced direction skill_frac floor (0.5 = no skill); gates backfill/qualify
+static constexpr float MT1_DIR_SKILL_FLOOR_START = 0.50f; // ramp start (no-skill baseline) — lenient so cold-start can bootstrap
+static constexpr int   MT1_DIR_SKILL_RAMP_DAYS   = 300;   // linearly ramp the floor START→FULL over the first N training days
 static constexpr int   MT1_DIR_STREAK_TRIP  = 5;   // consecutive collapse days before injection fires
 static constexpr int   MT1_DIR_COOLDOWN_LEN = 10;  // cooldown days after injection before re-injection allowed
 static constexpr int   HIST_WINDOW         = 15;
@@ -148,20 +150,26 @@ static constexpr int HIST_PER_DAY = 10;
 static constexpr int HIST_ELITE   = 7;   // top-7 direct elite slots saved per day
 static constexpr int HIST_WAVG    = 3;   // wavg slots (17,18,19) saved per day
 
-// MT1NN: 37→37→29→20→12→4, per-industry preprocessor (12 pools)
-static constexpr int   MT1NN_PARAMS        = 3412;
+// MT1NN: branched FC (blocks A/B/C → concat 28 → D taper), per-industry preprocessor (12 pools)
+static constexpr int   MT1NN_PARAMS        = 2218;
 static constexpr int   MT1_START_DAY       = 25;
 static constexpr int   MT1_FWD_DAYS        = 10;       // prediction horizon: target = cumulative relative return over next N sessions
 static constexpr bool  MT2_FEED_DIRECTION  = true;     // MT2 input from direction-pool slot0 (true) vs composite slot0 (false)
 static constexpr float MT1_SCALE_DOLLARS   = 10000.f;  // tanh(out[1]) × scale = dollar P&L prediction
 static constexpr float MT1_FLOOR_COLD      = 250.f;    // cold-start floor for rolling buffer
 static constexpr int   MT1_ROLLING_DAYS    = 10;       // days in per-industry |actual_d| buffer
-// MT1 weight layout offsets (kaiming_init writes weight+bias consecutively per layer)
-static constexpr int MT1_FC1_W = 0;       static constexpr int MT1_FC1_B = 1369;   // 37×37
-static constexpr int MT1_FC2_W = 1406;    static constexpr int MT1_FC2_B = 2479;   // +37, 37×29
-static constexpr int MT1_FC3_W = 2508;    static constexpr int MT1_FC3_B = 3088;   // +29, 29×20
-static constexpr int MT1_FC4_W = 3108;    static constexpr int MT1_FC4_B = 3348;   // +20, 20×12
-static constexpr int MT1_OUT_W = 3360;    static constexpr int MT1_OUT_B = 3408;   // +12, 12×4+4=3412
+// MT1 branched weight layout (weight+bias consecutively per layer, order = MT1_LAYER_DEFS).
+// A: a1 20→20, a2 20→20 | B: b1 10→6, b2 6→4 | C: c1 7→5, c2 5→4 | D: d1 28→22, d2 22→16, d3 16→10, d4 10→4
+static constexpr int MT1_A1_W=0,    MT1_A1_B=400;    // 20×20
+static constexpr int MT1_A2_W=420,  MT1_A2_B=820;    // 20×20
+static constexpr int MT1_B1_W=840,  MT1_B1_B=900;    // 6×10
+static constexpr int MT1_B2_W=906,  MT1_B2_B=930;    // 4×6
+static constexpr int MT1_C1_W=934,  MT1_C1_B=969;    // 5×7
+static constexpr int MT1_C2_W=974,  MT1_C2_B=994;    // 4×5
+static constexpr int MT1_D1_W=998,  MT1_D1_B=1614;   // 22×28
+static constexpr int MT1_D2_W=1636, MT1_D2_B=1988;   // 16×22
+static constexpr int MT1_D3_W=2004, MT1_D3_B=2164;   // 10×16
+static constexpr int MT1_D4_W=2174, MT1_D4_B=2214;   // 4×10  (ends at 2218)
 
 // MT2 injection: fire when ≥75% of pool scores below threshold (worst ~15% of days)
 static constexpr float MT2_INJ_THRESHOLD = -7.0f;
@@ -338,12 +346,24 @@ static void master_forward(const float* W, const float* today444, float* out48) 
 
 // MT1NN forward: 37→37→29→20→12→4 (raw logits; activations applied at score time)
 static void mt1_forward(const float* W, const float* in37, float* out4) {
-    float h1[37], h2[29], h3[20], h4[12];
-    sgemv_relu(W + MT1_FC1_W, W + MT1_FC1_B, in37, h1, 37, 37);
-    sgemv_relu(W + MT1_FC2_W, W + MT1_FC2_B, h1,   h2, 29, 37);
-    sgemv_relu(W + MT1_FC3_W, W + MT1_FC3_B, h2,   h3, 20, 29);
-    sgemv_relu(W + MT1_FC4_W, W + MT1_FC4_B, h3,   h4, 12, 20);
-    sgemv_only(W + MT1_OUT_W, W + MT1_OUT_B, h4,  out4,  4, 12);
+    // Input slices (Phase-1c layout): B daily [0:10], C decade [10:17], A vol+poly [17:37]
+    const float* xb = in37;        // 10
+    const float* xc = in37 + 10;   // 7
+    const float* xa = in37 + 17;   // 20
+    float a1[20], a2[20], b1[6], b2[4], c1[5], c2[4], cat[28], d1[22], d2[16], d3[10];
+    sgemv_relu(W + MT1_A1_W, W + MT1_A1_B, xa, a1, 20, 20);
+    sgemv_relu(W + MT1_A2_W, W + MT1_A2_B, a1, a2, 20, 20);
+    sgemv_relu(W + MT1_B1_W, W + MT1_B1_B, xb, b1,  6, 10);
+    sgemv_relu(W + MT1_B2_W, W + MT1_B2_B, b1, b2,  4,  6);
+    sgemv_relu(W + MT1_C1_W, W + MT1_C1_B, xc, c1,  5,  7);
+    sgemv_relu(W + MT1_C2_W, W + MT1_C2_B, c1, c2,  4,  5);
+    memcpy(cat,      a2, 20 * sizeof(float));   // concat [A20, B4, C4] = 28
+    memcpy(cat + 20, b2,  4 * sizeof(float));
+    memcpy(cat + 24, c2,  4 * sizeof(float));
+    sgemv_relu(W + MT1_D1_W, W + MT1_D1_B, cat, d1, 22, 28);
+    sgemv_relu(W + MT1_D2_W, W + MT1_D2_B, d1,  d2, 16, 22);
+    sgemv_relu(W + MT1_D3_W, W + MT1_D3_B, d2,  d3, 10, 16);
+    sgemv_only(W + MT1_D4_W, W + MT1_D4_B, d3, out4,  4, 10);
 }
 
 // Single LSTM time step (one layer). gates[4*hidden] is caller-provided scratch.
@@ -742,11 +762,16 @@ static void init_master_weights(float* W, PCG32& rng) {
 }
 
 static void init_mt1_weights(float* W, PCG32& rng) {
-    kaiming_init(W + MT1_FC1_W, 37, 37, rng);
-    kaiming_init(W + MT1_FC2_W, 29, 37, rng);
-    kaiming_init(W + MT1_FC3_W, 20, 29, rng);
-    kaiming_init(W + MT1_FC4_W, 12, 20, rng);
-    kaiming_init(W + MT1_OUT_W,  4, 12, rng);
+    kaiming_init(W + MT1_A1_W, 20, 20, rng);
+    kaiming_init(W + MT1_A2_W, 20, 20, rng);
+    kaiming_init(W + MT1_B1_W,  6, 10, rng);
+    kaiming_init(W + MT1_B2_W,  4,  6, rng);
+    kaiming_init(W + MT1_C1_W,  5,  7, rng);
+    kaiming_init(W + MT1_C2_W,  4,  5, rng);
+    kaiming_init(W + MT1_D1_W, 22, 28, rng);
+    kaiming_init(W + MT1_D2_W, 16, 22, rng);
+    kaiming_init(W + MT1_D3_W, 10, 16, rng);
+    kaiming_init(W + MT1_D4_W,  4, 10, rng);
 }
 
 static void init_mt2_weights(float* W, PCG32& rng) {
@@ -2410,19 +2435,24 @@ static MT1CompResult step_mt1_component(
     }
 
     // Direction backfill: skip update unless the best model shows real direction SKILL.
-    // Gate on balanced skill_frac = cat_sc/dir_W (0.5 = no skill); raw correct-count is
-    // sign-skew-inflated under the absolute target and would never trip.
+    // Gate on balanced skill_frac = cat_sc/dir_W (0.5 = no skill). The floor ramps linearly from
+    // MT1_DIR_SKILL_FLOOR_START (lenient — gives cold-start bootstrapping room, since the
+    // conditioned features have weak early direction signal) up to the full MT1_DIR_SKILL_FLOOR
+    // over the first MT1_DIR_SKILL_RAMP_DAYS training days.
+    float skill_floor = MT1_DIR_SKILL_FLOOR_START
+        + (MT1_DIR_SKILL_FLOOR - MT1_DIR_SKILL_FLOOR_START)
+          * fminf((float)actual_day / (float)MT1_DIR_SKILL_RAMP_DAYS, 1.f);
     float dir_best_skill = (dir_W > 0.f) ? (best_cat / dir_W) : 0.f;
-    if (pool_id == 0 && dir_best_skill < MT1_DIR_SKILL_FLOOR) {
+    if (pool_id == 0 && dir_best_skill < skill_floor) {
         scratch.dir_streak++;
         return {best_cat, slot0_cat, mean_cat, min_cat, mean_cdb};
     }
 
-    // Direction collapse streak: increment if too few live slots clear the skill floor.
+    // Direction collapse streak: increment if too few live slots clear the (ramped) skill floor.
     if (pool_id == 0) {
         int n_qual = 0;
         for (int s = 0; s < pool_slots; s++)
-            if (cat_sc[s] > -1e29f && dir_W > 0.f && (cat_sc[s] / dir_W) >= MT1_DIR_SKILL_FLOOR)
+            if (cat_sc[s] > -1e29f && dir_W > 0.f && (cat_sc[s] / dir_W) >= skill_floor)
                 n_qual++;
         if (n_qual < ELITE_COUNT)
             scratch.dir_streak++;
