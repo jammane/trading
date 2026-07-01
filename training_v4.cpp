@@ -624,6 +624,22 @@ struct MT1Scratch {
     // Best composite model weights (saved periodically as comp_0.bin)
     float*   comp0_buf;
 
+    // ── Heads/tails pools (redesign, Increment 2). Head = shared trunk (HEADNN_PARAMS);
+    //    4 tails = specialized 1-output (TAILNN_PARAMS). Production = head0 + tail0[4]. Added
+    //    alongside the branched pools above; Increment 3 migrates the loop and retires the old. ──
+    float*   head_elite;          // [MT1_COMP_PARENTS × HEADNN_PARAMS]
+    float*   tail_elite[4];       // 4 × [MT1_COMP_PARENTS × TAILNN_PARAMS]  (dir/acc/rng/cfd)
+    float*   head_new;            // selection scratch
+    float*   tail_new[4];
+    float*   head_mut;            // mutation scratch
+    float*   tail_mut;
+    float*   head_hist;           // [HIST_DAYS × HIST_PER_DAY × HEADNN_PARAMS]
+    float*   tail_hist[4];        // 4 × [HIST_DAYS × HIST_PER_DAY × TAILNN_PARAMS]
+    int      head_hist_head{0},  head_hist_count{0};
+    int      tail_hist_head[4]{}, tail_hist_count[4]{};
+    float*   head0_buf;           // best head (production)
+    float*   tail0_buf[4];        // best 4 tails (production)
+
     // Multi-day direction scoring buffer (last MT1_DIR_DAYS entries of features + actual_d)
     struct DirDayEntry { float feat37[37]; float actual_d; };
     DirDayEntry  dir_day_buf[MT1_DIR_DAYS]{};
@@ -652,12 +668,27 @@ struct MT1Scratch {
         dir_inject_buf  = new float[(size_t)MT1_COMP_INJECT  * MT1NN_PARAMS]();
         rng_inject_buf  = new float[(size_t)MT1_RANGE_INJECT * MT1NN_PARAMS]();
         comp0_buf       = new float[MT1NN_PARAMS]();
+        // heads/tails pools
+        size_t hep = (size_t)MT1_COMP_PARENTS * HEADNN_PARAMS;
+        size_t tep = (size_t)MT1_COMP_PARENTS * TAILNN_PARAMS;
+        size_t hhp = (size_t)HIST_DAYS * HIST_PER_DAY * HEADNN_PARAMS;
+        size_t thp = (size_t)HIST_DAYS * HIST_PER_DAY * TAILNN_PARAMS;
+        head_elite = new float[hep](); head_new = new float[hep](); head_mut = new float[HEADNN_PARAMS]();
+        head_hist  = new float[hhp](); head0_buf = new float[HEADNN_PARAMS]();
+        tail_mut   = new float[TAILNN_PARAMS]();
+        for (int p = 0; p < 4; p++) {
+            tail_elite[p] = new float[tep](); tail_new[p] = new float[tep]();
+            tail_hist[p]  = new float[thp](); tail0_buf[p] = new float[TAILNN_PARAMS]();
+        }
     }
     ~MT1Scratch() {
         for (int p = 0; p < 4; p++) { delete[] comp_elites[p]; delete[] pool_hist[p]; }
         delete[] new_elites; delete[] mut_buf;
         delete[] blend_hist; delete[] comp_inject_buf; delete[] dir_inject_buf;
         delete[] rng_inject_buf; delete[] comp0_buf;
+        delete[] head_elite; delete[] head_new; delete[] head_mut; delete[] head_hist; delete[] head0_buf;
+        delete[] tail_mut;
+        for (int p = 0; p < 4; p++) { delete[] tail_elite[p]; delete[] tail_new[p]; delete[] tail_hist[p]; delete[] tail0_buf[p]; }
     }
     float* comp_elite(int pool, int slot) { return comp_elites[pool] + (size_t)slot * MT1NN_PARAMS; }
     float* new_elite(int slot)            { return new_elites         + (size_t)slot * MT1NN_PARAMS; }
@@ -670,6 +701,13 @@ struct MT1Scratch {
     float* comp_inject(int k)  { return comp_inject_buf + (size_t)k * MT1NN_PARAMS; }
     float* dir_inject(int k)   { return dir_inject_buf  + (size_t)k * MT1NN_PARAMS; }
     float* rng_inject(int k)   { return rng_inject_buf  + (size_t)k * MT1NN_PARAMS; }
+    // heads/tails accessors
+    float* head_e(int slot)            { return head_elite    + (size_t)slot * HEADNN_PARAMS; }
+    float* tail_e(int p, int slot)     { return tail_elite[p] + (size_t)slot * TAILNN_PARAMS; }
+    float* head_new_e(int slot)        { return head_new      + (size_t)slot * HEADNN_PARAMS; }
+    float* tail_new_e(int p, int slot) { return tail_new[p]   + (size_t)slot * TAILNN_PARAMS; }
+    float* head_hist_slot(int d, int pos)         { return head_hist    + ((size_t)(d*HIST_PER_DAY+pos))*HEADNN_PARAMS; }
+    float* tail_hist_slot(int c, int d, int pos)  { return tail_hist[c] + ((size_t)(d*HIST_PER_DAY+pos))*TAILNN_PARAMS; }
 
     void push_dir_day(const float* f37, float ad) {
         memcpy(dir_day_buf[dir_day_head].feat37, f37, 37 * sizeof(float));
