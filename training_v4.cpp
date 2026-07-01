@@ -169,6 +169,17 @@ static constexpr int MT1_D2_W=1636, MT1_D2_B=1988;   // 16×22
 static constexpr int MT1_D3_W=2004, MT1_D3_B=2164;   // 10×16
 static constexpr int MT1_D4_W=2174, MT1_D4_B=2214;   // 4×10  (ends at 2218)
 
+// ── Heads/tails split (redesign): shared head trunk (37→28) + specialized 1-output tails (28→1) ──
+// Head buffer = a1..c2 (identical layout to the branched net's first 998 params).
+static constexpr int   HEADNN_PARAMS = 998;
+static constexpr int   TAILNN_PARAMS = 1187;
+static constexpr int HD_A1_W=0,   HD_A1_B=400;   static constexpr int HD_A2_W=420, HD_A2_B=820;   // 20×20, 20×20
+static constexpr int HD_B1_W=840, HD_B1_B=900;   static constexpr int HD_B2_W=906, HD_B2_B=930;   // 6×10, 4×6
+static constexpr int HD_C1_W=934, HD_C1_B=969;   static constexpr int HD_C2_W=974, HD_C2_B=994;   // 5×7, 4×5  (ends 998)
+// Tail buffer = d1..d4 with d4→1 (own buffer; NOT the branched net's D — d4 is 10×1 here).
+static constexpr int TL_D1_W=0,    TL_D1_B=616;  static constexpr int TL_D2_W=638,  TL_D2_B=990;  // 22×28, 16×22
+static constexpr int TL_D3_W=1006, TL_D3_B=1166; static constexpr int TL_D4_W=1176, TL_D4_B=1186; // 10×16, 1×10  (ends 1187)
+
 // MT2 injection: fire when ≥75% of pool scores below threshold (worst ~15% of days)
 static constexpr float MT2_INJ_THRESHOLD = -7.0f;
 static constexpr int   MT2_INJ_MIN_BELOW = (int)(N_SLOTS * 0.75f);  // 150/200
@@ -362,6 +373,41 @@ static void mt1_forward(const float* W, const float* in37, float* out4) {
     sgemv_relu(W + MT1_D2_W, W + MT1_D2_B, d1,  d2, 16, 22);
     sgemv_relu(W + MT1_D3_W, W + MT1_D3_B, d2,  d3, 10, 16);
     sgemv_only(W + MT1_D4_W, W + MT1_D4_B, d3, out4,  4, 10);
+}
+
+// Shared head trunk: in37 → concat28 (mirrors models.py MT1Head).
+static void head_forward(const float* W, const float* in37, float* concat28) {
+    const float* xb = in37;        // daily  [0:10]
+    const float* xc = in37 + 10;   // decade [10:17]
+    const float* xa = in37 + 17;   // vol+poly [17:37]
+    float a1[20], a2[20], b1[6], b2[4], c1[5], c2[4];
+    sgemv_relu(W + HD_A1_W, W + HD_A1_B, xa, a1, 20, 20);
+    sgemv_relu(W + HD_A2_W, W + HD_A2_B, a1, a2, 20, 20);
+    sgemv_relu(W + HD_B1_W, W + HD_B1_B, xb, b1,  6, 10);
+    sgemv_relu(W + HD_B2_W, W + HD_B2_B, b1, b2,  4,  6);
+    sgemv_relu(W + HD_C1_W, W + HD_C1_B, xc, c1,  5,  7);
+    sgemv_relu(W + HD_C2_W, W + HD_C2_B, c1, c2,  4,  5);
+    memcpy(concat28,      a2, 20 * sizeof(float));
+    memcpy(concat28 + 20, b2,  4 * sizeof(float));
+    memcpy(concat28 + 24, c2,  4 * sizeof(float));
+}
+
+// Specialized 1-output tail: concat28 → 1 raw logit (mirrors models.py MT1Tail).
+static void tail_forward(const float* W, const float* concat28, float* out1) {
+    float d1[22], d2[16], d3[10];
+    sgemv_relu(W + TL_D1_W, W + TL_D1_B, concat28, d1, 22, 28);
+    sgemv_relu(W + TL_D2_W, W + TL_D2_B, d1,  d2, 16, 22);
+    sgemv_relu(W + TL_D3_W, W + TL_D3_B, d2,  d3, 10, 16);
+    sgemv_only(W + TL_D4_W, W + TL_D4_B, d3, out1,  1, 10);
+}
+
+// Composed MT1: head + 4 tails → 4 raw logits (production/composite path; head_forward once,
+// then 4 tail_forwards share the concat).
+static void mt1_composed_forward(const float* head_w, const float* const tail_w[4],
+                                 const float* in37, float* out4) {
+    float concat28[28];
+    head_forward(head_w, in37, concat28);
+    for (int t = 0; t < 4; t++) tail_forward(tail_w[t], concat28, out4 + t);
 }
 
 // Single LSTM time step (one layer). gates[4*hidden] is caller-provided scratch.
@@ -770,6 +816,22 @@ static void init_mt1_weights(float* W, PCG32& rng) {
     kaiming_init(W + MT1_D2_W, 16, 22, rng);
     kaiming_init(W + MT1_D3_W, 10, 16, rng);
     kaiming_init(W + MT1_D4_W,  4, 10, rng);
+}
+
+static void init_head_weights(float* W, PCG32& rng) {
+    kaiming_init(W + HD_A1_W, 20, 20, rng);
+    kaiming_init(W + HD_A2_W, 20, 20, rng);
+    kaiming_init(W + HD_B1_W,  6, 10, rng);
+    kaiming_init(W + HD_B2_W,  4,  6, rng);
+    kaiming_init(W + HD_C1_W,  5,  7, rng);
+    kaiming_init(W + HD_C2_W,  4,  5, rng);
+}
+
+static void init_tail_weights(float* W, PCG32& rng) {
+    kaiming_init(W + TL_D1_W, 22, 28, rng);
+    kaiming_init(W + TL_D2_W, 16, 22, rng);
+    kaiming_init(W + TL_D3_W, 10, 16, rng);
+    kaiming_init(W + TL_D4_W,  1, 10, rng);
 }
 
 static void init_mt2_weights(float* W, PCG32& rng) {

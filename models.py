@@ -102,50 +102,64 @@ class MasterNN(nn.Module):
         return self.fc_out(x)   # (1, 48) raw logits
 
 
-class MT1NN(nn.Module):
+class MT1Head(nn.Module):
     """
-    Per-industry preprocessor — one pool per industry (12 total).
-
-    Branched FC (one sub-net per feature family, so a mutation stays localized to its
-    block — a friendlier fitness landscape for the evolutionary trainer). Input (1, 37)
-    is the Phase-1c conditioned layout, sliced contiguously:
-      B  x[:, 0:10]   10 daily returns   →  10 → 6 → 4
-      C  x[:, 10:17]  7 decade returns   →   7 → 5 → 4
-      A  x[:, 17:37]  vol + 19 poly coefs → 20 → 20 → 20
-      concat(A20, B4, C4) = 28 → D taper 28 → 22 → 16 → 10 → 4
-
-    Output (1, 4) raw logits (decoded at score time):
-      out[0] → sigmoid → direction confidence   out[1] → tanh × $10K → dollar P&L
-      out[2] → softplus → range frac            out[3] → sigmoid → calibrated confidence
-
-    Layer names/order MUST match MT1_LAYER_DEFS (prepare_models.py) and the C++
-    MT1_* offsets / mt1_forward. Total params: 2,218.
+    Shared MT1 feature-extraction trunk — ONE per industry, shared across all four component
+    tails. Input (batch, 37) Phase-1c layout → (batch, 28) concat feature vector.
+    Sliced contiguously: B daily [0:10], C decade [10:17], A vol+poly [17:37].
+      A: 20 → 20 → 20   B: 10 → 6 → 4   C: 7 → 5 → 4   → concat(A20,B4,C4)=28
+    998 params. Layer names/order MUST match HEAD_LAYER_DEFS + the C++ head offsets.
     """
 
     def __init__(self):
         super().__init__()
-        # Block A — level-relative regression (vol + poly)
-        self.a1 = nn.Linear(20, 20); self.a2 = nn.Linear(20, 20)
-        # Block B — daily momentum
-        self.b1 = nn.Linear(10, 6);  self.b2 = nn.Linear(6, 4)
-        # Block C — decade momentum
-        self.c1 = nn.Linear(7, 5);   self.c2 = nn.Linear(5, 4)
-        # Block D — fusion taper
-        self.d1 = nn.Linear(28, 22); self.d2 = nn.Linear(22, 16)
-        self.d3 = nn.Linear(16, 10); self.d4 = nn.Linear(10, 4)
+        self.a1 = nn.Linear(20, 20); self.a2 = nn.Linear(20, 20)   # vol + poly
+        self.b1 = nn.Linear(10, 6);  self.b2 = nn.Linear(6, 4)     # daily momentum
+        self.c1 = nn.Linear(7, 5);   self.c2 = nn.Linear(5, 4)     # decade momentum
 
     def forward(self, x):
-        xb = x[:, 0:10]    # daily returns
-        xc = x[:, 10:17]   # decade returns
-        xa = x[:, 17:37]   # vol + poly coefs
+        xb, xc, xa = x[:, 0:10], x[:, 10:17], x[:, 17:37]
         a = F.relu(self.a2(F.relu(self.a1(xa))))
         b = F.relu(self.b2(F.relu(self.b1(xb))))
         c = F.relu(self.c2(F.relu(self.c1(xc))))
-        d = torch.cat([a, b, c], dim=1)   # (batch, 28)
-        d = F.relu(self.d1(d))
-        d = F.relu(self.d2(d))
-        d = F.relu(self.d3(d))
-        return self.d4(d)   # (batch, 4) raw logits
+        return torch.cat([a, b, c], dim=1)   # (batch, 28)
+
+
+class MT1Tail(nn.Module):
+    """
+    Specialized single-output MT1 tail — ONE per component (direction / accuracy / range /
+    confidence). Consumes the shared head's (batch, 28) → (batch, 1) raw logit.
+      D taper: 28 → 22 → 16 → 10 → 1
+    1,187 params. Layer names/order MUST match TAIL_LAYER_DEFS + the C++ tail offsets.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.d1 = nn.Linear(28, 22); self.d2 = nn.Linear(22, 16)
+        self.d3 = nn.Linear(16, 10); self.d4 = nn.Linear(10, 1)
+
+    def forward(self, h):
+        h = F.relu(self.d1(h)); h = F.relu(self.d2(h)); h = F.relu(self.d3(h))
+        return self.d4(h)   # (batch, 1)
+
+
+class MT1NN(nn.Module):
+    """
+    Composed MT1 net: one shared MT1Head + four specialized MT1Tails → (batch, 4) raw logits.
+    Tail order = [direction, accuracy, range, confidence] → outputs [0,1,2,3]:
+      out[0] → sigmoid → direction confidence   out[1] → tanh × $10K → dollar P&L
+      out[2] → softplus → range frac            out[3] → sigmoid → calibrated confidence
+    Components evolve head + their single tail; composite/production uses all four. 5,746 params.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.head  = MT1Head()
+        self.tails = nn.ModuleList([MT1Tail() for _ in range(4)])
+
+    def forward(self, x):
+        h = self.head(x)
+        return torch.cat([t(h) for t in self.tails], dim=1)   # (batch, 4) raw logits
 
 
 class MT2NN(nn.Module):

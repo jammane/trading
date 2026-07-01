@@ -41,14 +41,25 @@ MASTER_LAYER_DEFS = [
     ('fc_out',  48, 180),
 ]
 
-# Branched MT1NN — layer order defines the flat .bin layout; must match models.py MT1NN
-# and the C++ MT1_* offsets. (prefix, out_size, in_size). Total 2,218 params.
+# (legacy) branched MT1NN layout — superseded by the heads/tails split below.
 MT1_LAYER_DEFS = [
-    ('a1', 20, 20), ('a2', 20, 20),   # block A: vol + poly
-    ('b1',  6, 10), ('b2',  4,  6),   # block B: daily returns
-    ('c1',  5,  7), ('c2',  4,  5),   # block C: decade returns
-    ('d1', 22, 28), ('d2', 16, 22),   # block D: fusion taper
+    ('a1', 20, 20), ('a2', 20, 20),
+    ('b1',  6, 10), ('b2',  4,  6),
+    ('c1',  5,  7), ('c2',  4,  5),
+    ('d1', 22, 28), ('d2', 16, 22),
     ('d3', 10, 16), ('d4',  4, 10),
+]
+
+# Heads/tails split — layer order defines each flat .bin; must match models.py MT1Head/MT1Tail
+# and the C++ HD_*/TL_* offsets. (prefix, out_size, in_size).
+HEAD_LAYER_DEFS = [          # shared trunk, 998 params (matches MT1Head, keys a1..c2)
+    ('a1', 20, 20), ('a2', 20, 20),
+    ('b1',  6, 10), ('b2',  4,  6),
+    ('c1',  5,  7), ('c2',  4,  5),
+]
+TAIL_LAYER_DEFS = [          # specialized 1-output tail, 1,187 params (matches MT1Tail, keys d1..d4)
+    ('d1', 22, 28), ('d2', 16, 22),
+    ('d3', 10, 16), ('d4',  1, 10),
 ]
 
 # MT2 layout mirrors C++ binary offsets (FC1, FC2, LSTM L1, LSTM L2, taper1-3, fc_out).
