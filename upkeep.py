@@ -54,6 +54,7 @@ from training_lib import (
     MT1_COMP_SLOTS,
     MT1_DIR_BACKFILL,
     MT1_DIR_DAYS,
+    MT1_DIR_SKILL_FLOOR,
     MT1_POOL_NAMES,
     MT1_RANGE_CEIL_MULT,
     MT1_RANGE_FLOOR,
@@ -379,6 +380,24 @@ def mt1_win_weight(di, day_count):
     return 1.0 if w < 1.0 else w
 
 
+def _dir_day_weights(dir_hist):
+    """Class-balanced direction-pool day weights (mirror of C++ step_mt1_component): up-days and
+    down-days each carry half the window weight, so a constant-prediction model scores exactly the
+    no-skill baseline dir_W/2 regardless of the absolute target's sign skew. Returns (weights, dir_W).
+    Single-class window → plain recency weights. dir_hist entries are (feat_t, actual_d)."""
+    n = len(dir_hist)
+    ws = [mt1_win_weight(di, n) for di in range(n)]
+    dir_W = sum(ws)
+    w_up = sum(ws[di] for di in range(n) if dir_hist[di][1] >= 0.0)
+    w_down = dir_W - w_up
+    if w_up > 0.0 and w_down > 0.0:
+        dw = [ws[di] * ((dir_W / (2.0 * w_up)) if dir_hist[di][1] >= 0.0 else (dir_W / (2.0 * w_down)))
+              for di in range(n)]
+    else:
+        dw = list(ws)
+    return dw, dir_W
+
+
 def _mt1_score_breakdown(out4, actual_d, acc_floor, range_ceiling=None):
     """
     Score one MT1 slot against the industry's actual dollar P&L.
@@ -479,6 +498,7 @@ def _mt1_burst_component(prefix, model_dir, dir_hist, actual_d,
     """
     # breakdown tuple: (composite, dir, rng, acc, conf) → pick component score
     _sc_idx = [1, 3, 2, 4][score_idx]
+    dir_dw, _ = _dir_day_weights(dir_hist) if dir_hist else ([], 0.0)   # class-balanced direction weights
 
     def _score_multiday(m):
         total = 0.0
@@ -510,14 +530,14 @@ def _mt1_burst_component(prefix, model_dir, dir_hist, actual_d,
                     prev_conf_pos = conf_pos
                     prev_act_pos  = act_pos
                 elif score_idx == 1:
-                    err = abs(ad - delta_d)
+                    err = abs(abs(ad) - abs(delta_d))   # signless: magnitude graded independent of sign
                     day_score = acc_floor / (err + acc_floor)
                 else:
                     bd = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)
                     day_score = bd[_sc_idx]
-                total += day_score * mt1_win_weight(di, len(dir_hist))
+                total += day_score * (dir_dw[di] if score_idx == 0 else mt1_win_weight(di, len(dir_hist)))
         if not culled and score_idx == 0 and len(dir_hist) >= 2:
-            required = (market_flips + 1) // 2
+            required = market_flips // 2   # floor: no cull at market_flips<=1 (mirror of C++)
             if conf_crossings < required:
                 culled = True
         return -1e30 if culled else total
@@ -732,6 +752,8 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
     # Pre-convert to tensors for scoring
     dir_hist = [(torch.tensor(e['feat37'], dtype=torch.float32).unsqueeze(0), e['actual_d'])
                 for e in dir_hist_raw]
+    # Class-balanced direction-pool day weights (mirror of C++); dir_W → skill_frac = score/dir_W
+    dir_dw, dir_W = _dir_day_weights(dir_hist) if dir_hist else ([], 0.0)
 
     # Per-pool sigmas: MT1_POOL_NAMES order is dir=0, acc=1, rng=2, cfd=3
     pool_sigmas = [dir_sigma, acc_sigma, rng_sigma, cfd_sigma]
@@ -804,10 +826,7 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
                         if (pool_id == 2 or pool_id == 3) and range_ceiling is not None:
                             if r_raw > range_ceiling:
                                 culled = True; break
-                        # Direction alignment cull: accuracy pool only
-                        if pool_id == 1:
-                            if (conf >= 0.5) != (delta_d >= 0.0):
-                                culled = True; break
+                        # (accuracy-pool sign-alignment cull removed — magnitude graded signless)
                         if pool_id == 0:
                             conf_pos = conf >= 0.5
                             act_pos  = ad >= 0.0
@@ -822,15 +841,15 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
                             prev_conf_pos = conf_pos
                             prev_act_pos  = act_pos
                         elif pool_id == 1:
-                            err = abs(ad - delta_d)
+                            err = abs(abs(ad) - abs(delta_d))   # signless: magnitude graded independent of sign
                             day_score = 1.0 / (err + 1.0)
                         else:
                             breakdown = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)
                             day_score = breakdown[2 if pool_id == 2 else 4]
-                        total_sum += day_score * mt1_win_weight(di, len(dir_hist))
+                        total_sum += day_score * (dir_dw[di] if pool_id == 0 else mt1_win_weight(di, len(dir_hist)))
                 # Direction flip cull after full window
                 if not culled and pool_id == 0 and len(dir_hist) >= 2:
-                    required = (market_flips + 1) // 2
+                    required = market_flips // 2   # floor: no cull at market_flips<=1 (mirror of C++)
                     if conf_crossings < required:
                         culled = True
                 score = -1e30 if culled else total_sum
@@ -875,13 +894,13 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
                             prev_conf_pos_h = conf_pos
                             prev_act_pos_h  = act_pos
                         elif pool_id == 1:
-                            err = abs(ad - delta_d)
+                            err = abs(abs(ad) - abs(delta_d))   # signless: magnitude graded independent of sign
                             day_score = 1.0 / (err + 1.0)
                         else:
                             breakdown = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)
                             day_score = breakdown[2 if pool_id == 2 else 4]
-                        total_sum += day_score * mt1_win_weight(di, len(dir_hist))
-                hist_sort_key = hcdb * 10.0 + total_sum if pool_id == 0 else total_sum
+                        total_sum += day_score * (dir_dw[di] if pool_id == 0 else mt1_win_weight(di, len(dir_hist)))
+                hist_sort_key = total_sum   # sort by balanced score (correct_dbl primary key retired)
                 hist_with_scores.append((hm, hist_sort_key))
         del comp_hist_models_raw
 
@@ -891,18 +910,17 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
         log(f"[mt1/{sn(industry)}:{pool_name}] best={best_cat:.4f} slot0={slot0_cat:.4f} "
             f"actual_d=${actual_d:+.1f}")
 
-        if pool_id == 0 and dir_hist and dir_max_correct < 3:
-            log(f"[mt1/{sn(industry)}:dir] max_correct={dir_max_correct}/{len(dir_hist)} < 3 — backfill: keeping yesterday's elites")
+        # Backfill: skip the direction update unless the best model clears the balanced skill floor
+        # (full 0.52 — production runs on mature models, so no cold-start ramp). Mirrors C++.
+        dir_skill = (best_cat / dir_W) if (pool_id == 0 and dir_W > 0.0) else 1.0
+        if pool_id == 0 and dir_hist and dir_skill < MT1_DIR_SKILL_FLOOR:
+            log(f"[mt1/{sn(industry)}:dir] skill={dir_skill:.3f} < {MT1_DIR_SKILL_FLOOR} — backfill: keeping yesterday's elites")
             del hist_with_scores
             continue
 
-        # Direction pool: encode (correct_dbl * 10 + score) so correct count is primary sort key.
-        # Pass encoded sort_scores to selection; keep raw scores for stats/logging above.
-        if pool_id == 0:
-            sort_scores = [(sl, dir_cdb.get(sl, 0) * 10.0 + sc if sc > -1e29 else sc)
-                           for sl, sc in scores]
-        else:
-            sort_scores = scores
+        # All pools (direction included) sort by their balanced score — the direction pool's score
+        # is class-balanced skill, so the old correct_dbl primary sort key is retired (mirror of C++).
+        sort_scores = scores
 
         new_elites, new_wavgs = _select_and_mutate_mt1_component(
             prefix, model_dir, sort_scores, pool_sigmas[pool_id], hist_models=hist_with_scores)
