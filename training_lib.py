@@ -43,8 +43,9 @@ MT1_COMP_SLOTS       = MT1_COMP_PARENTS * (MT1_COMP_CHILDREN + 1)  # 200
 MT1_BLEND_SLOTS      = 200          # composite blend pool size per day
 MT1_RANGE_FLOOR      = 1.0          # $1 — effectively no range floor
 MT1_RANGE_CEIL_MULT  = 4.0          # ceiling = 4 × max(mean, today) |actual−comp0_delta|
-MT1_DIR_BACKFILL     = 0.65         # skip direction pool update when best score < this
+MT1_DIR_BACKFILL     = 0.65         # (legacy) skip direction pool update when best score < this
 MT1_DIR_DAYS         = 10           # scoring window (all pools): linear-weighted last N days (oldest=1.0 → today=2.0)
+MT1_DIR_SKILL_FLOOR  = 0.52         # balanced direction skill_frac floor (0.5 = no skill); production uses the FULL value (no cold-start ramp — upkeep runs on mature models)
 MT1_FWD_DAYS         = 10           # prediction horizon: target = cumulative relative return over next N sessions
 MT2_FEED_DIRECTION   = True         # MT2 input from direction-pool slot0 (True) vs composite slot0 (False)
 MT1_POOL_NAMES       = ('dir', 'acc', 'rng', 'cfd')
