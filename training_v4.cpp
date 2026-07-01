@@ -121,7 +121,7 @@ static constexpr float MT1_DIR_BACKFILL    = 0.65f;  // skip direction pool upda
 static constexpr int   MT1_DIR_DAYS        = 10;  // scoring window (all pools): score each model over last N days, linear-weighted sum (oldest=1.0 → today=2.0)
 static constexpr int   MT1_DIR_QUALIFY      = 1;   // (legacy, unused) min correct_dbl for a live slot to qualify
 static constexpr float MT1_DIR_SKILL_FLOOR  = 0.52f; // full balanced direction skill_frac floor (0.5 = no skill); gates backfill/qualify
-static constexpr float MT1_DIR_SKILL_FLOOR_START = 0.50f; // ramp start (no-skill baseline) — lenient so cold-start can bootstrap
+static constexpr float MT1_DIR_SKILL_FLOOR_START = 0.37f; // ramp start (below no-skill 0.5) — very lenient so cold-start bootstraps freely
 static constexpr int   MT1_DIR_SKILL_RAMP_DAYS   = 300;   // linearly ramp the floor START→FULL over the first N training days
 static constexpr int   MT1_DIR_STREAK_TRIP  = 5;   // consecutive collapse days before injection fires
 static constexpr int   MT1_DIR_COOLDOWN_LEN = 10;  // cooldown days after injection before re-injection allowed
