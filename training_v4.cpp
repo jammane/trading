@@ -119,10 +119,8 @@ static constexpr float MT1_RANGE_FLOOR     = 1.f;    // $1 — effectively no fl
 static constexpr float MT1_RANGE_CEIL_MULT = 4.f;    // ceiling = 4 × max(mean, today) |actual−comp0_delta|
 static constexpr float MT1_DIR_BACKFILL    = 0.65f;  // skip direction pool update when best score < this
 static constexpr int   MT1_DIR_DAYS        = 10;  // scoring window (all pools): score each model over last N days, linear-weighted sum (oldest=1.0 → today=2.0)
-static constexpr int   MT1_DIR_QUALIFY      = 1;   // (legacy, unused) min correct_dbl for a live slot to qualify
-static constexpr float MT1_DIR_SKILL_FLOOR  = 0.52f; // full balanced direction skill_frac floor (0.5 = no skill); gates backfill/qualify
-static constexpr float MT1_DIR_SKILL_FLOOR_START = 0.37f; // ramp start (below no-skill 0.5) — very lenient so cold-start bootstraps freely
-static constexpr int   MT1_DIR_SKILL_RAMP_DAYS   = 300;   // linearly ramp the floor START→FULL over the first N training days
+static constexpr int   MT1_DIR_QUALIFY      = 1;   // (legacy, unused)
+static constexpr int   MT1_DIR_MIN_CORRECT  = 3;   // direction collapse floor: freeze/inject only when the best model got < N of the window's days' direction right (genuine collapse; random ≈ 5/10, so this rarely trips). Skill is optimized by the two-half selection, not this gate.
 static constexpr int   MT1_DIR_STREAK_TRIP  = 5;   // consecutive collapse days before injection fires
 static constexpr int   MT1_DIR_COOLDOWN_LEN = 10;  // cooldown days after injection before re-injection allowed
 static constexpr int   HIST_WINDOW         = 15;
@@ -2310,8 +2308,10 @@ static MT1CompResult step_mt1_component(
     int dir_max_correct = 0;
     // Direction pool: correct-prediction count with today doubled (primary sort key)
     int dir_correct_dbl[MT1_COMP_SLOTS] = {};
+    int dir_n_correct[MT1_COMP_SLOTS]     = {};   // integer correct-count per slot (direction pool)
+    int dir_today_correct[MT1_COMP_SLOTS] = {};   // 1 if slot got the most-recent day's direction right
 
-    // Class-balanced day weights (direction pool only) — see MT1_DIR_SKILL_FLOOR. Normalize so
+    // Class-balanced day weights (direction pool only). Normalize so
     // up-days and down-days each carry half the window weight; then any constant-prediction model
     // scores exactly the no-skill baseline dir_W/2 regardless of the absolute target's sign skew.
     // Other pools (and single-class windows) use plain recency weights. skill_frac = total_sum/dir_W.
@@ -2345,7 +2345,7 @@ static MT1CompResult step_mt1_component(
 
             float total_sum = 0.f;
             bool  culled    = false;
-            int   n_correct = 0, n_correct_dbl = 0, conf_crossings = 0, market_flips = 0;
+            int   n_correct = 0, n_correct_dbl = 0, conf_crossings = 0, market_flips = 0, today_correct = 0;
             bool  prev_conf_pos_valid = false, prev_conf_pos = false;
             bool  prev_act_pos_valid  = false, prev_act_pos  = false;
 
@@ -2374,6 +2374,7 @@ static MT1CompResult step_mt1_component(
                     bool correct = (conf_pos == act_pos);
                     n_correct     += correct ? 1 : 0;
                     n_correct_dbl += is_today ? (correct ? 2 : 0) : (correct ? 1 : 0);
+                    if (is_today) today_correct = correct ? 1 : 0;
                     if (prev_conf_pos_valid && conf_pos != prev_conf_pos) conf_crossings++;
                     if (prev_act_pos_valid  && act_pos  != prev_act_pos)  market_flips++;
                     prev_conf_pos = conf_pos; prev_conf_pos_valid = true;
@@ -2402,7 +2403,11 @@ static MT1CompResult step_mt1_component(
             }
 
             cat_sc[slot] = culled ? -1e30f : total_sum;
-            if (!culled && pool_id == 0) dir_correct_dbl[slot] = n_correct_dbl;
+            if (!culled && pool_id == 0) {
+                dir_correct_dbl[slot]   = n_correct_dbl;
+                dir_n_correct[slot]     = n_correct;
+                dir_today_correct[slot] = today_correct;
+            }
             if (!culled && n_correct > dir_max_correct) dir_max_correct = n_correct;
         }
     } else {
@@ -2434,36 +2439,26 @@ static MT1CompResult step_mt1_component(
         mean_cdb = sum_cdb / (float)live_count;
     }
 
-    // Direction backfill: skip update unless the best model shows real direction SKILL.
-    // Gate on balanced skill_frac = cat_sc/dir_W (0.5 = no skill). The floor ramps linearly from
-    // MT1_DIR_SKILL_FLOOR_START (lenient — gives cold-start bootstrapping room, since the
-    // conditioned features have weak early direction signal) up to the full MT1_DIR_SKILL_FLOOR
-    // over the first MT1_DIR_SKILL_RAMP_DAYS training days.
-    float skill_floor = MT1_DIR_SKILL_FLOOR_START
-        + (MT1_DIR_SKILL_FLOOR - MT1_DIR_SKILL_FLOOR_START)
-          * fminf((float)actual_day / (float)MT1_DIR_SKILL_RAMP_DAYS, 1.f);
-    float dir_best_skill = (dir_W > 0.f) ? (best_cat / dir_W) : 0.f;
-    if (pool_id == 0 && dir_best_skill < skill_floor) {
-        scratch.dir_streak++;
-        return {best_cat, slot0_cat, mean_cat, min_cat, mean_cdb};
-    }
-
-    // Direction collapse streak: increment if too few live slots clear the (ramped) skill floor.
+    // Direction collapse floor: only GENUINE collapse (best model got < MT1_DIR_MIN_CORRECT of the
+    // window's days' direction right) freezes the pool and drives the collapse-injection streak.
+    // Random ≈ 5/10, so a real signal easily clears 3/10 and this rarely trips — a last-resort net,
+    // not a skill gate. Skill is optimized by the balanced SCORE via the two-half selection below
+    // (half of elites by correct-count for viability, half by score for skill). This replaces the
+    // score-based skill floor, which was unreachable and deadlocked the pool (frozen below no-skill).
     if (pool_id == 0) {
-        int n_qual = 0;
-        for (int s = 0; s < pool_slots; s++)
-            if (cat_sc[s] > -1e29f && dir_W > 0.f && (cat_sc[s] / dir_W) >= skill_floor)
-                n_qual++;
-        if (n_qual < ELITE_COUNT)
+        if (dir_max_correct < MT1_DIR_MIN_CORRECT) {
             scratch.dir_streak++;
-        else
-            scratch.dir_streak = 0;
+            return {best_cat, slot0_cat, mean_cat, min_cat, mean_cdb};
+        }
+        scratch.dir_streak = 0;
     }
 
     // Score history candidates (no culling — history is the unconditional safety net)
     int n_hist = scratch.pool_hist_count[pool_id] * HIST_PER_DAY;
     float hist_cat_sc[HIST_DAYS * HIST_PER_DAY] = {};
-    int   hist_correct_dbl[HIST_DAYS * HIST_PER_DAY] = {};
+    int   hist_correct_dbl[HIST_DAYS * HIST_PER_DAY]   = {};
+    int   hist_n_correct[HIST_DAYS * HIST_PER_DAY]     = {};
+    int   hist_today_correct[HIST_DAYS * HIST_PER_DAY] = {};
     {
         int total = HIST_DAYS * HIST_PER_DAY;
         int oldest = (scratch.pool_hist_head[pool_id] * HIST_PER_DAY - n_hist + total) % total;
@@ -2471,7 +2466,7 @@ static MT1CompResult step_mt1_component(
             int abs_pos = (oldest + k) % total;
             float* hw = scratch.pool_hist[pool_id] + (size_t)abs_pos * MT1NN_PARAMS;
             float total_sum = 0.f;
-            int   hcdb = 0;
+            int   hcdb = 0, h_n_correct = 0, h_today = 0;
             for (int di = 0; di < scratch.dir_day_count; di++) {
                 const auto& e = scratch.dir_day(di);
                 bool is_today = (di == scratch.dir_day_count - 1);
@@ -2484,6 +2479,8 @@ static MT1CompResult step_mt1_component(
                     bool correct    = (conf_pos == actual_pos);
                     day_score = actual_pos ? conf : (1.f - conf);
                     hcdb += is_today ? (correct ? 2 : 0) : (correct ? 1 : 0);
+                    h_n_correct += correct ? 1 : 0;
+                    if (is_today) h_today = correct ? 1 : 0;
                 } else if (pool_id == 1) {
                     float delta_d = tanhf(out4[1]) * MT1_SCALE_DOLLARS;
                     float err     = fabsf(fabsf(e.actual_d) - fabsf(delta_d));
@@ -2494,27 +2491,59 @@ static MT1CompResult step_mt1_component(
                 }
                 total_sum += day_score * day_weight[di];
             }
-            hist_cat_sc[k]      = total_sum;
-            hist_correct_dbl[k] = hcdb;
+            hist_cat_sc[k]        = total_sum;
+            hist_correct_dbl[k]   = hcdb;
+            hist_n_correct[k]     = h_n_correct;
+            hist_today_correct[k] = h_today;
         }
     }
 
-    // Build candidate list. ALL pools (direction included) now sort by their balanced score —
-    // the direction pool's cat_sc is class-balanced skill (no-skill = dir_W/2), so the old
-    // correct_dbl primary key (sign-skew-inflated under the absolute target) is retired.
-    // dir_correct_dbl / hist_correct_dbl remain only for the binary-log diagnostic.
-    struct Cand { float score; bool is_hist; int idx; };
+    // Build candidate list. Direction (pool 0) carries correct-count keys for the two-half select.
+    struct Cand { float score; int n_correct; int today; bool is_hist; int idx; };
     std::vector<Cand> cands;
     cands.reserve(pool_slots + n_hist);
     for (int s = 0; s < pool_slots; s++)
-        cands.push_back({cat_sc[s], false, s});
+        cands.push_back({cat_sc[s], dir_n_correct[s], dir_today_correct[s], false, s});
     for (int k = 0; k < n_hist; k++)
-        cands.push_back({hist_cat_sc[k], true, k});
-    std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b){ return a.score > b.score; });
+        cands.push_back({hist_cat_sc[k], hist_n_correct[k], hist_today_correct[k], true, k});
 
-    // Select top ELITE_COUNT (17) direct elites into new_elites
-    for (int rank = 0; rank < ELITE_COUNT && rank < (int)cands.size(); rank++) {
-        const Cand& c = cands[rank];
+    // Elite ORDER (candidate indices for slots 0..ELITE_COUNT-1).
+    std::vector<int> order; order.reserve(ELITE_COUNT);
+    std::vector<int> by_score(cands.size());
+    for (int i = 0; i < (int)cands.size(); i++) by_score[i] = i;
+    std::sort(by_score.begin(), by_score.end(),
+              [&](int a, int b){ return cands[a].score > cands[b].score; });
+
+    if (pool_id != 0) {
+        // Non-direction pools: pure balanced score.
+        for (int i : by_score) { if ((int)order.size() >= ELITE_COUNT) break; order.push_back(i); }
+    } else {
+        // Direction two-half selection (mirror in upkeep.py):
+        //   slot0                 = highest-SCORE candidate that ALSO got today's direction right
+        //                           (fallback: highest score) — the production/MT2 feed is balanced-
+        //                           skilled AND currently correct.
+        //   score half (…9 total) = next by balanced score (seeks real skill).
+        //   correct half (…17)    = by (n_correct desc, score desc) — always viable, so the pool never
+        //                           deadlocks even when the balanced score is hard to reach; diversity
+        //                           for breeding.
+        std::vector<int> by_correct(cands.size());
+        for (int i = 0; i < (int)cands.size(); i++) by_correct[i] = i;
+        std::sort(by_correct.begin(), by_correct.end(), [&](int a, int b){
+            return cands[a].n_correct != cands[b].n_correct ? cands[a].n_correct > cands[b].n_correct
+                                                            : cands[a].score > cands[b].score; });
+        std::vector<char> taken(cands.size(), 0);
+        int slot0 = by_score.empty() ? -1 : by_score[0];
+        for (int i : by_score) if (cands[i].today) { slot0 = i; break; }
+        if (slot0 >= 0) { order.push_back(slot0); taken[slot0] = 1; }
+        int score_target = 1 + ELITE_COUNT / 2;   // slot0 + 8 = 9 from the score half
+        for (int i : by_score)   { if ((int)order.size() >= score_target) break; if (!taken[i]) { order.push_back(i); taken[i]=1; } }
+        for (int i : by_correct) { if ((int)order.size() >= ELITE_COUNT)   break; if (!taken[i]) { order.push_back(i); taken[i]=1; } }
+        for (int i : by_score)   { if ((int)order.size() >= ELITE_COUNT)   break; if (!taken[i]) { order.push_back(i); taken[i]=1; } }  // gap-fill
+    }
+
+    // Assign chosen candidates into new_elites in elite order.
+    for (int rank = 0; rank < (int)order.size(); rank++) {
+        const Cand& c = cands[order[rank]];
         if (!c.is_hist) {
             get_weights(c.idx, scratch.new_elite(rank));
         } else {
@@ -2527,7 +2556,7 @@ static MT1CompResult step_mt1_component(
         }
     }
     // Fill any unfilled direct elite slots from slot 0
-    for (int rank = (int)std::min((int)cands.size(), ELITE_COUNT); rank < ELITE_COUNT; rank++)
+    for (int rank = (int)order.size(); rank < ELITE_COUNT; rank++)
         memcpy(scratch.new_elite(rank), scratch.new_elite(0), MT1NN_PARAMS * sizeof(float));
 
     // Wavg blends (slots 17, 18, 19): equal-weight average of top 5, 10, 15 direct elites
