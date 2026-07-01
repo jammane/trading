@@ -4,7 +4,7 @@ import io
 import pytest
 import torch
 
-from models import MasterNN, MT1NN, MT2NN, StockNN
+from models import MasterNN, MT1NN, MT1Head, MT1Tail, MT2NN, StockNN
 
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
@@ -227,22 +227,39 @@ class TestMT1NN:
         assert out.shape == (1, 4)
 
     def test_param_count(self):
+        # Composed = shared head (998) + 4 specialized tails (1187 each) = 5746
+        assert sum(p.numel() for p in MT1Head().parameters()) == 998
+        assert sum(p.numel() for p in MT1Tail().parameters()) == 1187
         n = sum(p.numel() for p in MT1NN().parameters())
-        assert n == 2218, f"MT1NN param count: expected 2218, got {n}"
+        assert n == 5746, f"MT1NN param count: expected 5746, got {n}"
 
-    def test_layer_dims(self):
+    def test_head_tail_shapes(self, mt1_inputs):
+        h = MT1Head()(mt1_inputs)
+        assert h.shape == (1, 28)                 # concat A20+B4+C4
+        assert MT1Tail()(h).shape == (1, 1)       # single-output tail
+
+    def test_composition(self, mt1_inputs):
+        # Composed forward == head then the four tails concatenated.
         m = MT1NN()
-        # Block A (vol+poly), B (daily), C (decade), D (fusion taper)
-        assert m.a1.in_features == 20 and m.a1.out_features == 20
-        assert m.a2.in_features == 20 and m.a2.out_features == 20
-        assert m.b1.in_features == 10 and m.b1.out_features == 6
-        assert m.b2.in_features == 6  and m.b2.out_features == 4
-        assert m.c1.in_features == 7  and m.c1.out_features == 5
-        assert m.c2.in_features == 5  and m.c2.out_features == 4
-        assert m.d1.in_features == 28 and m.d1.out_features == 22
-        assert m.d2.in_features == 22 and m.d2.out_features == 16
-        assert m.d3.in_features == 16 and m.d3.out_features == 10
-        assert m.d4.in_features == 10 and m.d4.out_features == 4
+        h = m.head(mt1_inputs)
+        manual = torch.cat([t(h) for t in m.tails], dim=1)
+        assert torch.allclose(m(mt1_inputs), manual)
+
+    def test_head_tail_roundtrip(self):
+        import numpy as np
+        from prepare_models import state_dict_to_arr, HEAD_LAYER_DEFS, TAIL_LAYER_DEFS
+        from convert_weights import arr_to_state_dict
+        x = torch.randn(1, 37)
+        head = MT1Head()
+        arr = state_dict_to_arr(head.state_dict(), HEAD_LAYER_DEFS)
+        assert arr.size == 998
+        head2 = MT1Head(); head2.load_state_dict(arr_to_state_dict(arr, HEAD_LAYER_DEFS, MT1Head))
+        assert torch.allclose(head(x), head2(x))
+        tail = MT1Tail(); h = head(x)
+        tarr = state_dict_to_arr(tail.state_dict(), TAIL_LAYER_DEFS)
+        assert tarr.size == 1187
+        tail2 = MT1Tail(); tail2.load_state_dict(arr_to_state_dict(tarr, TAIL_LAYER_DEFS, MT1Tail))
+        assert torch.allclose(tail(h), tail2(h))
 
     def test_confidence_after_sigmoid(self, mt1_inputs):
         out = MT1NN()(mt1_inputs)
