@@ -261,6 +261,20 @@ class TestMT1NN:
         tail2 = MT1Tail(); tail2.load_state_dict(arr_to_state_dict(tarr, TAIL_LAYER_DEFS, MT1Tail))
         assert torch.allclose(tail(h), tail2(h))
 
+    def test_head_tail_compose_to_mt1nn(self):
+        """convert_weights composes a production MT1NN from head + 4 tail flat arrays (Inc 4A)."""
+        from prepare_models import state_dict_to_arr, HEAD_LAYER_DEFS, TAIL_LAYER_DEFS
+        from convert_weights import arr_to_state_dict
+        src = MT1NN()
+        head_arr  = state_dict_to_arr(src.head.state_dict(), HEAD_LAYER_DEFS)
+        tail_arrs = [state_dict_to_arr(src.tails[c].state_dict(), TAIL_LAYER_DEFS) for c in range(4)]
+        m = MT1NN()
+        m.head.load_state_dict(arr_to_state_dict(head_arr, HEAD_LAYER_DEFS, None))
+        for c in range(4):
+            m.tails[c].load_state_dict(arr_to_state_dict(tail_arrs[c], TAIL_LAYER_DEFS, None))
+        x = torch.randn(1, 37)
+        assert torch.allclose(src(x), m(x), atol=1e-6)
+
     def test_confidence_after_sigmoid(self, mt1_inputs):
         out = MT1NN()(mt1_inputs)
         conf = torch.sigmoid(out[:, 0])

@@ -116,10 +116,24 @@ replay, advance once at block end.
   `run_drift_study` still compiles; retiring them + the old MT1Scratch buffers is a later cleanup once
   the drift study is migrated. Wire `save_mt1_ht`/`load_or_init_mt1_ht` in `run_training` only.
 
-**Increment 4 — upkeep block cycle. STATUS: TODO.**
-- `upkeep.py`: daily upkeep evolves tails + MT2 only; block counter (persisted in
-  `mt1_rolling_state.json`) triggers a head cycle every `MT1_BLOCK_DAYS` runs. Mirror the
-  frozen-cross-reference (tails↔head) exactly as the trainer.
+**Increment 4 — Python production mirror.** Larger than the original one-line note: the whole
+Python MT1 chain (convert/prepare seam, upkeep, production) still used the old component-pool
+architecture. Sub-staged 4A/4B/4C.
+- 4A — STATUS: DONE (validation pending droplet pytest). The convert/prepare seam for head/tail:
+  `convert_weights.py` now converts head + 4 tail pool `.bin`→`.pt` (`_convert_mt1_pools`) and
+  composes `mt1_{ind}_best.pt` from the head + 4 tail production `_0.bin` (`_convert_mt1_best`,
+  replacing the dead `comp_0.bin` path that 3C broke). `prepare_models.py` main emits head/tail pool
+  `.bin` from `.pt` (`HT_PARENTS=20`). Added a compose roundtrip test. File naming (must match C++
+  `save_mt1_ht` + upkeep): `mt1_{ind}_head_{elite_N|model_N|0}.bin/.pt`,
+  `mt1_{ind}_tail_{dir|acc|rng|cfd}_{...}`.
+- 4B — STATUS: TODO (the big one). Rewrite `upkeep_mt1_industry` to head/tail block cycle: daily
+  evolve the 4 tail pools (freeze best head + other best tails; mirror C++ `step_mt1_tail`) + MT2;
+  a block counter in `mt1_rolling_state.json` triggers a head cycle (freeze best tails; mirror
+  `step_mt1_head`) every `MT1_BLOCK_DAYS` runs. Load/save head/tail pool `.pt` + composed `best.pt`
+  for inference. Reuse `_mt1_score_breakdown`, `_dir_day_weights`, two-half direction selection,
+  rolling helpers. History conversion (`.bin`→per-model `.pt`) also lands here.
+- 4C — STATUS: TODO. `production_v2.py` — MT2 feed from the composed production MT1 (one model;
+  `MT2_FEED_DIRECTION` toggle moot); confirm inference loads composed `best.pt`. Likely minimal.
 
 ## Risks / watch-items
 - **State snapshot/restore across phases** is the subtle core — rolling window/history must be

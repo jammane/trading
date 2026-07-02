@@ -15,9 +15,10 @@ import os
 import numpy as np
 import torch
 
-from models import StockNN, MasterNN, MT1NN, MT2NN
+from models import StockNN, MasterNN, MT1NN, MT1Head, MT1Tail, MT2NN
 from prepare_models import (
     STOCK_LAYER_DEFS, MASTER_LAYER_DEFS, MT1_LAYER_DEFS, MT2_LAYOUT,
+    HEAD_LAYER_DEFS, TAIL_LAYER_DEFS, HT_PARENTS, MT1_POOL_NAMES,
     ELITE_POOL,
 )
 
@@ -111,23 +112,43 @@ def convert_mt2(models_dir, output_dir):
         print('  [mt2] mt2_best.pt written (copy of slot 0)')
 
 
+def _read_bin_sd(models_dir, ind, name, layer_defs):
+    """Load a head/tail .bin into a state_dict, preferring the production _0.bin, else elite_0."""
+    for cand in (f'mt1_{ind}_{name}_0.bin', f'mt1_{ind}_{name}_elite_0.bin'):
+        p = os.path.join(models_dir, cand)
+        if os.path.exists(p):
+            return arr_to_state_dict(np.fromfile(p, dtype=np.float32), layer_defs, None)
+    return None
+
+
 def _convert_mt1_best(ind, models_dir, output_dir):
-    """Convert mt1_{ind}_comp_0.bin (best composite model) to mt1_{ind}_best.pt."""
-    import shutil
-    src = os.path.join(models_dir, f'mt1_{ind}_comp_0.bin')
-    if not os.path.exists(src):
-        print(f'  [mt1/{ind}] mt1_{ind}_comp_0.bin not found — skipping')
+    """Compose mt1_{ind}_best.pt (production MT1NN) from the head + 4 tail .bin production bests."""
+    head_sd = _read_bin_sd(models_dir, ind, 'head', HEAD_LAYER_DEFS)
+    if head_sd is None:
+        print(f'  [mt1/{ind}] head .bin not found — skipping best compose')
         return
     try:
-        arr = np.fromfile(src, dtype=np.float32)
-        sd  = arr_to_state_dict(arr, MT1_LAYER_DEFS, MT1NN)
-        m   = MT1NN()
-        m.load_state_dict(sd)
-        dst = os.path.join(output_dir, f'mt1_{ind}_best.pt')
-        torch.save(m.state_dict(), dst)
-        print(f'  [mt1/{ind}] mt1_{ind}_best.pt written from comp_0.bin')
+        m = MT1NN()
+        m.head.load_state_dict(head_sd)
+        for c, pool in enumerate(MT1_POOL_NAMES):
+            tail_sd = _read_bin_sd(models_dir, ind, f'tail_{pool}', TAIL_LAYER_DEFS)
+            if tail_sd is None:
+                print(f'  [mt1/{ind}] tail_{pool} .bin not found — skipping best compose')
+                return
+            m.tails[c].load_state_dict(tail_sd)
+        torch.save(m.state_dict(), os.path.join(output_dir, f'mt1_{ind}_best.pt'))
+        print(f'  [mt1/{ind}] mt1_{ind}_best.pt composed from head + 4 tail .bin')
     except Exception as e:
-        print(f'  [mt1/{ind}] ERROR converting comp_0.bin: {e}')
+        print(f'  [mt1/{ind}] ERROR composing best.pt: {e}')
+
+
+def _convert_mt1_pools(ind, models_dir, output_dir):
+    """Convert head + 4 tail pool elite .bin → .pt so upkeep can keep evolving them."""
+    convert_industry(f'mt1_{ind}_head', models_dir, output_dir, HEAD_LAYER_DEFS, MT1Head,
+                     f'mt1_{ind}_head', n_elites=HT_PARENTS)
+    for pool in MT1_POOL_NAMES:
+        convert_industry(f'mt1_{ind}_tail_{pool}', models_dir, output_dir, TAIL_LAYER_DEFS, MT1Tail,
+                         f'mt1_{ind}_tail_{pool}', n_elites=HT_PARENTS)
 
 
 def main():
@@ -152,8 +173,9 @@ def main():
     print(f'Converting master elite models from {models_dir} → {output_dir}')
     convert_industry('master', models_dir, output_dir, MASTER_LAYER_DEFS, MasterNN, 'master')
 
-    print(f'Converting MT1 composite best models from {models_dir} → {output_dir}')
+    print(f'Converting MT1 head/tail pools + composing best models from {models_dir} → {output_dir}')
     for ind in industries:
+        _convert_mt1_pools(ind, models_dir, output_dir)
         _convert_mt1_best(ind, models_dir, output_dir)
 
     print(f'Converting MT2 elite models from {models_dir} → {output_dir}')
