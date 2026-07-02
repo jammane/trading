@@ -89,13 +89,23 @@ replay, advance once at block end.
   pools/histories, which carry evolution forward); `save_mt1_ht`/`load_or_init_mt1_ht` (BREAKING
   head/tail file format, additive `head_*`/`tail_*` filenames so it coexists with old files until 3C;
   production bests fall back to elite slot 0 so they are always valid).
-- 3B — STATUS: TODO. `run_mt1_block` driver: snapshot data-state; phase T1 (freeze head0+tail0,
-  evolve 4 tail pools across the block, then set tail0=slot0); restore; phase H (freeze tail0, evolve
-  head, then set head0=slot0); restore; phase T2 (freeze new head0+tail0, evolve tails, set tail0);
-  leave data-state advanced at block end. Floors sourced from the composed head0+tail0 production model.
-- 3C — STATUS: TODO. Rewire `main`'s day loop into the block loop; interleave StockNN + MT2's M phase;
-  wire `save_mt1_ht`/`load_or_init_mt1_ht`; source `MTLogRecord` from tail pools + composed comp0;
-  retire the old branched component/composite pools + `step_mt1`/`step_mt1_component`/`step_mt1_composite`.
+- 3B — STATUS: CODE COMPLETE (local syntax-check passes; droplet build pending). `run_mt1_block`
+  driver: snapshot data-state; T1 (freeze head0+tail0, evolve 4 tail pools across the block, set
+  tail0=slot0); restore; H (freeze tail0, evolve head, set head0=slot0); restore; T2 (freeze new
+  head0+tail0, evolve tails, set tail0); leave data advanced at block end. Per-day floors + rolling
+  residual sourced from the composed head0+tail0 production model (`mt1_composed_forward`). Returns
+  an `MT1Result` from the last block day (head pool → "composite" stats, tail pools → components,
+  composed output → slot0/dir0 activations). Additive/unused until 3C.
+- 3C — STATUS: TODO (the risky main-loop surgery; needs a diagnostic run to validate, not just tests).
+  Decisions locked: (a) **cached-feature block model** — advance StockNN + market/OHLCV history + CSV
+  per day once, cache each fwd-valid day's 444-features + targets, trigger a block every
+  MT1_BLOCK_DAYS cached days; (b) **post-block MT1 feeds MT2** for every block day (mild within-block
+  leak accepted); (c) MT2 M-phase + CSV rows are written at block end (buffer per-day StockNN results
+  + mkt values for the block); (d) one `MTLogRecord` per block, layout unchanged; (e) MT1 production
+  = composed head0+tail0 → in48 built from it (MT2_FEED_DIRECTION toggle becomes moot — one
+  production model). **Keep the old `step_mt1`/component/composite + old pools as dead code** so
+  `run_drift_study` still compiles; retiring them + the old MT1Scratch buffers is a later cleanup once
+  the drift study is migrated. Wire `save_mt1_ht`/`load_or_init_mt1_ht` in `run_training` only.
 
 **Increment 4 — upkeep block cycle. STATUS: TODO.**
 - `upkeep.py`: daily upkeep evolves tails + MT2 only; block counter (persisted in

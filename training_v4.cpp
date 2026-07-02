@@ -4142,6 +4142,98 @@ static void load_or_init_mt1_ht(const std::string& dir, const std::string& load_
     }
 }
 
+// ── Heads/tails: one block of alternating training (Increment 3B) ─────────────────
+// Runs the T1 / H / T2 phases over one cached block of up to MT1_BLOCK_DAYS days. Features and
+// targets are precomputed by the caller (market-derived → identical across phases); only the MT1
+// data window (dir_day + rolling floors) is rewound between phases via MT1DataState, while the
+// head/tail pools carry evolution forward. Production bests (head0_buf/tail0_buf) update at each
+// phase boundary so the next phase freezes the just-trained side. Post-block: the composed
+// head0+tail0 IS the production MT1 (feeds MT2 for every day of this block). Returns block stats.
+static MT1Result run_mt1_block(
+    int ind_i, MT1Scratch& scratch, int block_len,
+    const float (*in37_block)[37], const float* actual_d_block, const int* actual_day_block,
+    float dir_sigma, float acc_sigma, float rng_sigma, float cfd_sigma, float head_sigma)
+{
+    MT1Result res{};
+    if (block_len <= 0) return res;
+
+    // tw[] point at the (stable) tail0 buffers; contents change as bests update, addresses do not.
+    const float* tw[4] = {scratch.tail0_buf[0], scratch.tail0_buf[1],
+                          scratch.tail0_buf[2], scratch.tail0_buf[3]};
+
+    auto floors = [&](const float* in37, float actual_d, float& acc_floor, float& range_ceiling) {
+        acc_floor = MT1_FLOOR_COLD / 2.f; range_ceiling = 1e30f;
+        if (scratch.rolling_count > 0) {
+            float sa = 0.f, sr = 0.f;
+            for (int k = 0; k < scratch.rolling_count; k++) { sa += scratch.rolling_actual[k]; sr += scratch.rolling_residual[k]; }
+            acc_floor = sa / (float)scratch.rolling_count / 2.f;
+            float mean_r = sr / (float)scratch.rolling_count;
+            float o4[4]; mt1_composed_forward(scratch.head0_buf, tw, in37, o4);
+            float today_r = fabsf(actual_d - tanhf(o4[1]) * MT1_SCALE_DOLLARS);
+            range_ceiling = MT1_RANGE_CEIL_MULT * fmaxf(mean_r, today_r);
+        }
+    };
+    auto advance_rolling = [&](const float* in37, float actual_d) {
+        float o4[4]; mt1_composed_forward(scratch.head0_buf, tw, in37, o4);
+        scratch.rolling_actual[scratch.rolling_head]   = fabsf(actual_d);
+        scratch.rolling_residual[scratch.rolling_head] = fabsf(actual_d - tanhf(o4[1]) * MT1_SCALE_DOLLARS);
+        scratch.rolling_head = (scratch.rolling_head + 1) % MT1_ROLLING_DAYS;
+        if (scratch.rolling_count < MT1_ROLLING_DAYS) scratch.rolling_count++;
+    };
+
+    MT1DataState snap; snapshot_mt1_data(scratch, snap);
+    MT1CompResult tail_res[4]{}, head_res{};
+    const float tsig[4] = {dir_sigma, acc_sigma, rng_sigma, cfd_sigma};
+
+    auto tail_phase = [&]() {
+        for (int d = 0; d < block_len; d++) {
+            scratch.push_dir_day(in37_block[d], actual_d_block[d]);
+            if (actual_day_block[d] >= MT1_START_DAY) {
+                float af, rc; floors(in37_block[d], actual_d_block[d], af, rc);
+                for (int c = 0; c < 4; c++)
+                    tail_res[c] = step_mt1_tail(c, ind_i, scratch, actual_day_block[d], tsig[c], af, rc);
+            }
+            advance_rolling(in37_block[d], actual_d_block[d]);
+        }
+        for (int c = 0; c < 4; c++)
+            memcpy(scratch.tail0_buf[c], scratch.tail_e(c, 0), TAILNN_PARAMS * sizeof(float));
+    };
+
+    // T1: freeze head0 + tail0 (block-start bests); evolve the 4 tail pools.
+    tail_phase();
+    restore_mt1_data(scratch, snap);
+
+    // H: freeze tail0 (from T1); evolve the head pool.
+    for (int d = 0; d < block_len; d++) {
+        scratch.push_dir_day(in37_block[d], actual_d_block[d]);
+        if (actual_day_block[d] >= MT1_START_DAY) {
+            float af, rc; floors(in37_block[d], actual_d_block[d], af, rc);
+            head_res = step_mt1_head(ind_i, scratch, actual_day_block[d], head_sigma, af, rc);
+        }
+        advance_rolling(in37_block[d], actual_d_block[d]);
+    }
+    memcpy(scratch.head0_buf, scratch.head_e(0), HEADNN_PARAMS * sizeof(float));
+    restore_mt1_data(scratch, snap);
+
+    // T2: freeze new head0 + tail0; evolve tails once more (they get the last word on the new head).
+    tail_phase();
+    // No restore after T2 — data-state stays advanced through the block (block end).
+
+    // Log record from the composed production model on the last block day.
+    float o4[4]; mt1_composed_forward(scratch.head0_buf, tw, in37_block[block_len - 1], o4);
+    res.slot0_conf = sigmoidf(o4[0]);        res.slot0_delta_t   = tanhf(o4[1]);
+    res.slot0_range_pct = log1pf(expf(o4[2])); res.slot0_conf4    = sigmoidf(o4[3]);
+    res.dir0_conf = res.slot0_conf; res.dir0_delta_t = res.slot0_delta_t;
+    res.dir0_range_pct = res.slot0_range_pct; res.dir0_conf4 = res.slot0_conf4;
+    // "composite" stats = head pool (its fitness IS the composite objective); components = tails.
+    res.best_score = head_res.best; res.slot0_score = head_res.slot0; res.mean_score = head_res.mean; res.min_score = head_res.min_v;
+    res.best_dir = tail_res[0].best; res.slot0_dir = tail_res[0].slot0; res.mean_dir = tail_res[0].mean; res.min_dir = tail_res[0].min_v; res.mean_dir_cdbl = tail_res[0].mean_correct_dbl;
+    res.best_acc = tail_res[1].best; res.slot0_acc = tail_res[1].slot0; res.mean_acc = tail_res[1].mean; res.min_acc = tail_res[1].min_v;
+    res.best_rng = tail_res[2].best; res.slot0_rng = tail_res[2].slot0; res.mean_rng = tail_res[2].mean; res.min_rng = tail_res[2].min_v;
+    res.best_cfd = tail_res[3].best; res.slot0_cfd = tail_res[3].slot0; res.mean_cfd = tail_res[3].mean; res.min_cfd = tail_res[3].min_v;
+    return res;
+}
+
 static void save_mt2_elites(const std::string& dir, MT2Scratch& scratch) {
     for (int slot = 0; slot < ELITE_POOL; slot++) {
         char p[512]; snprintf(p, sizeof(p), "%s/mt2_elite_%d.bin", dir.c_str(), slot);
