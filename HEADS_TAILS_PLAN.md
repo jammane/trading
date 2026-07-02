@@ -126,7 +126,12 @@ architecture. Sub-staged 4A/4B/4C.
   `.bin` from `.pt` (`HT_PARENTS=20`). Added a compose roundtrip test. File naming (must match C++
   `save_mt1_ht` + upkeep): `mt1_{ind}_head_{elite_N|model_N|0}.bin/.pt`,
   `mt1_{ind}_tail_{dir|acc|rng|cfd}_{...}`.
-- 4B — STATUS: TODO (the big one). Rewrite `upkeep_mt1_industry` to head/tail block cycle: daily
+- 4B — STATUS: harness written (`tests/test_upkeep_mt1.py`, skip-marked — unskip when the rewrite
+  lands; it is the validation gate). Contract locked: `upkeep_mt1_industry(ind, model_dir, in37_t,
+  actual_d, rolling_state=…)` → finite 10-tuple; writes `mt1_{ind}_head_model_{0..19}.pt` (MT1Head) +
+  `mt1_{ind}_tail_{dir|acc|rng|cfd}_model_{0..19}.pt` (MT1Tail) + composed `mt1_{ind}_best.pt`;
+  tails evolve every run, head only every `MT1_BLOCK_DAYS` runs (block counter in
+  `mt1_rolling_state.json`). TODO — implement: daily
   evolve the 4 tail pools (freeze best head + other best tails; mirror C++ `step_mt1_tail`) + MT2;
   a block counter in `mt1_rolling_state.json` triggers a head cycle (freeze best tails; mirror
   `step_mt1_head`) every `MT1_BLOCK_DAYS` runs. Load/save head/tail pool `.pt` + composed `best.pt`
