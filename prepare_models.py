@@ -88,7 +88,8 @@ MT2_LAYOUT = [
 ]
 
 ELITE_POOL       = 20
-MT1_COMP_PARENTS = 25  # 17 direct + 3 wavg + 5 injection per component pool
+MT1_COMP_PARENTS = 25  # 17 direct + 3 wavg + 5 injection per (legacy) component pool
+HT_PARENTS       = 20  # heads/tails pools: 17 direct + 3 wavg (no injection slots)
 MT1_POOL_NAMES   = ('dir', 'acc', 'rng', 'cfd')
 
 
@@ -180,11 +181,13 @@ def main():
     print(f'Converting master elite models from {load_dir} → {output_dir}')
     convert_industry('master', load_dir, output_dir, MASTER_LAYER_DEFS, 'master')
 
-    print(f'Converting MT1 component pool models from {load_dir} → {output_dir}')
+    print(f'Converting MT1 head/tail pool models from {load_dir} → {output_dir}')
     for ind in industries:
+        convert_industry(f'mt1_{ind}_head', load_dir, output_dir, HEAD_LAYER_DEFS,
+                         f'mt1_{ind}_head', n_elites=HT_PARENTS)
         for pool in MT1_POOL_NAMES:
-            convert_industry(f'mt1_{ind}_{pool}', load_dir, output_dir, MT1_LAYER_DEFS,
-                             f'mt1_{ind}_{pool}', n_elites=MT1_COMP_PARENTS)
+            convert_industry(f'mt1_{ind}_tail_{pool}', load_dir, output_dir, TAIL_LAYER_DEFS,
+                             f'mt1_{ind}_tail_{pool}', n_elites=HT_PARENTS)
 
     print(f'Converting MT2 elite models from {load_dir} → {output_dir}')
     convert_mt2(load_dir, output_dir)
