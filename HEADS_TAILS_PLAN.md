@@ -131,14 +131,18 @@ architecture. Sub-staged 4A/4B/4C.
   actual_d, rolling_state=…)` → finite 10-tuple; writes `mt1_{ind}_head_model_{0..19}.pt` (MT1Head) +
   `mt1_{ind}_tail_{dir|acc|rng|cfd}_model_{0..19}.pt` (MT1Tail) + composed `mt1_{ind}_best.pt`;
   tails evolve every run, head only every `MT1_BLOCK_DAYS` runs (block counter in
-  `mt1_rolling_state.json`). TODO — implement: daily
-  evolve the 4 tail pools (freeze best head + other best tails; mirror C++ `step_mt1_tail`) + MT2;
-  a block counter in `mt1_rolling_state.json` triggers a head cycle (freeze best tails; mirror
-  `step_mt1_head`) every `MT1_BLOCK_DAYS` runs. Load/save head/tail pool `.pt` + composed `best.pt`
-  for inference. Reuse `_mt1_score_breakdown`, `_dir_day_weights`, two-half direction selection,
-  rolling helpers. History conversion (`.bin`→per-model `.pt`) also lands here.
-- 4C — STATUS: TODO. `production_v2.py` — MT2 feed from the composed production MT1 (one model;
-  `MT2_FEED_DIRECTION` toggle moot); confirm inference loads composed `best.pt`. Likely minimal.
+  `mt1_rolling_state.json`).
+- 4B — STATUS: DONE (validated). Rewrote `upkeep_mt1_industry` to the head/tail block cycle: daily
+  tail phase (freeze best head + other best tails, `_score_tail` mirrors C++ `step_mt1_tail`;
+  direction keeps class-balanced weights + two-half selection + flip cull + collapse backfill) + a
+  head phase every `MT1_BLOCK_DAYS` runs (freeze best tails, composite fitness). New `_ht_*` helpers
+  (select/mutate with HT layout — 20 parents, 180 muts, no injection — + per-pool history). Bootstraps
+  pools from `best.pt` or fresh; composes `best.pt` from new head0+tail0. Added `MT1_BLOCK_DAYS`,
+  `HT_PARENTS`, `_HT_CHILDREN`, `UPKEEP_HEAD_SIGMA`. Harness unskipped → 95 tests pass.
+- 4C — STATUS: DONE. `run_mt_inference` already loads the composed `mt1_{ind}_best.pt`; removed the
+  now-moot `MT2_FEED_DIRECTION`/`dir_best.pt` special-case (single production model → composite and
+  direction feeds identical). Production `upkeep_mt1_industry` interface (10-tuple) preserved, so
+  `production_v2.py` needs no change.
 
 ## Risks / watch-items
 - **State snapshot/restore across phases** is the subtle core — rolling window/history must be

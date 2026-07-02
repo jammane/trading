@@ -32,17 +32,17 @@ def _md5(path):
         return hashlib.md5(f.read()).hexdigest()
 
 
-@pytest.mark.skip(reason="Increment 4B: unskip when upkeep_mt1_industry head/tail block cycle lands")
 def test_upkeep_mt1_head_tail_block_cycle(tmp_path, monkeypatch):
-    # Small block so a few days exercise >1 block boundary.
+    # Small block so a few days exercise >1 block boundary; small pool for test speed.
     monkeypatch.setattr(upkeep_mod, "MT1_BLOCK_DAYS", 3, raising=False)
+    monkeypatch.setattr(upkeep_mod, "MT1_COMP_SLOTS", 40, raising=False)
     ind = "energy"
     md = str(tmp_path)
     rolling: dict = {}
     torch.manual_seed(0)
 
     n_days = 7  # > 2 * block(3)
-    head_hashes, tail_hashes = [], []
+    head_hashes, best_hashes = [], []
     for _ in range(n_days):
         in37 = torch.randn(1, 37)
         actual_d = float(torch.randn(1).item()) * 500.0
@@ -52,7 +52,7 @@ def test_upkeep_mt1_head_tail_block_cycle(tmp_path, monkeypatch):
             fv = float(v)
             assert fv == fv and abs(fv) < 1e9, f"non-finite return value {v}"
         head_hashes.append(_md5(os.path.join(md, f"mt1_{ind}_head_model_0.pt")))
-        tail_hashes.append(_md5(os.path.join(md, f"mt1_{ind}_tail_dir_model_0.pt")))
+        best_hashes.append(_md5(os.path.join(md, f"mt1_{ind}_best.pt")))
 
     # Head/tail pool files exist with the right classes.
     MT1Head().load_state_dict(
@@ -71,9 +71,11 @@ def test_upkeep_mt1_head_tail_block_cycle(tmp_path, monkeypatch):
         out = m(torch.randn(1, 37))
     assert out.shape == (1, 4) and torch.isfinite(out).all()
 
-    # Block cadence: tails evolve daily, head only on block boundaries.
+    # Block cadence: the production model (composed head0+tail0) evolves every run via the daily
+    # tail phase, while the head pool only changes on block boundaries (every MT1_BLOCK_DAYS runs).
     head_changes = sum(1 for a, b in zip(head_hashes, head_hashes[1:]) if a != b)
-    tail_changes = sum(1 for a, b in zip(tail_hashes, tail_hashes[1:]) if a != b)
-    assert tail_changes > head_changes, (
-        f"tails should evolve more often than head (tail={tail_changes}, head={head_changes})")
+    best_changes = sum(1 for a, b in zip(best_hashes, best_hashes[1:]) if a != b)
+    assert best_changes > head_changes, (
+        f"production model should evolve more often than the head "
+        f"(best={best_changes}, head={head_changes})")
     assert head_changes >= 1, "head pool should evolve at least once across 2 block boundaries"
