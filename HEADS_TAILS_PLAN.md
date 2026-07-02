@@ -96,7 +96,16 @@ replay, advance once at block end.
   residual sourced from the composed head0+tail0 production model (`mt1_composed_forward`). Returns
   an `MT1Result` from the last block day (head pool → "composite" stats, tail pools → components,
   composed output → slot0/dir0 activations). Additive/unused until 3C.
-- 3C — STATUS: TODO (the risky main-loop surgery; needs a diagnostic run to validate, not just tests).
+- 3C — STATUS: DONE (validated). Local syntax-check + 93 tests pass; droplet build clean; diagnostic
+  run confirmed the block flush works end-to-end (EXIT=0, valid MT log records, no NaN, MT1 direction
+  climbing 5.4→7.7 across blocks, MT2 ≈ideal). Validated with a throwaway MT1_BLOCK_DAYS=5 build for a
+  fast flush; committed source keeps MT1_BLOCK_DAYS=25.
+  `run_training`'s day loop now: per day does StockNN + OHLCV/market history + caches each fwd-valid
+  day's 444-features/targets/StockNN-results; every MT1_BLOCK_DAYS cached days (or at range end / first
+  non-fwd day) calls `process_block` → run_mt1_block ×12 (T1/H/T2), MT2 M-phase over the block, then
+  flushes deferred CSV rows + one MT log record + a save. Non-fwd days get an inline CSV row. Switched
+  `run_training` to `load_or_init_mt1_ht`/`save_mt1_ht`. Old `step_mt1`/component/composite + old pools
+  kept as dead code (still used by `run_drift_study`). Retiring them is a later cleanup.
   Decisions locked: (a) **cached-feature block model** — advance StockNN + market/OHLCV history + CSV
   per day once, cache each fwd-valid day's 444-features + targets, trigger a block every
   MT1_BLOCK_DAYS cached days; (b) **post-block MT1 feeds MT2** for every block day (mild within-block
