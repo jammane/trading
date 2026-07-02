@@ -4978,9 +4978,9 @@ int main(int argc, char* argv[]) {
             ind_states[i].streak = 0;
             for (int s = 1; s < N_SLOTS; s++) ind_states[i].portfolios[s] = ind_states[i].portfolios[0];
         }
-        // Load MT1 elites (12 per-industry × 4 component pools + composite) and MT2 once at pass start
+        // Load MT1 head+tail pools (heads/tails redesign) and MT2 once at pass start
         for (int i = 0; i < N_IND; i++)
-            load_or_init_mt1(output_dir, load_dir, i, mt1_scratches[i]);
+            load_or_init_mt1_ht(output_dir, load_dir, i, mt1_scratches[i]);
         load_or_init_mt2(output_dir, load_dir, *mt2_scratch);
         // Init MT2 portfolio state
         mst->portfolios[0].cash = MST_STARTING_CASH;
@@ -5005,6 +5005,111 @@ int main(int argc, char* argv[]) {
         // Stable seq_flags per day (random 50/50 per symbol)
         bool seq_flags[N_SYMS];
         PCG32 seq_rng;
+
+        // ── Heads/tails block-alternating accumulation (Increment 3C) ──
+        // Each fwd-valid day's market-derived features + targets are cached; every MT1_BLOCK_DAYS
+        // cached days a block is processed (MT1 T1/H/T2 phases, then MT2's M phase, then flush CSV
+        // + MT log + save). StockNN, OHLCV/market histories and non-fwd-day CSV rows stay per-day.
+        static float blk_444[MT1_BLOCK_DAYS][444];
+        static float blk_fwd[MT1_BLOCK_DAYS][N_IND];
+        static float blk_perf[MT1_BLOCK_DAYS][N_IND];
+        static float blk_mkt_ret_c[MT1_BLOCK_DAYS][N_IND];
+        static float blk_mkt_val_c[MT1_BLOCK_DAYS][N_IND];
+        static IndResult blk_results[MT1_BLOCK_DAYS][N_IND];
+        int blk_actual_day[MT1_BLOCK_DAYS];
+        int blk_fill = 0;
+
+        auto process_block = [&](int blk_len) {
+            if (blk_len <= 0) return;
+            // 1. MT1 block-alternating training per industry (T1/H/T2 over the cached block)
+            MT1Result blk_mt1_res[N_IND];
+            for (int i = 0; i < N_IND; i++) {
+                float in37_i[MT1_BLOCK_DAYS][37];
+                float actd_i[MT1_BLOCK_DAYS];
+                int   aday_i[MT1_BLOCK_DAYS];
+                for (int d = 0; d < blk_len; d++) {
+                    memcpy(in37_i[d], &blk_444[d][i * 37], 37 * sizeof(float));
+                    actd_i[d] = blk_fwd[d][i] * MT1_SCALE_DOLLARS;
+                    aday_i[d] = blk_actual_day[d];
+                }
+                blk_mt1_res[i] = run_mt1_block(i, mt1_scratches[i], blk_len, in37_i, actd_i, aday_i,
+                                               cur_dir_sigma, cur_acc_sigma, cur_rng_sigma,
+                                               cur_cfd_sigma, cur_mst_sigma);
+            }
+            // 2. MT2 M phase: replay block days with the post-block composed MT1 (head0+tail0)
+            MasterResult blk_master_res[MT1_BLOCK_DAYS];
+            for (int d = 0; d < blk_len; d++) {
+                MasterResult mr{}; bool inj = false;
+                if (blk_actual_day[d] >= MASTER_START_DAY) {
+                    float in48[48];
+                    for (int i = 0; i < N_IND; i++) {
+                        MT1Scratch& sc = mt1_scratches[i];
+                        const float* tw[4] = {sc.tail0_buf[0], sc.tail0_buf[1], sc.tail0_buf[2], sc.tail0_buf[3]};
+                        float o4[4]; mt1_composed_forward(sc.head0_buf, tw, &blk_444[d][i * 37], o4);
+                        float conf = sigmoidf(o4[0]);
+                        in48[i*4 + 0] = conf;
+                        in48[i*4 + 1] = (conf >= 0.5f ? 1.f : -1.f) * fabsf(tanhf(o4[1]));
+                        in48[i*4 + 2] = log1pf(expf(o4[2]));
+                        in48[i*4 + 3] = sigmoidf(o4[3]);
+                    }
+                    mr = step_mt2(*mst, *mt2_scratch, in48, blk_perf[d],
+                                  blk_actual_day[d], total_days, cur_mt2_sigma, &inj);
+                }
+                blk_master_res[d] = mr;
+            }
+            // 3. CSV rows for the block (deferred so each row carries its MT2 result)
+            if (csv)
+                for (int d = 0; d < blk_len; d++)
+                    write_csv_row(csv, pass, blk_actual_day[d], blk_results[d],
+                                  blk_master_res[d], blk_mkt_ret_c[d], blk_mkt_val_c[d]);
+            // 4. One MT log record per block (final MT1 stats + last block-day MT2)
+            if (mt_log && blk_actual_day[blk_len - 1] >= MT1_START_DAY) {
+                MTLogRecord rec{};
+                rec.pass_num   = (uint32_t)pass;
+                rec.actual_day = (uint32_t)blk_actual_day[blk_len - 1];
+                for (int i = 0; i < N_IND; i++) {
+                    rec.mt1_best[i]  = blk_mt1_res[i].best_score;
+                    rec.mt1_slot0[i] = blk_mt1_res[i].slot0_score;
+                    rec.mt1_mean[i]  = blk_mt1_res[i].mean_score;
+                    rec.mt1_min[i]   = blk_mt1_res[i].min_score;
+                    rec.mt1_dir_best[i]        = blk_mt1_res[i].best_dir;
+                    rec.mt1_dir_slot0[i]       = blk_mt1_res[i].slot0_dir;
+                    rec.mt1_dir_mean[i]        = blk_mt1_res[i].mean_dir;
+                    rec.mt1_dir_min[i]         = blk_mt1_res[i].min_dir;
+                    rec.mt1_dir_correct_dbl[i] = blk_mt1_res[i].mean_dir_cdbl;
+                    rec.mt1_rng_best[i]  = blk_mt1_res[i].best_rng;
+                    rec.mt1_rng_slot0[i] = blk_mt1_res[i].slot0_rng;
+                    rec.mt1_rng_mean[i]  = blk_mt1_res[i].mean_rng;
+                    rec.mt1_rng_min[i]   = blk_mt1_res[i].min_rng;
+                    rec.mt1_acc_best[i]  = blk_mt1_res[i].best_acc;
+                    rec.mt1_acc_slot0[i] = blk_mt1_res[i].slot0_acc;
+                    rec.mt1_acc_mean[i]  = blk_mt1_res[i].mean_acc;
+                    rec.mt1_acc_min[i]   = blk_mt1_res[i].min_acc;
+                    rec.mt1_cfd_best[i]  = blk_mt1_res[i].best_cfd;
+                    rec.mt1_cfd_slot0[i] = blk_mt1_res[i].slot0_cfd;
+                    rec.mt1_cfd_mean[i]  = blk_mt1_res[i].mean_cfd;
+                    rec.mt1_cfd_min[i]   = blk_mt1_res[i].min_cfd;
+                    rec.mt1_dir_injected[i] = 0u;   // external collapse-injection retired (two-half selection guards)
+                    rec.mt1_slot0_act[i][0] = blk_mt1_res[i].slot0_conf;
+                    rec.mt1_slot0_act[i][1] = blk_mt1_res[i].slot0_delta_t;
+                    rec.mt1_slot0_act[i][2] = blk_mt1_res[i].slot0_range_pct;
+                    rec.mt1_slot0_act[i][3] = blk_mt1_res[i].slot0_conf4;
+                }
+                const MasterResult& lm = blk_master_res[blk_len - 1];
+                rec.mt2_best_pts   = lm.best_pts;
+                rec.mt2_slot0_pts  = lm.elite_mean_pts;
+                rec.mt2_ideal_pts  = lm.ideal_pts;
+                rec.mt2_injected   = 0u;
+                rec.mt2_consensus_flat_pts = lm.consensus_flat_pts;
+                rec.mt2_consensus_wtd_pts  = lm.consensus_wtd_pts;
+                write_mt_log_record(mt_log, rec);
+            }
+            // 5. Save (per block ≈ 25 days)
+            if (!g_no_save) {
+                for (int i = 0; i < N_IND; i++) save_mt1_ht(output_dir, i, mt1_scratches[i]);
+                save_mt2_elites(output_dir, *mt2_scratch);
+            }
+        };
 
         for (int day_num = 0; day_num < num_days; day_num++) {
             int actual_day = day_start + day_num;
@@ -5090,52 +5195,9 @@ int main(int argc, char* argv[]) {
             float today444[444];
             build_master_features(mst->mkt_val_hist, mst->ind_hist_count, today444);
 
-            // MT1 step × 12 (actual_day >= MT1_START_DAY)
-            // actual_d = fwd_ret × scale: ABSOLUTE own-industry forward return (sign-skewed;
-            // direction pool uses class-balanced scoring to stay skill-based — see step_mt1_component)
-            // MT1 step: called for all days; push_dir_day runs unconditionally;
-            // selection/mutation/culling gated at actual_day >= MT1_START_DAY inside step_mt1
-            MT1Result mt1_res[N_IND] = {};
-            if (fwd_valid) {
-                for (int i = 0; i < N_IND; i++) {
-                    const float* in37 = today444 + i * 37;
-                    float actual_d_i  = fwd_ret[i] * MT1_SCALE_DOLLARS;
-                    mt1_res[i] = step_mt1(i, mt1_scratches[i], actual_d_i,
-                                          in37, actual_day,
-                                          cur_dir_sigma, cur_rng_sigma,
-                                          cur_acc_sigma, cur_cfd_sigma);
-                }
-            }
-
-            // MT2 step (needs forward target; actual_day >= MASTER_START_DAY)
-            MasterResult master_res = {};
-            bool mt2_injected = false;
-            if (fwd_valid && actual_day >= MASTER_START_DAY) {
-                // Build 48-feature MT2 input from MT1 slot0 raw activations (no normalization).
-                // MT2_FEED_DIRECTION selects the direction-pool slot0 (strongest daily signal)
-                // vs the composite slot0; toggle back to composite once MT2 shows a learning curve.
-                // Reassemble the signed magnitude fed to MT2: SIGN from the direction confidence,
-                // |SIZE| from the prediction. Under signless magnitude scoring the raw delta sign
-                // is ungraded noise, so we re-impose sign = (conf >= 0.5 ? + : -).
-                float in48[48];
-                for (int i = 0; i < N_IND; i++) {
-                    if (MT2_FEED_DIRECTION) {
-                        float conf = mt1_res[i].dir0_conf;
-                        in48[i*4 + 0] = conf;
-                        in48[i*4 + 1] = (conf >= 0.5f ? 1.f : -1.f) * fabsf(mt1_res[i].dir0_delta_t);
-                        in48[i*4 + 2] = mt1_res[i].dir0_range_pct;
-                        in48[i*4 + 3] = mt1_res[i].dir0_conf4;
-                    } else {
-                        float conf = mt1_res[i].slot0_conf;
-                        in48[i*4 + 0] = conf;
-                        in48[i*4 + 1] = (conf >= 0.5f ? 1.f : -1.f) * fabsf(mt1_res[i].slot0_delta_t);
-                        in48[i*4 + 2] = mt1_res[i].slot0_range_pct;
-                        in48[i*4 + 3] = mt1_res[i].slot0_conf4;
-                    }
-                }
-                master_res = step_mt2(*mst, *mt2_scratch, in48, actual_perf,
-                                      actual_day, total_days, cur_mt2_sigma, &mt2_injected);
-            }
+            // MT1 + MT2 no longer run per day — the heads/tails redesign trains MT1 in
+            // block-alternating phases and MT2 in a post-block M phase. This day's market-derived
+            // features (today444) and targets are cached below and processed at the block boundary.
 
             // Append today's values to rolling histories
             float today_mkt_val[N_IND];
@@ -5166,105 +5228,35 @@ int main(int argc, char* argv[]) {
             }
             if (mst->ind_hist_count < IND_HIST_CAP) mst->ind_hist_count++;
 
-            // Log CSV row
-            if (csv) write_csv_row(csv, pass, actual_day, results, master_res, mkt_ret, today_mkt_val);
-
-            // MT1 direction collapse injection (fires after MT2 day is complete)
-            bool mt1_dir_inj[N_IND] = {};
-            if (actual_day >= MT1_START_DAY && fwd_valid) {
-                for (int ind_i = 0; ind_i < N_IND; ind_i++) {
-                    MT1Scratch& sc = mt1_scratches[ind_i];
-                    if (sc.dir_cooldown > 0) sc.dir_cooldown--;
-                    if (sc.dir_streak >= MT1_DIR_STREAK_TRIP && sc.dir_cooldown == 0) {
-                        PCG32 inj_rng;
-                        inj_rng.seed((uint64_t)actual_day * 199933ULL + (uint64_t)ind_i * 7919ULL);
-                        float inj_tmp[MT1NN_PARAMS];
-                        // 10 mutations: 2 Gaussian perturbations per composite source (slots 20-24)
-                        for (int k = 0; k < MT1_COMP_INJECT; k++) {
-                            const float* src_w = sc.comp_elite(0, ELITE_COUNT + WAVG_COUNT + k);
-                            for (int m = 0; m < 2; m++) {
-                                float* dst = sc.comp_elite(0, k * 2 + m);
-                                memcpy(dst, src_w, MT1NN_PARAMS * sizeof(float));
-                                apply_gaussian(dst, MT1NN_PARAMS, cur_dir_sigma,
-                                               ((uint64_t)inj_rng.next() << 32) | inj_rng.next());
-                            }
-                        }
-                        // 5 median models: 0.5 x composite source + 0.5 x fresh random init
-                        for (int k = 0; k < MT1_COMP_INJECT; k++) {
-                            const float* src_w = sc.comp_elite(0, ELITE_COUNT + WAVG_COUNT + k);
-                            float* dst = sc.comp_elite(0, 10 + k);
-                            init_mt1_weights(inj_tmp, inj_rng);
-                            for (int p = 0; p < MT1NN_PARAMS; p++)
-                                dst[p] = 0.5f * src_w[p] + 0.5f * inj_tmp[p];
-                        }
-                        sc.dir_streak   = 0;
-                        sc.dir_cooldown = MT1_DIR_COOLDOWN_LEN;
-                        mt1_dir_inj[ind_i] = true;
-                        log_msg(std::string("[mt1-dir] ") + IND_SHORT[ind_i] +
-                                " direction collapse injection -- streak reset, cooldown=" +
-                                std::to_string(MT1_DIR_COOLDOWN_LEN));
-                    }
-                }
+            // ── Cache this day for block-alternating MT1/MT2 (Increment 3C) ──
+            // fwd-valid days feed a block; non-fwd days (last MT1_FWD_DAYS) get an inline CSV row.
+            if (fwd_valid) {
+                int d = blk_fill;
+                memcpy(blk_444[d],       today444,      sizeof(today444));
+                memcpy(blk_fwd[d],       fwd_ret,       sizeof(fwd_ret));
+                memcpy(blk_perf[d],      actual_perf,   sizeof(actual_perf));
+                memcpy(blk_mkt_ret_c[d], mkt_ret,       sizeof(mkt_ret));
+                memcpy(blk_mkt_val_c[d], today_mkt_val, sizeof(today_mkt_val));
+                memcpy(blk_results[d],   results,       sizeof(IndResult) * N_IND);
+                blk_actual_day[d] = actual_day;
+                blk_fill++;
+                if (blk_fill == MT1_BLOCK_DAYS) { process_block(blk_fill); blk_fill = 0; }
+            } else {
+                if (blk_fill > 0) { process_block(blk_fill); blk_fill = 0; }  // flush before non-fwd rows
+                if (csv) write_csv_row(csv, pass, actual_day, results, MasterResult{}, mkt_ret, today_mkt_val);
             }
 
-            // Write MT binary log record (once MT1 is active; only days with a forward target)
-            if (mt_log && actual_day >= MT1_START_DAY && fwd_valid) {
-                MTLogRecord rec{};
-                rec.pass_num     = (uint32_t)pass;
-                rec.actual_day   = (uint32_t)actual_day;
-                for (int i = 0; i < N_IND; i++) {
-                    rec.mt1_best[i]      = mt1_res[i].best_score;
-                    rec.mt1_slot0[i]     = mt1_res[i].slot0_score;
-                    rec.mt1_mean[i]      = mt1_res[i].mean_score;
-                    rec.mt1_min[i]       = mt1_res[i].min_score;
-                    rec.mt1_dir_best[i]         = mt1_res[i].best_dir;
-                    rec.mt1_dir_slot0[i]        = mt1_res[i].slot0_dir;
-                    rec.mt1_dir_mean[i]         = mt1_res[i].mean_dir;
-                    rec.mt1_dir_min[i]          = mt1_res[i].min_dir;
-                    rec.mt1_dir_correct_dbl[i]  = mt1_res[i].mean_dir_cdbl;
-                    rec.mt1_rng_best[i]  = mt1_res[i].best_rng;
-                    rec.mt1_rng_slot0[i] = mt1_res[i].slot0_rng;
-                    rec.mt1_rng_mean[i]  = mt1_res[i].mean_rng;
-                    rec.mt1_rng_min[i]   = mt1_res[i].min_rng;
-                    rec.mt1_acc_best[i]  = mt1_res[i].best_acc;
-                    rec.mt1_acc_slot0[i] = mt1_res[i].slot0_acc;
-                    rec.mt1_acc_mean[i]  = mt1_res[i].mean_acc;
-                    rec.mt1_acc_min[i]   = mt1_res[i].min_acc;
-                    rec.mt1_cfd_best[i]  = mt1_res[i].best_cfd;
-                    rec.mt1_cfd_slot0[i] = mt1_res[i].slot0_cfd;
-                    rec.mt1_cfd_mean[i]  = mt1_res[i].mean_cfd;
-                    rec.mt1_cfd_min[i]   = mt1_res[i].min_cfd;
-                }
-                rec.mt2_best_pts   = master_res.best_pts;
-                rec.mt2_slot0_pts  = master_res.elite_mean_pts;  // slot0 pts proxy
-                rec.mt2_ideal_pts  = master_res.ideal_pts;
-                rec.mt2_injected   = mt2_injected ? 1u : 0u;
-                rec.mt2_consensus_flat_pts = master_res.consensus_flat_pts;
-                rec.mt2_consensus_wtd_pts  = master_res.consensus_wtd_pts;
-                for (int i = 0; i < N_IND; i++) {
-                    rec.mt1_dir_injected[i] = mt1_dir_inj[i] ? 1u : 0u;
-                    rec.mt1_slot0_act[i][0] = mt1_res[i].slot0_conf;
-                    rec.mt1_slot0_act[i][1] = mt1_res[i].slot0_delta_t;
-                    rec.mt1_slot0_act[i][2] = mt1_res[i].slot0_range_pct;
-                    rec.mt1_slot0_act[i][3] = mt1_res[i].slot0_conf4;
-                }
-                write_mt_log_record(mt_log, rec);
-            }
-
-            // Periodic MT1/MT2 save (industry elites already saved inside step_industry each day)
-            if (!g_no_save && (day_num % 50 == 49 || day_num == num_days - 1)) {
-                log_msg("Saving MT1/MT2 elites to " + output_dir + " ...");
-                for (int i = 0; i < N_IND; i++)
-                    save_mt1_all(output_dir, i, mt1_scratches[i]);
-                save_mt2_elites(output_dir, *mt2_scratch);
-            }
+            // (Per-day MT1 collapse-injection, MT log record, and periodic save moved into
+            //  process_block — the block boundary is where MT1/MT2 stats and saves now happen.)
         }
+        // Flush the final partial block (range ended on fwd-valid days)
+        if (blk_fill > 0) { process_block(blk_fill); blk_fill = 0; }
 
         // Save MT1/MT2 after each pass (industry elites already saved by step_industry)
         if (!g_no_save) {
             log_msg("Pass " + std::to_string(pass+1) + " complete — saving MT1/MT2 elites");
             for (int i = 0; i < N_IND; i++)
-                save_mt1_all(output_dir, i, mt1_scratches[i]);
+                save_mt1_ht(output_dir, i, mt1_scratches[i]);
             save_mt2_elites(output_dir, *mt2_scratch);
         }
     }
