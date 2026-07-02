@@ -38,7 +38,7 @@ from collections import defaultdict
 import torch
 import torch.nn.functional as F
 
-from models import MT1NN, MT2NN, StockNN
+from models import MT1NN, MT1Head, MT1Tail, MT2NN, StockNN
 from training_lib import (
     ELITE_COUNT,
     ELITE_POOL,
@@ -82,6 +82,7 @@ UPKEEP_DIR_SIGMA  = 0.006   # MT1 direction pool
 UPKEEP_RNG_SIGMA  = 0.004   # MT1 range pool (stable; ceiling cull handles exploration)
 UPKEEP_ACC_SIGMA  = 0.006   # MT1 accuracy pool (noisy until industry stabilizes)
 UPKEEP_CFD_SIGMA  = 0.003   # MT1 confidence pool (most stable; fine-tune only)
+UPKEEP_HEAD_SIGMA = 0.004   # MT1 shared head/trunk (block-cycle head phase)
 UPKEEP_MT2_SIGMA  = 0.001   # MT2 (v0.2.6.0: 0.002→0.001 to tighten the pool)
 MT1_SCALE_DOLLARS = 10000.0   # tanh ceiling for dollar P&L prediction
 MT1_FLOOR_COLD    = 250.0     # acc_floor cold-start (÷2 = $125)
@@ -89,11 +90,21 @@ MT1_ROLLING_DAYS  = 10        # days in rolling buffers
 MT2_INJ_THRESHOLD = -7.0      # injection fires when ≥75% of pool below this
 MT2_INJ_MIN_BELOW = int(N_SLOTS * 0.75)  # 150 of 200
 
-# Weighted children per parent for MT1 component pools (mirror of C++ kChildren): slot0=13,
+# Weighted children per parent for (legacy) MT1 component pools (mirror of C++ kChildren): slot0=13,
 # slots1-4=11/11/10/10, slots5-19=7, injected slots20-24=3. Sums to 175 = MT1_COMP_SLOTS-PARENTS.
 _MT1_CHILDREN     = [13, 11, 11, 10, 10] + [7] * 12 + [7] * 3 + [3] * 5
 MT1_PARENT_OF_MUT = [p for p, c in enumerate(_MT1_CHILDREN) for _ in range(c)]
 assert len(MT1_PARENT_OF_MUT) == MT1_COMP_SLOTS - MT1_COMP_PARENTS, "MT1 children table must sum to 175"
+
+# ── Heads/tails pool layout (Increment 4B) ──────────────────────────────────────
+# One shared head pool + 4 specialized tail pools per industry. No injection slots — the shared
+# head propagates cross-component learning. HT_PARENTS = 17 direct elites + 3 wavg (= 20); the
+# reclaimed capacity goes into more elite mutations. Children table mirrors C++ step_mt1_pool.
+MT1_BLOCK_DAYS = 25   # head cycle fires every MT1_BLOCK_DAYS upkeep runs; tails evolve every run
+HT_PARENTS     = ELITE_COUNT + WAVG_COUNT   # 20
+_HT_CHILDREN   = [16, 13, 13, 12, 12] + [8] * 12 + [6] * 3   # sums to 180
+HT_PARENT_OF_MUT = [p for p, c in enumerate(_HT_CHILDREN) for _ in range(c)]
+assert len(HT_PARENT_OF_MUT) == MT1_COMP_SLOTS - HT_PARENTS, "HT children table must sum to 180"
 
 
 
@@ -684,522 +695,391 @@ def upkeep_industry(industry, symbols, model_dir, primed_portfolio,
 
 # ── MT1 upkeep ─────────────────────────────────────────────────────────────────
 
+# ── Heads/tails pool history + selection helpers (Increment 4B) ──────────────────
+
+def _ht_load_hist(prefix, model_dir, model_class):
+    """Load a head/tail pool's 5-day elite history models. Returns a list (may be empty)."""
+    meta_path = os.path.join(model_dir, f'{prefix}_hist_meta.json')
+    models = []
+    try:
+        with open(meta_path) as f:
+            meta = json.load(f)
+        head, count = meta.get('head', 0), meta.get('count', 0)
+        n_days = min(count, HIST_DAYS)
+        for d in range(n_days):
+            day_slot = (head - n_days + d) % HIST_DAYS
+            for pos in range(HIST_PER_DAY):
+                hp = os.path.join(model_dir, f'{prefix}_hist_{day_slot}_{pos}.pt')
+                if os.path.exists(hp):
+                    try:
+                        m = model_class()
+                        m.load_state_dict(torch.load(hp, weights_only=True))
+                        models.append(m)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return models
+
+
+def _ht_save_hist(prefix, model_dir, model_class, new_elites, new_wavgs):
+    """Save top HIST_ELITE elites + HIST_WAVG wavg models to a head/tail pool's history."""
+    meta_path = os.path.join(model_dir, f'{prefix}_hist_meta.json')
+    try:
+        with open(meta_path) as f:
+            meta = json.load(f)
+        head, count = meta.get('head', 0), meta.get('count', 0)
+    except Exception:
+        head, count = 0, 0
+    for k, m in enumerate(new_elites[:HIST_ELITE]):
+        try:
+            torch.save(m.state_dict(), os.path.join(model_dir, f'{prefix}_hist_{head}_{k}.pt'))
+        except Exception:
+            pass
+    for k, m in enumerate(new_wavgs[:HIST_WAVG]):
+        try:
+            torch.save(m.state_dict(),
+                       os.path.join(model_dir, f'{prefix}_hist_{head}_{HIST_ELITE + k}.pt'))
+        except Exception:
+            pass
+    try:
+        with open(meta_path, 'w') as f:
+            json.dump({'head': (head + 1) % HIST_DAYS, 'count': min(count + 1, HIST_DAYS)}, f)
+    except Exception:
+        pass
+
+
+def _ht_select_and_mutate(prefix, model_dir, model_class, scores, sigma, hist_models=None):
+    """
+    Elite selection + mutation for one head or tail pool (HT layout, mirror of C++ step_mt1_pool):
+      0–16   direct elites (ELITE_COUNT)
+      17–19  wavg blends   (WAVG_COUNT: top-5/10/15)
+      20–…   mutations (HT_PARENT_OF_MUT children per parent; NO injection slots)
+    scores:      [(slot, score)] with culled slots = -1e30.
+    hist_models: [(model, score)] history candidates (no culling — safety-net entries).
+    Returns (new_elites[:HIST_ELITE], new_wavgs[:HIST_WAVG]) for history saving.
+    """
+    all_scores = list(scores)
+    hist_offset = MT1_COMP_SLOTS
+    if hist_models:
+        for h_idx, (hm, hsc) in enumerate(hist_models):
+            all_scores.append((hist_offset + h_idx, hsc))
+    sorted_scores = sorted(all_scores, key=lambda x: x[1], reverse=True)
+    top_entries = sorted_scores[:ELITE_COUNT]
+    while len(top_entries) < ELITE_COUNT:
+        top_entries.append(top_entries[0])
+
+    live_needed = {s for s, _ in top_entries if s < hist_offset}
+    cache = {s: load_slot_model(prefix, model_dir, s, model_class) for s in live_needed}
+    hist_cache = {}
+    if hist_models:
+        for h_idx, (hm, _) in enumerate(hist_models):
+            hist_cache[hist_offset + h_idx] = hm
+    for rank, (s, _) in enumerate(top_entries):
+        save_slot_model(prefix, model_dir, rank, cache[s] if s < hist_offset else hist_cache[s])
+
+    new_wavgs = []
+    for b, k in enumerate([5, 10, 15]):
+        inv_k = 1.0 / k
+        avg_st = None
+        for rank in range(k):
+            m = load_slot_model(prefix, model_dir, rank, model_class)
+            state = m.state_dict(); del m
+            if avg_st is None:
+                avg_st = {key: (v.clone().float() * inv_k if torch.is_floating_point(v) else v.clone())
+                          for key, v in state.items()}
+            else:
+                for key, v in state.items():
+                    if torch.is_floating_point(v) and key in avg_st:
+                        avg_st[key] = avg_st[key] + v.float() * inv_k
+        wm = model_class(); wm.load_state_dict(avg_st)
+        save_slot_model(prefix, model_dir, ELITE_COUNT + b, wm)
+        new_wavgs.append(wm); del avg_st
+    del cache
+
+    for i, slot in enumerate(range(HT_PARENTS, MT1_COMP_SLOTS)):
+        parent_rank = HT_PARENT_OF_MUT[i] if i < len(HT_PARENT_OF_MUT) else (i % HT_PARENTS)
+        parent = load_slot_model(prefix, model_dir, parent_rank, model_class)
+        child = _mutate_generic(parent, model_class, sigma)
+        save_slot_model(prefix, model_dir, slot, child)
+        del parent, child
+
+    new_elites = [load_slot_model(prefix, model_dir, k, model_class) for k in range(HIST_ELITE)]
+    return new_elites, new_wavgs[:HIST_WAVG]
+
+
+# ── MT1 industry upkeep (heads/tails block cycle) ────────────────────────────────
+
 def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
                          dir_sigma=UPKEEP_DIR_SIGMA, rng_sigma=UPKEEP_RNG_SIGMA,
                          acc_sigma=UPKEEP_ACC_SIGMA, cfd_sigma=UPKEEP_CFD_SIGMA,
-                         rolling_state=None):
+                         head_sigma=UPKEEP_HEAD_SIGMA, rolling_state=None):
     """
-    One evolution step for one industry's MT1NN 5-pool system.
+    One production evolution step for one industry's heads/tails MT1 (Increment 4B).
 
-    Runs 4 component pools (dir, acc, rng, cfd) then a composite blend pool.
-    Each component pool has MT1_COMP_SLOTS=200 slots (uniform); the composite pool generates
-    MT1_BLEND_SLOTS=200 fresh blends from component direct elites each day, scored by
-    composite score. Injection cascade: composite→dir, composite→rng, dir→acc, rng→cfd.
+    Daily: evolve the 4 tail pools (freeze the best head + the other best tails; mirror the C++
+    step_mt1_tail — direction keeps class-balanced weights, two-half selection, flip cull and the
+    correct-count collapse floor). Every MT1_BLOCK_DAYS runs (block counter in rolling_state):
+    also evolve the head pool (freeze the best tails; mirror step_mt1_head, composite fitness).
+    Production model = composed best head + best tails → mt1_{ind}_best.pt for inference.
 
-    industry:  industry key (e.g. 'energy')
-    model_dir: directory containing model files
-    in37_t:    (1, 37) tensor — this industry's slice of build_master_features output
-    actual_d:  float — relative market dollar P&L = (mkt_ret - median_mkt_ret) × MT1_SCALE_DOLLARS
-    dir/rng/acc/cfd_sigma: per-component mutation sigma
-    rolling_state: mutable dict with per-industry rolling buffer; updated in place.
+    File naming: mt1_{ind}_head_model_{slot}.pt (MT1Head),
+                 mt1_{ind}_tail_{dir|acc|rng|cfd}_model_{slot}.pt (MT1Tail),
+                 mt1_{ind}_best.pt (composed MT1NN), + per-pool _hist_* and mt1_{ind}_dir_hist.json.
 
-    File naming:
-      Component pools: mt1_{ind}_{dir|acc|rng|cfd}_model_{slot}.pt
-      Composite best:  mt1_{ind}_best.pt
-      Dir inject:      mt1_{ind}_dir_inject_{0..4}.pt
-      Comp history:    mt1_{ind}_comp_hist_{day}_{pos}.pt + mt1_{ind}_comp_hist_meta.json
-
-    Returns (best_comp_score, best_comp_score, slot0_conf, slot0_delta_t, slot0_range_pct,
-             slot0_conf4) — slot0 is the winning composite model.
+    Returns (best_score, best_score, conf, delta_t, range_pct, conf4, conf, delta_t, range_pct,
+    conf4) — the composed production model's slot0 activations (the composite and "direction" MT2
+    feeds are identical in the head/tail design, so MT2_FEED_DIRECTION is moot).
     """
     if rolling_state is None:
         rolling_state = {}
+    ind_rs    = rolling_state.setdefault(industry, {})
+    acc_floor = _rolling_acc_floor(ind_rs)
+    in37_t    = in37_t.detach()
 
-    ind_rs     = rolling_state.setdefault(industry, {})
-    acc_floor  = _rolling_acc_floor(ind_rs)
+    head_prefix   = f'mt1_{industry}_head'
+    tail_prefixes = [f'mt1_{industry}_tail_{n}' for n in MT1_POOL_NAMES]
+    tail_sigmas   = [dir_sigma, acc_sigma, rng_sigma, cfd_sigma]
+    best_path     = os.path.join(model_dir, f'mt1_{industry}_best.pt')
 
-    in37_t = in37_t.detach()
+    # Bootstrap pools on first run (seed from best.pt head/tails if present, else fresh).
+    if not os.path.exists(_model_path(head_prefix, model_dir, 0)):
+        base = MT1NN()
+        if os.path.exists(best_path):
+            try:
+                base.load_state_dict(torch.load(best_path, weights_only=True))
+                log(f"[mt1/{sn(industry)}] Bootstrapping head/tail pools from mt1_{industry}_best.pt")
+            except Exception:
+                log(f"[mt1/{sn(industry)}] Bootstrap failed — random head/tail pools")
+        else:
+            log(f"[mt1/{sn(industry)}] Initializing random head/tail pools")
+        hb = MT1Head(); hb.load_state_dict(base.head.state_dict())
+        save_slot_model(head_prefix, model_dir, 0, hb)
+        for slot in range(1, MT1_COMP_SLOTS):
+            save_slot_model(head_prefix, model_dir, slot, _mutate_generic(hb, MT1Head, head_sigma))
+        for c, tp in enumerate(tail_prefixes):
+            tb = MT1Tail(); tb.load_state_dict(base.tails[c].state_dict())
+            save_slot_model(tp, model_dir, 0, tb)
+            for slot in range(1, MT1_COMP_SLOTS):
+                save_slot_model(tp, model_dir, slot, _mutate_generic(tb, MT1Tail, tail_sigmas[c]))
+        del base
 
-    comp_prefix = f'mt1_{industry}_comp'
+    # Frozen production bests at phase start (head + 4 tails).
+    head0  = load_slot_model(head_prefix, model_dir, 0, MT1Head); head0.eval()
+    tails0 = [load_slot_model(tp, model_dir, 0, MT1Tail) for tp in tail_prefixes]
+    for t in tails0:
+        t.eval()
 
-    # Dynamic range ceiling: max(4 × mean_residual, 4 × today's comp0 residual)
+    # Today's residual (composed best) for the range ceiling.
     today_residual = 0.0
-    best_path = os.path.join(model_dir, f'mt1_{industry}_best.pt')
-    if os.path.exists(best_path) and ind_rs.get('residual_buf'):
-        try:
-            comp0_m = MT1NN()
-            comp0_m.load_state_dict(torch.load(best_path, weights_only=True))
-            comp0_m.eval()
-            with torch.inference_mode():
-                out4_c0 = comp0_m(in37_t).squeeze(0)
-            comp0_delta_d  = torch.tanh(out4_c0[1]).item() * MT1_SCALE_DOLLARS
-            today_residual = abs(actual_d - comp0_delta_d)
-            del comp0_m
-        except Exception:
-            pass
+    if ind_rs.get('residual_buf'):
+        with torch.inference_mode():
+            c0 = head0(in37_t)
+            comp0_delta_d = math.tanh(tails0[1](c0).reshape(-1)[0].item()) * MT1_SCALE_DOLLARS
+        today_residual = abs(actual_d - comp0_delta_d)
     range_ceiling = _rolling_range_ceiling(ind_rs, today_residual)
 
-    # ── Direction day buffer (multi-day scoring) ─────────────────────────────────
+    # Direction day buffer (append today, persist, load the trailing window).
     dir_hist_path = os.path.join(model_dir, f'mt1_{industry}_dir_hist.json')
-    dir_hist_raw: list[dict] = []
+    dir_hist_raw = []
     if os.path.exists(dir_hist_path):
-        with open(dir_hist_path) as _f:
-            dir_hist_raw = json.load(_f)
-    # Append today and trim to last MT1_DIR_DAYS entries
+        try:
+            with open(dir_hist_path) as _f:
+                dir_hist_raw = json.load(_f)
+        except Exception:
+            dir_hist_raw = []
     dir_hist_raw.append({'feat37': in37_t.squeeze(0).tolist(), 'actual_d': float(actual_d)})
     dir_hist_raw = dir_hist_raw[-MT1_DIR_DAYS:]
     with open(dir_hist_path, 'w') as _f:
         json.dump(dir_hist_raw, _f)
-    # Pre-convert to tensors for scoring
     dir_hist = [(torch.tensor(e['feat37'], dtype=torch.float32).unsqueeze(0), e['actual_d'])
                 for e in dir_hist_raw]
-    # Class-balanced direction-pool day weights (mirror of C++); dir_W → skill_frac = score/dir_W
-    dir_dw, dir_W = _dir_day_weights(dir_hist) if dir_hist else ([], 0.0)
+    dir_dw, _ = _dir_day_weights(dir_hist) if dir_hist else ([], 0.0)
+    n_win = len(dir_hist)
 
-    # Per-pool sigmas: MT1_POOL_NAMES order is dir=0, acc=1, rng=2, cfd=3
-    pool_sigmas = [dir_sigma, acc_sigma, rng_sigma, cfd_sigma]
+    # Precompute frozen-head concat + frozen tail logits per window day (shared across tail pools).
+    concats, frozen_logits = [], []
+    with torch.inference_mode():
+        for feat_t, _ad in dir_hist:
+            c = head0(feat_t)
+            concats.append(c)
+            frozen_logits.append([tails0[k](c).reshape(-1)[0].item() for k in range(4)])
 
-    # ── Component pools ──────────────────────────────────────────────────────────
-    for pool_id, pool_name in enumerate(MT1_POOL_NAMES):
-        prefix     = f'mt1_{industry}_{pool_name}'
-        slot0_path = _model_path(prefix, model_dir, 0)
+    def _score_tail(cand, comp, apply_cull=True):
+        cand.eval()
+        total = 0.0; culled = False
+        n_correct = n_correct_dbl = today_correct = 0
+        prev_cp = prev_ap = None; crossings = flips = 0
+        with torch.inference_mode():
+            for di, (feat_t, ad) in enumerate(dir_hist):
+                is_today = (di == n_win - 1)
+                o = list(frozen_logits[di]); o[comp] = cand(concats[di]).reshape(-1)[0].item()
+                out4 = torch.tensor(o)
+                conf    = torch.sigmoid(out4[0]).item()
+                delta_d = math.tanh(o[1]) * MT1_SCALE_DOLLARS
+                rng_pct = F.softplus(out4[2]).item()
+                r_raw   = rng_pct * max(abs(delta_d), MT1_RANGE_FLOOR)
+                if (comp == 2 or comp == 3) and range_ceiling is not None and r_raw > range_ceiling:
+                    culled = True
+                if comp == 0:
+                    cp = conf >= 0.5; ap = ad >= 0.0
+                    day = conf if ap else (1.0 - conf); corr = cp == ap
+                    n_correct += 1 if corr else 0
+                    n_correct_dbl += (2 if corr else 0) if is_today else (1 if corr else 0)
+                    if is_today:
+                        today_correct = 1 if corr else 0
+                    if prev_cp is not None and cp != prev_cp:
+                        crossings += 1
+                    if prev_ap is not None and ap != prev_ap:
+                        flips += 1
+                    prev_cp = cp; prev_ap = ap
+                elif comp == 1:
+                    err = abs(abs(ad) - abs(delta_d)); day = acc_floor / (err + acc_floor)
+                else:
+                    day = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)[2 if comp == 2 else 4]
+                total += day * (dir_dw[di] if comp == 0 else mt1_win_weight(di, n_win))
+        if comp == 0 and n_win >= 2 and crossings < flips // 2:
+            culled = True
+        if apply_cull and culled:
+            return -1e30, n_correct, n_correct_dbl, today_correct
+        return total, n_correct, n_correct_dbl, today_correct
 
-        if not os.path.exists(slot0_path):
-            base = MT1NN()
-            if os.path.exists(best_path):
-                try:
-                    base.load_state_dict(torch.load(best_path, weights_only=True))
-                    log(f"[mt1/{sn(industry)}:{pool_name}] Bootstrapping from mt1_{industry}_best.pt")
-                except Exception:
-                    log(f"[mt1/{sn(industry)}:{pool_name}] Bootstrap failed — random weights")
-            else:
-                log(f"[mt1/{sn(industry)}:{pool_name}] Initializing with random weights")
-            save_slot_model(prefix, model_dir, 0, base)
-            for slot in range(1, MT1_COMP_SLOTS):
-                child = _mutate_generic(base, MT1NN, pool_sigmas[pool_id])
-                save_slot_model(prefix, model_dir, slot, child)
-                del child
-            del base
+    # ── Tail phase (every run): freeze head0 + tail0, evolve the 4 tail pools ──
+    for comp, prefix in enumerate(tail_prefixes):
+        scores = []; dir_ncorr = {}; dir_today = {}; dir_max_correct = 0
+        for slot in range(MT1_COMP_SLOTS):
+            m = load_slot_model(prefix, model_dir, slot, MT1Tail)
+            sc, nc, _ncd, td = _score_tail(m, comp, apply_cull=True)
+            scores.append((slot, sc))
+            if comp == 0 and sc > -1e29:
+                dir_ncorr[slot] = nc; dir_today[slot] = td
+                if nc > dir_max_correct:
+                    dir_max_correct = nc
+            del m
+        hist_models = _ht_load_hist(prefix, model_dir, MT1Tail)
+        hist_cands = []
+        for hm in hist_models:
+            sc, nc, _ncd, td = _score_tail(hm, comp, apply_cull=False)
+            hist_cands.append((hm, sc, nc, td))
 
-        # Load injection models into slots 20–24 from cascade source before scoring/selection.
-        # All four pools now inject from the (balanced, equal-weight) composite top-5 — mirror of
-        # C++ Change 3. dir_inject/rng_inject sources are no longer used.
-        inject_slot_base = ELITE_COUNT + WAVG_COUNT  # slot 20
-        inject_src_pattern = f'mt1_{industry}_comp_inject_{{}}.pt'
-        for k in range(MT1_COMP_INJECT):
-            src = os.path.join(model_dir, inject_src_pattern.format(k))
-            if os.path.exists(src):
-                try:
-                    inj_m = MT1NN()
-                    inj_m.load_state_dict(torch.load(src, weights_only=True))
-                    save_slot_model(prefix, model_dir, inject_slot_base + k, inj_m)
-                    del inj_m
-                except Exception:
-                    pass
-
-        # Load history models for this component pool (scored unconditionally, no culling)
-        comp_hist_models_raw = _load_comp_pool_hist_models(industry, pool_name, model_dir)
-
-        scores = []
-        dir_cdb = {}         # slot -> n_correct_dbl (direction pool only)
-        dir_ncorr = {}       # slot -> n_correct (direction two-half selection)
-        dir_today = {}       # slot -> 1 if got the most-recent day's direction right
-        dir_max_correct = 0
-        if dir_hist:
-            for slot in range(MT1_COMP_SLOTS):
-                m = load_slot_model(prefix, model_dir, slot, MT1NN)
-                m.eval()
-                total_sum     = 0.0
-                culled        = False
-                n_correct     = 0
-                n_correct_dbl = 0  # today counts double
-                today_correct = 0
-                prev_conf_pos, prev_act_pos = None, None
-                conf_crossings, market_flips = 0, 0
-                with torch.inference_mode():
-                    for di, (feat_t, ad) in enumerate(dir_hist):
-                        if culled:
-                            break
-                        is_today = (di == len(dir_hist) - 1)
-                        out4 = m(feat_t).squeeze(0)
-                        conf    = torch.sigmoid(out4[0]).item()
-                        delta_d = torch.tanh(out4[1]).item() * MT1_SCALE_DOLLARS
-                        rng_pct = F.softplus(out4[2]).item()
-                        r_raw   = rng_pct * max(abs(delta_d), MT1_RANGE_FLOOR)
-                        # Range ceiling cull: range and confidence pools
-                        if (pool_id == 2 or pool_id == 3) and range_ceiling is not None:
-                            if r_raw > range_ceiling:
-                                culled = True; break
-                        # (accuracy-pool sign-alignment cull removed — magnitude graded signless)
-                        if pool_id == 0:
-                            conf_pos = conf >= 0.5
-                            act_pos  = ad >= 0.0
-                            day_score = conf if act_pos else (1.0 - conf)
-                            correct   = conf_pos == act_pos
-                            n_correct     += 1 if correct else 0
-                            n_correct_dbl += (2 if correct else 0) if is_today else (1 if correct else 0)
-                            if is_today:
-                                today_correct = 1 if correct else 0
-                            if prev_conf_pos is not None and conf_pos != prev_conf_pos:
-                                conf_crossings += 1
-                            if prev_act_pos is not None and act_pos != prev_act_pos:
-                                market_flips += 1
-                            prev_conf_pos = conf_pos
-                            prev_act_pos  = act_pos
-                        elif pool_id == 1:
-                            err = abs(abs(ad) - abs(delta_d))   # signless: magnitude graded independent of sign
-                            day_score = 1.0 / (err + 1.0)
-                        else:
-                            breakdown = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)
-                            day_score = breakdown[2 if pool_id == 2 else 4]
-                        total_sum += day_score * (dir_dw[di] if pool_id == 0 else mt1_win_weight(di, len(dir_hist)))
-                # Direction flip cull after full window
-                if not culled and pool_id == 0 and len(dir_hist) >= 2:
-                    required = market_flips // 2   # floor: no cull at market_flips<=1 (mirror of C++)
-                    if conf_crossings < required:
-                        culled = True
-                score = -1e30 if culled else total_sum
-                scores.append((slot, score))
-                if pool_id == 0 and not culled:
-                    dir_cdb[slot]   = n_correct_dbl
-                    dir_ncorr[slot] = n_correct
-                    dir_today[slot] = today_correct
-                if not culled and n_correct > dir_max_correct:
-                    dir_max_correct = n_correct
-                del m
-
-        live_count = len([sc for _, sc in scores if sc > -1e29])
-
-        # Score history models (same formula, no culling)
-        hist_cands = []   # (model, score, n_correct, today) — carried for the two-half order
-        if dir_hist and comp_hist_models_raw:
-            for hm in comp_hist_models_raw:
-                hm.eval()
-                total_sum   = 0.0
-                n_correct_h = 0
-                hcdb        = 0   # n_correct_dbl for this history model
-                today_h     = 0
-                prev_conf_pos_h, prev_act_pos_h = None, None
-                conf_crossings_h, market_flips_h = 0, 0
-                with torch.inference_mode():
-                    for di, (feat_t, ad) in enumerate(dir_hist):
-                        is_today = (di == len(dir_hist) - 1)
-                        out4 = hm(feat_t).squeeze(0)
-                        conf    = torch.sigmoid(out4[0]).item()
-                        delta_d = torch.tanh(out4[1]).item() * MT1_SCALE_DOLLARS
-                        rng_pct = F.softplus(out4[2]).item()
-                        # No culling for history candidates
-                        if pool_id == 0:
-                            conf_pos = conf >= 0.5
-                            act_pos  = ad >= 0.0
-                            day_score = conf if act_pos else (1.0 - conf)
-                            correct_h = conf_pos == act_pos
-                            n_correct_h += 1 if correct_h else 0
-                            hcdb += (2 if correct_h else 0) if is_today else (1 if correct_h else 0)
-                            if is_today:
-                                today_h = 1 if correct_h else 0
-                            if prev_conf_pos_h is not None and conf_pos != prev_conf_pos_h:
-                                conf_crossings_h += 1
-                            if prev_act_pos_h is not None and act_pos != prev_act_pos_h:
-                                market_flips_h += 1
-                            prev_conf_pos_h = conf_pos
-                            prev_act_pos_h  = act_pos
-                        elif pool_id == 1:
-                            err = abs(abs(ad) - abs(delta_d))   # signless: magnitude graded independent of sign
-                            day_score = 1.0 / (err + 1.0)
-                        else:
-                            breakdown = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)
-                            day_score = breakdown[2 if pool_id == 2 else 4]
-                        total_sum += day_score * (dir_dw[di] if pool_id == 0 else mt1_win_weight(di, len(dir_hist)))
-                hist_cands.append((hm, total_sum, n_correct_h, today_h))
-        del comp_hist_models_raw
-
-        live_scores = [sc for _, sc in scores if sc > -1e29]
-        best_cat  = max(live_scores) if live_scores else 0.0
-        slot0_cat = scores[0][1] if scores[0][1] > -1e29 else 0.0
-        log(f"[mt1/{sn(industry)}:{pool_name}] best={best_cat:.4f} slot0={slot0_cat:.4f} "
-            f"actual_d=${actual_d:+.1f}")
-
-        # Backfill: skip the direction update only on GENUINE collapse — best model got
-        # < MT1_DIR_MIN_CORRECT of the window's days' direction right (random ~5/10, rarely trips).
-        # Mirror of C++; replaces the unreachable score floor that deadlocked the pool.
-        if pool_id == 0 and dir_hist and dir_max_correct < MT1_DIR_MIN_CORRECT:
-            log(f"[mt1/{sn(industry)}:dir] max_correct={dir_max_correct} < {MT1_DIR_MIN_CORRECT} — backfill: keeping yesterday's elites")
-            del hist_cands
+        # Direction collapse backfill: keep yesterday's elites on genuine collapse.
+        if comp == 0 and dir_max_correct < MT1_DIR_MIN_CORRECT:
+            log(f"[mt1/{sn(industry)}:dir] max_correct={dir_max_correct} < {MT1_DIR_MIN_CORRECT} "
+                f"— backfill: keeping yesterday's tail elites")
             continue
 
         hist_offset = MT1_COMP_SLOTS
-        if pool_id != 0:
-            sort_scores      = scores   # pure balanced score
+        if comp != 0:
+            sort_scores = scores
             hist_with_scores = [(hm, sc) for (hm, sc, _, _) in hist_cands]
         else:
-            # Direction two-half selection (mirror of C++). Unified candidate list keyed by id
-            # (slot, or hist_offset+i), compute the elite ORDER, then encode it as synthetic scores
-            # so the score-sorting helper reproduces the order (no helper change needed).
-            cand = {}   # id -> (score, n_correct, today)
+            # Direction two-half selection (mirror of C++ / old component path).
+            cand = {}
             for slot, sc in scores:
                 cand[slot] = (sc, dir_ncorr.get(slot, 0), dir_today.get(slot, 0))
             for i, (_hm, sc, nc, td) in enumerate(hist_cands):
                 cand[hist_offset + i] = (sc, nc, td)
-            ids        = list(cand.keys())
+            ids = list(cand.keys())
             by_score   = sorted(ids, key=lambda k: cand[k][0], reverse=True)
             by_correct = sorted(ids, key=lambda k: (cand[k][1], cand[k][0]), reverse=True)
             order, taken = [], set()
             slot0 = by_score[0] if by_score else None
             for k in by_score:
-                if cand[k][2]:          # got today's direction right
+                if cand[k][2]:
                     slot0 = k; break
             if slot0 is not None:
                 order.append(slot0); taken.add(slot0)
-            score_target = 1 + ELITE_COUNT // 2   # slot0 + 8 from the score half
+            score_target = 1 + ELITE_COUNT // 2
             for k in by_score:
                 if len(order) >= score_target: break
                 if k not in taken: order.append(k); taken.add(k)
-            for k in by_correct:                  # correct half (viability + diversity)
+            for k in by_correct:
                 if len(order) >= ELITE_COUNT: break
                 if k not in taken: order.append(k); taken.add(k)
-            for k in by_score:                    # gap-fill
+            for k in by_score:
                 if len(order) >= ELITE_COUNT: break
                 if k not in taken: order.append(k); taken.add(k)
             BIG = 1e9
-            syn = {k: cand[k][0] for k in ids}    # non-elites keep real score
+            syn = {k: cand[k][0] for k in ids}
             for rank, k in enumerate(order):
-                syn[k] = BIG - rank               # elites: big, in order
-            sort_scores      = [(slot, syn[slot]) for slot, _ in scores]
-            hist_with_scores = [(hm, syn[hist_offset + i]) for i, (hm, _sc, _nc, _td) in enumerate(hist_cands)]
+                syn[k] = BIG - rank
+            sort_scores = [(slot, syn[slot]) for slot, _ in scores]
+            hist_with_scores = [(hm, syn[hist_offset + i])
+                                for i, (hm, _s, _n, _t) in enumerate(hist_cands)]
 
-        new_elites, new_wavgs = _select_and_mutate_mt1_component(
-            prefix, model_dir, sort_scores, pool_sigmas[pool_id], hist_models=hist_with_scores)
-        del hist_with_scores, hist_cands
+        new_elites, new_wavgs = _ht_select_and_mutate(
+            prefix, model_dir, MT1Tail, sort_scores, tail_sigmas[comp], hist_models=hist_with_scores)
+        _ht_save_hist(prefix, model_dir, MT1Tail, new_elites, new_wavgs)
+        del new_elites, new_wavgs, hist_cands, hist_models
 
-        # Save history for this component pool
-        _save_comp_pool_hist(industry, pool_name, model_dir, new_elites, new_wavgs)
-        del new_elites
+    # ── Head phase (every MT1_BLOCK_DAYS runs): freeze the just-updated tails, evolve head ──
+    block_ctr = int(ind_rs.get('block_ctr', 0))
+    do_head = n_win > 0 and (block_ctr % MT1_BLOCK_DAYS == 0)
+    if do_head:
+        tails_frozen = [load_slot_model(tp, model_dir, 0, MT1Tail) for tp in tail_prefixes]
+        for t in tails_frozen:
+            t.eval()
 
-        for burst_num in range(4):
-            _mt1_burst_component(prefix, model_dir, dir_hist, actual_d,
-                                  acc_floor, range_ceiling,
-                                  pool_sigmas[pool_id] / (2 ** (burst_num + 1)), pool_id)
+        def _score_head(cand):
+            cand.eval(); total = 0.0
+            with torch.inference_mode():
+                for di, (feat_t, ad) in enumerate(dir_hist):
+                    c = cand(feat_t)
+                    out4 = torch.tensor([tails_frozen[k](c).reshape(-1)[0].item() for k in range(4)])
+                    total += _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)[0] \
+                        * mt1_win_weight(di, n_win)
+            return total
 
-        # Blended injection: 1/3 inject_src + 2/3 dest_w5 (wavg-5 of new elites)
-        # If live_count == 0 (all culled), use direct copy instead of blending.
-        # dest_w5 is new_wavgs[0] (the top-5 wavg blend from _select_and_mutate_mt1_component).
-        dest_w5 = new_wavgs[0] if new_wavgs else None
-        del new_wavgs
+        scores = []
+        for slot in range(MT1_COMP_SLOTS):
+            m = load_slot_model(head_prefix, model_dir, slot, MT1Head)
+            scores.append((slot, _score_head(m)))
+            del m
+        hist_models = _ht_load_hist(head_prefix, model_dir, MT1Head)
+        hist_with_scores = [(hm, _score_head(hm)) for hm in hist_models]
+        new_elites, new_wavgs = _ht_select_and_mutate(
+            head_prefix, model_dir, MT1Head, scores, head_sigma, hist_models=hist_with_scores)
+        _ht_save_hist(head_prefix, model_dir, MT1Head, new_elites, new_wavgs)
+        best_head_sc = max((sc for _, sc in scores), default=0.0)
+        log(f"[mt1/{sn(industry)}:head] block cycle (ctr={block_ctr}) — best={best_head_sc:.4f}")
+        del new_elites, new_wavgs, hist_models, tails_frozen
 
-        # Direction pool: save top-5 for accuracy pool injection next day (blended)
-        if pool_id == 0:
-            for k in range(MT1_COMP_INJECT):
-                src_path = os.path.join(model_dir, inject_src_pattern.format(k))
-                dst_path = os.path.join(model_dir, f'mt1_{industry}_dir_inject_{k}.pt')
-                elite_path = os.path.join(model_dir, f'{prefix}_elite_{k}.pt')
-                if os.path.exists(elite_path):
-                    try:
-                        elite_m = MT1NN()
-                        elite_m.load_state_dict(torch.load(elite_path, weights_only=True))
-                        if live_count == 0 or dest_w5 is None or not os.path.exists(src_path):
-                            torch.save(elite_m.state_dict(), dst_path)
-                        else:
-                            src_m = MT1NN()
-                            src_m.load_state_dict(torch.load(src_path, weights_only=True))
-                            src_st  = src_m.state_dict()
-                            dst_st  = dest_w5.state_dict()
-                            blend_st = {}
-                            for key in src_st:
-                                vs, vd = src_st[key], dst_st[key]
-                                if torch.is_floating_point(vs):
-                                    blend_st[key] = (1.0/3.0) * vs.float() + (2.0/3.0) * vd.float()
-                                else:
-                                    blend_st[key] = vs.clone()
-                            bm = MT1NN(); bm.load_state_dict(blend_st)
-                            torch.save(bm.state_dict(), dst_path)
-                            del src_m, bm, blend_st
-                        del elite_m
-                    except Exception:
-                        pass
+    ind_rs['block_ctr'] = block_ctr + 1
 
-        # Range pool: save top-5 for confidence pool injection next day (blended)
-        if pool_id == 2:
-            for k in range(MT1_RANGE_INJECT):
-                src_path = os.path.join(model_dir, inject_src_pattern.format(k))
-                dst_path = os.path.join(model_dir, f'mt1_{industry}_rng_inject_{k}.pt')
-                elite_path = os.path.join(model_dir, f'{prefix}_elite_{k}.pt')
-                if os.path.exists(elite_path):
-                    try:
-                        elite_m = MT1NN()
-                        elite_m.load_state_dict(torch.load(elite_path, weights_only=True))
-                        if live_count == 0 or dest_w5 is None or not os.path.exists(src_path):
-                            torch.save(elite_m.state_dict(), dst_path)
-                        else:
-                            src_m = MT1NN()
-                            src_m.load_state_dict(torch.load(src_path, weights_only=True))
-                            src_st  = src_m.state_dict()
-                            dst_st  = dest_w5.state_dict()
-                            blend_st = {}
-                            for key in src_st:
-                                vs, vd = src_st[key], dst_st[key]
-                                if torch.is_floating_point(vs):
-                                    blend_st[key] = (1.0/3.0) * vs.float() + (2.0/3.0) * vd.float()
-                                else:
-                                    blend_st[key] = vs.clone()
-                            bm = MT1NN(); bm.load_state_dict(blend_st)
-                            torch.save(bm.state_dict(), dst_path)
-                            del src_m, bm, blend_st
-                        del elite_m
-                    except Exception:
-                        pass
-
-        del dest_w5
-
-    # ── Composite pool ───────────────────────────────────────────────────────────
-    # Load ELITE_COUNT direct elites from each component pool (ranks 0–16)
-    elites_by_pool = []
-    for pool_name in MT1_POOL_NAMES:
-        prefix      = f'mt1_{industry}_{pool_name}'
-        pool_elites = [load_slot_model(prefix, model_dir, rank, MT1NN)
-                       for rank in range(ELITE_COUNT)]
-        elites_by_pool.append(pool_elites)
-
-    # Generate MT1_BLEND_SLOTS composite blends via position-weighted averaging
-    blend_scored = []
-    for _ in range(MT1_BLEND_SLOTS):
-        sources = []
-        for pool_elites in elites_by_pool:
-            r1, r2 = sorted(random.sample(range(ELITE_COUNT), 2))
-            sources.append((r1, pool_elites[r1]))
-            sources.append((r2, pool_elites[r2]))
-        weights = [20 - r for r, _ in sources]
-        w_sum   = sum(weights)
-        weights = [w / w_sum for w in weights]
-        avg_st  = None
-        for wi, (_, m) in zip(weights, sources):
-            state = m.state_dict()
-            if avg_st is None:
-                avg_st = {k: (v.clone().float() * wi if torch.is_floating_point(v) else v.clone())
-                          for k, v in state.items()}
-            else:
-                for k, v in state.items():
-                    if torch.is_floating_point(v) and k in avg_st:
-                        avg_st[k] = avg_st[k] + v.float() * wi
-        bm = MT1NN()
-        bm.load_state_dict(avg_st)
-        bm.eval()
-        total_sum = 0.0
-        with torch.inference_mode():
-            for di, (feat_t, ad) in enumerate(dir_hist):
-                is_today = (di == len(dir_hist) - 1)
-                out4 = bm(feat_t).squeeze(0)
-                day_sc = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)[0]
-                total_sum += day_sc * mt1_win_weight(di, len(dir_hist))
-        comp_sc = total_sum
-        blend_scored.append((bm, comp_sc))
-        del avg_st
-
-    for pool_elites in elites_by_pool:
-        del pool_elites
-    del elites_by_pool
-
-    # Load composite history candidates and score against today's actual_d
-    hist_meta_path  = os.path.join(model_dir, f'{comp_prefix}_hist_meta.json')
-    hist_candidates = []
-    if os.path.exists(hist_meta_path):
-        try:
-            with open(hist_meta_path) as f:
-                hist_meta = json.load(f)
-            h_head = hist_meta.get('head', 0)
-            h_count = hist_meta.get('count', 0)
-            n_days  = min(h_count, HIST_DAYS)
-            for d in range(n_days):
-                day_slot = (h_head - n_days + d) % HIST_DAYS
-                for pos in range(HIST_PER_DAY):
-                    hp = os.path.join(model_dir, f'{comp_prefix}_hist_{day_slot}_{pos}.pt')
-                    if os.path.exists(hp):
-                        try:
-                            hm = MT1NN()
-                            hm.load_state_dict(torch.load(hp, weights_only=True))
-                            hm.eval()
-                            total_sum = 0.0
-                            with torch.inference_mode():
-                                for di, (feat_t, ad) in enumerate(dir_hist):
-                                    is_today = (di == len(dir_hist) - 1)
-                                    out4 = hm(feat_t).squeeze(0)
-                                    day_sc = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)[0]
-                                    total_sum += day_sc * mt1_win_weight(di, len(dir_hist))
-                            comp_sc = total_sum
-                            hist_candidates.append((hm, comp_sc))
-                        except Exception:
-                            pass
-        except Exception:
-            pass
-
-    all_candidates = blend_scored + hist_candidates
-    all_candidates.sort(key=lambda x: x[1], reverse=True)
-
-    best_comp_model = all_candidates[0][0]
-    best_comp_score = all_candidates[0][1]
-
-    log(f"[mt1/{sn(industry)}:comp] best={best_comp_score:.4f} actual_d=${actual_d:+.1f} "
-        f"acc_floor=${acc_floor:.1f} n_hist={len(hist_candidates)}")
-
-    slot0_conf, slot0_delta_t, slot0_range_pct, slot0_conf4 = _mt1_decode(best_comp_model, in37_t)
-    comp0_delta_d  = slot0_delta_t * MT1_SCALE_DOLLARS
-    comp0_residual = abs(actual_d - comp0_delta_d)
-
-    # Save best composite model as _best.pt for production inference
+    # ── Compose production best from the new head0 + new tail0 ──
+    best = MT1NN()
+    nh = load_slot_model(head_prefix, model_dir, 0, MT1Head)
+    best.head.load_state_dict(nh.state_dict())
+    for c, tp in enumerate(tail_prefixes):
+        nt = load_slot_model(tp, model_dir, 0, MT1Tail)
+        best.tails[c].load_state_dict(nt.state_dict())
+    best.eval()
     try:
-        torch.save(best_comp_model.state_dict(), best_path)
+        torch.save(best.state_dict(), best_path)
     except Exception as e:
         log(f"WARNING: could not save mt1_{industry}_best.pt: {e}")
 
-    # Save top MT1_COMP_INJECT models for next-day direction + range injection (slots 20–24)
-    for k in range(min(MT1_COMP_INJECT, len(all_candidates))):
-        cp = os.path.join(model_dir, f'mt1_{industry}_comp_inject_{k}.pt')
-        try:
-            torch.save(all_candidates[k][0].state_dict(), cp)
-        except Exception as e:
-            log(f"WARNING: could not save mt1_{industry}_comp_inject_{k}: {e}")
-
-    # Save top HIST_PER_DAY composite models to circular history (5 days × 10/day)
-    if os.path.exists(hist_meta_path):
-        try:
-            with open(hist_meta_path) as f:
-                hist_meta = json.load(f)
-        except Exception:
-            hist_meta = {'head': 0, 'count': 0}
-    else:
-        hist_meta = {'head': 0, 'count': 0}
-    h_head  = hist_meta.get('head', 0)
-    h_count = hist_meta.get('count', 0)
-    day_slot = h_head % HIST_DAYS
-    for pos, (hm, _) in enumerate(all_candidates[:HIST_PER_DAY]):
-        hp = os.path.join(model_dir, f'{comp_prefix}_hist_{day_slot}_{pos}.pt')
-        try:
-            torch.save(hm.state_dict(), hp)
-        except Exception as e:
-            log(f"WARNING: could not save comp hist {day_slot}_{pos}: {e}")
-    try:
-        with open(hist_meta_path, 'w') as f:
-            json.dump({'head': (h_head + 1) % HIST_DAYS,
-                       'count': min(h_count + 1, HIST_DAYS)}, f)
-    except Exception as e:
-        log(f"WARNING: could not save {comp_prefix}_hist_meta: {e}")
-
+    # Composed slot0 activations + windowed composite score + rolling update.
+    best_score = 0.0
+    with torch.inference_mode():
+        out4 = best(in37_t).squeeze(0)
+        for di, (feat_t, ad) in enumerate(dir_hist):
+            o4d = best(feat_t).squeeze(0)
+            best_score += _mt1_score_breakdown(o4d, ad, acc_floor, range_ceiling)[0] \
+                * mt1_win_weight(di, n_win)
+    slot0_conf      = torch.sigmoid(out4[0]).item()
+    slot0_delta_t   = torch.tanh(out4[1]).item()
+    slot0_range_pct = F.softplus(out4[2]).item()
+    slot0_conf4     = torch.sigmoid(out4[3]).item()
+    comp0_residual  = abs(actual_d - slot0_delta_t * MT1_SCALE_DOLLARS)
     _rolling_update(ind_rs, abs(actual_d), comp0_residual)
 
-    del blend_scored, hist_candidates, all_candidates
+    log(f"[mt1/{sn(industry)}] best={best_score:.4f} actual_d=${actual_d:+.1f} "
+        f"acc_floor=${acc_floor:.1f} head_cycle={'Y' if do_head else 'n'}")
+
     gc.collect()
-
-    # Direction-pool slot0 activations (MT2 direction-feed source; mirror of C++ dir0_*)
-    try:
-        dir0_model = load_slot_model(f'mt1_{industry}_dir', model_dir, 0, MT1NN)
-        d0_conf, d0_delta_t, d0_range_pct, d0_conf4 = _mt1_decode(dir0_model, in37_t)
-        del dir0_model
-    except Exception:
-        d0_conf, d0_delta_t, d0_range_pct, d0_conf4 = (slot0_conf, slot0_delta_t,
-                                                       slot0_range_pct, slot0_conf4)
-
-    return (best_comp_score, best_comp_score, slot0_conf, slot0_delta_t, slot0_range_pct,
-            slot0_conf4, d0_conf, d0_delta_t, d0_range_pct, d0_conf4)
+    return (best_score, best_score, slot0_conf, slot0_delta_t, slot0_range_pct, slot0_conf4,
+            slot0_conf, slot0_delta_t, slot0_range_pct, slot0_conf4)
 
 
 # ── MT2 upkeep ─────────────────────────────────────────────────────────────────
@@ -1499,24 +1379,12 @@ def run_mt_inference(model_dir, industries, mkt_val_history, zero_counts, total_
         mt1_outputs[ind] = (conf, delta_t, range_pct, conf4)
         del mt1_m
 
-    # Build in48 for MT2: direction-pool slot0 when MT2_FEED_DIRECTION (mirror of C++), else
-    # composite. Uses mt1_{ind}_dir_best.pt; falls back to composite if absent (convert_weights.py
-    # must emit dir_best for this path to activate — until then it degrades to composite cleanly).
-    from training_lib import MT2_FEED_DIRECTION
+    # Build in48 for MT2 from the composed production MT1 (head0+tail0). In the heads/tails design
+    # there is a single production model, so the composite and direction feeds are identical and the
+    # MT2_FEED_DIRECTION toggle is moot (Increment 4C).
     in48 = []
-    for i, ind in enumerate(industry_list):
-        feed = mt1_outputs[ind]
-        if MT2_FEED_DIRECTION:
-            dpath = os.path.join(model_dir, f"mt1_{ind}_dir_best.pt")
-            if os.path.exists(dpath):
-                try:
-                    dm = MT1NN(); dm.load_state_dict(torch.load(dpath, weights_only=True)); dm.eval()
-                    with torch.no_grad():
-                        feed = _mt1_decode(dm, today444[:, i * 37:(i + 1) * 37])
-                    del dm
-                except Exception:
-                    feed = mt1_outputs[ind]
-        in48.extend(list(feed))
+    for ind in industry_list:
+        in48.extend(list(mt1_outputs[ind]))
     in48_t = torch.tensor(in48, dtype=torch.float32).unsqueeze(0)   # (1, 48)
 
     mt2_path = os.path.join(model_dir, 'mt2_best.pt')
