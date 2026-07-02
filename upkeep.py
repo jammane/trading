@@ -47,19 +47,12 @@ from training_lib import (
     HIST_PER_DAY,
     HIST_WAVG,
     IND_STARTING_CASH,
-    MT1_BLEND_SLOTS,
-    MT1_COMP_CHILDREN,
-    MT1_COMP_INJECT,
-    MT1_COMP_PARENTS,
     MT1_COMP_SLOTS,
-    MT1_DIR_BACKFILL,
     MT1_DIR_DAYS,
-    MT1_DIR_SKILL_FLOOR,
     MT1_DIR_MIN_CORRECT,
     MT1_POOL_NAMES,
     MT1_RANGE_CEIL_MULT,
     MT1_RANGE_FLOOR,
-    MT1_RANGE_INJECT,
     N_SLOTS,
     WAVG_COUNT,
     _master_points,
@@ -89,12 +82,6 @@ MT1_FLOOR_COLD    = 250.0     # acc_floor cold-start (÷2 = $125)
 MT1_ROLLING_DAYS  = 10        # days in rolling buffers
 MT2_INJ_THRESHOLD = -7.0      # injection fires when ≥75% of pool below this
 MT2_INJ_MIN_BELOW = int(N_SLOTS * 0.75)  # 150 of 200
-
-# Weighted children per parent for (legacy) MT1 component pools (mirror of C++ kChildren): slot0=13,
-# slots1-4=11/11/10/10, slots5-19=7, injected slots20-24=3. Sums to 175 = MT1_COMP_SLOTS-PARENTS.
-_MT1_CHILDREN     = [13, 11, 11, 10, 10] + [7] * 12 + [7] * 3 + [3] * 5
-MT1_PARENT_OF_MUT = [p for p, c in enumerate(_MT1_CHILDREN) for _ in range(c)]
-assert len(MT1_PARENT_OF_MUT) == MT1_COMP_SLOTS - MT1_COMP_PARENTS, "MT1 children table must sum to 175"
 
 # ── Heads/tails pool layout (Increment 4B) ──────────────────────────────────────
 # One shared head pool + 4 specialized tail pools per industry. No injection slots — the shared
@@ -187,146 +174,6 @@ def _select_and_mutate(prefix, model_dir, model_class, scores, sigma):
         del parent
 
     return elite_slots, elite_vals
-
-
-def _select_and_mutate_mt1_component(prefix, model_dir, scores, sigma,
-                                       hist_models=None):
-    """
-    Elite selection + mutation for one MT1 component pool (200 slots).
-
-    scores:      list of (slot, cat_score) — culled slots have score=-1e30.
-    hist_models: optional list of (MT1NN, cat_score) for history candidates
-                 (no culling applied — they are unconditional safety-net entries).
-
-    Slot layout after selection:
-      0–16   direct elites (ELITE_COUNT)
-      17–19  wavg blends   (WAVG_COUNT: top-5, top-10, top-15)
-      20–24  injection slots (MT1_COMP_INJECT) — written by caller after this call
-      25–199 mutations (MT1_COMP_CHILDREN=7 per parent, round-robin over 25 parents)
-    Returns (new_elite_models, new_wavg_models) — lists of loaded MT1NN objects for
-    the HIST_ELITE direct elites and HIST_WAVG wavg models (for history saving by caller).
-    """
-    # Build combined candidate list: live slots + history candidates
-    # History candidates use sentinel slot indices >= MT1_COMP_SLOTS
-    all_scores = list(scores)  # (slot_idx, score)
-    hist_offset = MT1_COMP_SLOTS
-    if hist_models:
-        for h_idx, (hm, hsc) in enumerate(hist_models):
-            all_scores.append((hist_offset + h_idx, hsc))
-
-    sorted_scores = sorted(all_scores, key=lambda x: x[1], reverse=True)
-    top_entries = sorted_scores[:ELITE_COUNT]
-    while len(top_entries) < ELITE_COUNT:
-        top_entries.append(top_entries[0])
-
-    # Build cache: live slots loaded from disk, history models from hist_models list
-    live_slots_needed = {s for s, _ in top_entries if s < hist_offset}
-    cache = {s: load_slot_model(prefix, model_dir, s, MT1NN) for s in live_slots_needed}
-    hist_cache = {}
-    if hist_models:
-        for h_idx, (hm, _) in enumerate(hist_models):
-            hist_cache[hist_offset + h_idx] = hm
-
-    for rank, (s, _) in enumerate(top_entries):
-        m = cache[s] if s < hist_offset else hist_cache[s]
-        save_slot_model(prefix, model_dir, rank, m)
-
-    # Wavg blends: equal-weight average of top 5, 10, 15 direct elites
-    new_wavg_models = []
-    for b, k in enumerate([5, 10, 15]):
-        inv_k  = 1.0 / k
-        avg_st = None
-        for rank in range(k):
-            m     = load_slot_model(prefix, model_dir, rank, MT1NN)
-            state = m.state_dict()
-            del m
-            if avg_st is None:
-                avg_st = {key: (v.clone().float() * inv_k if torch.is_floating_point(v) else v.clone())
-                          for key, v in state.items()}
-            else:
-                for key, v in state.items():
-                    if torch.is_floating_point(v) and key in avg_st:
-                        avg_st[key] = avg_st[key] + v.float() * inv_k
-        wm = MT1NN(); wm.load_state_dict(avg_st)
-        save_slot_model(prefix, model_dir, ELITE_COUNT + b, wm)
-        new_wavg_models.append(wm)
-        del avg_st
-
-    # Injection slots 20–24: written by caller after this call
-
-    del cache
-
-    # Mutations: weighted children per parent (mirror of C++ kChildren) — concentrate breeding on
-    # proven elites (slot0=13, slots1-4=11/11/10/10, slots5-19=7) and starve unproven injected
-    # immigrants (slots 20-24 = 3 each). Sums to 175 = MT1_COMP_SLOTS - MT1_COMP_PARENTS.
-    for i, slot in enumerate(range(MT1_COMP_PARENTS, MT1_COMP_SLOTS)):
-        parent_rank = MT1_PARENT_OF_MUT[i]
-        parent = load_slot_model(prefix, model_dir, parent_rank, MT1NN)
-        child  = _mutate_generic(parent, MT1NN, sigma)
-        save_slot_model(prefix, model_dir, slot, child)
-        del parent, child
-
-    # Return top HIST_ELITE elites and HIST_WAVG wavg models for history saving
-    new_elites = [load_slot_model(prefix, model_dir, k, MT1NN) for k in range(HIST_ELITE)]
-    return new_elites, new_wavg_models[:HIST_WAVG]
-
-
-def _load_comp_pool_hist_models(industry, pool_name, model_dir):
-    """Load MT1 component pool history models. Returns list of MT1NN models (may be empty)."""
-    meta_path = os.path.join(model_dir, f'mt1_{industry}_{pool_name}_hist_meta.json')
-    models = []
-    try:
-        with open(meta_path) as f:
-            meta = json.load(f)
-        head  = meta.get('head', 0)
-        count = meta.get('count', 0)
-        n_days = min(count, HIST_DAYS)
-        for d in range(n_days):
-            day_slot = (head - n_days + d) % HIST_DAYS
-            for pos in range(HIST_PER_DAY):
-                hp = os.path.join(model_dir,
-                                  f'mt1_{industry}_{pool_name}_hist_{day_slot}_{pos}.pt')
-                if os.path.exists(hp):
-                    try:
-                        m = MT1NN()
-                        m.load_state_dict(torch.load(hp, weights_only=True))
-                        models.append(m)
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-    return models
-
-
-def _save_comp_pool_hist(industry, pool_name, model_dir, new_elites, new_wavgs):
-    """Save top HIST_ELITE elites + HIST_WAVG wavg models to component pool history."""
-    meta_path = os.path.join(model_dir, f'mt1_{industry}_{pool_name}_hist_meta.json')
-    try:
-        with open(meta_path) as f:
-            meta = json.load(f)
-        head, count = meta.get('head', 0), meta.get('count', 0)
-    except Exception:
-        head, count = 0, 0
-    for k, m in enumerate(new_elites[:HIST_ELITE]):
-        hp = os.path.join(model_dir, f'mt1_{industry}_{pool_name}_hist_{head}_{k}.pt')
-        try:
-            torch.save(m.state_dict(), hp)
-        except Exception:
-            pass
-    for k, m in enumerate(new_wavgs[:HIST_WAVG]):
-        hp = os.path.join(model_dir,
-                          f'mt1_{industry}_{pool_name}_hist_{head}_{HIST_ELITE + k}.pt')
-        try:
-            torch.save(m.state_dict(), hp)
-        except Exception:
-            pass
-    head  = (head + 1) % HIST_DAYS
-    count = min(count + 1, HIST_DAYS)
-    try:
-        with open(meta_path, 'w') as f:
-            json.dump({'head': head, 'count': count}, f)
-    except Exception:
-        pass
 
 
 # ── MT1 rolling floor ─────────────────────────────────────────────────────────
@@ -496,132 +343,6 @@ def _mt1_decode(model, in37_t):
 
 
 # ── MT1 burst refinement ───────────────────────────────────────────────────────
-
-def _mt1_burst_component(prefix, model_dir, dir_hist, actual_d,
-                          acc_floor, range_ceiling, burst_sigma, score_idx):
-    """
-    One burst refinement pass for one MT1 component pool.
-
-    score_idx: 0=direction 1=accuracy 2=range 3=confidence
-    Uses 5-day summed scoring from dir_hist; today (last entry) is doubled.
-    Applies same culls as main scoring (range ceiling for pool 2/3,
-    alignment for pool 1). Generates 10 mutants per MT1_COMP_PARENTS (25)
-    parent elites, merges top-ELITE_COUNT with current elites (cap: 2 replacements).
-    """
-    # breakdown tuple: (composite, dir, rng, acc, conf) → pick component score
-    _sc_idx = [1, 3, 2, 4][score_idx]
-    dir_dw, _ = _dir_day_weights(dir_hist) if dir_hist else ([], 0.0)   # class-balanced direction weights
-
-    def _score_multiday(m):
-        total = 0.0
-        culled = False
-        prev_conf_pos, prev_act_pos = None, None
-        conf_crossings, market_flips = 0, 0
-        with torch.inference_mode():
-            for di, (feat_t, ad) in enumerate(dir_hist):
-                if culled:
-                    break
-                is_today = (di == len(dir_hist) - 1)
-                out4 = m(feat_t).squeeze(0)
-                conf    = torch.sigmoid(out4[0]).item()
-                delta_d = torch.tanh(out4[1]).item() * MT1_SCALE_DOLLARS
-                rng_pct = F.softplus(out4[2]).item()
-                r_raw   = rng_pct * max(abs(delta_d), MT1_RANGE_FLOOR)
-                if (score_idx == 2 or score_idx == 3) and range_ceiling is not None:
-                    if r_raw > range_ceiling:
-                        culled = True; break
-                # (accuracy-pool sign-alignment cull removed — magnitude graded signless)
-                if score_idx == 0:
-                    conf_pos = conf >= 0.5
-                    act_pos  = ad >= 0.0
-                    day_score = conf if act_pos else (1.0 - conf)
-                    if prev_conf_pos is not None and conf_pos != prev_conf_pos:
-                        conf_crossings += 1
-                    if prev_act_pos is not None and act_pos != prev_act_pos:
-                        market_flips += 1
-                    prev_conf_pos = conf_pos
-                    prev_act_pos  = act_pos
-                elif score_idx == 1:
-                    err = abs(abs(ad) - abs(delta_d))   # signless: magnitude graded independent of sign
-                    day_score = acc_floor / (err + acc_floor)
-                else:
-                    bd = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)
-                    day_score = bd[_sc_idx]
-                total += day_score * (dir_dw[di] if score_idx == 0 else mt1_win_weight(di, len(dir_hist)))
-        if not culled and score_idx == 0 and len(dir_hist) >= 2:
-            required = market_flips // 2   # floor: no cull at market_flips<=1 (mirror of C++)
-            if conf_crossings < required:
-                culled = True
-        return -1e30 if culled else total
-
-    burst_candidates = []
-    for elite_slot in range(MT1_COMP_PARENTS):
-        parent = load_slot_model(prefix, model_dir, elite_slot, MT1NN)
-        for _ in range(10):
-            child = _mutate_generic(parent, MT1NN, burst_sigma)
-            child.eval()
-            cat_sc = _score_multiday(child)
-            burst_candidates.append((child, cat_sc))
-        del parent
-    burst_candidates.sort(key=lambda x: x[1], reverse=True)
-    top_burst = burst_candidates[:ELITE_COUNT]
-
-    current_elites = []
-    for rank in range(ELITE_COUNT):
-        m = load_slot_model(prefix, model_dir, rank, MT1NN)
-        m.eval()
-        cat_sc = _score_multiday(m)
-        current_elites.append((m, cat_sc))
-
-    burst_ids  = {id(m) for m, _ in top_burst}
-    all_cands  = current_elites + top_burst
-    all_cands.sort(key=lambda x: x[1], reverse=True)
-
-    new_elites  = []
-    burst_count = 0
-    for cand in all_cands:
-        if len(new_elites) >= ELITE_COUNT:
-            break
-        if id(cand[0]) in burst_ids:
-            if burst_count >= 2:
-                continue
-            burst_count += 1
-        new_elites.append(cand)
-
-    prev_best = current_elites[0][1]
-    new_best  = new_elites[0][1]
-    label     = MT1_POOL_NAMES[score_idx]
-    if new_best > prev_best:
-        log(f"[mt1/{sn(prefix[4:])}:{label}] Burst σ={burst_sigma:.5f}: {burst_count} replacement(s), best={new_best:.4f}")
-    else:
-        log(f"[mt1/{sn(prefix[4:])}:{label}] Burst σ={burst_sigma:.5f}: best={new_best:.4f} — no improvement")
-
-    for rank, (m, _) in enumerate(new_elites):
-        save_slot_model(prefix, model_dir, rank, m)
-
-    # Regenerate wavg blend slots 17, 18, 19 (top-5, top-10, top-15)
-    for b, k in enumerate([5, 10, 15]):
-        inv_k  = 1.0 / k
-        avg_st = None
-        for rank in range(k):
-            m     = load_slot_model(prefix, model_dir, rank, MT1NN)
-            state = m.state_dict()
-            del m
-            if avg_st is None:
-                avg_st = {kk: (v.clone().float() * inv_k if torch.is_floating_point(v) else v.clone())
-                          for kk, v in state.items()}
-            else:
-                for kk, v in state.items():
-                    if torch.is_floating_point(v) and kk in avg_st:
-                        avg_st[kk] = avg_st[kk] + v.float() * inv_k
-        wm = MT1NN(); wm.load_state_dict(avg_st)
-        save_slot_model(prefix, model_dir, ELITE_COUNT + b, wm)
-        del wm, avg_st
-
-    del burst_candidates, current_elites, top_burst, all_cands, new_elites
-    gc.collect()
-    return new_best
-
 
 # ── Industry upkeep ────────────────────────────────────────────────────────────
 

@@ -104,31 +104,16 @@ static constexpr int   WAVG_COUNT          = 3;
 static constexpr int   ELITE_POOL          = 20;   // industry + MT2
 static constexpr int   MUTATIONS_PER_PARENT = 9;
 
-// MT1: 5 separate pools (4 component + 1 composite blend).
-// Component pools (dir/acc/rng/cfd): uniform 200 slots each.
-//   Slot layout: 0-16 direct elites | 17-19 wavg | 20-24 injected | 25-199 mutations (7/parent).
-//   Injection cascade: composite→dir, composite→rng, dir→acc, rng→cfd.
-// Composite pool: 200 blends/day (no mutation); 5-day history (10/day).
-static constexpr int   MT1_COMP_INJECT     = 5;      // injection slots per pool (cascade sources)
-static constexpr int   MT1_RANGE_INJECT    = 5;      // range→confidence injection count
-static constexpr int   MT1_COMP_PARENTS    = ELITE_COUNT + WAVG_COUNT + MT1_COMP_INJECT; // 25
-static constexpr int   MT1_COMP_CHILDREN   = 7;      // mutations per parent
-static constexpr int   MT1_COMP_SLOTS      = MT1_COMP_PARENTS * (MT1_COMP_CHILDREN + 1); // 200
-static constexpr int   MT1_BLEND_SLOTS     = 200;
-// Heads/tails pool layout (Increment 2): NO injection slots. The old composite→pool injection
-// existed to propagate one component's learning back to the others; the shared head trunk now
-// does exactly that, so those 5 parent slots are removed and their capacity is redirected into
-// more mutations of the proven elites (see kChildren in step_mt1_pool).
+// MT1 heads/tails: one shared head pool + 4 specialized tail pools per industry, 200 slots each.
+//   Slot layout: 0-16 direct elites | 17-19 wavg blends | 20-199 mutations (NO injection slots —
+//   the shared head propagates cross-component learning; capacity goes into more elite mutations).
+static constexpr int   MT1_COMP_SLOTS      = 200;                           // slots per pool
 static constexpr int   HT_PARENTS          = ELITE_COUNT + WAVG_COUNT;      // 20 (17 elites + 3 wavg)
 static constexpr int   HT_MUTS             = MT1_COMP_SLOTS - HT_PARENTS;   // 180 mutations
 static constexpr float MT1_RANGE_FLOOR     = 1.f;    // $1 — effectively no floor
 static constexpr float MT1_RANGE_CEIL_MULT = 4.f;    // ceiling = 4 × max(mean, today) |actual−comp0_delta|
-static constexpr float MT1_DIR_BACKFILL    = 0.65f;  // skip direction pool update when best score < this
 static constexpr int   MT1_DIR_DAYS        = 10;  // scoring window (all pools): score each model over last N days, linear-weighted sum (oldest=1.0 → today=2.0)
-static constexpr int   MT1_DIR_QUALIFY      = 1;   // (legacy, unused)
-static constexpr int   MT1_DIR_MIN_CORRECT  = 3;   // direction collapse floor: freeze/inject only when the best model got < N of the window's days' direction right (genuine collapse; random ≈ 5/10, so this rarely trips). Skill is optimized by the two-half selection, not this gate.
-static constexpr int   MT1_DIR_STREAK_TRIP  = 5;   // consecutive collapse days before injection fires
-static constexpr int   MT1_DIR_COOLDOWN_LEN = 10;  // cooldown days after injection before re-injection allowed
+static constexpr int   MT1_DIR_MIN_CORRECT  = 3;   // direction collapse floor: freeze the pool only when the best model got < N of the window's days' direction right (genuine collapse; random ≈ 5/10, so this rarely trips). Skill is optimized by the two-half selection, not this gate.
 static constexpr int   HIST_WINDOW         = 15;
 
 static constexpr float IND_STARTING_CASH   = 25000.0f;
@@ -361,26 +346,6 @@ static void master_forward(const float* W, const float* today444, float* out48) 
 }
 
 // MT1NN forward: 37→37→29→20→12→4 (raw logits; activations applied at score time)
-static void mt1_forward(const float* W, const float* in37, float* out4) {
-    // Input slices (Phase-1c layout): B daily [0:10], C decade [10:17], A vol+poly [17:37]
-    const float* xb = in37;        // 10
-    const float* xc = in37 + 10;   // 7
-    const float* xa = in37 + 17;   // 20
-    float a1[20], a2[20], b1[6], b2[4], c1[5], c2[4], cat[28], d1[22], d2[16], d3[10];
-    sgemv_relu(W + MT1_A1_W, W + MT1_A1_B, xa, a1, 20, 20);
-    sgemv_relu(W + MT1_A2_W, W + MT1_A2_B, a1, a2, 20, 20);
-    sgemv_relu(W + MT1_B1_W, W + MT1_B1_B, xb, b1,  6, 10);
-    sgemv_relu(W + MT1_B2_W, W + MT1_B2_B, b1, b2,  4,  6);
-    sgemv_relu(W + MT1_C1_W, W + MT1_C1_B, xc, c1,  5,  7);
-    sgemv_relu(W + MT1_C2_W, W + MT1_C2_B, c1, c2,  4,  5);
-    memcpy(cat,      a2, 20 * sizeof(float));   // concat [A20, B4, C4] = 28
-    memcpy(cat + 20, b2,  4 * sizeof(float));
-    memcpy(cat + 24, c2,  4 * sizeof(float));
-    sgemv_relu(W + MT1_D1_W, W + MT1_D1_B, cat, d1, 22, 28);
-    sgemv_relu(W + MT1_D2_W, W + MT1_D2_B, d1,  d2, 16, 22);
-    sgemv_relu(W + MT1_D3_W, W + MT1_D3_B, d2,  d3, 10, 16);
-    sgemv_only(W + MT1_D4_W, W + MT1_D4_B, d3, out4,  4, 10);
-}
 
 // Shared head trunk: in37 → concat28 (mirrors models.py MT1Head).
 static void head_forward(const float* W, const float* in37, float* concat28) {
@@ -600,40 +565,11 @@ struct MasterScratch {
 // ── MT1/MT2 structures ──────────────────────────────────────────────────────────
 
 struct MT1Scratch {
-    // 4 component pool elite buffers [MT1_COMP_PARENTS × MT1NN_PARAMS each]
-    // pool: 0=dir  1=acc  2=rng  3=cfd (uniform 200-slot layout for all pools)
-    float*   comp_elites[4];
-    float*   new_elites;           // scratch [MT1_COMP_PARENTS × MT1NN_PARAMS]
-    float*   mut_buf;              // [MT1NN_PARAMS]
-    uint64_t mut_seeds[HT_MUTS];  // 180 — covers both the component pool (175) and the head/tail pools
+    // Deterministic per-day mutation seeds — shared scratch for the head + tail pools.
+    uint64_t mut_seeds[HT_MUTS];  // 180 = MT1_COMP_SLOTS - HT_PARENTS
 
-    // Component pool 5-day histories [HIST_DAYS × HIST_PER_DAY × MT1NN_PARAMS each]
-    float*   pool_hist[4];
-    int      pool_hist_head[4]{};
-    int      pool_hist_count[4]{};
-
-    // Composite blend-pool history [HIST_DAYS × HIST_PER_DAY × MT1NN_PARAMS]
-    float*   blend_hist;
-    int      blend_hist_head{0};
-    int      blend_hist_count{0};
-
-    // Injection cascade buffers (populated after each pool step, applied next day)
-    // composite top-5 → direction slots 20–24 AND range slots 20–24
-    float*   comp_inject_buf;
-    int      comp_inject_count{0};
-    // direction top-5 → accuracy slots 20–24
-    float*   dir_inject_buf;
-    int      dir_inject_count{0};
-    // range top-5 → confidence slots 20–24
-    float*   rng_inject_buf;
-    int      rng_inject_count{0};
-
-    // Best composite model weights (saved periodically as comp_0.bin)
-    float*   comp0_buf;
-
-    // ── Heads/tails pools (redesign, Increment 2). Head = shared trunk (HEADNN_PARAMS);
-    //    4 tails = specialized 1-output (TAILNN_PARAMS). Production = head0 + tail0[4]. Added
-    //    alongside the branched pools above; Increment 3 migrates the loop and retires the old. ──
+    // ── Heads/tails pools. Head = shared trunk (HEADNN_PARAMS); 4 tails = specialized 1-output
+    //    (TAILNN_PARAMS). Production model = composed head0 + tail0[4]. ──
     float*   head_elite;          // [MT1_COMP_PARENTS × HEADNN_PARAMS]
     float*   tail_elite[4];       // 4 × [MT1_COMP_PARENTS × TAILNN_PARAMS]  (dir/acc/rng/cfd)
     float*   head_new;            // selection scratch
@@ -662,22 +598,8 @@ struct MT1Scratch {
     int      rolling_count{0};
 
     MT1Scratch() {
-        size_t ep  = (size_t)MT1_COMP_PARENTS * MT1NN_PARAMS;
-        size_t hp  = (size_t)HIST_DAYS * HIST_PER_DAY * MT1NN_PARAMS;
-        for (int p = 0; p < 4; p++) {
-            comp_elites[p] = new float[ep]();
-            pool_hist[p]   = new float[hp]();
-        }
-        new_elites      = new float[ep]();
-        mut_buf         = new float[MT1NN_PARAMS]();
-        blend_hist      = new float[hp]();
-        comp_inject_buf = new float[(size_t)MT1_COMP_INJECT  * MT1NN_PARAMS]();
-        dir_inject_buf  = new float[(size_t)MT1_COMP_INJECT  * MT1NN_PARAMS]();
-        rng_inject_buf  = new float[(size_t)MT1_RANGE_INJECT * MT1NN_PARAMS]();
-        comp0_buf       = new float[MT1NN_PARAMS]();
-        // heads/tails pools
-        size_t hep = (size_t)MT1_COMP_PARENTS * HEADNN_PARAMS;
-        size_t tep = (size_t)MT1_COMP_PARENTS * TAILNN_PARAMS;
+        size_t hep = (size_t)HT_PARENTS * HEADNN_PARAMS;
+        size_t tep = (size_t)HT_PARENTS * TAILNN_PARAMS;
         size_t hhp = (size_t)HIST_DAYS * HIST_PER_DAY * HEADNN_PARAMS;
         size_t thp = (size_t)HIST_DAYS * HIST_PER_DAY * TAILNN_PARAMS;
         head_elite = new float[hep](); head_new = new float[hep](); head_mut = new float[HEADNN_PARAMS]();
@@ -689,26 +611,10 @@ struct MT1Scratch {
         }
     }
     ~MT1Scratch() {
-        for (int p = 0; p < 4; p++) { delete[] comp_elites[p]; delete[] pool_hist[p]; }
-        delete[] new_elites; delete[] mut_buf;
-        delete[] blend_hist; delete[] comp_inject_buf; delete[] dir_inject_buf;
-        delete[] rng_inject_buf; delete[] comp0_buf;
         delete[] head_elite; delete[] head_new; delete[] head_mut; delete[] head_hist; delete[] head0_buf;
         delete[] tail_mut;
         for (int p = 0; p < 4; p++) { delete[] tail_elite[p]; delete[] tail_new[p]; delete[] tail_hist[p]; delete[] tail0_buf[p]; }
     }
-    float* comp_elite(int pool, int slot) { return comp_elites[pool] + (size_t)slot * MT1NN_PARAMS; }
-    float* new_elite(int slot)            { return new_elites         + (size_t)slot * MT1NN_PARAMS; }
-    float* pool_hist_slot(int p, int day, int pos) {
-        return pool_hist[p] + ((size_t)(day * HIST_PER_DAY + pos)) * MT1NN_PARAMS;
-    }
-    float* blend_hist_slot(int day, int pos) {
-        return blend_hist + ((size_t)(day * HIST_PER_DAY + pos)) * MT1NN_PARAMS;
-    }
-    float* comp_inject(int k)  { return comp_inject_buf + (size_t)k * MT1NN_PARAMS; }
-    float* dir_inject(int k)   { return dir_inject_buf  + (size_t)k * MT1NN_PARAMS; }
-    float* rng_inject(int k)   { return rng_inject_buf  + (size_t)k * MT1NN_PARAMS; }
-    // heads/tails accessors
     float* head_e(int slot)            { return head_elite    + (size_t)slot * HEADNN_PARAMS; }
     float* tail_e(int p, int slot)     { return tail_elite[p] + (size_t)slot * TAILNN_PARAMS; }
     float* head_new_e(int slot)        { return head_new      + (size_t)slot * HEADNN_PARAMS; }
@@ -2343,395 +2249,6 @@ static MT1ScoreBreakdown compute_mt1_scores(
 
 struct MT1CompResult { float best, slot0, mean, min_v, mean_correct_dbl; };
 
-static MT1CompResult step_mt1_component(
-    int pool_id, int ind_i, MT1Scratch& scratch,
-    float actual_d, const float in37[37], int actual_day, float sigma,
-    float acc_floor, float range_ceiling)
-{
-    // All pools: uniform 200 slots — 25 parents × (7 children + 1 parent)
-    const int pool_elite = MT1_COMP_PARENTS;        // 25
-    const int pool_slots = MT1_COMP_SLOTS;          // 200
-    const int pool_muts  = pool_slots - pool_elite; // 175
-
-    // Load injection models into slots 20–24 from cascade source (populated previous day)
-    // inject_src is hoisted to function scope so the carry-forward step can blend against it
-    const float* inject_src;
-    {
-        // All four pools inject from the (now balanced, equal-weight) composite top-5.
-        // A balanced composite is an all-rounder, so broadcasting it spreads balanced lessons
-        // instead of the direction-bias the old gated composite caused. dir_inject_buf /
-        // rng_inject_buf are no longer used as cascade sources.
-        inject_src = scratch.comp_inject_buf;
-        (void)pool_id;
-        for (int k = 0; k < MT1_COMP_INJECT; k++)
-            memcpy(scratch.comp_elite(pool_id, ELITE_COUNT + WAVG_COUNT + k),
-                   inject_src + (size_t)k * MT1NN_PARAMS, MT1NN_PARAMS * sizeof(float));
-    }
-
-    // Deterministic mutation seeds (per day + industry + pool)
-    {
-        PCG32 seed_rng;
-        seed_rng.seed((uint64_t)actual_day * 987017ULL +
-                      (uint64_t)ind_i      * 10007ULL  +
-                      (uint64_t)pool_id    *   997ULL  + 11111ULL);
-        for (int i = 0; i < pool_muts; i++)
-            scratch.mut_seeds[i] = ((uint64_t)seed_rng.next() << 32) | seed_rng.next();
-    }
-
-    // Weighted children per parent: concentrate breeding on proven elites, starve unproven
-    // injected immigrants (slots 20-24). slot0=13, slots1-4=11/11/10/10, slots5-19=7,
-    // injected=3. Sums to 175 = pool_muts. Replaces the old uniform 7-per-parent round-robin.
-    static const int kChildren[MT1_COMP_PARENTS] = {
-        13, 11, 11, 10, 10,                     // slot 0 (prod) + top-4 elites = 55
-        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,     // slots 5-16 direct elites      = 84
-        7, 7, 7,                                // slots 17-19 wavg blends       = 21
-        3, 3, 3, 3, 3                           // slots 20-24 injected          = 15
-    };
-    int parent_of_mut[MT1_COMP_SLOTS - MT1_COMP_PARENTS];   // length pool_muts (175)
-    {
-        int idx = 0;
-        for (int p = 0; p < pool_elite && idx < pool_muts; p++)
-            for (int c = 0; c < kChildren[p] && idx < pool_muts; c++)
-                parent_of_mut[idx++] = p;
-        for (; idx < pool_muts; idx++) parent_of_mut[idx] = idx % pool_elite;  // safety pad
-    }
-
-    // get_weights: reconstructs slot weights into dst (elite or mutation)
-    auto get_weights = [&](int slot, float* dst) {
-        if (slot < pool_elite) {
-            memcpy(dst, scratch.comp_elite(pool_id, slot), MT1NN_PARAMS * sizeof(float));
-        } else {
-            int mut_i  = slot - pool_elite;
-            int parent = parent_of_mut[mut_i];
-            memcpy(dst, scratch.comp_elite(pool_id, parent), MT1NN_PARAMS * sizeof(float));
-            apply_gaussian(dst, MT1NN_PARAMS, sigma, scratch.mut_seeds[mut_i]);
-        }
-    };
-
-    // Score all pool_slots with per-pool culls and pool-specific scoring formulas
-    float cat_sc[MT1_COMP_SLOTS];
-    float out4[4];
-
-    int dir_max_correct = 0;
-    // Direction pool: correct-prediction count with today doubled (primary sort key)
-    int dir_correct_dbl[MT1_COMP_SLOTS] = {};
-    int dir_n_correct[MT1_COMP_SLOTS]     = {};   // integer correct-count per slot (direction pool)
-    int dir_today_correct[MT1_COMP_SLOTS] = {};   // 1 if slot got the most-recent day's direction right
-
-    // Class-balanced day weights (direction pool only). Normalize so
-    // up-days and down-days each carry half the window weight; then any constant-prediction model
-    // scores exactly the no-skill baseline dir_W/2 regardless of the absolute target's sign skew.
-    // Other pools (and single-class windows) use plain recency weights. skill_frac = total_sum/dir_W.
-    float day_weight[MT1_DIR_DAYS] = {};
-    float dir_W = 0.f;
-    if (scratch.dir_day_count > 0) {
-        float w_up = 0.f, w_down = 0.f;
-        for (int di = 0; di < scratch.dir_day_count; di++) {
-            float w = mt1_win_weight(di, scratch.dir_day_count);
-            dir_W += w;
-            if (scratch.dir_day(di).actual_d >= 0.f) w_up += w; else w_down += w;
-        }
-        bool balance = (pool_id == 0) && (w_up > 0.f) && (w_down > 0.f);
-        for (int di = 0; di < scratch.dir_day_count; di++) {
-            float w = mt1_win_weight(di, scratch.dir_day_count);
-            day_weight[di] = balance
-                ? w * ((scratch.dir_day(di).actual_d >= 0.f) ? dir_W/(2.f*w_up) : dir_W/(2.f*w_down))
-                : w;
-        }
-    }
-
-    if (scratch.dir_day_count > 0) {
-        for (int slot = 0; slot < pool_slots; slot++) {
-            const float* wptr;
-            if (slot < pool_elite) {
-                wptr = scratch.comp_elite(pool_id, slot);
-            } else {
-                get_weights(slot, scratch.mut_buf);
-                wptr = scratch.mut_buf;
-            }
-
-            float total_sum = 0.f;
-            bool  culled    = false;
-            int   n_correct = 0, n_correct_dbl = 0, conf_crossings = 0, market_flips = 0, today_correct = 0;
-            bool  prev_conf_pos_valid = false, prev_conf_pos = false;
-            bool  prev_act_pos_valid  = false, prev_act_pos  = false;
-
-            for (int di = 0; di < scratch.dir_day_count && !culled; di++) {
-                const auto& e = scratch.dir_day(di);
-                bool is_today = (di == scratch.dir_day_count - 1);
-                mt1_forward(wptr, e.feat37, out4);
-
-                float conf      = 1.f / (1.f + expf(-out4[0]));
-                float delta_d   = tanhf(out4[1]) * MT1_SCALE_DOLLARS;
-                float range_pct = log1pf(expf(out4[2]));
-                float eff_delta = fmaxf(fabsf(delta_d), MT1_RANGE_FLOOR);
-                float r_raw     = range_pct * eff_delta;
-
-                // Range ceiling cull: range (id=2) and confidence (id=3) pools, live slots only
-                if ((pool_id == 2 || pool_id == 3) && range_ceiling < 1e30f)
-                    if (r_raw > range_ceiling) { culled = true; break; }
-
-                // (accuracy-pool sign-alignment cull removed — magnitude is graded signless,
-                //  so the delta sign is decoupled and this cull would arbitrarily drop ~half.)
-
-                float day_score;
-                if (pool_id == 0) {
-                    bool conf_pos = (conf >= 0.5f), act_pos = (e.actual_d >= 0.f);
-                    day_score  = act_pos ? conf : (1.f - conf);
-                    bool correct = (conf_pos == act_pos);
-                    n_correct     += correct ? 1 : 0;
-                    n_correct_dbl += is_today ? (correct ? 2 : 0) : (correct ? 1 : 0);
-                    if (is_today) today_correct = correct ? 1 : 0;
-                    if (prev_conf_pos_valid && conf_pos != prev_conf_pos) conf_crossings++;
-                    if (prev_act_pos_valid  && act_pos  != prev_act_pos)  market_flips++;
-                    prev_conf_pos = conf_pos; prev_conf_pos_valid = true;
-                    prev_act_pos  = act_pos;  prev_act_pos_valid  = true;
-                } else if (pool_id == 1) {
-                    // Accuracy pool: proportional to acc_floor (scale-relative, always in (0,1])
-                    float err = fabsf(fabsf(e.actual_d) - fabsf(delta_d));
-                    day_score = acc_floor / (err + acc_floor);
-                } else {
-                    auto sb = compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling);
-                    day_score = (pool_id == 2) ? sb.range : sb.confidence;
-                }
-                total_sum += day_score * day_weight[di];
-            }
-
-            // Direction flip cull — only in genuinely-choppy windows. required = floor(market_flips/2):
-            // at market_flips 0 or 1 (the common case: autocorrelated forward returns rarely flip)
-            // required=0, so confident trend-followers are NOT culled. At market_flips >= 2, absence
-            // of conf crossings really means "not tracking" and is culled. Was ceil(...) — that
-            // culled 0-crossers at market_flips=1 and drove the collapse under the ABSOLUTE target
-            // (A/B: ceil → 35 collapse injections + full culls; cull off → 8). The balanced scoring
-            // additionally penalizes a missed flip via the heavily-weighted minority-class day.
-            if (!culled && pool_id == 0 && scratch.dir_day_count >= 2) {
-                int required = market_flips / 2;   // floor(market_flips / 2)
-                if (conf_crossings < required) culled = true;
-            }
-
-            cat_sc[slot] = culled ? -1e30f : total_sum;
-            if (!culled && pool_id == 0) {
-                dir_correct_dbl[slot]   = n_correct_dbl;
-                dir_n_correct[slot]     = n_correct;
-                dir_today_correct[slot] = today_correct;
-            }
-            if (!culled && n_correct > dir_max_correct) dir_max_correct = n_correct;
-        }
-    } else {
-        memset(cat_sc, 0, sizeof(cat_sc));
-    }
-
-    // Pool statistics (exclude culled slots)
-    float mean_cat = 0.f, best_cat = -1e30f, min_cat = 1e30f;
-    int   live_count = 0;
-    for (int s = 0; s < pool_slots; s++) {
-        if (cat_sc[s] > -1e29f) {
-            mean_cat += cat_sc[s];
-            if (cat_sc[s] > best_cat) best_cat = cat_sc[s];
-            if (cat_sc[s] < min_cat)  min_cat  = cat_sc[s];
-            live_count++;
-        }
-    }
-    if (live_count > 0) mean_cat /= live_count;
-    if (best_cat < -1e29f) best_cat = 0.f;
-    if (min_cat  >  9e29f) min_cat  = 0.f;
-    float slot0_cat = cat_sc[0] > -1e29f ? cat_sc[0] : 0.f;
-
-    // Mean n_correct_dbl across live direction pool slots (logged to binary log)
-    float mean_cdb = 0.f;
-    if (pool_id == 0 && live_count > 0) {
-        float sum_cdb = 0.f;
-        for (int s = 0; s < pool_slots; s++)
-            if (cat_sc[s] > -1e29f) sum_cdb += (float)dir_correct_dbl[s];
-        mean_cdb = sum_cdb / (float)live_count;
-    }
-
-    // Direction collapse floor: only GENUINE collapse (best model got < MT1_DIR_MIN_CORRECT of the
-    // window's days' direction right) freezes the pool and drives the collapse-injection streak.
-    // Random ≈ 5/10, so a real signal easily clears 3/10 and this rarely trips — a last-resort net,
-    // not a skill gate. Skill is optimized by the balanced SCORE via the two-half selection below
-    // (half of elites by correct-count for viability, half by score for skill). This replaces the
-    // score-based skill floor, which was unreachable and deadlocked the pool (frozen below no-skill).
-    if (pool_id == 0) {
-        if (dir_max_correct < MT1_DIR_MIN_CORRECT) {
-            scratch.dir_streak++;
-            return {best_cat, slot0_cat, mean_cat, min_cat, mean_cdb};
-        }
-        scratch.dir_streak = 0;
-    }
-
-    // Score history candidates (no culling — history is the unconditional safety net)
-    int n_hist = scratch.pool_hist_count[pool_id] * HIST_PER_DAY;
-    float hist_cat_sc[HIST_DAYS * HIST_PER_DAY] = {};
-    int   hist_correct_dbl[HIST_DAYS * HIST_PER_DAY]   = {};
-    int   hist_n_correct[HIST_DAYS * HIST_PER_DAY]     = {};
-    int   hist_today_correct[HIST_DAYS * HIST_PER_DAY] = {};
-    {
-        int total = HIST_DAYS * HIST_PER_DAY;
-        int oldest = (scratch.pool_hist_head[pool_id] * HIST_PER_DAY - n_hist + total) % total;
-        for (int k = 0; k < n_hist; k++) {
-            int abs_pos = (oldest + k) % total;
-            float* hw = scratch.pool_hist[pool_id] + (size_t)abs_pos * MT1NN_PARAMS;
-            float total_sum = 0.f;
-            int   hcdb = 0, h_n_correct = 0, h_today = 0;
-            for (int di = 0; di < scratch.dir_day_count; di++) {
-                const auto& e = scratch.dir_day(di);
-                bool is_today = (di == scratch.dir_day_count - 1);
-                mt1_forward(hw, e.feat37, out4);
-                float day_score;
-                if (pool_id == 0) {
-                    float conf      = 1.f / (1.f + expf(-out4[0]));
-                    bool actual_pos = (e.actual_d >= 0.f);
-                    bool conf_pos   = (conf >= 0.5f);
-                    bool correct    = (conf_pos == actual_pos);
-                    day_score = actual_pos ? conf : (1.f - conf);
-                    hcdb += is_today ? (correct ? 2 : 0) : (correct ? 1 : 0);
-                    h_n_correct += correct ? 1 : 0;
-                    if (is_today) h_today = correct ? 1 : 0;
-                } else if (pool_id == 1) {
-                    float delta_d = tanhf(out4[1]) * MT1_SCALE_DOLLARS;
-                    float err     = fabsf(fabsf(e.actual_d) - fabsf(delta_d));
-                    day_score = acc_floor / (err + acc_floor);
-                } else {
-                    auto sb = compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling);
-                    day_score = (pool_id == 2) ? sb.range : sb.confidence;
-                }
-                total_sum += day_score * day_weight[di];
-            }
-            hist_cat_sc[k]        = total_sum;
-            hist_correct_dbl[k]   = hcdb;
-            hist_n_correct[k]     = h_n_correct;
-            hist_today_correct[k] = h_today;
-        }
-    }
-
-    // Build candidate list. Direction (pool 0) carries correct-count keys for the two-half select.
-    struct Cand { float score; int n_correct; int today; bool is_hist; int idx; };
-    std::vector<Cand> cands;
-    cands.reserve(pool_slots + n_hist);
-    for (int s = 0; s < pool_slots; s++)
-        cands.push_back({cat_sc[s], dir_n_correct[s], dir_today_correct[s], false, s});
-    for (int k = 0; k < n_hist; k++)
-        cands.push_back({hist_cat_sc[k], hist_n_correct[k], hist_today_correct[k], true, k});
-
-    // Elite ORDER (candidate indices for slots 0..ELITE_COUNT-1).
-    std::vector<int> order; order.reserve(ELITE_COUNT);
-    std::vector<int> by_score(cands.size());
-    for (int i = 0; i < (int)cands.size(); i++) by_score[i] = i;
-    std::sort(by_score.begin(), by_score.end(),
-              [&](int a, int b){ return cands[a].score > cands[b].score; });
-
-    if (pool_id != 0) {
-        // Non-direction pools: pure balanced score.
-        for (int i : by_score) { if ((int)order.size() >= ELITE_COUNT) break; order.push_back(i); }
-    } else {
-        // Direction two-half selection (mirror in upkeep.py):
-        //   slot0                 = highest-SCORE candidate that ALSO got today's direction right
-        //                           (fallback: highest score) — the production/MT2 feed is balanced-
-        //                           skilled AND currently correct.
-        //   score half (…9 total) = next by balanced score (seeks real skill).
-        //   correct half (…17)    = by (n_correct desc, score desc) — always viable, so the pool never
-        //                           deadlocks even when the balanced score is hard to reach; diversity
-        //                           for breeding.
-        std::vector<int> by_correct(cands.size());
-        for (int i = 0; i < (int)cands.size(); i++) by_correct[i] = i;
-        std::sort(by_correct.begin(), by_correct.end(), [&](int a, int b){
-            return cands[a].n_correct != cands[b].n_correct ? cands[a].n_correct > cands[b].n_correct
-                                                            : cands[a].score > cands[b].score; });
-        std::vector<char> taken(cands.size(), 0);
-        int slot0 = by_score.empty() ? -1 : by_score[0];
-        for (int i : by_score) if (cands[i].today) { slot0 = i; break; }
-        if (slot0 >= 0) { order.push_back(slot0); taken[slot0] = 1; }
-        int score_target = 1 + ELITE_COUNT / 2;   // slot0 + 8 = 9 from the score half
-        for (int i : by_score)   { if ((int)order.size() >= score_target) break; if (!taken[i]) { order.push_back(i); taken[i]=1; } }
-        for (int i : by_correct) { if ((int)order.size() >= ELITE_COUNT)   break; if (!taken[i]) { order.push_back(i); taken[i]=1; } }
-        for (int i : by_score)   { if ((int)order.size() >= ELITE_COUNT)   break; if (!taken[i]) { order.push_back(i); taken[i]=1; } }  // gap-fill
-    }
-
-    // Assign chosen candidates into new_elites in elite order.
-    for (int rank = 0; rank < (int)order.size(); rank++) {
-        const Cand& c = cands[order[rank]];
-        if (!c.is_hist) {
-            get_weights(c.idx, scratch.new_elite(rank));
-        } else {
-            int total = HIST_DAYS * HIST_PER_DAY;
-            int oldest = (scratch.pool_hist_head[pool_id] * HIST_PER_DAY - n_hist + total) % total;
-            int abs_pos = (oldest + c.idx) % total;
-            memcpy(scratch.new_elite(rank),
-                   scratch.pool_hist[pool_id] + (size_t)abs_pos * MT1NN_PARAMS,
-                   MT1NN_PARAMS * sizeof(float));
-        }
-    }
-    // Fill any unfilled direct elite slots from slot 0
-    for (int rank = (int)order.size(); rank < ELITE_COUNT; rank++)
-        memcpy(scratch.new_elite(rank), scratch.new_elite(0), MT1NN_PARAMS * sizeof(float));
-
-    // Wavg blends (slots 17, 18, 19): equal-weight average of top 5, 10, 15 direct elites
-    static constexpr int wavg_k[3] = {5, 10, 15};
-    for (int b = 0; b < WAVG_COUNT; b++) {
-        float* dst  = scratch.new_elite(ELITE_COUNT + b);
-        int    k    = wavg_k[b];
-        float inv_k = 1.f / (float)k;
-        memset(dst, 0, MT1NN_PARAMS * sizeof(float));
-        for (int e = 0; e < k; e++)
-            for (int p = 0; p < MT1NN_PARAMS; p++) dst[p] += scratch.new_elite(e)[p] * inv_k;
-    }
-
-    // Injection slots (20–24): blended injection (1/3 source + 2/3 dest_w5),
-    // or direct injection if the destination pool was fully culled (live_count == 0).
-    {
-        // dest_w5 = wavg blend of top-5 direct elites (slot ELITE_COUNT, i.e. slot 17)
-        const float* dest_w5 = scratch.new_elite(ELITE_COUNT);
-        for (int k = 0; k < MT1_COMP_INJECT; k++) {
-            const float* src = inject_src + (size_t)k * MT1NN_PARAMS;
-            float* dst = scratch.new_elite(ELITE_COUNT + WAVG_COUNT + k);
-            if (live_count == 0) {
-                // Destination pool fully culled — direct injection
-                memcpy(dst, src, MT1NN_PARAMS * sizeof(float));
-            } else {
-                // Blend: 1/3 injection source + 2/3 destination w5
-                for (int p = 0; p < MT1NN_PARAMS; p++)
-                    dst[p] = (1.f/3.f) * src[p] + (2.f/3.f) * dest_w5[p];
-            }
-        }
-    }
-
-    // Commit all 25 parent slots (elites + wavg + injection)
-    memcpy(scratch.comp_elites[pool_id], scratch.new_elites,
-           (size_t)MT1_COMP_PARENTS * MT1NN_PARAMS * sizeof(float));
-
-    // Save top 7 direct elites + 3 wavg blends to 5-day history
-    {
-        int& head  = scratch.pool_hist_head[pool_id];
-        int& count = scratch.pool_hist_count[pool_id];
-        for (int k = 0; k < HIST_ELITE; k++)
-            memcpy(scratch.pool_hist_slot(pool_id, head, k),
-                   scratch.comp_elite(pool_id, k), MT1NN_PARAMS * sizeof(float));
-        for (int k = 0; k < HIST_WAVG; k++)
-            memcpy(scratch.pool_hist_slot(pool_id, head, HIST_ELITE + k),
-                   scratch.comp_elite(pool_id, ELITE_COUNT + k), MT1NN_PARAMS * sizeof(float));
-        head = (head + 1) % HIST_DAYS;
-        if (count < HIST_DAYS) count++;
-    }
-
-    // Direction pool: save top-5 for accuracy pool injection next day
-    if (pool_id == 0) {
-        scratch.dir_inject_count = std::min(MT1_COMP_INJECT, ELITE_COUNT);
-        for (int k = 0; k < scratch.dir_inject_count; k++)
-            memcpy(scratch.dir_inject(k),
-                   scratch.comp_elite(0, k), MT1NN_PARAMS * sizeof(float));
-    }
-
-    // Range pool: save top-5 for confidence pool injection next day
-    if (pool_id == 2) {
-        scratch.rng_inject_count = std::min(MT1_RANGE_INJECT, ELITE_COUNT);
-        for (int k = 0; k < scratch.rng_inject_count; k++)
-            memcpy(scratch.rng_inject(k),
-                   scratch.comp_elite(2, k), MT1NN_PARAMS * sizeof(float));
-    }
-
-    return {best_cat, slot0_cat, mean_cat, min_cat, mean_cdb};
-}
 
 // ── Heads/tails pool step (Increment 2 part 2) ───────────────────────────────────
 // Generic evolutionary selection over ONE head or tail pool. Mirrors step_mt1_component's
@@ -3045,198 +2562,11 @@ static MT1CompResult step_mt1_head(
 // ── MT1 composite blend-pool step ────────────────────────────────────────────────
 
 // Regenerate blend b into dst (deterministic per actual_day, ind_i, b)
-static void gen_mt1_blend(int b, int ind_i, int actual_day, MT1Scratch& scratch, float* dst) {
-    PCG32 rng; rng.seed((uint64_t)actual_day * 654321ULL +
-                        (uint64_t)ind_i      * 31337ULL  +
-                        (uint64_t)b          *  1009ULL);
-    int src_pool[8] = {0, 0, 1, 1, 2, 2, 3, 3};
-    int src_rank[8];
-    for (int p = 0; p < 4; p++) {
-        int r1 = (int)(rng.next() % ELITE_COUNT);
-        int r2 = (int)(rng.next() % (ELITE_COUNT - 1));
-        if (r2 >= r1) r2++;
-        src_rank[p*2]   = r1;
-        src_rank[p*2+1] = r2;
-    }
-    float w[8], wsum = 0.f;
-    for (int k = 0; k < 8; k++) { w[k] = 20.f - (float)src_rank[k]; wsum += w[k]; }
-    float inv = 1.f / wsum;
-    for (int k = 0; k < 8; k++) w[k] *= inv;
-    memset(dst, 0, MT1NN_PARAMS * sizeof(float));
-    for (int k = 0; k < 8; k++) {
-        const float* src = scratch.comp_elite(src_pool[k], src_rank[k]);
-        for (int p = 0; p < MT1NN_PARAMS; p++) dst[p] += src[p] * w[k];
-    }
-}
 
-struct MT1BlendResult {
-    float best_score, slot0_score, mean_score, min_score;
-    float slot0_conf, slot0_delta_t, slot0_range_pct, slot0_conf4;
-    float comp0_residual;  // |actual_d - comp0_delta_d| for rolling_residual
-};
 
-static MT1BlendResult step_mt1_composite(
-    int ind_i, MT1Scratch& scratch,
-    float actual_d, const float in37[37], int actual_day,
-    float acc_floor, float range_ceiling)
-{
-    // Score all MT1_BLEND_SLOTS (200) new blends
-    float blend_sc[MT1_BLEND_SLOTS];
-    float out4[4];
-    float mean_sc = 0.f, best_sc = -1e9f, min_sc = 1e9f;
-
-    for (int b = 0; b < MT1_BLEND_SLOTS; b++) {
-        gen_mt1_blend(b, ind_i, actual_day, scratch, scratch.mut_buf);
-        float total_sum = 0.f;
-        for (int di = 0; di < scratch.dir_day_count; di++) {
-            const auto& e  = scratch.dir_day(di);
-            mt1_forward(scratch.mut_buf, e.feat37, out4);
-            float day_sc = compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling).composite;
-            total_sum += day_sc * mt1_win_weight(di, scratch.dir_day_count);
-        }
-        blend_sc[b] = total_sum;
-        mean_sc += blend_sc[b];
-        if (blend_sc[b] > best_sc) best_sc = blend_sc[b];
-        if (blend_sc[b] < min_sc)  min_sc  = blend_sc[b];
-    }
-    mean_sc /= MT1_BLEND_SLOTS;
-
-    // Score history candidates
-    int n_hist = scratch.blend_hist_count * HIST_PER_DAY;
-    float hist_sc[HIST_DAYS * HIST_PER_DAY] = {};
-    {
-        int total  = HIST_DAYS * HIST_PER_DAY;
-        int oldest = (scratch.blend_hist_head * HIST_PER_DAY - n_hist + total) % total;
-        for (int k = 0; k < n_hist; k++) {
-            int abs_pos = (oldest + k) % total;
-            float* hw = scratch.blend_hist + (size_t)abs_pos * MT1NN_PARAMS;
-            float total_sum = 0.f;
-            for (int di = 0; di < scratch.dir_day_count; di++) {
-                const auto& e  = scratch.dir_day(di);
-                mt1_forward(hw, e.feat37, out4);
-                float day_sc = compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling).composite;
-                total_sum += day_sc * mt1_win_weight(di, scratch.dir_day_count);
-            }
-            hist_sc[k] = total_sum;
-        }
-    }
-
-    // Build sorted candidate list (blend index or history position)
-    struct BLCand { float score; bool is_hist; int idx; };
-    std::vector<BLCand> cands;
-    cands.reserve(MT1_BLEND_SLOTS + n_hist);
-    for (int b = 0; b < MT1_BLEND_SLOTS; b++) cands.push_back({blend_sc[b], false, b});
-    for (int k = 0; k < n_hist; k++)          cands.push_back({hist_sc[k], true, k});
-    std::sort(cands.begin(), cands.end(), [](const BLCand& a, const BLCand& b){ return a.score > b.score; });
-
-    // Helper: retrieve weights for a candidate
-    auto get_cand_weights = [&](const BLCand& c, float* dst) {
-        if (!c.is_hist) {
-            gen_mt1_blend(c.idx, ind_i, actual_day, scratch, dst);
-        } else {
-            int total  = HIST_DAYS * HIST_PER_DAY;
-            int oldest = (scratch.blend_hist_head * HIST_PER_DAY - n_hist + total) % total;
-            int abs_pos = (oldest + c.idx) % total;
-            memcpy(dst, scratch.blend_hist + (size_t)abs_pos * MT1NN_PARAMS, MT1NN_PARAMS * sizeof(float));
-        }
-    };
-
-    // Top candidate → production model (comp0_buf)
-    float raw0[4] = {};
-    get_cand_weights(cands[0], scratch.comp0_buf);
-    mt1_forward(scratch.comp0_buf, in37, raw0);
-    float comp0_delta_d = tanhf(raw0[1]) * MT1_SCALE_DOLLARS;
-
-    // Save top 5 to comp_inject_buf (for next day's direction slots 20–24 and range slots 20–24)
-    scratch.comp_inject_count = std::min(MT1_COMP_INJECT, (int)cands.size());
-    for (int k = 0; k < scratch.comp_inject_count; k++)
-        get_cand_weights(cands[k], scratch.comp_inject(k));
-
-    // Save top HIST_PER_DAY (10) to blend_hist circular buffer
-    int n_save = std::min(HIST_PER_DAY, (int)cands.size());
-    int& bhead = scratch.blend_hist_head;
-    for (int k = 0; k < n_save; k++) {
-        float* dst = scratch.blend_hist_slot(bhead, k);
-        get_cand_weights(cands[k], dst);
-    }
-    bhead = (bhead + 1) % HIST_DAYS;
-    if (scratch.blend_hist_count < HIST_DAYS) scratch.blend_hist_count++;
-
-    float slot0_conf      = sigmoidf(raw0[0]);
-    float slot0_delta_t   = tanhf(raw0[1]);
-    float slot0_range_pct = log1pf(expf(raw0[2]));
-    float slot0_conf4     = sigmoidf(raw0[3]);
-
-    return {best_sc, cands[0].score, mean_sc, min_sc,
-            slot0_conf, slot0_delta_t, slot0_range_pct, slot0_conf4,
-            fabsf(actual_d - comp0_delta_d)};
-}
 
 // ── MT1 orchestrator ─────────────────────────────────────────────────────────────
 
-static MT1Result step_mt1(int ind_i, MT1Scratch& scratch,
-                           float actual_d, const float in37[37],
-                           int actual_day,
-                           float dir_sigma, float rng_sigma, float acc_sigma, float cfd_sigma) {
-    // Record today's data unconditionally so direction pool has a full window when selection starts
-    scratch.push_dir_day(in37, actual_d);
-    if (actual_day < MT1_START_DAY) return {};
-
-    // Adaptive per-industry floors from rolling buffers
-    float acc_floor     = MT1_FLOOR_COLD / 2.f;  // cold-start
-    float range_ceiling = 1e30f;
-    if (scratch.rolling_count > 0) {
-        float sum_a = 0.f, sum_r = 0.f;
-        for (int k = 0; k < scratch.rolling_count; k++) {
-            sum_a += scratch.rolling_actual[k];
-            sum_r += scratch.rolling_residual[k];
-        }
-        acc_floor = sum_a / (float)scratch.rolling_count / 2.f;
-        // Dynamic ceiling: max(4 × mean_residual, 4 × today's comp0 residual)
-        float mean_r = sum_r / (float)scratch.rolling_count;
-        float today_r = 0.f;
-        if (scratch.rolling_count > 0) {
-            float out4_c0[4];
-            mt1_forward(scratch.comp0_buf, in37, out4_c0);
-            float comp0_delta_d = tanhf(out4_c0[1]) * MT1_SCALE_DOLLARS;
-            today_r = fabsf(actual_d - comp0_delta_d);
-        }
-        range_ceiling = MT1_RANGE_CEIL_MULT * fmaxf(mean_r, today_r);
-    }
-
-    // Step 4 component pools (dir=0, acc=1, rng=2, cfd=3) with per-pool sigmas
-    const float comp_sigmas[4] = {dir_sigma, acc_sigma, rng_sigma, cfd_sigma};
-    MT1CompResult cr[4];
-    for (int p = 0; p < 4; p++)
-        cr[p] = step_mt1_component(p, ind_i, scratch, actual_d, in37, actual_day, comp_sigmas[p],
-                                    acc_floor, range_ceiling);
-
-    // Step composite blend pool
-    auto br = step_mt1_composite(ind_i, scratch, actual_d, in37, actual_day,
-                                  acc_floor, range_ceiling);
-
-    // Update rolling buffers AFTER scoring
-    scratch.rolling_actual[scratch.rolling_head]   = fabsf(actual_d);
-    scratch.rolling_residual[scratch.rolling_head] = br.comp0_residual;
-    scratch.rolling_head = (scratch.rolling_head + 1) % MT1_ROLLING_DAYS;
-    if (scratch.rolling_count < MT1_ROLLING_DAYS) scratch.rolling_count++;
-
-    // Direction-pool slot0 activations (MT2 direction-feed toggle source)
-    float out4_dir[4];
-    mt1_forward(scratch.comp_elite(0, 0), in37, out4_dir);
-    float dir0_conf      = sigmoidf(out4_dir[0]);
-    float dir0_delta_t   = tanhf(out4_dir[1]);
-    float dir0_range_pct = log1pf(expf(out4_dir[2]));
-    float dir0_conf4     = sigmoidf(out4_dir[3]);
-
-    return {br.best_score, br.slot0_score, br.mean_score, br.min_score,
-            br.slot0_conf, br.slot0_delta_t, br.slot0_range_pct, br.slot0_conf4,
-            dir0_conf, dir0_delta_t, dir0_range_pct, dir0_conf4,
-            cr[0].best, cr[0].slot0, cr[0].mean, cr[0].min_v, cr[0].mean_correct_dbl,
-            cr[2].best, cr[2].slot0, cr[2].mean, cr[2].min_v,
-            cr[1].best, cr[1].slot0, cr[1].mean, cr[1].min_v,
-            cr[3].best, cr[3].slot0, cr[3].mean, cr[3].min_v};
-}
 
 // ── MT2 training step (replaces step_master) ────────────────────────────────────
 
@@ -3759,216 +3089,7 @@ static void load_or_init_master(const std::string& dir, const std::string& load_
 
 // ── MT1/MT2 persistence ──────────────────────────────────────────────────────────
 
-static void save_mt1_all(const std::string& dir, int ind_i, const MT1Scratch& scratch) {
-    const char* ind = g_ind_names[ind_i].c_str();
-    char path[512];
-    for (int p = 0; p < 4; p++) {
-        int n_elites = MT1_COMP_PARENTS;
-        for (int slot = 0; slot < n_elites; slot++) {
-            snprintf(path, sizeof(path), "%s/mt1_%s_%s_elite_%d.bin",
-                     dir.c_str(), ind, MT1_POOL_NAMES[p], slot);
-            if (!save_bin(path, scratch.comp_elites[p] + (size_t)slot * MT1NN_PARAMS, MT1NN_PARAMS))
-                log_msg(std::string("WARNING: could not save ") + path);
-        }
-        // Component pool history
-        snprintf(path, sizeof(path), "%s/mt1_%s_%s_hist.bin", dir.c_str(), ind, MT1_POOL_NAMES[p]);
-        FILE* f = fopen(path, "wb");
-        if (f) {
-            int meta[2] = {scratch.pool_hist_head[p], scratch.pool_hist_count[p]};
-            fwrite(meta, sizeof(int), 2, f);
-            fwrite(scratch.pool_hist[p], sizeof(float),
-                   (size_t)HIST_DAYS * HIST_PER_DAY * MT1NN_PARAMS, f);
-            fclose(f);
-        }
-    }
-    // Composite blend history
-    snprintf(path, sizeof(path), "%s/mt1_%s_comp_hist.bin", dir.c_str(), ind);
-    FILE* fch = fopen(path, "wb");
-    if (fch) {
-        int meta[2] = {scratch.blend_hist_head, scratch.blend_hist_count};
-        fwrite(meta, sizeof(int), 2, fch);
-        fwrite(scratch.blend_hist, sizeof(float),
-               (size_t)HIST_DAYS * HIST_PER_DAY * MT1NN_PARAMS, fch);
-        fclose(fch);
-    }
-    // Direction-inject buffer (top direction elites for accuracy pool injection)
-    snprintf(path, sizeof(path), "%s/mt1_%s_dir_inject.bin", dir.c_str(), ind);
-    FILE* fdi = fopen(path, "wb");
-    if (fdi) {
-        fwrite(&scratch.dir_inject_count, sizeof(int), 1, fdi);
-        if (scratch.dir_inject_count > 0)
-            fwrite(scratch.dir_inject_buf, sizeof(float),
-                   (size_t)scratch.dir_inject_count * MT1NN_PARAMS, fdi);
-        fclose(fdi);
-    }
-    // Range-inject buffer (top range elites for confidence cross-injection)
-    snprintf(path, sizeof(path), "%s/mt1_%s_rng_inject.bin", dir.c_str(), ind);
-    FILE* frni = fopen(path, "wb");
-    if (frni) {
-        fwrite(&scratch.rng_inject_count, sizeof(int), 1, frni);
-        if (scratch.rng_inject_count > 0)
-            fwrite(scratch.rng_inject_buf, sizeof(float),
-                   (size_t)scratch.rng_inject_count * MT1NN_PARAMS, frni);
-        fclose(frni);
-    }
-    // Composite-inject buffer (top composite elites for dir/acc/rng additive slots 23–27)
-    snprintf(path, sizeof(path), "%s/mt1_%s_comp_inject.bin", dir.c_str(), ind);
-    FILE* fci = fopen(path, "wb");
-    if (fci) {
-        fwrite(&scratch.comp_inject_count, sizeof(int), 1, fci);
-        if (scratch.comp_inject_count > 0)
-            fwrite(scratch.comp_inject_buf, sizeof(float),
-                   (size_t)scratch.comp_inject_count * MT1NN_PARAMS, fci);
-        fclose(fci);
-    }
-    // Direction day buffer (multi-day scoring window)
-    snprintf(path, sizeof(path), "%s/mt1_%s_dir_hist.bin", dir.c_str(), ind);
-    FILE* fdh = fopen(path, "wb");
-    if (fdh) {
-        int meta[4] = {scratch.dir_day_head, scratch.dir_day_count,
-                       scratch.dir_streak, scratch.dir_cooldown};
-        fwrite(meta, sizeof(int), 4, fdh);
-        fwrite(scratch.dir_day_buf, sizeof(MT1Scratch::DirDayEntry), MT1_DIR_DAYS, fdh);
-        fclose(fdh);
-    }
-    // Composite best (production model)
-    snprintf(path, sizeof(path), "%s/mt1_%s_comp_0.bin", dir.c_str(), ind);
-    save_bin(path, scratch.comp0_buf, MT1NN_PARAMS);
-}
 
-static void load_or_init_mt1(const std::string& dir, const std::string& load_dir,
-                               int ind_i, MT1Scratch& scratch) {
-    const char* ind = g_ind_names[ind_i].c_str();
-    PCG32 rng; rng.seed((uint64_t)(ind_i + N_IND) * 777777777ULL + 314159265ULL);
-    char path[512];
-
-    for (int p = 0; p < 4; p++) {
-        int n_elites = MT1_COMP_PARENTS;
-        for (int slot = 0; slot < n_elites; slot++) {
-            float* e = scratch.comp_elite(p, slot);
-            bool loaded = false;
-            for (const std::string* sd : {&load_dir, &dir}) {
-                if (sd->empty()) continue;
-                snprintf(path, sizeof(path), "%s/mt1_%s_%s_elite_%d.bin",
-                         sd->c_str(), ind, MT1_POOL_NAMES[p], slot);
-                if (load_bin(path, e, MT1NN_PARAMS)) { loaded = true; break; }
-            }
-            if (!loaded) init_mt1_weights(e, rng);
-        }
-        // Component pool history
-        bool hist_loaded = false;
-        for (const std::string* sd : {&load_dir, &dir}) {
-            if (sd->empty()) continue;
-            snprintf(path, sizeof(path), "%s/mt1_%s_%s_hist.bin",
-                     sd->c_str(), ind, MT1_POOL_NAMES[p]);
-            FILE* f = fopen(path, "rb");
-            if (!f) continue;
-            int meta[2] = {};
-            if (fread(meta, sizeof(int), 2, f) == 2) {
-                scratch.pool_hist_head[p]  = std::max(0, std::min(meta[0], HIST_DAYS - 1));
-                scratch.pool_hist_count[p] = std::max(0, std::min(meta[1], HIST_DAYS));
-            }
-            fread(scratch.pool_hist[p], sizeof(float),
-                  (size_t)HIST_DAYS * HIST_PER_DAY * MT1NN_PARAMS, f);
-            fclose(f);
-            hist_loaded = true;
-            break;
-        }
-        if (!hist_loaded) { scratch.pool_hist_head[p] = 0; scratch.pool_hist_count[p] = 0; }
-    }
-
-    // Composite blend history
-    for (const std::string* sd : {&load_dir, &dir}) {
-        if (sd->empty()) continue;
-        snprintf(path, sizeof(path), "%s/mt1_%s_comp_hist.bin", sd->c_str(), ind);
-        FILE* f = fopen(path, "rb");
-        if (!f) continue;
-        int meta[2] = {};
-        if (fread(meta, sizeof(int), 2, f) == 2) {
-            scratch.blend_hist_head  = std::max(0, std::min(meta[0], HIST_DAYS - 1));
-            scratch.blend_hist_count = std::max(0, std::min(meta[1], HIST_DAYS));
-        }
-        fread(scratch.blend_hist, sizeof(float),
-              (size_t)HIST_DAYS * HIST_PER_DAY * MT1NN_PARAMS, f);
-        fclose(f);
-        break;
-    }
-
-    // Direction-inject buffer (top direction elites for accuracy pool injection)
-    for (const std::string* sd : {&load_dir, &dir}) {
-        if (sd->empty()) continue;
-        snprintf(path, sizeof(path), "%s/mt1_%s_dir_inject.bin", sd->c_str(), ind);
-        FILE* f = fopen(path, "rb");
-        if (!f) continue;
-        int cnt = 0;
-        if (fread(&cnt, sizeof(int), 1, f) == 1 && cnt > 0 && cnt <= MT1_COMP_INJECT) {
-            fread(scratch.dir_inject_buf, sizeof(float), (size_t)cnt * MT1NN_PARAMS, f);
-            scratch.dir_inject_count = cnt;
-        }
-        fclose(f);
-        break;
-    }
-
-    // Range-inject buffer
-    for (const std::string* sd : {&load_dir, &dir}) {
-        if (sd->empty()) continue;
-        snprintf(path, sizeof(path), "%s/mt1_%s_rng_inject.bin", sd->c_str(), ind);
-        FILE* f = fopen(path, "rb");
-        if (!f) continue;
-        int cnt = 0;
-        if (fread(&cnt, sizeof(int), 1, f) == 1 && cnt > 0 && cnt <= MT1_RANGE_INJECT) {
-            fread(scratch.rng_inject_buf, sizeof(float), (size_t)cnt * MT1NN_PARAMS, f);
-            scratch.rng_inject_count = cnt;
-        }
-        fclose(f);
-        break;
-    }
-
-    // Composite-inject buffer (top composite elites for dir/acc/rng additive slots 23–27)
-    for (const std::string* sd : {&load_dir, &dir}) {
-        if (sd->empty()) continue;
-        snprintf(path, sizeof(path), "%s/mt1_%s_comp_inject.bin", sd->c_str(), ind);
-        FILE* f = fopen(path, "rb");
-        if (!f) continue;
-        int cnt = 0;
-        if (fread(&cnt, sizeof(int), 1, f) == 1 && cnt > 0 && cnt <= MT1_COMP_INJECT) {
-            fread(scratch.comp_inject_buf, sizeof(float), (size_t)cnt * MT1NN_PARAMS, f);
-            scratch.comp_inject_count = cnt;
-        }
-        fclose(f);
-        break;
-    }
-
-    // Direction day buffer (multi-day scoring window)
-    for (const std::string* sd : {&load_dir, &dir}) {
-        if (sd->empty()) continue;
-        snprintf(path, sizeof(path), "%s/mt1_%s_dir_hist.bin", sd->c_str(), ind);
-        FILE* f = fopen(path, "rb");
-        if (!f) continue;
-        int meta[4] = {};
-        int meta_read = (int)fread(meta, sizeof(int), 4, f);
-        if (meta_read >= 2 &&
-            meta[1] >= 0 && meta[1] <= MT1_DIR_DAYS &&
-            meta[0] >= 0 && meta[0] < MT1_DIR_DAYS) {
-            scratch.dir_day_head  = meta[0];
-            scratch.dir_day_count = meta[1];
-            if (meta_read >= 4) {
-                scratch.dir_streak   = meta[2];
-                scratch.dir_cooldown = meta[3];
-            }
-            fread(scratch.dir_day_buf, sizeof(MT1Scratch::DirDayEntry), MT1_DIR_DAYS, f);
-        }
-        fclose(f);
-        break;
-    }
-
-    // Composite best (production model) — load into comp0_buf if available
-    for (const std::string* sd : {&load_dir, &dir}) {
-        if (sd->empty()) continue;
-        snprintf(path, sizeof(path), "%s/mt1_%s_comp_0.bin", sd->c_str(), ind);
-        if (load_bin(path, scratch.comp0_buf, MT1NN_PARAMS)) break;
-    }
-}
 
 // ── Heads/tails: per-phase data-state snapshot/restore (Increment 3A) ─────────────
 // Block-alternating training replays the same MT1_BLOCK_DAYS days once per phase (T1/H/T2).
@@ -4506,24 +3627,52 @@ static void drift_mt1_floors(MT1Scratch& sc, const float in37[37], float actual_
         for (int k = 0; k < sc.rolling_count; k++) { sum_a += sc.rolling_actual[k]; sum_r += sc.rolling_residual[k]; }
         *acc_floor = sum_a / (float)sc.rolling_count / 2.f;
         float mean_r = sum_r / (float)sc.rolling_count;
-        float out4[4]; mt1_forward(sc.comp0_buf, in37, out4);
+        const float* tw[4] = {sc.tail0_buf[0], sc.tail0_buf[1], sc.tail0_buf[2], sc.tail0_buf[3]};
+        float out4[4]; mt1_composed_forward(sc.head0_buf, tw, in37, out4);
         float comp0_delta_d = tanhf(out4[1]) * MT1_SCALE_DOLLARS;
         float today_r = fabsf(actual_d - comp0_delta_d);
         *range_ceiling = MT1_RANGE_CEIL_MULT * fmaxf(mean_r, today_r);
     }
 }
 
-// Windowed composite score for one MT1 model (mirrors step_mt1_composite blend scoring):
-// linear recency-weighted sum of per-day composite over the trailing dir_day window.
-static float drift_score_mt1_comp(const float* W, MT1Scratch& sc, float acc_floor, float range_ceiling) {
+// Windowed composite score for one composed MT1 model (head + 4 tails): linear recency-weighted
+// sum of per-day composite over the trailing dir_day window (heads/tails production objective).
+static float drift_score_mt1_comp(const float* head_w, const float* const tail_w[4],
+                                  MT1Scratch& sc, float acc_floor, float range_ceiling) {
     float out4[4], total = 0.f;
     for (int di = 0; di < sc.dir_day_count; di++) {
         const auto& e = sc.dir_day(di);
-        mt1_forward(W, e.feat37, out4);
+        mt1_composed_forward(head_w, tail_w, e.feat37, out4);
         total += compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling).composite
                  * mt1_win_weight(di, sc.dir_day_count);
     }
     return total;
+}
+
+// One day of production-style heads/tails upkeep for the drift track (mirror of upkeep.py):
+// daily tail phase (freeze head0 + tail0, evolve the 4 tail pools) + a head phase every
+// MT1_BLOCK_DAYS days (freeze tails, evolve the head pool). Updates head0/tail0 + rolling.
+static void drift_mt1_day(int ind_i, MT1Scratch& sc, float actual_d, const float in37[37],
+                          int actual_day, float sigma, bool do_head) {
+    sc.push_dir_day(in37, actual_d);
+    if (actual_day < MT1_START_DAY) return;
+    float acc_floor, range_ceiling;
+    drift_mt1_floors(sc, in37, actual_d, &acc_floor, &range_ceiling);
+    for (int c = 0; c < 4; c++)
+        step_mt1_tail(c, ind_i, sc, actual_day, sigma, acc_floor, range_ceiling);
+    for (int c = 0; c < 4; c++)
+        memcpy(sc.tail0_buf[c], sc.tail_e(c, 0), TAILNN_PARAMS * sizeof(float));
+    if (do_head) {
+        step_mt1_head(ind_i, sc, actual_day, sigma, acc_floor, range_ceiling);
+        memcpy(sc.head0_buf, sc.head_e(0), HEADNN_PARAMS * sizeof(float));
+    }
+    const float* tw[4] = {sc.tail0_buf[0], sc.tail0_buf[1], sc.tail0_buf[2], sc.tail0_buf[3]};
+    float out4[4]; mt1_composed_forward(sc.head0_buf, tw, in37, out4);
+    float delta_d = tanhf(out4[1]) * MT1_SCALE_DOLLARS;
+    sc.rolling_actual[sc.rolling_head]   = fabsf(actual_d);
+    sc.rolling_residual[sc.rolling_head] = fabsf(actual_d - delta_d);
+    sc.rolling_head = (sc.rolling_head + 1) % MT1_ROLLING_DAYS;
+    if (sc.rolling_count < MT1_ROLLING_DAYS) sc.rolling_count++;
 }
 
 // Tier-classification pts for one MT2 model (mirrors the step_mt2 grading at lines ~2843).
@@ -4627,12 +3776,18 @@ static bool drift_advance_day(int run_day_num, int actual_day, int total_days,
     if (fwd_valid) for (int i = 0; i < N_IND; i++) {
         const float* in37 = today444 + i * 37;
         float actual_d = fwd_ret[i] * MT1_SCALE_DOLLARS;   // absolute (matches main loop)
-        MT1Result r = step_mt1(i, mt1_scr[i], actual_d, in37, actual_day,
-                               sigma, sigma, sigma, sigma);
-        // Composite feed (study asserts MT2_FEED_DIRECTION==false)
-        out_in48[i*4+0] = r.slot0_conf;
-        out_in48[i*4+1] = (r.slot0_conf >= 0.5f ? 1.f : -1.f) * fabsf(r.slot0_delta_t);  // signed-magnitude reassembly
-        out_in48[i*4+2] = r.slot0_range_pct; out_in48[i*4+3] = r.slot0_conf4;
+        bool do_head = (run_day_num % MT1_BLOCK_DAYS == 0);
+        drift_mt1_day(i, mt1_scr[i], actual_d, in37, actual_day, sigma, do_head);
+        // MT2 feed from the composed production MT1 (head0 + tail0); one model, so composite ==
+        // direction feed (MT2_FEED_DIRECTION moot).
+        MT1Scratch& sc = mt1_scr[i];
+        const float* tw[4] = {sc.tail0_buf[0], sc.tail0_buf[1], sc.tail0_buf[2], sc.tail0_buf[3]};
+        float o4[4]; mt1_composed_forward(sc.head0_buf, tw, in37, o4);
+        float conf = 1.f / (1.f + expf(-o4[0]));
+        out_in48[i*4+0] = conf;
+        out_in48[i*4+1] = (conf >= 0.5f ? 1.f : -1.f) * fabsf(tanhf(o4[1]));
+        out_in48[i*4+2] = log1pf(expf(o4[2]));
+        out_in48[i*4+3] = 1.f / (1.f + expf(-o4[3]));
     }
 
     if (fwd_valid && actual_day >= MASTER_START_DAY) {
@@ -4679,10 +3834,9 @@ static void drift_reseed(const std::string& scratch_dir, const std::string& seed
         memset(sc.dir_day_buf,      0, sizeof(sc.dir_day_buf));
         sc.dir_day_head = sc.dir_day_count = 0;
         sc.dir_streak = sc.dir_cooldown = 0;
-        sc.blend_hist_head = sc.blend_hist_count = 0;
-        sc.comp_inject_count = sc.dir_inject_count = sc.rng_inject_count = 0;
-        for (int p = 0; p < 4; p++) { sc.pool_hist_head[p] = 0; sc.pool_hist_count[p] = 0; }
-        load_or_init_mt1(scratch_dir, seed_dir, i, sc);
+        sc.head_hist_head = sc.head_hist_count = 0;
+        for (int p = 0; p < 4; p++) { sc.tail_hist_head[p] = 0; sc.tail_hist_count[p] = 0; }
+        load_or_init_mt1_ht(scratch_dir, seed_dir, i, sc);
     }
     load_or_init_mt2(scratch_dir, seed_dir, mt2_scr);
     mt2_scr.hist_head = mt2_scr.hist_count = 0;
@@ -4701,11 +3855,8 @@ static int run_drift_study(const std::string& seed_dir, const std::string& scrat
                            const std::string& log_dir, std::vector<DayData>& all_days,
                            int total_days, int win_start, int win_end,
                            float sigma, float mt2_sigma) {
-    if (MT2_FEED_DIRECTION) {
-        log_msg("ERROR: --drift-study requires MT2_FEED_DIRECTION==false (composite feed). "
-                "Flip the toggle in training_v4.cpp and rebuild before running the study.");
-        return 1;
-    }
+    // Heads/tails: a single composed production model feeds MT2, so the MT2_FEED_DIRECTION toggle
+    // is moot here (no separate composite/direction feeds).
     if (seed_dir.empty() || scratch_dir.empty()) {
         log_msg("ERROR: --drift-study needs --load-dir SEED and --drift-scratch DIR."); return 1;
     }
@@ -4736,7 +3887,10 @@ static int run_drift_study(const std::string& seed_dir, const std::string& scrat
     auto mt2_scr    = std::make_unique<MT2Scratch>();
     auto mst        = std::make_unique<MasterState>();
     auto wscr       = std::make_unique<WorkerScratch>();
-    std::vector<float> mt1_band((size_t)N_IND * DRIFT_BAND_N * MT1NN_PARAMS);
+    // Band = 8 composed MT1 models per industry: head-pool slots 0-7 each combined with the frozen
+    // best tails (the head pool IS the composite optimizer). Track = composed head0 + tail0.
+    std::vector<float> mt1_band_head((size_t)N_IND * DRIFT_BAND_N * HEADNN_PARAMS);
+    std::vector<float> mt1_band_tail((size_t)N_IND * 4 * TAILNN_PARAMS);
     std::vector<float> mt2_band((size_t)DRIFT_BAND_N * MT2NN_PARAMS);
 
     for (int freeze_day = first_freeze; freeze_day <= last_freeze; freeze_day += DRIFT_WEEK_LEN) {
@@ -4752,13 +3906,15 @@ static int run_drift_study(const std::string& seed_dir, const std::string& scrat
                               mt1_scr.get(), *mt2_scr, *mst, *wscr, scratch_dir, seed_dir,
                               sigma, mt2_sigma, in48, actual_perf);
 
-        // Freeze the band: composite = most-recent blend_hist top-8; MT2 = elite slots 0-7.
+        // Freeze the band: MT1 = head-pool slots 0-7 + the frozen best tails; MT2 = elite slots 0-7.
         for (int i = 0; i < N_IND; i++) {
             MT1Scratch& sc = mt1_scr[i];
-            int recent = (sc.blend_hist_head - 1 + HIST_DAYS) % HIST_DAYS;  // last day saved
             for (int b = 0; b < DRIFT_BAND_N; b++)
-                memcpy(&mt1_band[((size_t)i * DRIFT_BAND_N + b) * MT1NN_PARAMS],
-                       sc.blend_hist_slot(recent, b), MT1NN_PARAMS * sizeof(float));
+                memcpy(&mt1_band_head[((size_t)i * DRIFT_BAND_N + b) * HEADNN_PARAMS],
+                       sc.head_e(b), HEADNN_PARAMS * sizeof(float));
+            for (int c = 0; c < 4; c++)
+                memcpy(&mt1_band_tail[((size_t)i * 4 + c) * TAILNN_PARAMS],
+                       sc.tail0_buf[c], TAILNN_PARAMS * sizeof(float));
         }
         for (int b = 0; b < DRIFT_BAND_N; b++)
             memcpy(&mt2_band[(size_t)b * MT2NN_PARAMS], mt2_scr->elite(b), MT2NN_PARAMS * sizeof(float));
@@ -4777,22 +3933,27 @@ static int run_drift_study(const std::string& seed_dir, const std::string& scrat
             rec.calendar_day = (uint32_t)actual_day;
             rec.bucket       = (uint32_t)age_week;
 
-            // MT1 composite: per-industry track (comp0) vs 8-model band, identical floors.
+            // MT1 composite: per-industry track (composed head0+tail0) vs 8-model band, same floors.
+            static const float ZERO37[37] = {0};
             for (int i = 0; i < N_IND; i++) {
                 MT1Scratch& sc = mt1_scr[i];
-                const float* in37 = nullptr;  // floors use the freshest dir_day entry's features
                 float actual_d = sc.dir_day_count ? sc.dir_day(sc.dir_day_count - 1).actual_d : 0.f;
-                in37 = sc.dir_day_count ? sc.dir_day(sc.dir_day_count - 1).feat37 : sc.comp0_buf; // safe ptr
+                const float* in37 = sc.dir_day_count ? sc.dir_day(sc.dir_day_count - 1).feat37 : ZERO37;
                 float acc_floor, range_ceiling;
                 drift_mt1_floors(sc, in37, actual_d, &acc_floor, &range_ceiling);
+                const float* btw[4] = {&mt1_band_tail[((size_t)i*4+0)*TAILNN_PARAMS],
+                                       &mt1_band_tail[((size_t)i*4+1)*TAILNN_PARAMS],
+                                       &mt1_band_tail[((size_t)i*4+2)*TAILNN_PARAMS],
+                                       &mt1_band_tail[((size_t)i*4+3)*TAILNN_PARAMS]};
                 float bmean = 0.f, bmax = -1e30f, bmin = 1e30f;
                 for (int b = 0; b < DRIFT_BAND_N; b++) {
-                    float s = drift_score_mt1_comp(&mt1_band[((size_t)i*DRIFT_BAND_N + b)*MT1NN_PARAMS],
-                                                   sc, acc_floor, range_ceiling);
+                    float s = drift_score_mt1_comp(&mt1_band_head[((size_t)i*DRIFT_BAND_N + b)*HEADNN_PARAMS],
+                                                   btw, sc, acc_floor, range_ceiling);
                     bmean += s; bmax = fmaxf(bmax, s); bmin = fminf(bmin, s);
                 }
                 bmean /= DRIFT_BAND_N;
-                float track = drift_score_mt1_comp(sc.comp0_buf, sc, acc_floor, range_ceiling);
+                const float* ttw[4] = {sc.tail0_buf[0], sc.tail0_buf[1], sc.tail0_buf[2], sc.tail0_buf[3]};
+                float track = drift_score_mt1_comp(sc.head0_buf, ttw, sc, acc_floor, range_ceiling);
                 float floor = fmaxf(1e-3f, 0.05f * fabsf(bmean));   // band-width adaptive floor (§4)
                 rec.mt1_rel[i]       = drift_rel_metric(track, bmean, bmax, bmin, floor);
                 rec.mt1_band_mean[i] = bmean;
