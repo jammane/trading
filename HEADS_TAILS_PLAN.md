@@ -144,6 +144,22 @@ architecture. Sub-staged 4A/4B/4C.
   direction feeds identical). Production `upkeep_mt1_industry` interface (10-tuple) preserved, so
   `production_v2.py` needs no change.
 
+**Cleanup — retire old component/composite code. STATUS: DONE (validated).**
+- Migrated `run_drift_study` to head/tail: `drift_mt1_day` (daily tails + periodic head, mirror of
+  upkeep), band = head-pool top-8 composed with frozen best tails, scoring via `mt1_composed_forward`,
+  `drift_reseed` → `load_or_init_mt1_ht`; the `MT2_FEED_DIRECTION` guard is gone (moot).
+- Removed the dead C++: `mt1_forward`, `step_mt1`, `step_mt1_component`, `step_mt1_composite`,
+  `gen_mt1_blend`, `save_mt1_all`, `load_or_init_mt1`, `MT1BlendResult`, the old `MT1Scratch` pool
+  buffers (comp_elites/new_elites/mut_buf/pool_hist/blend_hist/comp_inject/dir_inject/rng_inject/
+  comp0_buf) + accessors, and the old constants (`MT1_COMP_PARENTS/CHILDREN/INJECT/RANGE_INJECT/
+  BLEND_SLOTS`, `MT1_DIR_STREAK_TRIP/COOLDOWN_LEN/QUALIFY/BACKFILL`). Head/tail elite buffers now
+  sized `HT_PARENTS` (20) not 25.
+- Removed the dead Python: upkeep `_select_and_mutate_mt1_component`, `_mt1_burst_component`,
+  `_load_comp_pool_hist_models`, `_save_comp_pool_hist`, the old children table + unused imports;
+  `MT1_LAYER_DEFS` from prepare/convert.
+- ~1,130 net lines removed. Validated: C++ build clean (both targets), 95 pytest tests, and a
+  BLOCK=5 smoke run of the trainer (valid block record, no NaN, no crash).
+
 ## Risks / watch-items
 - **State snapshot/restore across phases** is the subtle core — rolling window/history must be
   identical per phase replay or fitness drifts. Snapshot MT1Scratch data buffers (not model pools)
