@@ -109,6 +109,10 @@ assert _RECORD_STRUCT_V6.size == RECORD_SIZE_V6
 RECORD_SIZE_V7 = 1244
 _RECORD_STRUCT_V7 = struct.Struct("<II" + "f" * 255 + "Bxxx" + "12B" + "50f")
 assert _RECORD_STRUCT_V7.size == RECORD_SIZE_V7
+# bin-version-7 (V8 record): 1252 bytes — adds mt2_slot0_pts_pf + mt2_slot0_pts_mkt
+RECORD_SIZE_V8 = 1252
+_RECORD_STRUCT_V8 = struct.Struct("<II" + "f" * 255 + "Bxxx" + "12B" + "52f")
+assert _RECORD_STRUCT_V8.size == RECORD_SIZE_V8
 
 # ── Download ──────────────────────────────────────────────────────────────────
 def download_logs(host: str, account: str) -> None:
@@ -139,11 +143,14 @@ def load_binary_log(path: Path) -> list[dict]:
     magic, version, n_ind, _ = struct.unpack_from("<IIII", data, 0)
     if magic != MT_LOG_MAGIC:
         sys.exit(f"{path}: bad magic {magic:#010x} (expected {MT_LOG_MAGIC:#010x})")
-    if version not in (3, 4, 5, 6):
-        sys.exit(f"{path}: unsupported log version {version} (expected 3-6)")
+    if version not in (3, 4, 5, 6, 7):
+        sys.exit(f"{path}: unsupported log version {version} (expected 3-7)")
 
     # Pick record format by binary version number
-    if version == 6:
+    if version == 7:
+        rec_size   = RECORD_SIZE_V8
+        rec_struct = _RECORD_STRUCT_V8
+    elif version == 6:
         rec_size   = RECORD_SIZE_V7
         rec_struct = _RECORD_STRUCT_V7
     elif version == 5:
@@ -171,7 +178,19 @@ def load_binary_log(path: Path) -> list[dict]:
                 base = ci * 48 + si * 12
                 mt1[comp][stat] = list(f[base : base + 12])
 
-        if version == 6:
+        if version == 7:
+            # V8 layout: V7 + mt2_slot0_pts_pf (raw[320]) + mt2_slot0_pts_mkt (raw[321])
+            mt1_dir_cdb      = list(raw[242:254])
+            mt2_best         = raw[254]
+            mt2_slot0        = raw[255]
+            mt2_ideal        = raw[256]
+            mt2_inj          = raw[257]
+            mt1_dir_injected = list(raw[258:270])
+            mt2_cons_flat    = raw[318]
+            mt2_cons_wtd     = raw[319]
+            mt2_slot0_pf     = raw[320]
+            mt2_slot0_mkt    = raw[321]
+        elif version == 6:
             # V7 layout: V6 + mt1_slot0_act[12][4] (raw[270:318]) + consensus flat/wtd (318,319)
             mt1_dir_cdb      = list(raw[242:254])
             mt2_best         = raw[254]
@@ -181,6 +200,8 @@ def load_binary_log(path: Path) -> list[dict]:
             mt1_dir_injected = list(raw[258:270])
             mt2_cons_flat    = raw[318]
             mt2_cons_wtd     = raw[319]
+            mt2_slot0_pf     = None
+            mt2_slot0_mkt    = None
         elif version == 5:
             # V6 layout: same as V5 + mt1_dir_injected[12] at raw[258:270]
             mt1_dir_cdb      = list(raw[242:254])
@@ -191,6 +212,8 @@ def load_binary_log(path: Path) -> list[dict]:
             mt1_dir_injected = list(raw[258:270])
             mt2_cons_flat    = None
             mt2_cons_wtd     = None
+            mt2_slot0_pf     = None
+            mt2_slot0_mkt    = None
         elif version == 4:
             # V5 layout: mt1_dir_correct_dbl[12] at raw[242:254], MT2 at 254+
             mt1_dir_cdb      = list(raw[242:254])
@@ -201,6 +224,8 @@ def load_binary_log(path: Path) -> list[dict]:
             mt1_dir_injected = [0] * 12
             mt2_cons_flat    = None
             mt2_cons_wtd     = None
+            mt2_slot0_pf     = None
+            mt2_slot0_mkt    = None
         else:
             mt1_dir_cdb      = [0.0] * 12
             mt2_best         = raw[242]
@@ -210,6 +235,8 @@ def load_binary_log(path: Path) -> list[dict]:
             mt1_dir_injected = [0] * 12
             mt2_cons_flat    = None
             mt2_cons_wtd     = None
+            mt2_slot0_pf     = None
+            mt2_slot0_mkt    = None
 
         records.append({
             "pass":                pass_num,
@@ -223,6 +250,8 @@ def load_binary_log(path: Path) -> list[dict]:
             "mt2_inj":             mt2_inj,
             "mt2_consensus_flat":  mt2_cons_flat,
             "mt2_consensus_wtd":   mt2_cons_wtd,
+            "mt2_slot0_pts_pf":    mt2_slot0_pf,
+            "mt2_slot0_pts_mkt":   mt2_slot0_mkt,
         })
         offset += rec_size
 
@@ -719,6 +748,20 @@ def plot_mt2(rows: list[dict], pass_num: int, out_path: Path) -> None:
         ax.plot(xs_cf, cons_flat, color="#7e1ea0", linewidth=2.0, alpha=0.80,
                 linestyle=(0, (5, 2)), label="Consensus (flat)")
 
+    # Dual-graded deployed slot-0 (Part A, log v8+): the SAME allocation decision scored two
+    # ways — on the slot-0 StockNN portfolio delta (the trained objective) vs the market forward
+    # return (the old coincident proxy). The gap = how far the proxy was from what actually earns.
+    have_dual = bool(rows) and rows[0].get("mt2_slot0_pts_pf") is not None
+    if have_dual:
+        s0_pf_raw  = [r["mt2_slot0_pts_pf"]  for r in rows]
+        s0_mkt_raw = [r["mt2_slot0_pts_mkt"] for r in rows]
+        xs_pf, s0_pf  = _smooth(xs_raw, s0_pf_raw)
+        xs_mk, s0_mkt = _smooth(xs_raw, s0_mkt_raw)
+        ax.plot(xs_pf, s0_pf,  color="#17becf", linewidth=2.2, alpha=0.95,
+                label="Slot0 graded: portfolio (trained)")
+        ax.plot(xs_mk, s0_mkt, color="#8c564b", linewidth=1.6, alpha=0.85,
+                linestyle=(0, (3, 2)), label="Slot0 graded: market (proxy)")
+
     rand_score, t0m, assign = _mt2_realistic_random_baseline(rows)
     n0, n1, n2, n3 = assign
     ax.axhline(rand_score, color="#888888", linewidth=1.0, alpha=0.80, linestyle="--",
@@ -806,6 +849,12 @@ def plot_mt2(rows: list[dict], pass_num: int, out_path: Path) -> None:
             mlines.Line2D([], [], color="#7e1ea0", linewidth=2.0, linestyle=(0, (5, 2)),
                           label="Consensus (flat)"),
         ]
+    if have_dual:
+        legend_handles.extend([
+            mlines.Line2D([], [], color="#17becf", linewidth=2.2, label="Slot0 graded: portfolio (trained)"),
+            mlines.Line2D([], [], color="#8c564b", linewidth=1.6, linestyle=(0, (3, 2)),
+                          label="Slot0 graded: market (proxy)"),
+        ])
     if low_trend_handle:
         legend_handles.append(low_trend_handle)
     ax.legend(handles=legend_handles, loc="upper center", bbox_to_anchor=(0.5, -0.10),
