@@ -3,7 +3,7 @@
 // Run:   ./build/training_v4_cpp --output models [--load-dir DIR] [--start-day N] [--stop-day N]
 //        [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F] [--workers N]
 
-#define TRAINER_VERSION "0.3.0.9"
+#define TRAINER_VERSION "0.3.1.0"
 
 #include <algorithm>
 #include <atomic>
@@ -957,6 +957,10 @@ struct IndResult {
 struct MasterResult {
     float best_pts, elite_max_pts, elite_min_pts, elite_mean_pts, ideal_pts;
     float consensus_flat_pts, consensus_wtd_pts;  // pool-consensus diagnostic (not fed into training)
+    // Dual-graded deployed slot-0 pts (set in process_block, default 0 from aggregate returns):
+    //   slot0_pts_pf  = graded on the slot-0 StockNN portfolio delta (the TRAINED objective)
+    //   slot0_pts_mkt = graded on the market forward return (the old coincident proxy, diagnostic)
+    float slot0_pts_pf, slot0_pts_mkt;
 };
 
 // ── Forward declarations (needed because step_industry calls load/save defined later) ──
@@ -3416,7 +3420,7 @@ static void load_or_init_mt2(const std::string& dir, const std::string& load_dir
 // ── MT binary log ────────────────────────────────────────────────────────────────
 
 static constexpr uint32_t MT_LOG_MAGIC   = 0x4D543132u;  // 'MT12'
-static constexpr uint32_t MT_LOG_VERSION = 6u;
+static constexpr uint32_t MT_LOG_VERSION = 7u;
 
 static bool write_mt_log_header(FILE* f) {
     uint32_t hdr[4] = {MT_LOG_MAGIC, MT_LOG_VERSION, (uint32_t)N_IND, 0u};
@@ -3445,8 +3449,11 @@ struct MTLogRecord {
     float    mt1_slot0_act[N_IND][4];   // V7: raw slot0 activations (conf, delta_t, range_pct, conf4) ×12
     float    mt2_consensus_flat_pts;    // V7: pool-consensus allocation score (flat vote)
     float    mt2_consensus_wtd_pts;     // V7: pool-consensus allocation score (look-behind weighted)
+    // V7 (log v7): dual-graded deployed slot-0 pts — portfolio (trained objective) vs market (proxy).
+    float    mt2_slot0_pts_pf;          // deployed slot0 graded on slot-0 portfolio delta
+    float    mt2_slot0_pts_mkt;         // deployed slot0 graded on market forward return (diagnostic)
 };
-static_assert(sizeof(MTLogRecord) == 1244, "MTLogRecord must be 1244 bytes");
+static_assert(sizeof(MTLogRecord) == 1252, "MTLogRecord must be 1252 bytes");
 
 static void write_mt_log_record(FILE* f, const MTLogRecord& r) {
     fwrite(&r, sizeof(MTLogRecord), 1, f);
@@ -3515,6 +3522,7 @@ static void write_csv_row(FILE* csv, int pass_num, int actual_day,
     fprintf(csv, ",%+.2f,%+.2f,%+.2f,%+.2f",
             mst.elite_max_pts, mst.elite_min_pts, mst.elite_mean_pts, mst.ideal_pts);
     fprintf(csv, ",%+.2f,%+.2f", mst.consensus_flat_pts, mst.consensus_wtd_pts);
+    fprintf(csv, ",%+.2f,%+.2f", mst.slot0_pts_pf, mst.slot0_pts_mkt);
     for (int i = 0; i < N_IND; i++)
         fprintf(csv, ",%.6f,%.2f", mkt_ret[i], mkt_val[i]);
     fprintf(csv, "\n");
@@ -4086,6 +4094,7 @@ int main(int argc, char* argv[]) {
                     g_ind_names[i].c_str(), g_ind_names[i].c_str(), g_ind_names[i].c_str());
         fprintf(csv, ",mt2_elite_max_pts,mt2_elite_min_pts,mt2_elite_mean_pts,mt2_ideal_pts");
         fprintf(csv, ",mt2_consensus_flat_pts,mt2_consensus_wtd_pts");
+        fprintf(csv, ",mt2_slot0_pts_pf,mt2_slot0_pts_mkt");
         for (int i = 0; i < N_IND; i++)
             fprintf(csv, ",%s_mkt_ret,%s_mkt_val",
                     g_ind_names[i].c_str(), g_ind_names[i].c_str());
@@ -4197,10 +4206,14 @@ int main(int argc, char* argv[]) {
                                                cur_dir_sigma, cur_acc_sigma, cur_rng_sigma,
                                                cur_cfd_sigma, cur_mst_sigma);
             }
-            // 2. MT2 M phase: replay block days with the post-block composed MT1 (head0+tail0)
+            // 2. MT2 M phase: replay block days with the post-block composed MT1 (head0+tail0).
+            //    MT2 is now GRADED/TRAINED on the deployed slot-0 StockNN portfolio delta
+            //    (perf_pf = slot0_score/baseline − 1) — the quantity that actually earns — instead
+            //    of the coincident market forward return (blk_perf, kept as a read-only diagnostic).
             MasterResult blk_master_res[MT1_BLOCK_DAYS];
             for (int d = 0; d < blk_len; d++) {
                 MasterResult mr{}; bool inj = false;
+                float s0_pf = 0.f, s0_mkt = 0.f;
                 if (blk_actual_day[d] >= MASTER_START_DAY) {
                     float in48[48];
                     for (int i = 0; i < N_IND; i++) {
@@ -4213,9 +4226,22 @@ int main(int argc, char* argv[]) {
                         in48[i*4 + 2] = log1pf(expf(o4[2]));
                         in48[i*4 + 3] = sigmoidf(o4[3]);
                     }
-                    mr = step_mt2(*mst, *mt2_scratch, in48, blk_perf[d],
+                    // Deployed slot-0 portfolio return (training target) + market return (diagnostic).
+                    float perf_pf[N_IND], perf_mkt[N_IND];
+                    for (int i = 0; i < N_IND; i++) {
+                        float bl = blk_results[d][i].baseline;
+                        perf_pf[i]  = (bl > 1e-6f) ? (blk_results[d][i].slot0_score / bl - 1.f) : 0.f;
+                        perf_mkt[i] = blk_perf[d][i];   // cached market forward return
+                    }
+                    // Read-only dual grade of the deployed slot-0 (BEFORE step_mt2 reselects the pool):
+                    // the same allocation decision scored on both objectives, so the gap is visible.
+                    s0_pf  = drift_score_mt2_pts(mt2_scratch->elite(0), in48, perf_pf);
+                    s0_mkt = drift_score_mt2_pts(mt2_scratch->elite(0), in48, perf_mkt);
+                    mr = step_mt2(*mst, *mt2_scratch, in48, perf_pf,
                                   blk_actual_day[d], total_days, cur_mt2_sigma, &inj);
                 }
+                mr.slot0_pts_pf  = s0_pf;
+                mr.slot0_pts_mkt = s0_mkt;
                 blk_master_res[d] = mr;
             }
             // 3. CSV rows for the block (deferred so each row carries its MT2 result)
@@ -4263,6 +4289,8 @@ int main(int argc, char* argv[]) {
                 rec.mt2_injected   = 0u;
                 rec.mt2_consensus_flat_pts = lm.consensus_flat_pts;
                 rec.mt2_consensus_wtd_pts  = lm.consensus_wtd_pts;
+                rec.mt2_slot0_pts_pf       = lm.slot0_pts_pf;
+                rec.mt2_slot0_pts_mkt      = lm.slot0_pts_mkt;
                 write_mt_log_record(mt_log, rec);
             }
             // 5. Save (per block ≈ 25 days)
@@ -4377,8 +4405,10 @@ int main(int argc, char* argv[]) {
                             (IND_HIST_CAP - 1) * sizeof(float));
                     mst->mkt_val_hist[i][IND_HIST_CAP - 1] = today_mkt_val[i];
                 }
-                // StockNN best-slot portfolio value (kept for reference)
-                float today_v = results[i].baseline + results[i].best_delta;
+                // StockNN DEPLOYED slot-0 portfolio value — drives MT1 portfolio features + the
+                // MT1/MT2 portfolio target, consistent with the deployed model (was best_delta,
+                // hindsight best-slot, which no model can actually deploy).
+                float today_v = results[i].slot0_score;
                 if (mst->ind_hist_count < IND_HIST_CAP) {
                     mst->ind_val_hist[i][mst->ind_hist_count] = today_v;
                 } else {
