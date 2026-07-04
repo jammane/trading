@@ -43,13 +43,16 @@ MASTER_LAYER_DEFS = [
 
 # Heads/tails split — layer order defines each flat .bin; must match models.py MT1Head/MT1Tail
 # and the C++ HD_*/TL_* offsets. (prefix, out_size, in_size).
-HEAD_LAYER_DEFS = [          # shared trunk, 998 params (matches MT1Head, keys a1..c2)
-    ('a1', 20, 20), ('a2', 20, 20),
-    ('b1',  6, 10), ('b2',  4,  6),
-    ('c1',  5,  7), ('c2',  4,  5),
+HEAD_LAYER_DEFS = [          # dual trunk, 1,996 params (matches MT1DualHead: mkt then pf, each MT1Head)
+    ('mkt.a1', 20, 20), ('mkt.a2', 20, 20),
+    ('mkt.b1',  6, 10), ('mkt.b2',  4,  6),
+    ('mkt.c1',  5,  7), ('mkt.c2',  4,  5),
+    ('pf.a1', 20, 20), ('pf.a2', 20, 20),
+    ('pf.b1',  6, 10), ('pf.b2',  4,  6),
+    ('pf.c1',  5,  7), ('pf.c2',  4,  5),
 ]
-TAIL_LAYER_DEFS = [          # specialized 1-output tail, 1,187 params (matches MT1Tail, keys d1..d4)
-    ('d1', 22, 28), ('d2', 16, 22),
+TAIL_LAYER_DEFS = [          # specialized 1-output tail, 1,803 params (matches MT1Tail, keys d1..d4)
+    ('d1', 22, 56), ('d2', 16, 22),
     ('d3', 10, 16), ('d4',  1, 10),
 ]
 

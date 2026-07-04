@@ -38,7 +38,7 @@ from collections import defaultdict
 import torch
 import torch.nn.functional as F
 
-from models import MT1NN, MT1Head, MT1Tail, MT2NN, StockNN
+from models import MT1NN, MT1DualHead, MT1Tail, MT2NN, StockNN
 from training_lib import (
     ELITE_COUNT,
     ELITE_POOL,
@@ -323,7 +323,7 @@ def _mt1_score_breakdown(out4, actual_d, acc_floor, range_ceiling=None):
     return composite, score_dir, score_rng, score_acc, score_conf
 
 
-def _mt1_decode(model, in37_t):
+def _mt1_decode(model, in74_t):
     """Run MT1 inference and return raw activations for MT2 input and logging.
 
     Returns (conf, delta_t, range_pct, conf4):
@@ -334,7 +334,7 @@ def _mt1_decode(model, in37_t):
     """
     model.eval()
     with torch.inference_mode():
-        out4 = model(in37_t).squeeze(0)
+        out4 = model(in74_t).squeeze(0)
     conf      = torch.sigmoid(out4[0]).item()
     delta_t   = torch.tanh(out4[1]).item()
     range_pct = F.softplus(out4[2]).item()
@@ -531,7 +531,7 @@ def _ht_select_and_mutate(prefix, model_dir, model_class, scores, sigma, hist_mo
 
 # ── MT1 industry upkeep (heads/tails block cycle) ────────────────────────────────
 
-def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
+def upkeep_mt1_industry(industry, model_dir, in74_t, actual_d,
                          dir_sigma=UPKEEP_DIR_SIGMA, rng_sigma=UPKEEP_RNG_SIGMA,
                          acc_sigma=UPKEEP_ACC_SIGMA, cfd_sigma=UPKEEP_CFD_SIGMA,
                          head_sigma=UPKEEP_HEAD_SIGMA, rolling_state=None):
@@ -544,7 +544,7 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
     also evolve the head pool (freeze the best tails; mirror step_mt1_head, composite fitness).
     Production model = composed best head + best tails → mt1_{ind}_best.pt for inference.
 
-    File naming: mt1_{ind}_head_model_{slot}.pt (MT1Head),
+    File naming: mt1_{ind}_head_model_{slot}.pt (MT1DualHead),
                  mt1_{ind}_tail_{dir|acc|rng|cfd}_model_{slot}.pt (MT1Tail),
                  mt1_{ind}_best.pt (composed MT1NN), + per-pool _hist_* and mt1_{ind}_dir_hist.json.
 
@@ -556,7 +556,7 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
         rolling_state = {}
     ind_rs    = rolling_state.setdefault(industry, {})
     acc_floor = _rolling_acc_floor(ind_rs)
-    in37_t    = in37_t.detach()
+    in74_t    = in74_t.detach()
 
     head_prefix   = f'mt1_{industry}_head'
     tail_prefixes = [f'mt1_{industry}_tail_{n}' for n in MT1_POOL_NAMES]
@@ -574,10 +574,10 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
                 log(f"[mt1/{sn(industry)}] Bootstrap failed — random head/tail pools")
         else:
             log(f"[mt1/{sn(industry)}] Initializing random head/tail pools")
-        hb = MT1Head(); hb.load_state_dict(base.head.state_dict())
+        hb = MT1DualHead(); hb.load_state_dict(base.head.state_dict())
         save_slot_model(head_prefix, model_dir, 0, hb)
         for slot in range(1, MT1_COMP_SLOTS):
-            save_slot_model(head_prefix, model_dir, slot, _mutate_generic(hb, MT1Head, head_sigma))
+            save_slot_model(head_prefix, model_dir, slot, _mutate_generic(hb, MT1DualHead, head_sigma))
         for c, tp in enumerate(tail_prefixes):
             tb = MT1Tail(); tb.load_state_dict(base.tails[c].state_dict())
             save_slot_model(tp, model_dir, 0, tb)
@@ -586,7 +586,7 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
         del base
 
     # Frozen production bests at phase start (head + 4 tails).
-    head0  = load_slot_model(head_prefix, model_dir, 0, MT1Head); head0.eval()
+    head0  = load_slot_model(head_prefix, model_dir, 0, MT1DualHead); head0.eval()
     tails0 = [load_slot_model(tp, model_dir, 0, MT1Tail) for tp in tail_prefixes]
     for t in tails0:
         t.eval()
@@ -595,7 +595,7 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
     today_residual = 0.0
     if ind_rs.get('residual_buf'):
         with torch.inference_mode():
-            c0 = head0(in37_t)
+            c0 = head0(in74_t)
             comp0_delta_d = math.tanh(tails0[1](c0).reshape(-1)[0].item()) * MT1_SCALE_DOLLARS
         today_residual = abs(actual_d - comp0_delta_d)
     range_ceiling = _rolling_range_ceiling(ind_rs, today_residual)
@@ -609,11 +609,11 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
                 dir_hist_raw = json.load(_f)
         except Exception:
             dir_hist_raw = []
-    dir_hist_raw.append({'feat37': in37_t.squeeze(0).tolist(), 'actual_d': float(actual_d)})
+    dir_hist_raw.append({'feat74': in74_t.squeeze(0).tolist(), 'actual_d': float(actual_d)})
     dir_hist_raw = dir_hist_raw[-MT1_DIR_DAYS:]
     with open(dir_hist_path, 'w') as _f:
         json.dump(dir_hist_raw, _f)
-    dir_hist = [(torch.tensor(e['feat37'], dtype=torch.float32).unsqueeze(0), e['actual_d'])
+    dir_hist = [(torch.tensor(e['feat74'], dtype=torch.float32).unsqueeze(0), e['actual_d'])
                 for e in dir_hist_raw]
     dir_dw, _ = _dir_day_weights(dir_hist) if dir_hist else ([], 0.0)
     n_win = len(dir_hist)
@@ -753,14 +753,14 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
 
         scores = []
         for slot in range(MT1_COMP_SLOTS):
-            m = load_slot_model(head_prefix, model_dir, slot, MT1Head)
+            m = load_slot_model(head_prefix, model_dir, slot, MT1DualHead)
             scores.append((slot, _score_head(m)))
             del m
-        hist_models = _ht_load_hist(head_prefix, model_dir, MT1Head)
+        hist_models = _ht_load_hist(head_prefix, model_dir, MT1DualHead)
         hist_with_scores = [(hm, _score_head(hm)) for hm in hist_models]
         new_elites, new_wavgs = _ht_select_and_mutate(
-            head_prefix, model_dir, MT1Head, scores, head_sigma, hist_models=hist_with_scores)
-        _ht_save_hist(head_prefix, model_dir, MT1Head, new_elites, new_wavgs)
+            head_prefix, model_dir, MT1DualHead, scores, head_sigma, hist_models=hist_with_scores)
+        _ht_save_hist(head_prefix, model_dir, MT1DualHead, new_elites, new_wavgs)
         best_head_sc = max((sc for _, sc in scores), default=0.0)
         log(f"[mt1/{sn(industry)}:head] block cycle (ctr={block_ctr}) — best={best_head_sc:.4f}")
         del new_elites, new_wavgs, hist_models, tails_frozen
@@ -769,7 +769,7 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
 
     # ── Compose production best from the new head0 + new tail0 ──
     best = MT1NN()
-    nh = load_slot_model(head_prefix, model_dir, 0, MT1Head)
+    nh = load_slot_model(head_prefix, model_dir, 0, MT1DualHead)
     best.head.load_state_dict(nh.state_dict())
     for c, tp in enumerate(tail_prefixes):
         nt = load_slot_model(tp, model_dir, 0, MT1Tail)
@@ -783,7 +783,7 @@ def upkeep_mt1_industry(industry, model_dir, in37_t, actual_d,
     # Composed slot0 activations + windowed composite score + rolling update.
     best_score = 0.0
     with torch.inference_mode():
-        out4 = best(in37_t).squeeze(0)
+        out4 = best(in74_t).squeeze(0)
         for di, (feat_t, ad) in enumerate(dir_hist):
             o4d = best(feat_t).squeeze(0)
             best_score += _mt1_score_breakdown(o4d, ad, acc_floor, range_ceiling)[0] \
@@ -1065,13 +1065,14 @@ def upkeep_mt2(model_dir, mt1_slot0_outputs, actual_perf, industry_list,
 
 # ── Production inference (MT1 → MT2) ──────────────────────────────────────────
 
-def run_mt_inference(model_dir, industries, mkt_val_history, zero_counts, total_cash):
+def run_mt_inference(model_dir, industries, mkt_val_history, pf_val_history, zero_counts, total_cash):
     """
     MT1→MT2 inference chain for daily capital allocation in production.
 
-    mkt_val_history: {ind: [cumulative_market_index]} — features for MT1/MT2 input.
-    Loads mt1_{ind}_best.pt for each industry and mt2_best.pt, runs the full
-    chain, and returns (allocations, tier_map, mt1_outputs).
+    mkt_val_history: {ind: [cumulative_market_index]}  — market feature source.
+    pf_val_history:  {ind: [cumulative_slot0_portfolio_index]} — portfolio feature source (Part C).
+    MT1 input per industry = 74 = [37 market ‖ 37 portfolio] features. Loads mt1_{ind}_best.pt for
+    each industry and mt2_best.pt, runs the chain, returns (allocations, tier_map, mt1_outputs).
 
     Caller should fall back to MasterNN/equal allocation if mt2_best.pt is absent.
 
@@ -1082,11 +1083,11 @@ def run_mt_inference(model_dir, industries, mkt_val_history, zero_counts, total_
     from training_lib import build_master_features, tiers_to_alloc
 
     industry_list = list(industries.keys())
-    today444 = build_master_features(mkt_val_history, industry_list)
+    today888 = build_master_features(mkt_val_history, pf_val_history, industry_list)
 
     mt1_outputs: dict = {}
     for i, ind in enumerate(industry_list):
-        in37_t  = today444[:, i * 37:(i + 1) * 37]
+        in74_t  = today888[:, i * 74:(i + 1) * 74]
         best_pt = os.path.join(model_dir, f"mt1_{ind}_best.pt")
         mt1_m   = MT1NN()
         if os.path.exists(best_pt):
@@ -1096,7 +1097,7 @@ def run_mt_inference(model_dir, industries, mkt_val_history, zero_counts, total_
                 print(f"Warning: could not load mt1_{ind}_best.pt: {e}")
         mt1_m.eval()
         with torch.no_grad():
-            conf, delta_t, range_pct, conf4 = _mt1_decode(mt1_m, in37_t)
+            conf, delta_t, range_pct, conf4 = _mt1_decode(mt1_m, in74_t)
         mt1_outputs[ind] = (conf, delta_t, range_pct, conf4)
         del mt1_m
 

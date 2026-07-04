@@ -166,30 +166,30 @@ def train_industry_one_day_prod(industry, symbols, yesterday_data, primed_portfo
         return None
 
 
-def train_mt_one_day_prod(industries, model_dir, mkt_val_history,
-                          mkt_ret, norm_stats, mt1_outputs_prev=None):
+def train_mt_one_day_prod(industries, model_dir, mkt_val_history, pf_val_history,
+                          slot0_deltas, mkt_ret, norm_stats, mt1_outputs_prev=None):
     """
-    Upkeep training for MT1 (12 pools) and MT2 using market-based targets.
+    Upkeep training for MT1 (12 dual-head pools) and MT2 (Part C — mirrors the C++ trainer).
 
-    mkt_val_history: {ind: [cumulative_market_index]} — already updated for today.
-    mkt_ret:         {ind: float} — today's equal-weight close-to-close return per industry.
-    mt1_outputs_prev: MT1 slot0 outputs from production inference (optional).
+    mkt_val_history: {ind: [cumulative_market_index]}  — market feature source (compounding).
+    pf_val_history:  {ind: [cumulative_slot0_portfolio_index]} — portfolio feature source (compounding).
+    slot0_deltas:    {ind: today's deployed slot-0 portfolio return} — the MT2 same-day objective.
 
-    Called for side-effects (return unused). Uses an MT1_FWD_DAYS-session FORWARD target:
-    today's prediction can't be scored until its forward window completes, so predictions are
-    buffered (mt_fwd_buffer.json) and trained MT1_FWD_DAYS sessions later, when the realized
-    cumulative relative return is known. This mirrors the C++ trainer's forward target exactly.
+    MT1 input per industry = 74 = [37 market ‖ 37 portfolio] features. MT1 target = the PORTFOLIO
+    forward return over MT1_FWD_DAYS; MT2 trains on the deployed same-day slot-0 delta (Part A). Each
+    day's features + cumulative portfolio index + slot-0 delta are buffered (mt_fwd_buffer.json) and
+    trained MT1_FWD_DAYS sessions later, once the forward portfolio value is realized.
     """
-    from training_lib import (build_master_features, MT1_FWD_DAYS, MT2_FEED_DIRECTION)
+    from training_lib import build_master_features, MT1_FWD_DAYS
     from upkeep import MT1_SCALE_DOLLARS
     industry_list = list(industries.keys())
 
-    # Today's features + current cumulative market index per industry (last history entry)
-    today444 = build_master_features(mkt_val_history, industry_list)
-    cur_index = {}
+    # Today's dual features + current cumulative portfolio index per industry (last history entry)
+    today888 = build_master_features(mkt_val_history, pf_val_history, industry_list)
+    cur_pf_index = {}
     for ind in industry_list:
-        h = mkt_val_history.get(ind, [])
-        cur_index[ind] = float(h[-1]) if h else 25000.0  # IND_STARTING_CASH cold-start
+        h = pf_val_history.get(ind, [])
+        cur_pf_index[ind] = float(h[-1]) if h else 25000.0  # IND_STARTING_CASH cold-start
 
     # Forward-target prediction buffer (persisted across daily runs)
     buf_path = os.path.join(model_dir, 'mt_fwd_buffer.json')
@@ -200,36 +200,37 @@ def train_mt_one_day_prod(industries, model_dir, mkt_val_history,
                 buf = json.load(_f)
         except Exception:
             buf = []
-    buf.append({'feat444': today444.squeeze(0).tolist(), 'index': cur_index})
+    buf.append({'feat888':     today888.squeeze(0).tolist(),
+                'pf_index':    cur_pf_index,
+                'slot0_delta': {ind: float(slot0_deltas.get(ind, 0.0)) for ind in industry_list}})
 
-    # Train once the oldest buffered prediction's MT1_FWD_DAYS window has completed
+    # Train once the oldest buffered prediction's MT1_FWD_DAYS forward window has completed
     if len(buf) > MT1_FWD_DAYS:
         old = buf.pop(0)
-        old_index = old['index']
-        fwd_ret = {}
+        old_pf = old.get('pf_index', {})
+        pf_fwd = {}
         for ind in industry_list:
-            oi = old_index.get(ind, 0.0)
-            fwd_ret[ind] = (cur_index[ind] / oi - 1.0) if oi else 0.0
-        # MT1 target is the ABSOLUTE own-industry forward return; MT2 relativizes (actual_perf).
-        actual_d_by_ind = {ind: fwd_ret[ind] * MT1_SCALE_DOLLARS
-                           for ind in industry_list}
-        actual_perf = {ind: fwd_ret[ind] for ind in industry_list}
-        old_feat = torch.tensor(old['feat444'], dtype=torch.float32).unsqueeze(0)
+            oi = old_pf.get(ind, 0.0)
+            pf_fwd[ind] = (cur_pf_index[ind] / oi - 1.0) if oi else 0.0
+        # MT1 target = PORTFOLIO forward return; MT2 grades on the matured day's same-day slot-0 delta.
+        actual_d_by_ind = {ind: pf_fwd[ind] * MT1_SCALE_DOLLARS for ind in industry_list}
+        mt2_perf = {ind: float(old.get('slot0_delta', {}).get(ind, 0.0)) for ind in industry_list}
+        old_feat = torch.tensor(old['feat888'], dtype=torch.float32).unsqueeze(0)
 
         mt2_inputs: dict = {}
         for i, ind in enumerate(industry_list):
-            in37_t = old_feat[:, i * 37:(i + 1) * 37]
+            in74_t = old_feat[:, i * 74:(i + 1) * 74]
             try:
                 (_, _, conf, delta, range_pct, conf4,
                  d0_conf, d0_delta, d0_range, d0_conf4) = upkeep_mt1_industry(
-                    ind, model_dir, in37_t, actual_d_by_ind[ind])
-                mt2_inputs[ind] = ((d0_conf, d0_delta, d0_range, d0_conf4)
-                                   if MT2_FEED_DIRECTION else (conf, delta, range_pct, conf4))
+                    ind, model_dir, in74_t, actual_d_by_ind[ind])
+                # Heads/tails design: one production model, so composite == direction feed.
+                mt2_inputs[ind] = (d0_conf, d0_delta, d0_range, d0_conf4)
             except Exception as e:
                 print(f"Error in upkeep_mt1_industry {ind}: {e}")
                 mt2_inputs[ind] = (0.5, 0.0, 0.02, 0.5)
         try:
-            upkeep_mt2(model_dir, mt2_inputs, actual_perf, industry_list)
+            upkeep_mt2(model_dir, mt2_inputs, mt2_perf, industry_list)
         except Exception as e:
             print(f"Error in upkeep_mt2: {e}")
 
@@ -444,38 +445,41 @@ def compute_industry_current_values(industries, holdings, histories):
     return ind_values
 
 
-def run_master_allocation(master_model, industries, mkt_val_history, zero_counts,
+def run_master_allocation(master_model, industries, mkt_val_history, pf_val_history, zero_counts,
                           total_cash, norm_stats=None, model_dir=None):
     """
     Run master inference to get tier classification and capital allocation.
     Mutates zero_counts in place.
 
-    mkt_val_history: {ind: [cumulative_market_index]} — used for build_master_features.
-    Priority: MT2 (mt2_best.pt exists) → legacy MasterNN → equal allocation.
+    mkt_val_history: {ind: [cumulative_market_index]}  — market feature source.
+    pf_val_history:  {ind: [cumulative_slot0_portfolio_index]} — portfolio feature source (Part C).
+    Priority: MT2 (mt2_best.pt exists) → legacy MasterNN (market-only 444) → equal allocation.
     Returns (allocations, tier_map, mt1_outputs).
       allocations:  {ind: dollar_amount}
       tier_map:     {ind: 0-3}
       mt1_outputs:  {ind: (conf, delta, range_hw)} or None for legacy path
     """
-    from training_lib import build_master_features, decode_master_tiers, tiers_to_alloc
+    from training_lib import _build_ind_features37, decode_master_tiers, tiers_to_alloc
     industry_list = list(industries.keys())
     tier_map      = {ind: 0 for ind in industry_list}
     mt1_outputs   = None
 
-    # MT2 path — preferred if mt2_best.pt exists and norm_stats are available
+    # MT2 path — preferred if mt2_best.pt exists (MT2 consumes raw MT1 activations, no norm stats).
     mt2_path = os.path.join(model_dir, 'mt2_best.pt') if model_dir else None
-    if mt2_path and os.path.exists(mt2_path) and norm_stats is not None:
+    if mt2_path and os.path.exists(mt2_path):
         try:
             allocations, tier_map, mt1_outputs = run_mt_inference(
-                model_dir, industries, mkt_val_history, norm_stats, zero_counts, total_cash)
+                model_dir, industries, mkt_val_history, pf_val_history, zero_counts, total_cash)
             return allocations, tier_map, mt1_outputs
         except Exception as e:
             print(f"Warning: MT2 inference failed ({e}) — falling back to MasterNN")
 
-    # Legacy MasterNN fallback
+    # Legacy MasterNN fallback — market-only 444 features (MasterNN predates the dual MT1 input).
     if master_model is not None:
         try:
-            today_t = build_master_features(mkt_val_history, industry_list)
+            feats = [f for ind in industry_list
+                     for f in _build_ind_features37(mkt_val_history.get(ind, []))]
+            today_t = torch.tensor(feats, dtype=torch.float32).unsqueeze(0)
             with torch.no_grad():
                 out = master_model(today_t)
             tier_map = decode_master_tiers(out, industry_list)
@@ -704,7 +708,7 @@ def main():
         ind_value_history, mkt_val_history, zero_counts, norm_stats = _load_master_state(model_dir, industry_list)
         master = load_weighted_model(MasterNN, model_dir, 'master')
         allocations, tier_map, _mt1_inf_outputs = run_master_allocation(
-            master, industries, mkt_val_history, zero_counts, cash,
+            master, industries, mkt_val_history, ind_value_history, zero_counts, cash,
             norm_stats=norm_stats, model_dir=model_dir)
 
         # Liquidate industries with 3+ consecutive tier-0 predictions
@@ -1039,24 +1043,31 @@ def main():
             hist_v.append(prev_v * (1.0 + mkt_ret.get(ind, 0.0)))
             mkt_val_history[ind] = hist_v[-92:]  # cap at IND_HIST_CAP=92
 
-        # Append today's industry slot0 values and persist master state for next day.
+        # Append today's PORTFOLIO index (Part C: compound the deployed slot-0 return so a 10-day
+        # forward ratio is a meaningful cumulative return, matching the C++ ind_val_hist), and record
+        # today's same-day slot-0 delta (the MT2 objective). industry_top_scores[ind] = (baseline, slot0).
+        slot0_deltas = {}
         for ind in industry_list:
             if ind in industry_top_scores:
-                ind_value_history[ind].append(industry_top_scores[ind][1])
+                baseline, slot0_v = industry_top_scores[ind]
+                slot0_ret = (slot0_v / baseline - 1.0) if baseline > 1e-6 else 0.0
+                slot0_deltas[ind] = slot0_ret
+                hist_v = ind_value_history.get(ind, [])
+                prev_v = hist_v[-1] if hist_v else IND_START
+                hist_v.append(prev_v * (1.0 + slot0_ret))
+                ind_value_history[ind] = hist_v[-92:]  # cap at IND_HIST_CAP=92
         _save_master_state(model_dir, ind_value_history, mkt_val_history, zero_counts)
 
-        # MT1/MT2 upkeep — gate on ≥15 days of real history (same guard as old master).
-        # MT1 upkeep needs build_master_features input; MT2 upkeep needs ≥5 MT1 warmup.
-        # Sentinel filter: per-industry values ≠ 3000 (40% of $3k paper account = $1200).
+        # MT1/MT2 upkeep — gate on ≥15 days of history (MT1 needs features; MT2 needs ≥5 MT1 warmup).
         min_real_days = min(
-            (sum(1 for v in ind_value_history.get(ind, []) if v != 3000.0)
-             for ind in industry_list),
+            (len(ind_value_history.get(ind, [])) for ind in industry_list),
             default=0,
         )
         if min_real_days >= 15:
-            print(f"Running MT1/MT2 upkeep ({min_real_days} real history days) ...")
+            print(f"Running MT1/MT2 upkeep ({min_real_days} history days) ...")
             train_mt_one_day_prod(
-                industries, model_dir, mkt_val_history, mkt_ret, norm_stats)
+                industries, model_dir, mkt_val_history, ind_value_history,
+                slot0_deltas, mkt_ret, norm_stats)
             save_mt2_norm_stats(model_dir, norm_stats)
         elif os.path.exists(f"{model_dir}/master_best.pt"):
             # Legacy MasterNN upkeep during transition period (≤15 real days)
