@@ -125,17 +125,35 @@ class MT1Head(nn.Module):
         return torch.cat([a, b, c], dim=1)   # (batch, 28)
 
 
-class MT1Tail(nn.Module):
+class MT1DualHead(nn.Module):
     """
-    Specialized single-output MT1 tail — ONE per component (direction / accuracy / range /
-    confidence). Consumes the shared head's (batch, 28) → (batch, 1) raw logit.
-      D taper: 28 → 22 → 16 → 10 → 1
-    1,187 params. Layer names/order MUST match TAIL_LAYER_DEFS + the C++ tail offsets.
+    Dual shared trunk (Part C): two parallel MT1Head trunks — one over the 37 market-index
+    features, one over the 37 normalized portfolio (slot-0 StockNN) features — concatenated.
+    Input (batch, 74) = [market37 ‖ portfolio37] → (batch, 56) concat feature vector.
+    1,996 params (2 × 998). Submodule order (mkt, pf) MUST match HEAD_LAYER_DEFS + the C++
+    head offsets (mkt sub-head at buffer base 0, pf sub-head at base HEADNN_SUB=998).
     """
 
     def __init__(self):
         super().__init__()
-        self.d1 = nn.Linear(28, 22); self.d2 = nn.Linear(22, 16)
+        self.mkt = MT1Head()   # market-index features  x[:, 0:37]
+        self.pf  = MT1Head()   # portfolio features     x[:, 37:74]
+
+    def forward(self, x):
+        return torch.cat([self.mkt(x[:, 0:37]), self.pf(x[:, 37:74])], dim=1)   # (batch, 56)
+
+
+class MT1Tail(nn.Module):
+    """
+    Specialized single-output MT1 tail — ONE per component (direction / accuracy / range /
+    confidence). Consumes the dual head's (batch, 56) → (batch, 1) raw logit.
+      D taper: 56 → 22 → 16 → 10 → 1
+    1,803 params. Layer names/order MUST match TAIL_LAYER_DEFS + the C++ tail offsets.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.d1 = nn.Linear(56, 22); self.d2 = nn.Linear(22, 16)
         self.d3 = nn.Linear(16, 10); self.d4 = nn.Linear(10, 1)
 
     def forward(self, h):
@@ -145,16 +163,17 @@ class MT1Tail(nn.Module):
 
 class MT1NN(nn.Module):
     """
-    Composed MT1 net: one shared MT1Head + four specialized MT1Tails → (batch, 4) raw logits.
+    Composed MT1 net: one shared MT1DualHead (74→56) + four specialized MT1Tails → (batch, 4)
+    raw logits. Input (batch, 74) = [37 market-index ‖ 37 portfolio] features per industry.
     Tail order = [direction, accuracy, range, confidence] → outputs [0,1,2,3]:
       out[0] → sigmoid → direction confidence   out[1] → tanh × $10K → dollar P&L
       out[2] → softplus → range frac            out[3] → sigmoid → calibrated confidence
-    Components evolve head + their single tail; composite/production uses all four. 5,746 params.
+    Components evolve head + their single tail; composite/production uses all four. 9,208 params.
     """
 
     def __init__(self):
         super().__init__()
-        self.head  = MT1Head()
+        self.head  = MT1DualHead()
         self.tails = nn.ModuleList([MT1Tail() for _ in range(4)])
 
     def forward(self, x):

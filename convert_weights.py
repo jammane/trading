@@ -15,7 +15,7 @@ import os
 import numpy as np
 import torch
 
-from models import StockNN, MasterNN, MT1NN, MT1Head, MT1Tail, MT2NN
+from models import StockNN, MasterNN, MT1NN, MT1Head, MT1DualHead, MT1Tail, MT2NN
 from prepare_models import (
     STOCK_LAYER_DEFS, MASTER_LAYER_DEFS, MT2_LAYOUT,
     HEAD_LAYER_DEFS, TAIL_LAYER_DEFS, HT_PARENTS, MT1_POOL_NAMES,
@@ -144,7 +144,7 @@ def _convert_mt1_best(ind, models_dir, output_dir):
 
 def _convert_mt1_pools(ind, models_dir, output_dir):
     """Convert head + 4 tail pool elite .bin → .pt so upkeep can keep evolving them."""
-    convert_industry(f'mt1_{ind}_head', models_dir, output_dir, HEAD_LAYER_DEFS, MT1Head,
+    convert_industry(f'mt1_{ind}_head', models_dir, output_dir, HEAD_LAYER_DEFS, MT1DualHead,
                      f'mt1_{ind}_head', n_elites=HT_PARENTS)
     for pool in MT1_POOL_NAMES:
         convert_industry(f'mt1_{ind}_tail_{pool}', models_dir, output_dir, TAIL_LAYER_DEFS, MT1Tail,

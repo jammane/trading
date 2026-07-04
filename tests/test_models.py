@@ -4,7 +4,7 @@ import io
 import pytest
 import torch
 
-from models import MasterNN, MT1NN, MT1Head, MT1Tail, MT2NN, StockNN
+from models import MasterNN, MT1NN, MT1DualHead, MT1Head, MT1Tail, MT2NN, StockNN
 
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
@@ -218,7 +218,7 @@ class TestMasterNN:
 @pytest.fixture
 def mt1_inputs():
     torch.manual_seed(0)
-    return torch.randn(1, 37)
+    return torch.randn(1, 74)   # Part C: [market37 ‖ portfolio37]
 
 
 class TestMT1NN:
@@ -227,42 +227,43 @@ class TestMT1NN:
         assert out.shape == (1, 4)
 
     def test_param_count(self):
-        # Composed = shared head (998) + 4 specialized tails (1187 each) = 5746
+        # Composed = dual head (2×998=1996) + 4 specialized tails (1803 each) = 9208
         assert sum(p.numel() for p in MT1Head().parameters()) == 998
-        assert sum(p.numel() for p in MT1Tail().parameters()) == 1187
+        assert sum(p.numel() for p in MT1DualHead().parameters()) == 1996
+        assert sum(p.numel() for p in MT1Tail().parameters()) == 1803
         n = sum(p.numel() for p in MT1NN().parameters())
-        assert n == 5746, f"MT1NN param count: expected 5746, got {n}"
+        assert n == 9208, f"MT1NN param count: expected 9208, got {n}"
 
     def test_head_tail_shapes(self, mt1_inputs):
-        h = MT1Head()(mt1_inputs)
-        assert h.shape == (1, 28)                 # concat A20+B4+C4
+        h = MT1DualHead()(mt1_inputs)
+        assert h.shape == (1, 56)                 # concat of two (A20+B4+C4) trunks
         assert MT1Tail()(h).shape == (1, 1)       # single-output tail
+        assert MT1Head()(torch.randn(1, 37)).shape == (1, 28)   # one sub-trunk
 
     def test_composition(self, mt1_inputs):
-        # Composed forward == head then the four tails concatenated.
+        # Composed forward == dual head then the four tails concatenated.
         m = MT1NN()
         h = m.head(mt1_inputs)
         manual = torch.cat([t(h) for t in m.tails], dim=1)
         assert torch.allclose(m(mt1_inputs), manual)
 
     def test_head_tail_roundtrip(self):
-        import numpy as np
         from prepare_models import state_dict_to_arr, HEAD_LAYER_DEFS, TAIL_LAYER_DEFS
         from convert_weights import arr_to_state_dict
-        x = torch.randn(1, 37)
-        head = MT1Head()
+        x = torch.randn(1, 74)
+        head = MT1DualHead()
         arr = state_dict_to_arr(head.state_dict(), HEAD_LAYER_DEFS)
-        assert arr.size == 998
-        head2 = MT1Head(); head2.load_state_dict(arr_to_state_dict(arr, HEAD_LAYER_DEFS, MT1Head))
+        assert arr.size == 1996
+        head2 = MT1DualHead(); head2.load_state_dict(arr_to_state_dict(arr, HEAD_LAYER_DEFS, MT1DualHead))
         assert torch.allclose(head(x), head2(x))
         tail = MT1Tail(); h = head(x)
         tarr = state_dict_to_arr(tail.state_dict(), TAIL_LAYER_DEFS)
-        assert tarr.size == 1187
+        assert tarr.size == 1803
         tail2 = MT1Tail(); tail2.load_state_dict(arr_to_state_dict(tarr, TAIL_LAYER_DEFS, MT1Tail))
         assert torch.allclose(tail(h), tail2(h))
 
     def test_head_tail_compose_to_mt1nn(self):
-        """convert_weights composes a production MT1NN from head + 4 tail flat arrays (Inc 4A)."""
+        """convert_weights composes a production MT1NN from dual head + 4 tail flat arrays."""
         from prepare_models import state_dict_to_arr, HEAD_LAYER_DEFS, TAIL_LAYER_DEFS
         from convert_weights import arr_to_state_dict
         src = MT1NN()
@@ -272,7 +273,7 @@ class TestMT1NN:
         m.head.load_state_dict(arr_to_state_dict(head_arr, HEAD_LAYER_DEFS, None))
         for c in range(4):
             m.tails[c].load_state_dict(arr_to_state_dict(tail_arrs[c], TAIL_LAYER_DEFS, None))
-        x = torch.randn(1, 37)
+        x = torch.randn(1, 74)
         assert torch.allclose(src(x), m(x), atol=1e-6)
 
     def test_confidence_after_sigmoid(self, mt1_inputs):

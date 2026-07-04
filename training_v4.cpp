@@ -3,7 +3,7 @@
 // Run:   ./build/training_v4_cpp --output models [--load-dir DIR] [--start-day N] [--stop-day N]
 //        [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F] [--workers N]
 
-#define TRAINER_VERSION "0.3.1.1"
+#define TRAINER_VERSION "0.4.0.0"
 
 #include <algorithm>
 #include <atomic>
@@ -161,16 +161,19 @@ static constexpr int MT1_D2_W=1636, MT1_D2_B=1988;   // 16×22
 static constexpr int MT1_D3_W=2004, MT1_D3_B=2164;   // 10×16
 static constexpr int MT1_D4_W=2174, MT1_D4_B=2214;   // 4×10  (ends at 2218)
 
-// ── Heads/tails split (redesign): shared head trunk (37→28) + specialized 1-output tails (28→1) ──
-// Head buffer = a1..c2 (identical layout to the branched net's first 998 params).
-static constexpr int   HEADNN_PARAMS = 998;
-static constexpr int   TAILNN_PARAMS = 1187;
+// ── Heads/tails split (Part C dual head): TWO 37→28 trunks (market ‖ portfolio) → concat56,
+//    + specialized 1-output tails (56→1). Input per industry = 74 = [market37 ‖ portfolio37]. ──
+// Head buffer = mkt sub-head (a1..c2, 998) then pf sub-head (a1..c2, 998) = 1996. HD_* offsets
+// are relative to each sub-head base (0 for mkt, HEADNN_SUB for pf).
+static constexpr int   HEADNN_SUB    = 998;              // one MT1Head trunk (37→28)
+static constexpr int   HEADNN_PARAMS = 2 * HEADNN_SUB;   // dual trunk = 1996
+static constexpr int   TAILNN_PARAMS = 1803;
 static constexpr int HD_A1_W=0,   HD_A1_B=400;   static constexpr int HD_A2_W=420, HD_A2_B=820;   // 20×20, 20×20
 static constexpr int HD_B1_W=840, HD_B1_B=900;   static constexpr int HD_B2_W=906, HD_B2_B=930;   // 6×10, 4×6
 static constexpr int HD_C1_W=934, HD_C1_B=969;   static constexpr int HD_C2_W=974, HD_C2_B=994;   // 5×7, 4×5  (ends 998)
-// Tail buffer = d1..d4 with d4→1 (own buffer; NOT the branched net's D — d4 is 10×1 here).
-static constexpr int TL_D1_W=0,    TL_D1_B=616;  static constexpr int TL_D2_W=638,  TL_D2_B=990;  // 22×28, 16×22
-static constexpr int TL_D3_W=1006, TL_D3_B=1166; static constexpr int TL_D4_W=1176, TL_D4_B=1186; // 10×16, 1×10  (ends 1187)
+// Tail buffer = d1..d4 with d1 now 56-wide input (concat of both trunks), d4→1.
+static constexpr int TL_D1_W=0,    TL_D1_B=1232; static constexpr int TL_D2_W=1254, TL_D2_B=1606; // 22×56, 16×22
+static constexpr int TL_D3_W=1622, TL_D3_B=1782; static constexpr int TL_D4_W=1792, TL_D4_B=1802; // 10×16, 1×10  (ends 1803)
 
 // MT2 injection: fire when ≥75% of pool scores below threshold (worst ~15% of days)
 static constexpr float MT2_INJ_THRESHOLD = -7.0f;
@@ -345,10 +348,10 @@ static void master_forward(const float* W, const float* today444, float* out48) 
     sgemv_only(W + MAST_OUT_W, W + MAST_OUT_B, h4,    out48,  48, 180);
 }
 
-// MT1NN forward: 37→37→29→20→12→4 (raw logits; activations applied at score time)
+// MT1NN forward (Part C): dual head 74→56, tails 56→4 (raw logits; activations at score time)
 
-// Shared head trunk: in37 → concat28 (mirrors models.py MT1Head).
-static void head_forward(const float* W, const float* in37, float* concat28) {
+// One 37→28 sub-trunk (mirrors models.py MT1Head). W points at the sub-head's base.
+static void head_subforward(const float* W, const float* in37, float* concat28) {
     const float* xb = in37;        // daily  [0:10]
     const float* xc = in37 + 10;   // decade [10:17]
     const float* xa = in37 + 17;   // vol+poly [17:37]
@@ -364,22 +367,29 @@ static void head_forward(const float* W, const float* in37, float* concat28) {
     memcpy(concat28 + 24, c2,  4 * sizeof(float));
 }
 
-// Specialized 1-output tail: concat28 → 1 raw logit (mirrors models.py MT1Tail).
-static void tail_forward(const float* W, const float* concat28, float* out1) {
+// Dual head trunk: in74 = [market37 ‖ portfolio37] → concat56 (mirrors models.py MT1DualHead).
+// mkt sub-head at W[0:HEADNN_SUB] over in74[0:37]; pf sub-head at W[HEADNN_SUB:] over in74[37:74].
+static void head_forward(const float* W, const float* in74, float* concat56) {
+    head_subforward(W,               in74,      concat56);       // market trunk → concat56[0:28]
+    head_subforward(W + HEADNN_SUB,  in74 + 37, concat56 + 28);  // portfolio trunk → concat56[28:56]
+}
+
+// Specialized 1-output tail: concat56 → 1 raw logit (mirrors models.py MT1Tail).
+static void tail_forward(const float* W, const float* concat56, float* out1) {
     float d1[22], d2[16], d3[10];
-    sgemv_relu(W + TL_D1_W, W + TL_D1_B, concat28, d1, 22, 28);
+    sgemv_relu(W + TL_D1_W, W + TL_D1_B, concat56, d1, 22, 56);
     sgemv_relu(W + TL_D2_W, W + TL_D2_B, d1,  d2, 16, 22);
     sgemv_relu(W + TL_D3_W, W + TL_D3_B, d2,  d3, 10, 16);
     sgemv_only(W + TL_D4_W, W + TL_D4_B, d3, out1,  1, 10);
 }
 
-// Composed MT1: head + 4 tails → 4 raw logits (production/composite path; head_forward once,
-// then 4 tail_forwards share the concat).
+// Composed MT1: dual head + 4 tails → 4 raw logits (production/composite path; head_forward once,
+// then 4 tail_forwards share the concat56).
 static void mt1_composed_forward(const float* head_w, const float* const tail_w[4],
-                                 const float* in37, float* out4) {
-    float concat28[28];
-    head_forward(head_w, in37, concat28);
-    for (int t = 0; t < 4; t++) tail_forward(tail_w[t], concat28, out4 + t);
+                                 const float* in74, float* out4) {
+    float concat56[56];
+    head_forward(head_w, in74, concat56);
+    for (int t = 0; t < 4; t++) tail_forward(tail_w[t], concat56, out4 + t);
 }
 
 // Single LSTM time step (one layer). gates[4*hidden] is caller-provided scratch.
@@ -584,7 +594,7 @@ struct MT1Scratch {
     float*   tail0_buf[4];        // best 4 tails (production)
 
     // Multi-day direction scoring buffer (last MT1_DIR_DAYS entries of features + actual_d)
-    struct DirDayEntry { float feat37[37]; float actual_d; };
+    struct DirDayEntry { float feat74[74]; float actual_d; };
     DirDayEntry  dir_day_buf[MT1_DIR_DAYS]{};
     int          dir_day_head{0};
     int          dir_day_count{0};
@@ -622,8 +632,8 @@ struct MT1Scratch {
     float* head_hist_slot(int d, int pos)         { return head_hist    + ((size_t)(d*HIST_PER_DAY+pos))*HEADNN_PARAMS; }
     float* tail_hist_slot(int c, int d, int pos)  { return tail_hist[c] + ((size_t)(d*HIST_PER_DAY+pos))*TAILNN_PARAMS; }
 
-    void push_dir_day(const float* f37, float ad) {
-        memcpy(dir_day_buf[dir_day_head].feat37, f37, 37 * sizeof(float));
+    void push_dir_day(const float* f74, float ad) {
+        memcpy(dir_day_buf[dir_day_head].feat74, f74, 74 * sizeof(float));
         dir_day_buf[dir_day_head].actual_d = ad;
         dir_day_head = (dir_day_head + 1) % MT1_DIR_DAYS;
         if (dir_day_count < MT1_DIR_DAYS) dir_day_count++;
@@ -770,16 +780,20 @@ static void init_mt1_weights(float* W, PCG32& rng) {
 }
 
 static void init_head_weights(float* W, PCG32& rng) {
-    kaiming_init(W + HD_A1_W, 20, 20, rng);
-    kaiming_init(W + HD_A2_W, 20, 20, rng);
-    kaiming_init(W + HD_B1_W,  6, 10, rng);
-    kaiming_init(W + HD_B2_W,  4,  6, rng);
-    kaiming_init(W + HD_C1_W,  5,  7, rng);
-    kaiming_init(W + HD_C2_W,  4,  5, rng);
+    // Two identical 37→28 sub-trunks (mkt at base 0, pf at base HEADNN_SUB).
+    for (int s = 0; s < 2; s++) {
+        float* Ws = W + s * HEADNN_SUB;
+        kaiming_init(Ws + HD_A1_W, 20, 20, rng);
+        kaiming_init(Ws + HD_A2_W, 20, 20, rng);
+        kaiming_init(Ws + HD_B1_W,  6, 10, rng);
+        kaiming_init(Ws + HD_B2_W,  4,  6, rng);
+        kaiming_init(Ws + HD_C1_W,  5,  7, rng);
+        kaiming_init(Ws + HD_C2_W,  4,  5, rng);
+    }
 }
 
 static void init_tail_weights(float* W, PCG32& rng) {
-    kaiming_init(W + TL_D1_W, 22, 28, rng);
+    kaiming_init(W + TL_D1_W, 22, 56, rng);
     kaiming_init(W + TL_D2_W, 16, 22, rng);
     kaiming_init(W + TL_D3_W, 10, 16, rng);
     kaiming_init(W + TL_D4_W,  1, 10, rng);
@@ -1762,422 +1776,78 @@ static void fill_window(const float* hist, int hist_count, int win, float* windo
     }
 }
 
-// Build 444-feature vector for master from per-industry value history.
-// out444 layout per industry (37 features × 12 = 444):
-//   [0..17]   18 delta lookbacks at LOOKBACKS days
-//   [18..20]  3 poly-2 coefs over 5-day window
-//   [21..36]  16 poly-3 coefs over 4 windows (10,30,60,90 days)
-static void build_master_features(const float ind_val_hist[][IND_HIST_CAP],
-                                   int hist_count, float* out444) {
+// Build the 37-feature block for ONE industry from a cumulative-value history `h`.
+// feat37 layout (must stay bit-identical to training_lib.build_master_features):
+//   [0..9]   10 daily returns (Δt=1, days 1..10 back)
+//   [10..16] 7 cumulative 10-day bucket returns (Δt=10, coherent decade-resolution series)
+//   [17]     realized return-volatility (mean |daily return| over trailing 20 days) — the
+//            scale/uncertainty anchor for the magnitude + range/confidence outputs
+//   [18..20] poly-2 over 5d, values normalized by current level (dimensionless shape)
+//   [21..36] poly-3 over {10,30,60,90}, values normalized by current level
+static void build_ind_features37(const float* h, int hist_count, float* feat) {
     static constexpr int POLY3_WINS[4] = {10,30,60,90};
     // Return features are ~0.01 in magnitude; lift them to ~unit scale so the net produces
-    // output variance at init (otherwise tiny logits → conf≈0.5 for every model → the direction
-    // pool has no signal to select and collapses). Information-preserving constant, NOT a
-    // normalization. Applied to feat[0..17]; poly coefs (level-normalized) are already ~O(1).
+    // output variance at init. Information-preserving constant, NOT a normalization.
     static constexpr float RETURN_SCALE = 100.f;
-    memset(out444, 0, 444 * sizeof(float));
+    float cur = hist_at(h, hist_count, 0);
+    float cur_denom = fabsf(cur) > 1e-9f ? cur : 1e-9f;
 
-    // Per-industry 37-feature layout (must stay bit-identical to training_lib.build_master_features):
-    //   [0..9]   10 daily returns (Δt=1, days 1..10 back)
-    //   [10..16] 7 cumulative 10-day bucket returns (Δt=10, coherent decade-resolution series)
-    //   [17]     realized return-volatility (mean |daily return| over trailing 20 days) — the
-    //            scale/uncertainty anchor for the magnitude + range/confidence outputs; supersedes
-    //            the old raw current-level slot (~25k, which dominated the first layer)
-    //   [18..20] poly-2 over 5d, values normalized by current level (dimensionless shape)
-    //   [21..36] poly-3 over {10,30,60,90}, values normalized by current level
-    // Poly value-normalization brings coefs from ~25k down to ~O(1), comparable to the returns.
-    for (int i = 0; i < N_IND; i++) {
-        const float* h = ind_val_hist[i];
-        float* feat = out444 + i * 37;
-        float cur = hist_at(h, hist_count, 0);
-        float cur_denom = fabsf(cur) > 1e-9f ? cur : 1e-9f;
-
-        for (int lt = 0; lt < 10; lt++) {                 // [0..9] daily returns
-            int t = lt + 1;
-            float vt  = hist_at(h, hist_count, t);
-            float vt1 = hist_at(h, hist_count, t + 1);
+    for (int lt = 0; lt < 10; lt++) {                 // [0..9] daily returns
+        int t = lt + 1;
+        float vt  = hist_at(h, hist_count, t);
+        float vt1 = hist_at(h, hist_count, t + 1);
+        float denom = fabsf(vt1) > 1e-9f ? vt1 : (vt1 >= 0.f ? 1e-9f : -1e-9f);
+        feat[lt] = (vt - vt1) / fabsf(denom);
+    }
+    for (int k = 1; k <= 7; k++) {                    // [10..16] 10-day bucket returns
+        float va = hist_at(h, hist_count, 10 * (k - 1));
+        float vb = hist_at(h, hist_count, 10 * k);
+        float denom = fabsf(vb) > 1e-9f ? vb : (vb >= 0.f ? 1e-9f : -1e-9f);
+        feat[9 + k] = (va - vb) / fabsf(denom);
+    }
+    {                                                 // [17] realized return-volatility
+        float s = 0.f;
+        for (int d = 1; d <= 20; d++) {
+            float vt  = hist_at(h, hist_count, d);
+            float vt1 = hist_at(h, hist_count, d + 1);
             float denom = fabsf(vt1) > 1e-9f ? vt1 : (vt1 >= 0.f ? 1e-9f : -1e-9f);
-            feat[lt] = (vt - vt1) / fabsf(denom);
+            s += fabsf((vt - vt1) / fabsf(denom));
         }
-        for (int k = 1; k <= 7; k++) {                    // [10..16] 10-day bucket returns
-            float va = hist_at(h, hist_count, 10 * (k - 1));
-            float vb = hist_at(h, hist_count, 10 * k);
-            float denom = fabsf(vb) > 1e-9f ? vb : (vb >= 0.f ? 1e-9f : -1e-9f);
-            feat[9 + k] = (va - vb) / fabsf(denom);
-        }
-        {                                                 // [17] realized return-volatility
-            float s = 0.f;
-            for (int d = 1; d <= 20; d++) {
-                float vt  = hist_at(h, hist_count, d);
-                float vt1 = hist_at(h, hist_count, d + 1);
-                float denom = fabsf(vt1) > 1e-9f ? vt1 : (vt1 >= 0.f ? 1e-9f : -1e-9f);
-                s += fabsf((vt - vt1) / fabsf(denom));
-            }
-            feat[17] = s / 20.f;
-        }
-        for (int j = 0; j < 18; j++) feat[j] *= RETURN_SCALE;   // lift returns/vol to ~unit scale
-        float win5[5];                                    // [18..20] poly-2, level-normalized
-        fill_window(h, hist_count, 5, win5);
-        for (int j = 0; j < 5; j++) win5[j] /= cur_denom;
-        polyfit2(win5, 5, feat + 18);
-        float polywin[90];                                // [21..36] poly-3, level-normalized
-        for (int wi = 0; wi < 4; wi++) {
-            int W = POLY3_WINS[wi];
-            fill_window(h, hist_count, W, polywin);
-            for (int j = 0; j < W; j++) polywin[j] /= cur_denom;
-            polyfit3(polywin, W, feat + 21 + wi * 4);
-        }
+        feat[17] = s / 20.f;
+    }
+    for (int j = 0; j < 18; j++) feat[j] *= RETURN_SCALE;   // lift returns/vol to ~unit scale
+    float win5[5];                                    // [18..20] poly-2, level-normalized
+    fill_window(h, hist_count, 5, win5);
+    for (int j = 0; j < 5; j++) win5[j] /= cur_denom;
+    polyfit2(win5, 5, feat + 18);
+    float polywin[90];                                // [21..36] poly-3, level-normalized
+    for (int wi = 0; wi < 4; wi++) {
+        int W = POLY3_WINS[wi];
+        fill_window(h, hist_count, W, polywin);
+        for (int j = 0; j < W; j++) polywin[j] /= cur_denom;
+        polyfit3(polywin, W, feat + 21 + wi * 4);
     }
 }
 
-// ── step_master ─────────────────────────────────────────────────────────────────
-
-static MasterResult step_master(MasterState& state, MasterScratch& scratch,
-                                const IndResult* ind_results,
-                                int actual_day, int total_avail,
-                                float sigma) {
-    // Gate: must have 30+ days of actual market data before master can train.
-    if (actual_day < MASTER_START_DAY) return {0.f, 0.f, 0.f, 0.f, 0.f};
-
-    // Compute actual_perf[N_IND] from slot-0 industry results
-    float actual_perf[N_IND] = {};
+// Build the 888-feature dual vector for MT1 (Part C): per industry, 74 features =
+// [37 market-index features ‖ 37 portfolio (slot-0 StockNN) features]. The two blocks share the
+// identical 37-feature builder; only the source cumulative-value history differs.
+static void build_master_features(const float mkt_val_hist[][IND_HIST_CAP],
+                                   const float pf_val_hist[][IND_HIST_CAP],
+                                   int hist_count, float* out888) {
+    memset(out888, 0, 888 * sizeof(float));
     for (int i = 0; i < N_IND; i++) {
-        if (ind_results[i].baseline > 0.f)
-            actual_perf[i] = ind_results[i].slot0_score / ind_results[i].baseline - 1.f;
+        float* feat = out888 + i * 74;
+        build_ind_features37(mkt_val_hist[i], hist_count, feat);        // [0..36]  market
+        build_ind_features37(pf_val_hist[i],  hist_count, feat + 37);   // [37..73] portfolio
     }
-
-    // Build 444-feature vector (same for all slots — features independent of portfolio state)
-    float today444[444];
-    build_master_features(state.ind_val_hist, state.ind_hist_count, today444);
-
-    // Snapshot slot-0's portfolio as baseline
-    float ref_cash = state.portfolios[0].cash;
-    float ref_hold[N_IND];
-    for (int i = 0; i < N_IND; i++) ref_hold[i] = state.portfolios[0].holdings[i];
-    float baseline = ref_cash;
-    for (int i = 0; i < N_IND; i++) baseline += ref_hold[i] * IND_UNIT_PRICE;
-
-    // Reset all portfolios to slot-0's state; zero_counts for slots 1+ inherit slot 0's counts
-    for (int s = 0; s < N_SLOTS; s++) {
-        state.portfolios[s].cash = ref_cash;
-        for (int i = 0; i < N_IND; i++) state.portfolios[s].holdings[i] = ref_hold[i];
-    }
-    for (int s = 1; s < N_SLOTS; s++)
-        memcpy(state.zero_counts[s], state.zero_counts[0], N_IND * sizeof(int));
-
-    // Pregenerate mutation seeds
-    float*    mast_mut_buf   = scratch.mut_buf;
-    uint64_t* mast_mut_seeds = scratch.mut_seeds;
-    {
-        PCG32 seed_rng; seed_rng.seed((uint64_t)actual_day * 777017ULL + 99999ULL);
-        for (int i = 0; i < N_SLOTS - ELITE_POOL; i++)
-            mast_mut_seeds[i] = ((uint64_t)seed_rng.next() << 32) | seed_rng.next();
-    }
-
-    // Compute optimal tiers retroactively from actual_perf (for points scoring)
-    // Negatives → tier 0; positives sorted ascending, split bottom-up into thirds.
-    // n_pos==1: opt=3; n_pos==2: lower=2,higher=3; n_pos>=3: bottom-up formula.
-    int opt_tier[N_IND] = {};
-    {
-        int pos_idx[N_IND]; int n_pos_opt = 0;
-        for (int i = 0; i < N_IND; i++)
-            if (actual_perf[i] >= 0.f) pos_idx[n_pos_opt++] = i;
-        std::sort(pos_idx, pos_idx + n_pos_opt,
-                  [&actual_perf](int a, int b){ return actual_perf[a] < actual_perf[b]; });
-        if (n_pos_opt == 1) {
-            opt_tier[pos_idx[0]] = 3;
-        } else if (n_pos_opt == 2) {
-            opt_tier[pos_idx[0]] = 2;
-            opt_tier[pos_idx[1]] = 3;
-        } else {
-            int base = n_pos_opt / 3, rem = n_pos_opt % 3;
-            int n1 = base + (rem >= 1 ? 1 : 0);
-            int n2 = base + (rem >= 2 ? 1 : 0);
-            for (int rank = 0; rank < n_pos_opt; rank++) {
-                int ind = pos_idx[rank];
-                if      (rank < n1)        opt_tier[ind] = 1;
-                else if (rank < n1 + n2)   opt_tier[ind] = 2;
-                else                        opt_tier[ind] = 3;
-            }
-        }
-    }
-
-    float ideal_pts = 0.f;
-    for (int i = 0; i < N_IND; i++) ideal_pts += (float)opt_tier[i];
-
-    float pred_scores[N_SLOTS] = {};
-    float port_vals[N_SLOTS]   = {};
-    int   slot_tiers[N_SLOTS][N_IND] = {};
-    float out48[48];
-
-    for (int slot = 0; slot < N_SLOTS; slot++) {
-        const float* W;
-        if (slot < ELITE_POOL) {
-            W = scratch.elite(slot);
-        } else {
-            int mut_i  = slot - ELITE_POOL;
-            int parent = mut_i / MUTATIONS_PER_PARENT;
-            memcpy(mast_mut_buf, scratch.elite(parent), MASTERNN_PARAMS * sizeof(float));
-            apply_gaussian(mast_mut_buf, MASTERNN_PARAMS, sigma, mast_mut_seeds[mut_i]);
-            W = mast_mut_buf;
-        }
-
-        master_forward(W, today444, out48);
-
-        // Decode tiers: argmax over each group of 4 logits
-        int tier[N_IND];
-        for (int i = 0; i < N_IND; i++) {
-            const float* lg = out48 + i * 4;
-            int best = 0;
-            for (int k = 1; k < 4; k++) if (lg[k] > lg[best]) best = k;
-            tier[i] = best;
-            slot_tiers[slot][i] = best;
-        }
-
-        // Update consecutive-zero counts for this slot
-        for (int i = 0; i < N_IND; i++) {
-            if (tier[i] == 0) state.zero_counts[slot][i]++;
-            else              state.zero_counts[slot][i] = 0;
-        }
-
-        MasterPortfolio& port = state.portfolios[slot];
-
-        // Liquidate industries with 3+ consecutive tier-0 predictions
-        for (int i = 0; i < N_IND; i++) {
-            if (state.zero_counts[slot][i] >= 3 && port.holdings[i] > 1e-9f) {
-                port.cash        += sell_net(port.holdings[i], IND_UNIT_PRICE);
-                port.holdings[i]  = 0.f;
-            }
-        }
-
-        // Compute tier-based allocation (bottom-up, null-padded for n_pos < 3)
-        int positives[N_IND]; int n_pos = 0;
-        for (int i = 0; i < N_IND; i++) if (tier[i] > 0) positives[n_pos++] = i;
-
-        float alloc[N_IND] = {};
-        if (n_pos > 0) {
-            std::sort(positives, positives + n_pos,
-                      [&tier](int a, int b){ return tier[a] < tier[b]; });
-
-            float pool = port.cash;
-            for (int i = 0; i < N_IND; i++) pool += port.holdings[i] * IND_UNIT_PRICE;
-
-            if (n_pos == 1) {
-                alloc[positives[0]] = TIER_WEIGHTS[3] / NULL_DENOM * pool;
-            } else if (n_pos == 2) {
-                alloc[positives[0]] = TIER_WEIGHTS[2] / NULL_DENOM * pool;
-                alloc[positives[1]] = TIER_WEIGHTS[3] / NULL_DENOM * pool;
-            } else {
-                int base = n_pos / 3, rem = n_pos % 3;
-                int n1 = base + (rem >= 1 ? 1 : 0);
-                int n2 = base + (rem >= 2 ? 1 : 0);
-
-                int assigned[N_IND] = {};
-                for (int rank = 0; rank < n_pos; rank++) {
-                    int ind = positives[rank];
-                    if      (rank < n1)        assigned[ind] = 1;
-                    else if (rank < n1 + n2)   assigned[ind] = 2;
-                    else                        assigned[ind] = 3;
-                }
-
-                float total_w = 0.f;
-                for (int k = 0; k < n_pos; k++)
-                    total_w += TIER_WEIGHTS[assigned[positives[k]]];
-
-                if (total_w > 0.f)
-                    for (int k = 0; k < n_pos; k++) {
-                        int ind = positives[k];
-                        alloc[ind] = TIER_WEIGHTS[assigned[ind]] / total_w * pool;
-                    }
-            }
-        }
-
-        // Apply allocation: liquidate first, then buy
-        for (int i = 0; i < N_IND; i++) {
-            float cur_v = port.holdings[i] * IND_UNIT_PRICE;
-            float tgt_v = alloc[i];
-            if (cur_v > tgt_v + 1e-6f) {
-                float units = (cur_v - tgt_v) / IND_UNIT_PRICE;
-                port.holdings[i] -= units;
-                port.cash        += sell_net(units, IND_UNIT_PRICE);
-            }
-        }
-        for (int i = 0; i < N_IND; i++) {
-            float cur_v = port.holdings[i] * IND_UNIT_PRICE;
-            float tgt_v = alloc[i];
-            if (tgt_v > cur_v + 1e-6f) {
-                float diff = std::min(tgt_v - cur_v, port.cash);
-                float units = diff / IND_UNIT_PRICE;
-                port.holdings[i] += units;
-                port.cash        -= units * IND_UNIT_PRICE;
-            }
-        }
-
-        // Apply daily industry returns
-        for (int i = 0; i < N_IND; i++)
-            port.holdings[i] *= (1.f + actual_perf[i]);
-
-        // Score via points table against retroactive optimal tiers
-        float port_val = port.cash;
-        for (int i = 0; i < N_IND; i++) port_val += port.holdings[i] * IND_UNIT_PRICE;
-        port_vals[slot] = port_val;
-        float pts = 0.f;
-        for (int i = 0; i < N_IND; i++) {
-            int pred = tier[i], opt = opt_tier[i];
-            if (opt == 0) {
-                if (pred > 0) pts += -2.f - 0.25f * pred;
-            } else if (pred == 0) {
-                pts -= (float)opt;
-            } else if (pred <= opt) {
-                pts += (float)pred;
-            } else {
-                pts += (float)opt - 0.25f * (float)(pred - opt);
-            }
-        }
-        pred_scores[slot] = pts * 1e9f + port_val;
-    }
-
-    // Log tier distribution for slot-0
-    int tier_counts[4] = {};
-    for (int i = 0; i < N_IND; i++) tier_counts[slot_tiers[0][i]]++;
-    int best_slot_idx = (int)(std::max_element(pred_scores, pred_scores + N_SLOTS) - pred_scores);
-    float best_score  = pred_scores[best_slot_idx];
-    float best_pts_v  = (best_score - port_vals[best_slot_idx]) / 1e9f;
-    float slot0_pts_v = (pred_scores[0] - port_vals[0]) / 1e9f;
-
-    auto fmt_pts = [](float v) -> std::string {
-        char buf[32]; snprintf(buf, sizeof(buf), "%+.2f", v); return buf;
-    };
-    log_msg(std::string("[master  ] Day ") + std::to_string(actual_day + 1) +
-            "/" + std::to_string(total_avail) +
-            " | best_pts=" + fmt_pts(best_pts_v) +
-            " slot0_pts=" + fmt_pts(slot0_pts_v) +
-            " | t0=" + std::to_string(tier_counts[0]) +
-            " t1="   + std::to_string(tier_counts[1]) +
-            " t2="   + std::to_string(tier_counts[2]) +
-            " t3="   + std::to_string(tier_counts[3]));
-
-    // Floor reset
-    if (baseline < MST_STARTING_CASH * 0.9f) {
-        for (int s = 0; s < N_SLOTS; s++) {
-            state.portfolios[s].cash = MST_STARTING_CASH;
-            for (int i = 0; i < N_IND; i++) state.portfolios[s].holdings[i] = 0.f;
-        }
-        memset(state.zero_counts, 0, sizeof(state.zero_counts));
-        return {0.f, 0.f, 0.f, 0.f, 0.f};
-    }
-
-    // Snapshot slot-0's own portfolio and zero_counts before selection mutates them
-    MasterPortfolio slot0_own = state.portfolios[0];
-    int slot0_zc[N_IND];
-    memcpy(slot0_zc, state.zero_counts[0], N_IND * sizeof(int));
-
-    // Selection gate: run selection unless best score is below -1 pt (injection threshold).
-    if (best_pts_v >= -1.f) {
-        float mean_ps = 0.f;
-        for (int s = 0; s < N_SLOTS; s++) mean_ps += pred_scores[s];
-        mean_ps /= N_SLOTS;
-        float var_ps = 0.f;
-        for (int s = 0; s < N_SLOTS; s++) { float d = pred_scores[s]-mean_ps; var_ps += d*d; }
-        float pool_floor = mean_ps - sqrtf(var_ps / N_SLOTS);
-
-        std::vector<std::pair<float,int>> surviving;
-        for (int s = 0; s < N_SLOTS; s++)
-            if (pred_scores[s] >= pool_floor)
-                surviving.push_back({pred_scores[s], s});
-        if (surviving.empty()) surviving.push_back({pred_scores[0], 0});
-
-        std::sort(surviving.begin(), surviving.end(),
-                  [](const auto& a, const auto& b){ return a.first > b.first; });
-        int n_top = std::min((int)surviving.size(), ELITE_COUNT);
-
-        int   src_rank[ELITE_COUNT] = {};
-        float src_val[ELITE_COUNT]  = {};
-        for (int k = 0; k < n_top; k++) { src_rank[k] = surviving[k].second; src_val[k] = surviving[k].first; }
-        for (int k = n_top; k < ELITE_COUNT; k++) { src_rank[k] = src_rank[0]; src_val[k] = src_val[0]; }
-
-        float w5_w[5], w10_w[10], w15_w[15];
-        int n5 = std::min(n_top,5), n10 = std::min(n_top,10), n15 = std::min(n_top,15);
-        normalize_weights(src_val, w5_w, n5);
-        normalize_weights(src_val, w10_w, n10);
-        normalize_weights(src_val, w15_w, n15);
-
-        // New slot-0's zero_counts come from the best-scoring slot
-        memcpy(slot0_zc, state.zero_counts[src_rank[0]], N_IND * sizeof(int));
-
-        MasterPortfolio new_mports[ELITE_POOL];
-        const MasterPortfolio* mp5[5], *mp10[10], *mp15[15];
-        for (int k=0;k<n5;k++)  mp5[k]  = &state.portfolios[src_rank[k]];
-        for (int k=0;k<n10;k++) mp10[k] = &state.portfolios[src_rank[k]];
-        for (int k=0;k<n15;k++) mp15[k] = &state.portfolios[src_rank[k]];
-        MasterPortfolio wp5={}, wp10={}, wp15={};
-        wavg_mst_portfolio(mp5,  w5_w,  n5,  wp5);
-        wavg_mst_portfolio(mp10, w10_w, n10, wp10);
-        wavg_mst_portfolio(mp15, w15_w, n15, wp15);
-
-        for (int k = 0; k < n_top; k++) {
-            int slot = src_rank[k];
-            if (slot < ELITE_POOL) {
-                memcpy(scratch.new_elite(k), scratch.elite(slot), MASTERNN_PARAMS * sizeof(float));
-            } else {
-                int mut_i  = slot - ELITE_POOL;
-                int parent = mut_i / MUTATIONS_PER_PARENT;
-                memcpy(scratch.new_elite(k), scratch.elite(parent), MASTERNN_PARAMS * sizeof(float));
-                apply_gaussian(scratch.new_elite(k), MASTERNN_PARAMS, sigma, mast_mut_seeds[mut_i]);
-            }
-            new_mports[k] = state.portfolios[slot];
-        }
-        for (int k = n_top; k < ELITE_COUNT; k++) {
-            memcpy(scratch.new_elite(k), scratch.new_elite(0), MASTERNN_PARAMS * sizeof(float));
-            new_mports[k] = new_mports[0];
-        }
-
-        int seq[ELITE_COUNT]; for (int k = 0; k < ELITE_COUNT; k++) seq[k] = k;
-        wavg_weights_flat(scratch.new_elites, MASTERNN_PARAMS, seq, w5_w,  n5,  scratch.wavg(0));
-        wavg_weights_flat(scratch.new_elites, MASTERNN_PARAMS, seq, w10_w, n10, scratch.wavg(1));
-        wavg_weights_flat(scratch.new_elites, MASTERNN_PARAMS, seq, w15_w, n15, scratch.wavg(2));
-
-        memcpy(scratch.new_elite(ELITE_COUNT),     scratch.wavg(0), MASTERNN_PARAMS * sizeof(float));
-        memcpy(scratch.new_elite(ELITE_COUNT + 1), scratch.wavg(1), MASTERNN_PARAMS * sizeof(float));
-        memcpy(scratch.new_elite(ELITE_COUNT + 2), scratch.wavg(2), MASTERNN_PARAMS * sizeof(float));
-        new_mports[ELITE_COUNT]   = wp5;
-        new_mports[ELITE_COUNT+1] = wp10;
-        new_mports[ELITE_COUNT+2] = wp15;
-
-        for (int k = 0; k < ELITE_POOL; k++) {
-            memcpy(scratch.elite(k), scratch.new_elite(k), MASTERNN_PARAMS * sizeof(float));
-            state.portfolios[k] = new_mports[k];
-        }
-        for (int mut_i = 0; mut_i < N_SLOTS - ELITE_POOL; mut_i++)
-            state.portfolios[ELITE_POOL + mut_i] = state.portfolios[mut_i / MUTATIONS_PER_PARENT];
-    } else {
-        int half = ELITE_COUNT / 2;
-        log_msg("[master  ] best_pts=" + fmt_pts(best_pts_v) + " < -1 — injecting diversity");
-        PCG32 div_rng; div_rng.seed((uint64_t)actual_day * 55555ULL + 77777ULL);
-        for (int k = half; k < ELITE_COUNT; k++) {
-            init_master_weights(scratch.mut_buf, div_rng);
-            for (int p = 0; p < MASTERNN_PARAMS; p++)
-                scratch.elite(k)[p] = 0.5f * scratch.elite(k-half)[p] + 0.5f * scratch.mut_buf[p];
-            state.portfolios[k] = state.portfolios[k - half];
-        }
-    }
-
-    // Restore slot-0's own portfolio and propagate its zero_counts to the new best
-    state.portfolios[0] = slot0_own;
-    memcpy(state.zero_counts[0], slot0_zc, N_IND * sizeof(int));
-
-    // Elite pts stats (slots 0..ELITE_COUNT-1)
-    float elite_max_pts = -1e9f, elite_min_pts = 1e9f, elite_mean_pts = 0.f;
-    for (int s = 0; s < ELITE_COUNT; s++) {
-        float p = (pred_scores[s] - port_vals[s]) / 1e9f;
-        if (p > elite_max_pts) elite_max_pts = p;
-        if (p < elite_min_pts) elite_min_pts = p;
-        elite_mean_pts += p;
-    }
-    elite_mean_pts /= ELITE_COUNT;
-
-    return {best_pts_v, elite_max_pts, elite_min_pts, elite_mean_pts, ideal_pts};
 }
+
+// ── step_master (legacy MasterNN allocator) removed in Part C ─────────────────────
+// The 444-wide MasterNN path is fully superseded by MT2 (48 raw MT1 activations). Its
+// build_master_features + master_forward wiring was incompatible with the 888-wide dual
+// (market ‖ portfolio) feature vector, so the dead function was dropped. master_forward /
+// MasterNN class remain (unused, self-contained) for backward-compat of any .bin readers.
 
 // ── MT1 per-industry training step ──────────────────────────────────────────────
 
@@ -2473,11 +2143,11 @@ static MT1CompResult step_mt1_tail(
     }
 
     // Frozen-head concat + frozen tail raw logits per window day.
-    float concat[MT1_DIR_DAYS][28];
+    float concat[MT1_DIR_DAYS][56];
     float frozen4[MT1_DIR_DAYS][4];
     for (int di = 0; di < dc; di++) {
         const auto& e = scratch.dir_day(di);
-        head_forward(scratch.head0_buf, e.feat37, concat[di]);
+        head_forward(scratch.head0_buf, e.feat74, concat[di]);
         for (int c = 0; c < 4; c++) tail_forward(scratch.tail0_buf[c], concat[di], &frozen4[di][c]);
     }
 
@@ -2545,11 +2215,11 @@ static MT1CompResult step_mt1_head(
     auto score_model = [&](const float* W) -> MT1PoolScore {
         MT1PoolScore R{0.f, false, 0, 0, 0};
         if (dc == 0) return R;
-        float concat28[28], out4[4];
+        float concat56[56], out4[4];
         for (int di = 0; di < dc; di++) {
             const auto& e = scratch.dir_day(di);
-            head_forward(W, e.feat37, concat28);
-            for (int c = 0; c < 4; c++) tail_forward(scratch.tail0_buf[c], concat28, &out4[c]);
+            head_forward(W, e.feat74, concat56);
+            for (int c = 0; c < 4; c++) tail_forward(scratch.tail0_buf[c], concat56, &out4[c]);
             R.score += compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling).composite
                        * day_weight[di];
         }
@@ -3276,7 +2946,7 @@ static void load_or_init_mt1_ht(const std::string& dir, const std::string& load_
 // head0+tail0 IS the production MT1 (feeds MT2 for every day of this block). Returns block stats.
 static MT1Result run_mt1_block(
     int ind_i, MT1Scratch& scratch, int block_len,
-    const float (*in37_block)[37], const float* actual_d_block, const int* actual_day_block,
+    const float (*in74_block)[74], const float* actual_d_block, const int* actual_day_block,
     float dir_sigma, float acc_sigma, float rng_sigma, float cfd_sigma, float head_sigma)
 {
     MT1Result res{};
@@ -3312,13 +2982,13 @@ static MT1Result run_mt1_block(
 
     auto tail_phase = [&]() {
         for (int d = 0; d < block_len; d++) {
-            scratch.push_dir_day(in37_block[d], actual_d_block[d]);
+            scratch.push_dir_day(in74_block[d], actual_d_block[d]);
             if (actual_day_block[d] >= MT1_START_DAY) {
-                float af, rc; floors(in37_block[d], actual_d_block[d], af, rc);
+                float af, rc; floors(in74_block[d], actual_d_block[d], af, rc);
                 for (int c = 0; c < 4; c++)
                     tail_res[c] = step_mt1_tail(c, ind_i, scratch, actual_day_block[d], tsig[c], af, rc);
             }
-            advance_rolling(in37_block[d], actual_d_block[d]);
+            advance_rolling(in74_block[d], actual_d_block[d]);
         }
         for (int c = 0; c < 4; c++)
             memcpy(scratch.tail0_buf[c], scratch.tail_e(c, 0), TAILNN_PARAMS * sizeof(float));
@@ -3330,12 +3000,12 @@ static MT1Result run_mt1_block(
 
     // H: freeze tail0 (from T1); evolve the head pool.
     for (int d = 0; d < block_len; d++) {
-        scratch.push_dir_day(in37_block[d], actual_d_block[d]);
+        scratch.push_dir_day(in74_block[d], actual_d_block[d]);
         if (actual_day_block[d] >= MT1_START_DAY) {
-            float af, rc; floors(in37_block[d], actual_d_block[d], af, rc);
+            float af, rc; floors(in74_block[d], actual_d_block[d], af, rc);
             head_res = step_mt1_head(ind_i, scratch, actual_day_block[d], head_sigma, af, rc);
         }
-        advance_rolling(in37_block[d], actual_d_block[d]);
+        advance_rolling(in74_block[d], actual_d_block[d]);
     }
     memcpy(scratch.head0_buf, scratch.head_e(0), HEADNN_PARAMS * sizeof(float));
     restore_mt1_data(scratch, snap);
@@ -3345,7 +3015,7 @@ static MT1Result run_mt1_block(
     // No restore after T2 — data-state stays advanced through the block (block end).
 
     // Log record from the composed production model on the last block day.
-    float o4[4]; mt1_composed_forward(scratch.head0_buf, tw, in37_block[block_len - 1], o4);
+    float o4[4]; mt1_composed_forward(scratch.head0_buf, tw, in74_block[block_len - 1], o4);
     res.slot0_conf = sigmoidf(o4[0]);        res.slot0_delta_t   = tanhf(o4[1]);
     res.slot0_range_pct = log1pf(expf(o4[2])); res.slot0_conf4    = sigmoidf(o4[3]);
     res.dir0_conf = res.slot0_conf; res.dir0_delta_t = res.slot0_delta_t;
@@ -3626,7 +3296,7 @@ static inline float drift_rel_metric(float S, float mean, float mx, float mn, fl
 
 // Adaptive MT1 floors for a given day — mirrors the block in step_mt1 so band and track
 // are scored under identical floors (rel stays internally consistent).
-static void drift_mt1_floors(MT1Scratch& sc, const float in37[37], float actual_d,
+static void drift_mt1_floors(MT1Scratch& sc, const float in74[74], float actual_d,
                              float* acc_floor, float* range_ceiling) {
     *acc_floor     = MT1_FLOOR_COLD / 2.f;
     *range_ceiling = 1e30f;
@@ -3636,7 +3306,7 @@ static void drift_mt1_floors(MT1Scratch& sc, const float in37[37], float actual_
         *acc_floor = sum_a / (float)sc.rolling_count / 2.f;
         float mean_r = sum_r / (float)sc.rolling_count;
         const float* tw[4] = {sc.tail0_buf[0], sc.tail0_buf[1], sc.tail0_buf[2], sc.tail0_buf[3]};
-        float out4[4]; mt1_composed_forward(sc.head0_buf, tw, in37, out4);
+        float out4[4]; mt1_composed_forward(sc.head0_buf, tw, in74, out4);
         float comp0_delta_d = tanhf(out4[1]) * MT1_SCALE_DOLLARS;
         float today_r = fabsf(actual_d - comp0_delta_d);
         *range_ceiling = MT1_RANGE_CEIL_MULT * fmaxf(mean_r, today_r);
@@ -3650,7 +3320,7 @@ static float drift_score_mt1_comp(const float* head_w, const float* const tail_w
     float out4[4], total = 0.f;
     for (int di = 0; di < sc.dir_day_count; di++) {
         const auto& e = sc.dir_day(di);
-        mt1_composed_forward(head_w, tail_w, e.feat37, out4);
+        mt1_composed_forward(head_w, tail_w, e.feat74, out4);
         total += compute_mt1_scores(e.actual_d, out4, acc_floor, range_ceiling).composite
                  * mt1_win_weight(di, sc.dir_day_count);
     }
@@ -3660,12 +3330,12 @@ static float drift_score_mt1_comp(const float* head_w, const float* const tail_w
 // One day of production-style heads/tails upkeep for the drift track (mirror of upkeep.py):
 // daily tail phase (freeze head0 + tail0, evolve the 4 tail pools) + a head phase every
 // MT1_BLOCK_DAYS days (freeze tails, evolve the head pool). Updates head0/tail0 + rolling.
-static void drift_mt1_day(int ind_i, MT1Scratch& sc, float actual_d, const float in37[37],
+static void drift_mt1_day(int ind_i, MT1Scratch& sc, float actual_d, const float in74[74],
                           int actual_day, float sigma, bool do_head) {
-    sc.push_dir_day(in37, actual_d);
+    sc.push_dir_day(in74, actual_d);
     if (actual_day < MT1_START_DAY) return;
     float acc_floor, range_ceiling;
-    drift_mt1_floors(sc, in37, actual_d, &acc_floor, &range_ceiling);
+    drift_mt1_floors(sc, in74, actual_d, &acc_floor, &range_ceiling);
     for (int c = 0; c < 4; c++)
         step_mt1_tail(c, ind_i, sc, actual_day, sigma, acc_floor, range_ceiling);
     for (int c = 0; c < 4; c++)
@@ -3675,7 +3345,7 @@ static void drift_mt1_day(int ind_i, MT1Scratch& sc, float actual_d, const float
         memcpy(sc.head0_buf, sc.head_e(0), HEADNN_PARAMS * sizeof(float));
     }
     const float* tw[4] = {sc.tail0_buf[0], sc.tail0_buf[1], sc.tail0_buf[2], sc.tail0_buf[3]};
-    float out4[4]; mt1_composed_forward(sc.head0_buf, tw, in37, out4);
+    float out4[4]; mt1_composed_forward(sc.head0_buf, tw, in74, out4);
     float delta_d = tanhf(out4[1]) * MT1_SCALE_DOLLARS;
     sc.rolling_actual[sc.rolling_head]   = fabsf(actual_d);
     sc.rolling_residual[sc.rolling_head] = fabsf(actual_d - delta_d);
@@ -3778,19 +3448,19 @@ static bool drift_advance_day(int run_day_num, int actual_day, int total_days,
     }
     for (int i = 0; i < N_IND; i++) out_actual_perf[i] = fwd_ret[i];
 
-    float today444[444];
-    build_master_features(mst.mkt_val_hist, mst.ind_hist_count, today444);
+    float today888[888];
+    build_master_features(mst.mkt_val_hist, mst.ind_val_hist, mst.ind_hist_count, today888);
 
     if (fwd_valid) for (int i = 0; i < N_IND; i++) {
-        const float* in37 = today444 + i * 37;
+        const float* in74 = today888 + i * 74;
         float actual_d = fwd_ret[i] * MT1_SCALE_DOLLARS;   // absolute (matches main loop)
         bool do_head = (run_day_num % MT1_BLOCK_DAYS == 0);
-        drift_mt1_day(i, mt1_scr[i], actual_d, in37, actual_day, sigma, do_head);
+        drift_mt1_day(i, mt1_scr[i], actual_d, in74, actual_day, sigma, do_head);
         // MT2 feed from the composed production MT1 (head0 + tail0); one model, so composite ==
         // direction feed (MT2_FEED_DIRECTION moot).
         MT1Scratch& sc = mt1_scr[i];
         const float* tw[4] = {sc.tail0_buf[0], sc.tail0_buf[1], sc.tail0_buf[2], sc.tail0_buf[3]};
-        float o4[4]; mt1_composed_forward(sc.head0_buf, tw, in37, o4);
+        float o4[4]; mt1_composed_forward(sc.head0_buf, tw, in74, o4);
         float conf = 1.f / (1.f + expf(-o4[0]));
         out_in48[i*4+0] = conf;
         out_in48[i*4+1] = (conf >= 0.5f ? 1.f : -1.f) * fabsf(tanhf(o4[1]));
@@ -3942,13 +3612,13 @@ static int run_drift_study(const std::string& seed_dir, const std::string& scrat
             rec.bucket       = (uint32_t)age_week;
 
             // MT1 composite: per-industry track (composed head0+tail0) vs 8-model band, same floors.
-            static const float ZERO37[37] = {0};
+            static const float ZERO74[74] = {0};
             for (int i = 0; i < N_IND; i++) {
                 MT1Scratch& sc = mt1_scr[i];
                 float actual_d = sc.dir_day_count ? sc.dir_day(sc.dir_day_count - 1).actual_d : 0.f;
-                const float* in37 = sc.dir_day_count ? sc.dir_day(sc.dir_day_count - 1).feat37 : ZERO37;
+                const float* in74 = sc.dir_day_count ? sc.dir_day(sc.dir_day_count - 1).feat74 : ZERO74;
                 float acc_floor, range_ceiling;
-                drift_mt1_floors(sc, in37, actual_d, &acc_floor, &range_ceiling);
+                drift_mt1_floors(sc, in74, actual_d, &acc_floor, &range_ceiling);
                 const float* btw[4] = {&mt1_band_tail[((size_t)i*4+0)*TAILNN_PARAMS],
                                        &mt1_band_tail[((size_t)i*4+1)*TAILNN_PARAMS],
                                        &mt1_band_tail[((size_t)i*4+2)*TAILNN_PARAMS],
@@ -4180,7 +3850,11 @@ int main(int argc, char* argv[]) {
         // Each fwd-valid day's market-derived features + targets are cached; every MT1_BLOCK_DAYS
         // cached days a block is processed (MT1 T1/H/T2 phases, then MT2's M phase, then flush CSV
         // + MT log + save). StockNN, OHLCV/market histories and non-fwd-day CSV rows stay per-day.
-        static float blk_444[MT1_BLOCK_DAYS][444];
+        // blk_888  = dual [market‖portfolio] MT1 features per day
+        // blk_fwd  = MT1 target: PORTFOLIO forward return over MT1_FWD_DAYS (Part C; matured via the
+        //            pending ring below, since the portfolio forward value isn't known until t+FWD)
+        // blk_perf = market forward return (MT2 read-only diagnostic; MT2 trains on same-day slot-0)
+        static float blk_888[MT1_BLOCK_DAYS][888];
         static float blk_fwd[MT1_BLOCK_DAYS][N_IND];
         static float blk_perf[MT1_BLOCK_DAYS][N_IND];
         static float blk_mkt_ret_c[MT1_BLOCK_DAYS][N_IND];
@@ -4189,20 +3863,34 @@ int main(int argc, char* argv[]) {
         int blk_actual_day[MT1_BLOCK_DAYS];
         int blk_fill = 0;
 
+        // ── Forward-buffer for the MT1 PORTFOLIO target (Part C) ──
+        // The portfolio forward value at t+MT1_FWD_DAYS isn't known until StockNN has simulated
+        // that far, so each day's full context is buffered here and only fed into a block once its
+        // forward window closes (i.e. MT1_FWD_DAYS days later). MT2 still trains on the same-day
+        // slot-0 delta; both stay aligned on the matured day t.
+        struct PendingDay {
+            int actual_day;
+            float feat888[888];
+            IndResult results[N_IND];
+            float mkt_ret[N_IND], mkt_val[N_IND], mkt_fwd[N_IND], pf_base[N_IND];
+        };
+        static PendingDay pend[MT1_FWD_DAYS + 1];
+        int pend_head = 0, pend_count = 0;
+
         auto process_block = [&](int blk_len) {
             if (blk_len <= 0) return;
             // 1. MT1 block-alternating training per industry (T1/H/T2 over the cached block)
             MT1Result blk_mt1_res[N_IND];
             for (int i = 0; i < N_IND; i++) {
-                float in37_i[MT1_BLOCK_DAYS][37];
+                float in74_i[MT1_BLOCK_DAYS][74];
                 float actd_i[MT1_BLOCK_DAYS];
                 int   aday_i[MT1_BLOCK_DAYS];
                 for (int d = 0; d < blk_len; d++) {
-                    memcpy(in37_i[d], &blk_444[d][i * 37], 37 * sizeof(float));
+                    memcpy(in74_i[d], &blk_888[d][i * 74], 74 * sizeof(float));
                     actd_i[d] = blk_fwd[d][i] * MT1_SCALE_DOLLARS;
                     aday_i[d] = blk_actual_day[d];
                 }
-                blk_mt1_res[i] = run_mt1_block(i, mt1_scratches[i], blk_len, in37_i, actd_i, aday_i,
+                blk_mt1_res[i] = run_mt1_block(i, mt1_scratches[i], blk_len, in74_i, actd_i, aday_i,
                                                cur_dir_sigma, cur_acc_sigma, cur_rng_sigma,
                                                cur_cfd_sigma, cur_mst_sigma);
             }
@@ -4219,7 +3907,7 @@ int main(int argc, char* argv[]) {
                     for (int i = 0; i < N_IND; i++) {
                         MT1Scratch& sc = mt1_scratches[i];
                         const float* tw[4] = {sc.tail0_buf[0], sc.tail0_buf[1], sc.tail0_buf[2], sc.tail0_buf[3]};
-                        float o4[4]; mt1_composed_forward(sc.head0_buf, tw, &blk_444[d][i * 37], o4);
+                        float o4[4]; mt1_composed_forward(sc.head0_buf, tw, &blk_888[d][i * 74], o4);
                         float conf = sigmoidf(o4[0]);
                         in48[i*4 + 0] = conf;
                         in48[i*4 + 1] = (conf >= 0.5f ? 1.f : -1.f) * fabsf(tanhf(o4[1]));
@@ -4372,76 +4060,88 @@ int main(int argc, char* argv[]) {
                     fwd_ret[i] = valid > 0 ? sum / valid : 0.f;
                 }
             }
-            // (median removed — MT1 now predicts the ABSOLUTE own-industry forward return;
-            //  cross-sectional relativization is MT2's job via opt_tier on actual_perf below.)
+            // (median removed — MT1 predicts the ABSOLUTE own-industry forward return;
+            //  cross-sectional relativization is MT2's job via opt_tier on perf below.)
 
-            // actual_perf for MT2: forward cumulative market return per industry
-            float actual_perf[N_IND] = {};
-            for (int i = 0; i < N_IND; i++)
-                actual_perf[i] = fwd_ret[i];
+            // Build the 888-feature DUAL vector: [37 market-index ‖ 37 portfolio(slot-0)] features
+            // per industry, from histories BEFORE today's append (backward-looking).
+            float today888[888];
+            build_master_features(mst->mkt_val_hist, mst->ind_val_hist, mst->ind_hist_count, today888);
 
-            // Build 444-feature vector using cumulative market index (from BEFORE today)
-            float today444[444];
-            build_master_features(mst->mkt_val_hist, mst->ind_hist_count, today444);
+            // MT1 + MT2 no longer run per day — MT1 trains in block-alternating phases (post-forward
+            // buffer) and MT2 in the post-block M phase. This day's features + context are buffered
+            // in the pending ring below and fed into a block once its forward window closes.
 
-            // MT1 + MT2 no longer run per day — the heads/tails redesign trains MT1 in
-            // block-alternating phases and MT2 in a post-block M phase. This day's market-derived
-            // features (today444) and targets are cached below and processed at the block boundary.
-
-            // Append today's values to rolling histories
-            float today_mkt_val[N_IND];
+            // Append today's cumulative indices. BOTH now COMPOUND daily returns so a 10-day forward
+            // ratio is a meaningful cumulative return:
+            //   market index    = prev × (1 + mkt_ret)
+            //   portfolio index = prev × (1 + slot0_return),  slot0_return = slot0_score/baseline − 1
+            float today_mkt_val[N_IND], today_pf_val[N_IND];
             for (int i = 0; i < N_IND; i++) {
-                // Market cumulative index: prev × (1 + mkt_ret)
                 float prev_mkt = (mst->ind_hist_count > 0)
-                    ? (mst->ind_hist_count < IND_HIST_CAP
-                        ? mst->mkt_val_hist[i][mst->ind_hist_count - 1]
-                        : mst->mkt_val_hist[i][IND_HIST_CAP - 1])
+                    ? (mst->ind_hist_count < IND_HIST_CAP ? mst->mkt_val_hist[i][mst->ind_hist_count - 1]
+                                                          : mst->mkt_val_hist[i][IND_HIST_CAP - 1])
                     : static_cast<float>(IND_STARTING_CASH);
                 today_mkt_val[i] = prev_mkt * (1.f + mkt_ret[i]);
+                float prev_pf = (mst->ind_hist_count > 0)
+                    ? (mst->ind_hist_count < IND_HIST_CAP ? mst->ind_val_hist[i][mst->ind_hist_count - 1]
+                                                          : mst->ind_val_hist[i][IND_HIST_CAP - 1])
+                    : static_cast<float>(IND_STARTING_CASH);
+                float slot0_ret = (results[i].baseline > 1e-6f)
+                    ? (results[i].slot0_score / results[i].baseline - 1.f) : 0.f;
+                today_pf_val[i] = prev_pf * (1.f + slot0_ret);
                 if (mst->ind_hist_count < IND_HIST_CAP) {
                     mst->mkt_val_hist[i][mst->ind_hist_count] = today_mkt_val[i];
+                    mst->ind_val_hist[i][mst->ind_hist_count] = today_pf_val[i];
                 } else {
-                    memmove(mst->mkt_val_hist[i], mst->mkt_val_hist[i] + 1,
-                            (IND_HIST_CAP - 1) * sizeof(float));
+                    memmove(mst->mkt_val_hist[i], mst->mkt_val_hist[i] + 1, (IND_HIST_CAP - 1) * sizeof(float));
                     mst->mkt_val_hist[i][IND_HIST_CAP - 1] = today_mkt_val[i];
-                }
-                // StockNN DEPLOYED slot-0 portfolio value — drives MT1 portfolio features + the
-                // MT1/MT2 portfolio target, consistent with the deployed model (was best_delta,
-                // hindsight best-slot, which no model can actually deploy).
-                float today_v = results[i].slot0_score;
-                if (mst->ind_hist_count < IND_HIST_CAP) {
-                    mst->ind_val_hist[i][mst->ind_hist_count] = today_v;
-                } else {
-                    memmove(mst->ind_val_hist[i], mst->ind_val_hist[i] + 1,
-                            (IND_HIST_CAP - 1) * sizeof(float));
-                    mst->ind_val_hist[i][IND_HIST_CAP - 1] = today_v;
+                    memmove(mst->ind_val_hist[i], mst->ind_val_hist[i] + 1, (IND_HIST_CAP - 1) * sizeof(float));
+                    mst->ind_val_hist[i][IND_HIST_CAP - 1] = today_pf_val[i];
                 }
             }
             if (mst->ind_hist_count < IND_HIST_CAP) mst->ind_hist_count++;
 
-            // ── Cache this day for block-alternating MT1/MT2 (Increment 3C) ──
-            // fwd-valid days feed a block; non-fwd days (last MT1_FWD_DAYS) get an inline CSV row.
-            if (fwd_valid) {
+            // Push today into the pending ring (buffers full day-context until its forward matures).
+            {
+                PendingDay& pd = pend[(pend_head + pend_count) % (MT1_FWD_DAYS + 1)];
+                pd.actual_day = actual_day;
+                memcpy(pd.feat888, today888,      sizeof(today888));
+                memcpy(pd.results, results,       sizeof(IndResult) * N_IND);
+                memcpy(pd.mkt_ret, mkt_ret,       sizeof(mkt_ret));
+                memcpy(pd.mkt_val, today_mkt_val, sizeof(today_mkt_val));
+                memcpy(pd.mkt_fwd, fwd_ret,       sizeof(fwd_ret));   // market forward (MT2 diagnostic)
+                memcpy(pd.pf_base, today_pf_val,  sizeof(today_pf_val));
+                pend_count++;
+            }
+            // A day matures once its t+MT1_FWD_DAYS portfolio value (= today's) is realized.
+            if (pend_count == MT1_FWD_DAYS + 1) {
+                PendingDay& t = pend[pend_head];
+                pend_head = (pend_head + 1) % (MT1_FWD_DAYS + 1);
+                pend_count--;
                 int d = blk_fill;
-                memcpy(blk_444[d],       today444,      sizeof(today444));
-                memcpy(blk_fwd[d],       fwd_ret,       sizeof(fwd_ret));
-                memcpy(blk_perf[d],      actual_perf,   sizeof(actual_perf));
-                memcpy(blk_mkt_ret_c[d], mkt_ret,       sizeof(mkt_ret));
-                memcpy(blk_mkt_val_c[d], today_mkt_val, sizeof(today_mkt_val));
-                memcpy(blk_results[d],   results,       sizeof(IndResult) * N_IND);
-                blk_actual_day[d] = actual_day;
+                memcpy(blk_888[d], t.feat888, sizeof(t.feat888));
+                for (int i = 0; i < N_IND; i++) {
+                    blk_fwd[d][i]  = (t.pf_base[i] != 0.f) ? (today_pf_val[i] / t.pf_base[i] - 1.f) : 0.f;  // MT1 target: portfolio forward
+                    blk_perf[d][i] = t.mkt_fwd[i];                                                          // MT2 diagnostic: market forward
+                }
+                memcpy(blk_mkt_ret_c[d], t.mkt_ret, sizeof(t.mkt_ret));
+                memcpy(blk_mkt_val_c[d], t.mkt_val, sizeof(t.mkt_val));
+                memcpy(blk_results[d],   t.results, sizeof(IndResult) * N_IND);
+                blk_actual_day[d] = t.actual_day;
                 blk_fill++;
                 if (blk_fill == MT1_BLOCK_DAYS) { process_block(blk_fill); blk_fill = 0; }
-            } else {
-                if (blk_fill > 0) { process_block(blk_fill); blk_fill = 0; }  // flush before non-fwd rows
-                if (csv) write_csv_row(csv, pass, actual_day, results, MasterResult{}, mkt_ret, today_mkt_val);
             }
-
-            // (Per-day MT1 collapse-injection, MT log record, and periodic save moved into
-            //  process_block — the block boundary is where MT1/MT2 stats and saves now happen.)
         }
-        // Flush the final partial block (range ended on fwd-valid days)
+        // Flush the final partial block (matured days), then drain the un-matured tail (the last
+        // MT1_FWD_DAYS days whose forward window never closed) as plain CSV rows.
         if (blk_fill > 0) { process_block(blk_fill); blk_fill = 0; }
+        while (pend_count > 0) {
+            PendingDay& t = pend[pend_head];
+            pend_head = (pend_head + 1) % (MT1_FWD_DAYS + 1);
+            pend_count--;
+            if (csv) write_csv_row(csv, pass, t.actual_day, t.results, MasterResult{}, t.mkt_ret, t.mkt_val);
+        }
 
         // Save MT1/MT2 after each pass (industry elites already saved by step_industry)
         if (!g_no_save) {
