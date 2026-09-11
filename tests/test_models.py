@@ -1,11 +1,10 @@
 """Tests for StockNN, MasterNN, MT1NN, and MT2NN model architecture."""
 
-import io
 import pytest
 import torch
+import torch.nn.functional as F
 
-from models import MasterNN, MT1NN, MT1DualHead, MT1Head, MT1Tail, MT2NN, StockNN
-
+from models import MT1NN, MT2NN, MasterNN, MT1DualHead, MT1Head, MT1Tail, StockNN
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
 
@@ -130,8 +129,6 @@ class TestStockNN:
 
 # ── MasterNN ───────────────────────────────────────────────────────────────────
 
-import torch.nn.functional as F
-
 class TestMasterNN:
     def test_output_shape(self, master_inputs):
         (today,) = master_inputs
@@ -248,8 +245,8 @@ class TestMT1NN:
         assert torch.allclose(m(mt1_inputs), manual)
 
     def test_head_tail_roundtrip(self):
-        from prepare_models import state_dict_to_arr, HEAD_LAYER_DEFS, TAIL_LAYER_DEFS
         from convert_weights import arr_to_state_dict
+        from prepare_models import HEAD_LAYER_DEFS, TAIL_LAYER_DEFS, state_dict_to_arr
         x = torch.randn(1, 74)
         head = MT1DualHead()
         arr = state_dict_to_arr(head.state_dict(), HEAD_LAYER_DEFS)
@@ -264,8 +261,8 @@ class TestMT1NN:
 
     def test_head_tail_compose_to_mt1nn(self):
         """convert_weights composes a production MT1NN from dual head + 4 tail flat arrays."""
-        from prepare_models import state_dict_to_arr, HEAD_LAYER_DEFS, TAIL_LAYER_DEFS
         from convert_weights import arr_to_state_dict
+        from prepare_models import HEAD_LAYER_DEFS, TAIL_LAYER_DEFS, state_dict_to_arr
         src = MT1NN()
         head_arr  = state_dict_to_arr(src.head.state_dict(), HEAD_LAYER_DEFS)
         tail_arrs = [state_dict_to_arr(src.tails[c].state_dict(), TAIL_LAYER_DEFS) for c in range(4)]
@@ -385,3 +382,4 @@ class TestMT2NN:
 
     def test_no_inf(self, mt2_inputs):
         assert not torch.isinf(MT2NN()(mt2_inputs)).any()
+

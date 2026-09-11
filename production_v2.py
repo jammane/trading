@@ -18,20 +18,26 @@ import random
 from datetime import datetime
 
 import keyring
-import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import yfinance as yf
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, OrderType, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, MarketOrderRequest, StopOrderRequest
 
 import training_lib
-from fees import BUY_FILL, FINRA_TAF_MAX, FINRA_TAF_PER_SHARE, SEC_FEE_RATE, SELL_FILL, _sell_net
-from models import MasterNN, MT1NN, MT2NN, StockNN
+from fees import BUY_FILL, SELL_FILL, _sell_net
+from models import MasterNN, StockNN
 from universe import INDUSTRIES
-from version import VERSION
+
+# BROKEN — FIX WITH THE NEXT CHANGE TO THIS FILE.
+# `load_mt2_norm_stats` / `save_mt2_norm_stats` no longer exist in upkeep.py: they were deleted in
+# eb70bea (v0.2.0.0, "MT2 48-feature no-norm input") but the import and call sites here were left
+# behind, so `import production_v2` raises ImportError and this module cannot run at all. This is
+# why the 5C production mirror was never runtime-validated — it could not be. `main` is unaffected;
+# the break is specific to the mt1-heads-tails lineage.
+# Fix = remove the norm-stats plumbing entirely (MT2 takes raw MT1 activations, no normalization —
+# see CLAUDE.md). It threads through _load_master_state(), _save_master_state() and
+# run_master_allocation(norm_stats=...). Add a test that merely imports this module so it can't recur.
 from upkeep import (
     load_mt2_norm_stats,
     run_mt_inference,
@@ -40,6 +46,7 @@ from upkeep import (
     upkeep_mt1_industry,
     upkeep_mt2,
 )
+from version import VERSION
 
 MAX_SINGLE_STOCK_PCT = 0.60   # max fraction of industry cash in one stock
 
@@ -112,7 +119,10 @@ def _load_master_state(model_dir, industry_list):
         hist     = state.get('ind_value_history', {ind: [] for ind in industry_list})
         mkt_hist = state.get('mkt_val_history',   {ind: [] for ind in industry_list})
         zcnt     = state.get('zero_counts',        {ind: 0  for ind in industry_list})
-    except Exception:
+    except (OSError, json.JSONDecodeError) as e:
+        # Falling back to empty history silently restarts the MT1/MT2 feature ring from cold,
+        # which looks like a fresh account rather than a failure. Say so.
+        print(f"Warning: master state {path} unreadable ({e}) — starting histories cold")
         hist     = {ind: [] for ind in industry_list}
         mkt_hist = {ind: [] for ind in industry_list}
         zcnt     = {ind: 0  for ind in industry_list}
@@ -127,7 +137,7 @@ def _save_master_state(model_dir, ind_value_history, mkt_val_history, zero_count
                 'mkt_val_history':   mkt_val_history,
                 'zero_counts':       zero_counts,
             }, f)
-    except Exception as e:
+    except OSError as e:
         print(f"Warning: could not save master state: {e}")
 
 def load_weighted_model(model_class, model_dir, prefix):
@@ -180,7 +190,7 @@ def train_mt_one_day_prod(industries, model_dir, mkt_val_history, pf_val_history
     day's features + cumulative portfolio index + slot-0 delta are buffered (mt_fwd_buffer.json) and
     trained MT1_FWD_DAYS sessions later, once the forward portfolio value is realized.
     """
-    from training_lib import build_master_features, MT1_FWD_DAYS
+    from training_lib import MT1_FWD_DAYS, build_master_features
     from upkeep import MT1_SCALE_DOLLARS
     industry_list = list(industries.keys())
 
@@ -198,7 +208,9 @@ def train_mt_one_day_prod(industries, model_dir, mkt_val_history, pf_val_history
         try:
             with open(buf_path) as _f:
                 buf = json.load(_f)
-        except Exception:
+        except (OSError, json.JSONDecodeError) as e:
+            # An empty buffer costs MT1_FWD_DAYS of MT1 training before it refills.
+            print(f"Warning: MT1 forward buffer {buf_path} unreadable ({e}) — restarting empty")
             buf = []
     buf.append({'feat888':     today888.squeeze(0).tolist(),
                 'pf_index':    cur_pf_index,
@@ -703,7 +715,6 @@ def main():
               f"({len(intraday_data)} symbols with 1-min data)")
 
         # ── Master: predict tier allocations (MT2 preferred, MasterNN fallback) ──
-        all_symbols_flat  = [sym for syms in industries.values() for sym in syms]
         industry_list     = list(industries.keys())
         ind_value_history, mkt_val_history, zero_counts, norm_stats = _load_master_state(model_dir, industry_list)
         master = load_weighted_model(MasterNN, model_dir, 'master')
@@ -833,7 +844,7 @@ def main():
                         dl = [histories[sym][-(t+1)][5:] for sym in symbols
                               if len(histories.get(sym,[])) > t]
                         if dl:
-                            tr   = list(zip(*dl))
+                            tr   = list(zip(*dl, strict=True))
                             aggs = []
                             for tp in tr:
                                 aggs += [max(tp), min(tp), sum(tp)/len(tp)]
@@ -872,7 +883,7 @@ def main():
                                    (raw_t[0] * raw_t[4]) / st['avg_dv']])
                     today_dl.append(dlt_t)
                 if today_dl:
-                    tr = list(zip(*today_dl))
+                    tr = list(zip(*today_dl, strict=True))
                     for tp in tr: today_row += [max(tp), min(tp), sum(tp)/len(tp)]
                 else:
                     today_row += [0.0] * 15
@@ -957,7 +968,7 @@ def main():
                 raw = [d['open'], d['close'], d['high'], d['low'], d['volume']]
                 if sym in histories and histories[sym]:
                     prev = histories[sym][-1][:5]
-                    deltas = [r - p for r, p in zip(raw, prev)]
+                    deltas = [r - p for r, p in zip(raw, prev, strict=True)]
                 else:
                     deltas = [0.0] * 5
                 if sym not in histories:

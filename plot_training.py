@@ -34,9 +34,9 @@ from pathlib import Path
 try:
     import matplotlib
     matplotlib.use("Agg")
+    import matplotlib.lines as mlines
     import matplotlib.pyplot as plt
     import matplotlib.ticker as ticker
-    import matplotlib.lines as mlines
 except ImportError:
     sys.exit("matplotlib is required: pip install matplotlib")
 
@@ -77,7 +77,7 @@ COLORS = [
     "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
     "#bcbd22", "#17becf", "#f0a500", "#00897b",
 ]
-IND_COLOR = dict(zip(INDUSTRIES, COLORS))
+IND_COLOR = dict(zip(INDUSTRIES, COLORS, strict=True))
 
 _COMP_NAMES = ["composite", "direction", "range", "accuracy", "confidence"]
 _STAT_NAMES = ["best", "slot0", "mean", "min"]
@@ -113,6 +113,24 @@ assert _RECORD_STRUCT_V7.size == RECORD_SIZE_V7
 RECORD_SIZE_V8 = 1252
 _RECORD_STRUCT_V8 = struct.Struct("<II" + "f" * 255 + "Bxxx" + "12B" + "52f")
 assert _RECORD_STRUCT_V8.size == RECORD_SIZE_V8
+# bin-version-8 (V9 record): 1300 bytes — adds mt1_actual_d[12] (the MT1 target). V9 records are
+# also written PER BLOCK-DAY rather than once per 25-day block, so a pass has ~1238 records, not 50.
+RECORD_SIZE_V9 = 1300
+_RECORD_STRUCT_V9 = struct.Struct("<II" + "f" * 255 + "Bxxx" + "12B" + "52f" + "12f")
+assert _RECORD_STRUCT_V9.size == RECORD_SIZE_V9
+# bin-version-9 (V10 record): 1684 bytes — adds mt1_oos_act[12][4] then mt1_skill[12][4].
+# mt1_oos_act is the leak-free twin of mt1_slot0_act, produced by the head0/tail0 snapshot taken at
+# block start, so the model behind it never saw the day it is graded on. mt1_dir_injected also
+# carries real values from V10 (hardcoded 0 through V9).
+RECORD_SIZE_V10 = 1684
+_RECORD_STRUCT_V10 = struct.Struct("<II" + "f" * 255 + "Bxxx" + "12B" + "52f" + "12f" + "96f")
+assert _RECORD_STRUCT_V10.size == RECORD_SIZE_V10
+# bin-version-10 (V11 record): 2212 bytes — adds mt1_dir_stats[12][6] then mt1_dir_life[12][5],
+# the direction pool's forward-accumulation lifecycle (mature fraction, culls, lineage share and
+# count, mean secondary score, mean retirement age, cumulative retirement-age histogram).
+RECORD_SIZE_V11 = 2212
+_RECORD_STRUCT_V11 = struct.Struct("<II" + "f" * 255 + "Bxxx" + "12B" + "52f" + "12f" + "96f" + "132f")
+assert _RECORD_STRUCT_V11.size == RECORD_SIZE_V11
 
 # ── Download ──────────────────────────────────────────────────────────────────
 def download_logs(host: str, account: str) -> None:
@@ -143,11 +161,20 @@ def load_binary_log(path: Path) -> list[dict]:
     magic, version, n_ind, _ = struct.unpack_from("<IIII", data, 0)
     if magic != MT_LOG_MAGIC:
         sys.exit(f"{path}: bad magic {magic:#010x} (expected {MT_LOG_MAGIC:#010x})")
-    if version not in (3, 4, 5, 6, 7):
-        sys.exit(f"{path}: unsupported log version {version} (expected 3-7)")
+    if version not in (3, 4, 5, 6, 7, 8, 9, 10):
+        sys.exit(f"{path}: unsupported log version {version} (expected 3-10)")
 
     # Pick record format by binary version number
-    if version == 7:
+    if version == 10:
+        rec_size   = RECORD_SIZE_V11
+        rec_struct = _RECORD_STRUCT_V11
+    elif version == 9:
+        rec_size   = RECORD_SIZE_V10
+        rec_struct = _RECORD_STRUCT_V10
+    elif version == 8:
+        rec_size   = RECORD_SIZE_V9
+        rec_struct = _RECORD_STRUCT_V9
+    elif version == 7:
         rec_size   = RECORD_SIZE_V8
         rec_struct = _RECORD_STRUCT_V8
     elif version == 6:
@@ -178,7 +205,21 @@ def load_binary_log(path: Path) -> list[dict]:
                 base = ci * 48 + si * 12
                 mt1[comp][stat] = list(f[base : base + 12])
 
-        if version == 7:
+        if version in (8, 9, 10):
+            # V9 layout: V8 + mt1_actual_d[12] (raw[322:334]) — the MT1 target per industry.
+            # V10 appends mt1_oos_act[12][4] (raw[334:382]) + mt1_skill[12][4] (raw[382:430]);
+            # everything up to 334 is byte-identical, so the two share this branch.
+            mt1_dir_cdb      = list(raw[242:254])
+            mt2_best         = raw[254]
+            mt2_slot0        = raw[255]
+            mt2_ideal        = raw[256]
+            mt2_inj          = raw[257]
+            mt1_dir_injected = list(raw[258:270])
+            mt2_cons_flat    = raw[318]
+            mt2_cons_wtd     = raw[319]
+            mt2_slot0_pf     = raw[320]
+            mt2_slot0_mkt    = raw[321]
+        elif version == 7:
             # V8 layout: V7 + mt2_slot0_pts_pf (raw[320]) + mt2_slot0_pts_mkt (raw[321])
             mt1_dir_cdb      = list(raw[242:254])
             mt2_best         = raw[254]
@@ -242,6 +283,8 @@ def load_binary_log(path: Path) -> list[dict]:
             "pass":                pass_num,
             "day":                 actual_day,
             "mt1":                 mt1,
+            # V9+: the MT1 target per industry (None on older logs, which never recorded it).
+            "mt1_actual_d":        list(raw[322:334]) if version >= 8 else None,
             "mt1_dir_correct_dbl": mt1_dir_cdb,
             "mt1_dir_injected":    mt1_dir_injected,
             "mt2_best":            mt2_best,
@@ -317,11 +360,11 @@ def _linear_trend(pairs: list[tuple]) -> tuple[float, float, float]:
         return 0.0, pairs[0][1] if pairs else 0.0, float("nan")
     xs = [p[0] for p in pairs]; ys = [p[1] for p in pairs]
     n = len(xs); mx, my = sum(xs) / n, sum(ys) / n
-    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys, strict=True))
     den = sum((x - mx) ** 2 for x in xs)
     slope = num / den if den else 0.0
     intercept = my - slope * mx
-    ss_res = sum((y - (slope * x + intercept)) ** 2 for x, y in zip(xs, ys))
+    ss_res = sum((y - (slope * x + intercept)) ** 2 for x, y in zip(xs, ys, strict=True))
     ss_tot = sum((y - my) ** 2 for y in ys)
     r2 = 1.0 - ss_res / ss_tot if ss_tot else float("nan")
     return slope, intercept, r2
@@ -362,7 +405,7 @@ def _build_industry_series(
         segs: list[tuple[list, list]] = []
         seg_x: list[float] = []
         seg_y: list[float] = []
-        for x, v in zip(xs, raw):
+        for x, v in zip(xs, raw, strict=True):
             if x in reset_xs_set:
                 seg_x.append(float(x))
                 seg_y.append(FLOOR_VALUE)   # line drops to open-circle level
@@ -776,12 +819,12 @@ def plot_mt2(rows: list[dict], pass_num: int, out_path: Path) -> None:
             return float("nan")
         return max(0.0, min(1.0, score / ideal))
 
-    ratio_max_raw  = [_ratio(mx,  id_) for mx,  id_ in zip(maxes_raw,  ideals_raw)]
-    ratio_mean_raw = [_ratio(mn,  id_) for mn,  id_ in zip(means_raw,  ideals_raw)]
-    ratio_min_raw  = [_ratio(mi,  id_) for mi,  id_ in zip(mins_raw,   ideals_raw)]
+    ratio_max_raw  = [_ratio(mx,  id_) for mx,  id_ in zip(maxes_raw,  ideals_raw, strict=True)]
+    ratio_mean_raw = [_ratio(mn,  id_) for mn,  id_ in zip(means_raw,  ideals_raw, strict=True)]
+    ratio_min_raw  = [_ratio(mi,  id_) for mi,  id_ in zip(mins_raw,   ideals_raw, strict=True)]
 
     def _filter_nan(xs, ys):
-        pairs = [(x, y) for x, y in zip(xs, ys) if not math.isnan(y)]
+        pairs = [(x, y) for x, y in zip(xs, ys, strict=True) if not math.isnan(y)]
         return ([p[0] for p in pairs], [p[1] for p in pairs]) if pairs else ([], [])
 
     xs_rb, rm_b = _filter_nan(xs_raw, ratio_max_raw)

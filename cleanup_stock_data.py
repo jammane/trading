@@ -71,7 +71,6 @@ def main() -> None:
 
     tag = '[DRY RUN] ' if args.dry_run else ''
     for fname in stale:
-        sym = fname[:-5]
         print(f'  {tag}removing {fname}')
         if not args.dry_run:
             os.remove(os.path.join(STOCK_DATA_DIR, fname))

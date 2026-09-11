@@ -34,7 +34,10 @@ def _load_existing(sym: str) -> list:
     try:
         with open(path) as f:
             return json.load(f).get('days', [])
-    except Exception:
+    except (OSError, json.JSONDecodeError) as e:
+        # Returning [] triggers a full 5-year refetch for this symbol — say so, because silently
+        # refetching every run would look like normal behaviour.
+        print(f"WARNING: {path} unreadable ({e}) — treating as empty, will refetch in full")
         return []
 
 

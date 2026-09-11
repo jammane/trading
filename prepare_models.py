@@ -12,7 +12,6 @@ Usage:
 
 import argparse
 import os
-import sys
 
 import numpy as np
 import torch
@@ -84,6 +83,9 @@ MT2_LAYOUT = [
 ELITE_POOL       = 20
 MT1_COMP_PARENTS = 25  # 17 direct + 3 wavg + 5 injection per (legacy) component pool
 HT_PARENTS       = 20  # heads/tails pools: 17 direct + 3 wavg (no injection slots)
+# The direction pool left the elites+regenerated-mutations regime in v0.5.0.0: all 200 slots are
+# persistent individuals carrying their own record, so all 200 have weight files on disk.
+MT1_COMP_SLOTS   = 200
 MT1_POOL_NAMES   = ('dir', 'acc', 'rng', 'cfd')
 
 
@@ -180,8 +182,9 @@ def main():
         convert_industry(f'mt1_{ind}_head', load_dir, output_dir, HEAD_LAYER_DEFS,
                          f'mt1_{ind}_head', n_elites=HT_PARENTS)
         for pool in MT1_POOL_NAMES:
+            n = MT1_COMP_SLOTS if pool == 'dir' else HT_PARENTS
             convert_industry(f'mt1_{ind}_tail_{pool}', load_dir, output_dir, TAIL_LAYER_DEFS,
-                             f'mt1_{ind}_tail_{pool}', n_elites=HT_PARENTS)
+                             f'mt1_{ind}_tail_{pool}', n_elites=n)
 
     print(f'Converting MT2 elite models from {load_dir} → {output_dir}')
     convert_mt2(load_dir, output_dir)

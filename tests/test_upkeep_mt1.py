@@ -15,12 +15,11 @@ in the 4B commit; it is the validation gate for that rewrite.
 import hashlib
 import os
 
-import pytest
 import torch
 
 import upkeep as upkeep_mod
-from upkeep import upkeep_mt1_industry
 from models import MT1NN, MT1DualHead, MT1Tail
+from upkeep import upkeep_mt1_industry
 
 TAILS = ("dir", "acc", "rng", "cfd")
 
@@ -73,8 +72,10 @@ def test_upkeep_mt1_head_tail_block_cycle(tmp_path, monkeypatch):
 
     # Block cadence: the production model (composed head0+tail0) evolves every run via the daily
     # tail phase, while the head pool only changes on block boundaries (every MT1_BLOCK_DAYS runs).
-    head_changes = sum(1 for a, b in zip(head_hashes, head_hashes[1:]) if a != b)
-    best_changes = sum(1 for a, b in zip(best_hashes, best_hashes[1:]) if a != b)
+    # strict=False is deliberate: the second operand is the list shifted by one, so it is
+    # always exactly one shorter. This is a sliding pairwise window, not a parallel-array zip.
+    head_changes = sum(1 for a, b in zip(head_hashes, head_hashes[1:], strict=False) if a != b)
+    best_changes = sum(1 for a, b in zip(best_hashes, best_hashes[1:], strict=False) if a != b)
     assert best_changes > head_changes, (
         f"production model should evolve more often than the head "
         f"(best={best_changes}, head={head_changes})")
