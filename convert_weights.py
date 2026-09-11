@@ -15,11 +15,17 @@ import os
 import numpy as np
 import torch
 
-from models import StockNN, MasterNN, MT1NN, MT1Head, MT1DualHead, MT1Tail, MT2NN
+from models import MT1NN, MT2NN, MasterNN, MT1DualHead, MT1Tail, StockNN
 from prepare_models import (
-    STOCK_LAYER_DEFS, MASTER_LAYER_DEFS, MT2_LAYOUT,
-    HEAD_LAYER_DEFS, TAIL_LAYER_DEFS, HT_PARENTS, MT1_POOL_NAMES,
     ELITE_POOL,
+    HEAD_LAYER_DEFS,
+    HT_PARENTS,
+    MASTER_LAYER_DEFS,
+    MT1_COMP_SLOTS,
+    MT1_POOL_NAMES,
+    MT2_LAYOUT,
+    STOCK_LAYER_DEFS,
+    TAIL_LAYER_DEFS,
 )
 
 
@@ -147,8 +153,11 @@ def _convert_mt1_pools(ind, models_dir, output_dir):
     convert_industry(f'mt1_{ind}_head', models_dir, output_dir, HEAD_LAYER_DEFS, MT1DualHead,
                      f'mt1_{ind}_head', n_elites=HT_PARENTS)
     for pool in MT1_POOL_NAMES:
+        # The direction pool holds MT1_COMP_SLOTS persistent individuals rather than HT_PARENTS
+        # elites plus seed-regenerated mutations, so every slot has a real weight file to convert.
+        n = MT1_COMP_SLOTS if pool == 'dir' else HT_PARENTS
         convert_industry(f'mt1_{ind}_tail_{pool}', models_dir, output_dir, TAIL_LAYER_DEFS, MT1Tail,
-                         f'mt1_{ind}_tail_{pool}', n_elites=HT_PARENTS)
+                         f'mt1_{ind}_tail_{pool}', n_elites=n)
 
 
 def main():

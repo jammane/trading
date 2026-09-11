@@ -69,10 +69,10 @@ class TestIndustries:
 
     def test_all_symbols_list_matches_industries(self):
         flat = [sym for syms in INDUSTRIES.values() for sym in syms]
-        assert ALL_SYMBOLS == flat
+        assert flat == ALL_SYMBOLS
 
     def test_industry_names_list_matches_industries(self):
-        assert INDUSTRY_NAMES == list(INDUSTRIES.keys())
+        assert list(INDUSTRIES.keys()) == INDUSTRY_NAMES
 
     def test_no_none_symbols(self):
         for name, symbols in INDUSTRIES.items():

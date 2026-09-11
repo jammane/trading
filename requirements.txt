@@ -6,3 +6,6 @@ keyring==25.7.0
 numpy==2.4.4
 pytest>=8.0
 matplotlib>=3.8
+# Pinned exactly: ruff's rule set grows between releases, so an unpinned version
+# silently changes what `ruff check .` reports and makes the lint gate meaningless.
+ruff==0.15.22

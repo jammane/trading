@@ -31,14 +31,13 @@ import gc
 import json
 import math
 import os
-import random
+import pickle
 import shutil
 from collections import defaultdict
 
 import torch
-import torch.nn.functional as F
 
-from models import MT1NN, MT1DualHead, MT1Tail, MT2NN, StockNN
+from models import MT1NN, MT2NN, MT1DualHead, MT1Tail, StockNN
 from training_lib import (
     ELITE_COUNT,
     ELITE_POOL,
@@ -46,20 +45,21 @@ from training_lib import (
     HIST_ELITE,
     HIST_PER_DAY,
     HIST_WAVG,
-    IND_STARTING_CASH,
     MT1_COMP_SLOTS,
+    MT1_DIR_CONST_TRIP,
     MT1_DIR_DAYS,
+    MT1_DIR_INJ_BLEND,
+    MT1_DIR_INJ_COOLDOWN,
     MT1_DIR_MIN_CORRECT,
+    MT1_LOGIT_CAP,
     MT1_POOL_NAMES,
-    MT1_RANGE_CEIL_MULT,
-    MT1_RANGE_FLOOR,
+    MT1_SOFTPLUS_CLAMP,
     N_SLOTS,
     WAVG_COUNT,
     _master_points,
     _model_path,
     _optimal_tiers,
     blend_model_halfway,
-    build_master_features,
     compute_weighted_avg_model,
     load_slot_model,
     log,
@@ -92,6 +92,27 @@ HT_PARENTS     = ELITE_COUNT + WAVG_COUNT   # 20
 _HT_CHILDREN   = [16, 13, 13, 12, 12] + [8] * 12 + [6] * 3   # sums to 180
 HT_PARENT_OF_MUT = [p for p, c in enumerate(_HT_CHILDREN) for _ in range(c)]
 assert len(HT_PARENT_OF_MUT) == MT1_COMP_SLOTS - HT_PARENTS, "HT children table must sum to 180"
+
+# ── Direction pool: forward accumulation (v0.5.0.0) ─────────────────────────────
+# The acc/rng/cfd pools score a model by REPLAYING it over the trailing window, which regenerates
+# 183 of 200 slots every run and gives ~1.6 independent observations at MT1_FWD_DAYS = 10. The
+# v0.4.3.0 out-of-sample instrument measured direction at 49.54% OOS against 61.09% in-sample —
+# all fit, no skill. Direction now keeps MT1_COMP_SLOTS persistent individuals, each carrying its
+# own rolling 16-prediction record, culled gently on a percentile floor.
+# These MUST match mt1_scoring.h; the C++ trainer and this path evolve the same pool files.
+# Volatility gets its own scale, not MT1_SCALE_DOLLARS — the target averages $242, so at the
+# $10,000 delta scale a model would need softplus in 0.005-0.06, deep in its flat tail where
+# mutations barely move the output. Must match mt1_scoring.h.
+MT1_VOL_SCALE       = 500.0
+MT1_UNGRADED_FEED   = 0.5    # what the ungraded conf4 channel forwards to MT2
+MT1_DIR_HIST_BITS   = 16
+MT1_DIR_MIN_AGE     = 8       # predictions before a model may be culled OR breed
+MT1_DIR_CULL_PCT    = 0.083   # fraction of MATURE models culled per run → ~60% mature, ~20-run life
+MT1_DIR_ELITE_PCT   = 0.10    # top fraction of mature models used as parents
+MT1_DIR_LINEAGE_CAP = 0.125   # lineage above this share of the pool stops breeding
+MT1_DIR_LINEAGE_RESUME = 0.10  # ...and resumes only below this (hysteresis; see _upkeep_dir_pool)
+MT1_DIR_RECENCY_W   = (1.0, 0.8, 0.6, 0.4)   # most-recent-first, blocks of 4; full record sums 11.2
+MT1_DIR_WAVG_K      = (5, 10, 15)            # ephemeral blend parents (top-5/10/15)
 
 
 
@@ -185,8 +206,8 @@ def load_mt1_rolling_state(model_dir):
         try:
             with open(path) as f:
                 return json.load(f)
-        except Exception:
-            pass
+        except (OSError, json.JSONDecodeError) as e:
+            log(f"WARNING: rolling state {path} unreadable, starting cold: {e}")
     return {}
 
 
@@ -195,7 +216,7 @@ def save_mt1_rolling_state(model_dir, state):
     try:
         with open(os.path.join(model_dir, 'mt1_rolling_state.json'), 'w') as f:
             json.dump(state, f)
-    except Exception as e:
+    except OSError as e:
         log(f"WARNING: could not save mt1_rolling_state: {e}")
 
 
@@ -207,24 +228,52 @@ def _rolling_acc_floor(ind_state):
     return sum(buf) / len(buf) / 2.0
 
 
-def _rolling_range_ceiling(ind_state, today_residual=0.0):
-    """Range ceiling = max(4 × mean_residual, 4 × today_residual).
-    Returns None (no ceiling) on cold start."""
-    buf = ind_state.get('residual_buf', [])
+def _rolling_vol_floor(ind_state):
+    """Vol floor = mean(last 10 vol targets) / 2, the same shape as the acc floor. 2x this is the
+    naive "predict the rolling mean" answer that sec_vol normalizes against. Returns
+    MT1_FLOOR_COLD/2 on cold start. Mirror of C++ run_mt1_block::floors()."""
+    buf = ind_state.get('vol_buf', [])
     if not buf:
-        return None
-    mean_r = sum(buf) / len(buf)
-    return MT1_RANGE_CEIL_MULT * max(mean_r, today_residual)
+        return MT1_FLOOR_COLD / 2.0
+    return sum(buf) / len(buf) / 2.0
 
 
-def _rolling_update(ind_state, abs_actual_d, comp0_residual):
-    """Update both rolling circular buffers (max MT1_ROLLING_DAYS entries each)."""
-    for key, val in (('actual_buf', abs_actual_d), ('residual_buf', comp0_residual)):
+def _rolling_update(ind_state, abs_actual_d, vol_actual):
+    """Update both rolling circular buffers (max MT1_ROLLING_DAYS entries each).
+
+    The second buffer held |actual_d - comp0_delta| for the retired band ceiling; it now holds the
+    realized-vol target itself, since channel 2 predicts volatility as of v0.5.0.0.
+    """
+    for key, val in (('actual_buf', abs_actual_d), ('vol_buf', vol_actual)):
         buf = ind_state.get(key, [])
         buf.append(val)
         if len(buf) > MT1_ROLLING_DAYS:
             buf = buf[-MT1_ROLLING_DAYS:]
         ind_state[key] = buf
+
+
+# ── MT1 output decode (single source of truth) ─────────────────────────────────
+# Mirror of the C++ mt1_conf / mt1_conf4 / mt1_range_pct / mt1_delta_t helpers. Every consumer of an
+# MT1 raw logit must go through these so the bounded activation cannot be bypassed at one site.
+#
+# conf/conf4 squash the logit through tanh before the sigmoid so the output can never reach the 0/1
+# rails, where the derivative vanishes and Gaussian weight mutations stop moving the output at all.
+
+def _mt1_conf(raw):
+    return 1.0 / (1.0 + math.exp(-MT1_LOGIT_CAP * math.tanh(raw / MT1_LOGIT_CAP)))
+
+
+def _mt1_conf4(raw):
+    return _mt1_conf(raw)
+
+
+def _mt1_range_pct(raw):
+    c = max(-MT1_SOFTPLUS_CLAMP, min(MT1_SOFTPLUS_CLAMP, raw))
+    return math.log1p(math.exp(c))          # softplus, guarded against overflow → inf
+
+
+def _mt1_delta_t(raw):
+    return math.tanh(raw)                   # already bounded; unchanged
 
 
 # ── MT1 scoring ────────────────────────────────────────────────────────────────
@@ -239,107 +288,79 @@ def mt1_win_weight(di, day_count):
     return 1.0 if w < 1.0 else w
 
 
-def _dir_day_weights(dir_hist):
-    """Class-balanced direction-pool day weights (mirror of C++ step_mt1_component): up-days and
-    down-days each carry half the window weight, so a constant-prediction model scores exactly the
-    no-skill baseline dir_W/2 regardless of the absolute target's sign skew. Returns (weights, dir_W).
-    Single-class window → plain recency weights. dir_hist entries are (feat_t, actual_d)."""
-    n = len(dir_hist)
-    ws = [mt1_win_weight(di, n) for di in range(n)]
-    dir_W = sum(ws)
-    w_up = sum(ws[di] for di in range(n) if dir_hist[di][1] >= 0.0)
-    w_down = dir_W - w_up
-    if w_up > 0.0 and w_down > 0.0:
-        dw = [ws[di] * ((dir_W / (2.0 * w_up)) if dir_hist[di][1] >= 0.0 else (dir_W / (2.0 * w_down)))
-              for di in range(n)]
-    else:
-        dw = list(ws)
-    return dw, dir_W
-
-
-def _mt1_score_breakdown(out4, actual_d, acc_floor, range_ceiling=None):
+def _mt1_score_breakdown(out4, actual_d, acc_floor, vol_actual=0.0, vol_floor=None):
     """
-    Score one MT1 slot against the industry's actual dollar P&L.
+    Score one MT1 slot against the industry's actual dollar P&L and realized volatility.
 
-    out4:          raw logit tensor shape (4,)
-    actual_d:      float — actual dollar P&L (actual_frac × portfolio_value)
-    acc_floor:     float — per-industry adaptive floor for accuracy denom
-    range_ceiling: float or None — cap on range r (None = no ceiling)
-    Returns (composite, direction, range_, accuracy, confidence) all in [0.0, 1.0].
+    out4:       raw logit tensor shape (4,)
+    actual_d:   float — actual dollar P&L (actual_frac x portfolio_value)
+    acc_floor:  float — per-industry adaptive floor for the accuracy denom
+    vol_actual: float — realized vol over the next MT1_VOL_DAYS sessions, x MT1_SCALE_DOLLARS
+    vol_floor:  float — half the rolling mean of vol_actual (None -> cold start)
+    Returns (composite, direction, vol, accuracy, confidence), all in [0.0, 1.0].
 
-    Composite = equal-weight mean of the four components' secondary [0,1] normalizations
-    against each one's naive baseline (mirror of C++ compute_mt1_scores). The returned
-    direction/range/accuracy/confidence are the RAW component scores (used by the pools).
+    Composite = equal-weight mean of the THREE graded components' secondary [0,1] normalizations
+    (mirror of C++ compute_mt1_scores). conf4 is present but ungraded and always returns 0.0.
     """
-    conf     = torch.sigmoid(out4[0]).item()
-    delta_t  = torch.tanh(out4[1]).item()
-    delta_d  = delta_t * MT1_SCALE_DOLLARS
-    rng_pct  = F.softplus(out4[2]).item()
-    conf4    = torch.sigmoid(out4[3]).item()
+    if vol_floor is None:
+        vol_floor = MT1_FLOOR_COLD / 2.0
+    conf     = _mt1_conf(out4[0].item())
+    delta_d  = _mt1_delta_t(out4[1].item()) * MT1_SCALE_DOLLARS
+    vol_pred = _mt1_range_pct(out4[2].item()) * MT1_VOL_SCALE       # channel 2 is VOLATILITY now
 
     score_dir = conf if actual_d >= 0.0 else (1.0 - conf)
 
-    eff_delta = max(abs(delta_d), MT1_RANGE_FLOOR)
-    r         = rng_pct * eff_delta
-    if range_ceiling is not None:
-        r = min(r, range_ceiling)
-    err       = abs(abs(actual_d) - abs(delta_d))   # signless: magnitude graded independent of sign (direction owns sign)
-    m         = err / r if r > 0.0 else float('inf')
-    score_rng = m if m < 1.0 else 0.0
-
+    # Magnitude: signless, so the delta head owns size and the direction head owns sign.
+    err       = abs(abs(actual_d) - abs(delta_d))
     denom     = max(abs(actual_d), acc_floor)
     score_acc = denom / (err + denom)
 
-    d         = err
-    dor       = (d / r) if r > 1e-9 else (1e9 if d > 0.0 else 0.0)
-    ideal     = 1.0 / (1.0 + dor * dor)
-    diff      = conf4 - ideal
-    score_conf = 1.0 - diff * diff
-    if err > r:
-        score_conf = 0.5 + 0.25 * score_conf  # compress outside-range to [0.5, 0.75]
+    # Volatility. Channel 2 used to be a band width graded against the delta head's own residual —
+    # against the part of the target it had just failed to predict, i.e. noise — so the pool
+    # converged to a constant. Forward realized vol IS predictable (trailing vol reaches OOS
+    # r = 0.444; the same pool machinery on a full window reaches 0.527).
+    err_vol   = abs(vol_pred - vol_actual)
+    # Guarded: a degenerate all-zero vol history leaves vol_actual and vol_floor both 0, and an
+    # unguarded den_vol raises ZeroDivisionError (C++ would silently produce NaN instead).
+    den_vol   = max(vol_actual, vol_floor, 1e-6)
+    score_vol = den_vol / (err_vol + den_vol)
+
+    # conf4 no longer scored: it graded against the band geometry that went away, and with
+    # err > r always its optimum was the degenerate conf4 = 0.
+    score_conf = 0.0
 
     # Secondary [0,1] normalization per component vs naive baseline B (ideal=1):
-    #   sec = clamp((raw - B) / (1 - B), 0, 1)  → naive→0, ideal→1.  (mirror of C++)
+    #   sec = clamp((raw - B) / (1 - B), 0, 1)  -> naive->0, ideal->1.  (mirror of C++)
     def _c01(x):
         return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
 
     b_dir   = 0.5                                          # conf = 0.5, no view
     sec_dir = _c01((score_dir - b_dir) / max(1.0 - b_dir, 1e-6))
 
-    b_acc   = denom / (abs(actual_d) + denom)              # predict-0 null model
+    b_acc   = denom / (abs(actual_d) + denom)               # predict-0 null model
     sec_acc = _c01((score_acc - b_acc) / max(1.0 - b_acc, 1e-6))
 
-    m_naive = (err / acc_floor) if acc_floor > 1e-9 else (1e9 if err > 0.0 else 0.0)
-    b_rng   = m_naive if m_naive < 1.0 else 0.0            # band = unconditional scale (acc_floor)
-    sec_rng = _c01((score_rng - b_rng) / max(1.0 - b_rng, 1e-6))
+    # Naive vol predictor = the rolling mean, which is 2 x vol_floor by construction.
+    b_vol   = den_vol / (abs(2.0 * vol_floor - vol_actual) + den_vol)
+    sec_vol = _c01((score_vol - b_vol) / max(1.0 - b_vol, 1e-6))
 
-    diff0   = 0.5 - ideal                                  # conf4 = 0.5
-    b_cfd   = 1.0 - diff0 * diff0
-    if err > r:
-        b_cfd = 0.5 + 0.25 * b_cfd
-    sec_cfd = _c01((score_conf - b_cfd) / max(1.0 - b_cfd, 1e-6))
-
-    composite = 0.25 * (sec_dir + sec_acc + sec_rng + sec_cfd)
-    return composite, score_dir, score_rng, score_acc, score_conf
-
+    composite = (sec_dir + sec_acc + sec_vol) / 3.0
+    return composite, score_dir, score_vol, score_acc, score_conf
 
 def _mt1_decode(model, in74_t):
     """Run MT1 inference and return raw activations for MT2 input and logging.
 
-    Returns (conf, delta_t, range_pct, conf4):
-      conf     = sigmoid(out[0]) ∈ [0,1]  — direction confidence
-      delta_t  = tanh(out[1])   ∈ [-1,1] — bounded P&L (× MT1_SCALE_DOLLARS for dollars)
-      range_pct = softplus(out[2]) > 0    — range as % of effective delta
-      conf4    = sigmoid(out[3]) ∈ [0,1]  — calibrated confidence
+    Returns (conf, delta_t, range_pct, conf4) — all via the bounded decode helpers:
+      conf      = _mt1_conf(out[0])      ∈ (0.018, 0.982) — direction confidence, never saturating
+      delta_t   = tanh(out[1])           ∈ [-1,1] — bounded P&L (× MT1_SCALE_DOLLARS for dollars)
+      range_pct = softplus(clamp(out[2])) > 0     — range as % of effective delta, finite
+      conf4     = _mt1_conf4(out[3])     ∈ (0.018, 0.982) — calibrated confidence
     """
     model.eval()
     with torch.inference_mode():
         out4 = model(in74_t).squeeze(0)
-    conf      = torch.sigmoid(out4[0]).item()
-    delta_t   = torch.tanh(out4[1]).item()
-    range_pct = F.softplus(out4[2]).item()
-    conf4     = torch.sigmoid(out4[3]).item()
-    return conf, delta_t, range_pct, conf4
+    return (_mt1_conf(out4[0].item()), _mt1_delta_t(out4[1].item()),
+            _mt1_range_pct(out4[2].item()), _mt1_conf4(out4[3].item()))
 
 
 # ── MT1 burst refinement ───────────────────────────────────────────────────────
@@ -391,10 +412,10 @@ def upkeep_industry(industry, symbols, model_dir, primed_portfolio,
                     prev   = ([entries[i-1]['open'], entries[i-1]['close'],
                                 entries[i-1]['high'], entries[i-1]['low'],
                                 float(entries[i-1]['volume'])] if i > 0 else None)
-                    deltas = [r - p for r, p in zip(raw, prev)] if prev else [0.0] * 5
+                    deltas = [r - p for r, p in zip(raw, prev, strict=True)] if prev else [0.0] * 5
                     hist.append(raw + deltas)
                 histories[sym] = hist
-            except Exception as e:
+            except (OSError, json.JSONDecodeError, KeyError, ValueError) as e:
                 log(f"WARNING: could not load history for {sym}: {e}")
                 histories[sym] = []
         else:
@@ -436,10 +457,12 @@ def _ht_load_hist(prefix, model_dir, model_class):
                         m = model_class()
                         m.load_state_dict(torch.load(hp, weights_only=True))
                         models.append(m)
-                    except Exception:
-                        pass
-    except Exception:
-        pass
+                    except (OSError, RuntimeError, EOFError, pickle.UnpicklingError) as e:
+                        # A dropped history model silently shrinks the candidate pool, which is
+                        # indistinguishable from genuine convergence — never swallow this.
+                        log(f"WARNING: could not load history model {hp}: {e}")
+    except (OSError, json.JSONDecodeError) as e:
+        log(f"WARNING: could not read history meta {meta_path}: {e}")
     return models
 
 
@@ -450,24 +473,26 @@ def _ht_save_hist(prefix, model_dir, model_class, new_elites, new_wavgs):
         with open(meta_path) as f:
             meta = json.load(f)
         head, count = meta.get('head', 0), meta.get('count', 0)
-    except Exception:
+    except (OSError, json.JSONDecodeError) as e:
+        log(f"WARNING: history meta {meta_path} unreadable, restarting ring at 0: {e}")
         head, count = 0, 0
     for k, m in enumerate(new_elites[:HIST_ELITE]):
+        hp = os.path.join(model_dir, f'{prefix}_hist_{head}_{k}.pt')
         try:
-            torch.save(m.state_dict(), os.path.join(model_dir, f'{prefix}_hist_{head}_{k}.pt'))
-        except Exception:
-            pass
+            torch.save(m.state_dict(), hp)
+        except (OSError, RuntimeError) as e:
+            log(f"WARNING: could not save history elite {hp}: {e}")
     for k, m in enumerate(new_wavgs[:HIST_WAVG]):
+        hp = os.path.join(model_dir, f'{prefix}_hist_{head}_{HIST_ELITE + k}.pt')
         try:
-            torch.save(m.state_dict(),
-                       os.path.join(model_dir, f'{prefix}_hist_{head}_{HIST_ELITE + k}.pt'))
-        except Exception:
-            pass
+            torch.save(m.state_dict(), hp)
+        except (OSError, RuntimeError) as e:
+            log(f"WARNING: could not save history wavg {hp}: {e}")
     try:
         with open(meta_path, 'w') as f:
             json.dump({'head': (head + 1) % HIST_DAYS, 'count': min(count + 1, HIST_DAYS)}, f)
-    except Exception:
-        pass
+    except OSError as e:
+        log(f"WARNING: could not write history meta {meta_path}: {e}")
 
 
 def _ht_select_and_mutate(prefix, model_dir, model_class, scores, sigma, hist_models=None):
@@ -531,7 +556,203 @@ def _ht_select_and_mutate(prefix, model_dir, model_class, scores, sigma, hist_mo
 
 # ── MT1 industry upkeep (heads/tails block cycle) ────────────────────────────────
 
-def upkeep_mt1_industry(industry, model_dir, in74_t, actual_d,
+def _mt1_dir_record_scores(hist, n_pred):
+    """(primary, secondary, tertiary) for one rolling record. Exact mirror of
+    mt1_dir_record_scores in mt1_scoring.h — the C++ trainer and this path evolve the SAME pool
+    files, so any divergence here silently re-ranks models between a batch run and daily upkeep.
+
+    n = min(n_pred, 16) occupied slots. A partial record normalizes by the weight actually
+    occupied, so an 8-prediction model is judged on its 8 rather than diluted toward zero.
+    """
+    n = min(int(n_pred), MT1_DIR_HIST_BITS)
+    if n <= 0:
+        return 0.0, 0.0, 0.0
+    correct = wsum = wcorrect = 0.0
+    for i in range(n):
+        w = MT1_DIR_RECENCY_W[i // 4]
+        if (hist >> i) & 1:
+            correct += 1.0
+            wcorrect += w
+        wsum += w
+    primary = correct / n
+    secondary = (wcorrect / wsum) if wsum > 0 else 0.0
+    # Tertiary is a function of the other two, so as a THIRD sort key it can never break a tie they
+    # left. Computed because the blend distribution is worth logging.
+    return primary, secondary, 0.4 * primary + 0.6 * secondary
+
+
+def _dir_sort_key(meta):
+    """Descending (primary, secondary, tertiary) — use with reverse=True."""
+    return _mt1_dir_record_scores(meta[0], meta[1])
+
+
+def _load_dir_meta(model_dir, industry):
+    """Per-slot direction metadata: [hist, n_pred, lineage] per slot. Missing file → every slot is
+    a fresh individual with its own lineage, which is exactly the cold-start state (and how a pool
+    converted from .bin by convert_weights.py arrives)."""
+    path = os.path.join(model_dir, f'mt1_{industry}_tail_dir_meta.json')
+    slots, next_lineage, best_slot = None, MT1_COMP_SLOTS, 0
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                d = json.load(f)
+            s = d.get('slots')
+            if isinstance(s, list) and len(s) == MT1_COMP_SLOTS:
+                slots = [[int(x[0]), int(x[1]), int(x[2])] for x in s]
+                next_lineage = int(d.get('next_lineage', MT1_COMP_SLOTS))
+                best_slot = int(d.get('best_slot', 0)) % MT1_COMP_SLOTS
+        except Exception:
+            slots = None
+    if slots is None:
+        slots = [[0, 0, i] for i in range(MT1_COMP_SLOTS)]
+    return slots, next_lineage, best_slot
+
+
+def _save_dir_meta(model_dir, industry, slots, next_lineage, best_slot):
+    path = os.path.join(model_dir, f'mt1_{industry}_tail_dir_meta.json')
+    with open(path, 'w') as f:
+        json.dump({'slots': slots, 'next_lineage': int(next_lineage),
+                   'best_slot': int(best_slot)}, f)
+
+
+def _upkeep_dir_pool(prefix, model_dir, industry, concat_today, actual_d, sigma, ind_rs):
+    """One forward-accumulation step for the direction pool. Mirrors step_mt1_dir_pool in
+    training_v4.cpp: every slot predicts today, the outcome shifts into its record, the worst
+    MT1_DIR_CULL_PCT of MATURE models are culled, and the freed slots are refilled round-robin
+    from the top MT1_DIR_ELITE_PCT plus three ephemeral wavg blends.
+
+    Returns (best_slot, stats dict).
+    """
+    slots, next_lineage, _prev_best = _load_dir_meta(model_dir, industry)
+    target_up = bool(actual_d >= 0.0)
+
+    # 1. Predict + record. This is the only place a model's evidence grows: there is no replay, so
+    #    a model's score IS its own track record.
+    for s in range(MT1_COMP_SLOTS):
+        m = load_slot_model(prefix, model_dir, s, MT1Tail)
+        with torch.no_grad():
+            logit = m(concat_today).reshape(-1)[0].item()
+        del m
+        correct = (_mt1_conf(logit) >= 0.5) == target_up
+        slots[s][0] = ((slots[s][0] << 1) | (1 if correct else 0)) & 0xFFFF
+        if slots[s][1] < 0xFFFF:
+            slots[s][1] += 1
+
+    mature = [s for s in range(MT1_COMP_SLOTS) if slots[s][1] >= MT1_DIR_MIN_AGE]
+    mature.sort(key=lambda s: _dir_sort_key(slots[s]), reverse=True)
+    best_slot = mature[0] if mature else 0
+
+    scores = [_mt1_dir_record_scores(slots[s][0], slots[s][1]) for s in range(MT1_COMP_SLOTS)]
+    stats = {
+        'mature': len(mature) / MT1_COMP_SLOTS,
+        'mean_primary': sum(x[0] for x in scores) / MT1_COMP_SLOTS,
+        'mean_secondary': sum(x[1] for x in scores) / MT1_COMP_SLOTS,
+        'culled': 0,
+    }
+    if len(mature) < 4:
+        _save_dir_meta(model_dir, industry, slots, next_lineage, best_slot)
+        return best_slot, stats
+
+    # 2. Lineage shares and the breeding bar.
+    counts = {}
+    for s in range(MT1_COMP_SLOTS):
+        counts[slots[s][2]] = counts.get(slots[s][2], 0) + 1
+    barred = set(ind_rs.get('dir_barred', []))
+    for lin, c in counts.items():
+        share = c / MT1_COMP_SLOTS
+        # Hysteresis: bar above CAP, release only below RESUME. Equal thresholds make a lineage
+        # hovering at the cap flip state constantly, and a bar that lasts one step suppresses
+        # nothing (the first C++ run logged 1850 barrings / 1838 re-enables over 35 days).
+        if lin not in barred and share > MT1_DIR_LINEAGE_CAP:
+            barred.add(lin)
+            log(f"[mt1/{sn(industry)}:dir] lineage {lin} BARRED from breeding "
+                f"(share {100*share:.0f}%)")
+        elif lin in barred and share <= MT1_DIR_LINEAGE_RESUME:
+            barred.discard(lin)
+            log(f"[mt1/{sn(industry)}:dir] lineage {lin} re-enabled (share {100*share:.0f}%)")
+    barred &= set(counts)          # forget lineages that no longer exist
+    ind_rs['dir_barred'] = sorted(barred)
+    stats['lineage_max'] = max(counts.values()) / MT1_COMP_SLOTS
+    stats['lineage_n'] = len(counts)
+
+    # 3. Parents: top MT1_DIR_ELITE_PCT of mature with an unbarred lineage. The three wavg blends
+    #    are breeding TEMPLATES rather than pool residents — a synthetic average has no track
+    #    record, so it could never mature, and giving it a slot would park an unscoreable model
+    #    in the pool.
+    want = max(1, int(len(mature) * MT1_DIR_ELITE_PCT + 0.5))
+    parents = [s for s in mature if slots[s][2] not in barred][:want]
+    if not parents:
+        parents = [mature[0]]                       # every lineage barred: breed anyway
+    n_par = len(parents) + len(MT1_DIR_WAVG_K)
+
+    n_cull = max(1, int(len(mature) * MT1_DIR_CULL_PCT + 0.5))
+    n_cull = max(0, min(n_cull, len(mature) - len(parents)))
+    stats['culled'] = n_cull
+
+    for k in range(n_cull):
+        dead = mature[len(mature) - 1 - k]
+        pi = k % n_par
+        if pi < len(parents):
+            parent = load_slot_model(prefix, model_dir, parents[pi], MT1Tail)
+            child = _mutate_generic(parent, MT1Tail, sigma)
+            del parent
+            child_lineage = slots[parents[pi]][2]
+        else:
+            kk = min(MT1_DIR_WAVG_K[pi - len(parents)], len(mature))
+            inv = 1.0 / kk
+            avg = None
+            for t in range(kk):
+                m = load_slot_model(prefix, model_dir, mature[t], MT1Tail)
+                st = m.state_dict(); del m
+                if avg is None:
+                    avg = {key: (v.clone().float() * inv if torch.is_floating_point(v) else v.clone())
+                           for key, v in st.items()}
+                else:
+                    for key, v in st.items():
+                        if torch.is_floating_point(v) and key in avg:
+                            avg[key] = avg[key] + v.float() * inv
+            blend = MT1Tail(); blend.load_state_dict(avg)
+            child = _mutate_generic(blend, MT1Tail, sigma)
+            del blend, avg
+            child_lineage = next_lineage           # a blend is a genuinely new genotype
+            next_lineage += 1
+        save_slot_model(prefix, model_dir, dead, child)
+        del child
+        slots[dead] = [0, 0, child_lineage]        # fresh individual: no record, immune until MIN_AGE
+
+    _save_dir_meta(model_dir, industry, slots, next_lineage, best_slot)
+    return best_slot, stats
+
+
+def _inject_dir_tail(prefix, model_dir, industry, best_dir_tail):
+    """Re-diversify the direction pool after a constant-collapse. Under forward accumulation this
+    targets the WORST mature individuals rather than elite ranks — with persistent identity there
+    are no rank slots to overwrite, and replacing the bottom of the pool is what "re-diversify
+    without discarding the good models" actually means. Each replacement becomes a fresh individual
+    (no record, own lineage, immune until MT1_DIR_MIN_AGE), exactly like a cull birth."""
+    slots, next_lineage, _best = _load_dir_meta(model_dir, industry)
+    mature = [s for s in range(MT1_COMP_SLOTS) if slots[s][1] >= MT1_DIR_MIN_AGE]
+    if not mature:
+        return 0
+    mature.sort(key=lambda s: _dir_sort_key(slots[s]), reverse=True)
+    best_state = best_dir_tail.state_dict()
+    n_inj = max(1, len(mature) // 4)               # worst quartile of mature
+    for k in range(n_inj):
+        dead = mature[len(mature) - 1 - k]
+        rand_state = MT1Tail().state_dict()        # PyTorch default (kaiming-uniform) random tail
+        blended = {key: MT1_DIR_INJ_BLEND * best_state[key]
+                        + (1.0 - MT1_DIR_INJ_BLEND) * rand_state[key]
+                   for key in best_state}
+        m = MT1Tail(); m.load_state_dict(blended)
+        save_slot_model(prefix, model_dir, dead, m)
+        del m
+        slots[dead] = [0, 0, next_lineage]
+        next_lineage += 1
+    _save_dir_meta(model_dir, industry, slots, next_lineage, _best)
+    return n_inj
+
+
+def upkeep_mt1_industry(industry, model_dir, in74_t, actual_d, vol_actual=0.0,
                          dir_sigma=UPKEEP_DIR_SIGMA, rng_sigma=UPKEEP_RNG_SIGMA,
                          acc_sigma=UPKEEP_ACC_SIGMA, cfd_sigma=UPKEEP_CFD_SIGMA,
                          head_sigma=UPKEEP_HEAD_SIGMA, rolling_state=None):
@@ -591,14 +812,8 @@ def upkeep_mt1_industry(industry, model_dir, in74_t, actual_d,
     for t in tails0:
         t.eval()
 
-    # Today's residual (composed best) for the range ceiling.
-    today_residual = 0.0
-    if ind_rs.get('residual_buf'):
-        with torch.inference_mode():
-            c0 = head0(in74_t)
-            comp0_delta_d = math.tanh(tails0[1](c0).reshape(-1)[0].item()) * MT1_SCALE_DOLLARS
-        today_residual = abs(actual_d - comp0_delta_d)
-    range_ceiling = _rolling_range_ceiling(ind_rs, today_residual)
+    # Vol floor from the trailing vol-target buffer (strictly backward-looking).
+    vol_floor = _rolling_vol_floor(ind_rs)
 
     # Direction day buffer (append today, persist, load the trailing window).
     dir_hist_path = os.path.join(model_dir, f'mt1_{industry}_dir_hist.json')
@@ -607,66 +822,83 @@ def upkeep_mt1_industry(industry, model_dir, in74_t, actual_d,
         try:
             with open(dir_hist_path) as _f:
                 dir_hist_raw = json.load(_f)
-        except Exception:
+        except (OSError, json.JSONDecodeError) as e:
+            # Losing the window silently resets MT1 scoring to a 1-day window without warning.
+            log(f"WARNING: direction history {dir_hist_path} unreadable, restarting window: {e}")
             dir_hist_raw = []
-    dir_hist_raw.append({'feat74': in74_t.squeeze(0).tolist(), 'actual_d': float(actual_d)})
+    dir_hist_raw.append({'feat74': in74_t.squeeze(0).tolist(), 'actual_d': float(actual_d),
+                         'vol_d': float(vol_actual)})
     dir_hist_raw = dir_hist_raw[-MT1_DIR_DAYS:]
     with open(dir_hist_path, 'w') as _f:
         json.dump(dir_hist_raw, _f)
-    dir_hist = [(torch.tensor(e['feat74'], dtype=torch.float32).unsqueeze(0), e['actual_d'])
+    # vol_d defaults to 0.0 for windows written before v0.5.0.0, so an in-flight state file loads
+    # rather than crashing; the entry ages out within MT1_DIR_DAYS runs.
+    dir_hist = [(torch.tensor(e['feat74'], dtype=torch.float32).unsqueeze(0), e['actual_d'],
+                 e.get('vol_d', 0.0))
                 for e in dir_hist_raw]
-    dir_dw, _ = _dir_day_weights(dir_hist) if dir_hist else ([], 0.0)
     n_win = len(dir_hist)
 
     # Precompute frozen-head concat + frozen tail logits per window day (shared across tail pools).
     concats, frozen_logits = [], []
     with torch.inference_mode():
-        for feat_t, _ad in dir_hist:
+        for feat_t, _ad, _vd in dir_hist:
             c = head0(feat_t)
             concats.append(c)
             frozen_logits.append([tails0[k](c).reshape(-1)[0].item() for k in range(4)])
 
     def _score_tail(cand, comp, apply_cull=True):
+        """Score one candidate tail over the trailing window (mirror of C++ step_mt1_tail).
+
+        No culls. Both were removed in v0.4.1.0:
+          * range-ceiling cull (comps 2/3) — score_rng is now single-peaked and self-limiting on the
+            wide side, and the threshold was derived from today's target.
+          * direction flip cull — it culled any model whose confidence never crossed 0.5, i.e. exactly
+            the constant predictor that _dir_day_weights is DESIGNED to score at the no-skill baseline
+            (dir_W/2 = 7.50). Removing that floor let the pool sit below it, and it did: ~35% balanced
+            accuracy, systematically inverted, for all 5 passes of the v0.4.0.0 run.
+        `apply_cull` is retained for signature compatibility with the history-candidate call sites.
+        """
         cand.eval()
-        total = 0.0; culled = False
+        total = 0.0
         n_correct = n_correct_dbl = today_correct = 0
-        prev_cp = prev_ap = None; crossings = flips = 0
         with torch.inference_mode():
-            for di, (feat_t, ad) in enumerate(dir_hist):
+            for di, (feat_t, ad, vd) in enumerate(dir_hist):
                 is_today = (di == n_win - 1)
                 o = list(frozen_logits[di]); o[comp] = cand(concats[di]).reshape(-1)[0].item()
                 out4 = torch.tensor(o)
-                conf    = torch.sigmoid(out4[0]).item()
-                delta_d = math.tanh(o[1]) * MT1_SCALE_DOLLARS
-                rng_pct = F.softplus(out4[2]).item()
-                r_raw   = rng_pct * max(abs(delta_d), MT1_RANGE_FLOOR)
-                if (comp == 2 or comp == 3) and range_ceiling is not None and r_raw > range_ceiling:
-                    culled = True
                 if comp == 0:
+                    conf = _mt1_conf(o[0])
                     cp = conf >= 0.5; ap = ad >= 0.0
                     day = conf if ap else (1.0 - conf); corr = cp == ap
                     n_correct += 1 if corr else 0
                     n_correct_dbl += (2 if corr else 0) if is_today else (1 if corr else 0)
                     if is_today:
                         today_correct = 1 if corr else 0
-                    if prev_cp is not None and cp != prev_cp:
-                        crossings += 1
-                    if prev_ap is not None and ap != prev_ap:
-                        flips += 1
-                    prev_cp = cp; prev_ap = ap
                 elif comp == 1:
+                    delta_d = _mt1_delta_t(o[1]) * MT1_SCALE_DOLLARS
                     err = abs(abs(ad) - abs(delta_d)); day = acc_floor / (err + acc_floor)
                 else:
-                    day = _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)[2 if comp == 2 else 4]
-                total += day * (dir_dw[di] if comp == 0 else mt1_win_weight(di, n_win))
-        if comp == 0 and n_win >= 2 and crossings < flips // 2:
-            culled = True
-        if apply_cull and culled:
-            return -1e30, n_correct, n_correct_dbl, today_correct
+                    day = _mt1_score_breakdown(out4, ad, acc_floor, vd, vol_floor)[2 if comp == 2 else 4]
+                total += day * mt1_win_weight(di, n_win)
         return total, n_correct, n_correct_dbl, today_correct
 
-    # ── Tail phase (every run): freeze head0 + tail0, evolve the 4 tail pools ──
+    # ── Direction pool (v0.5.0.0): forward accumulation, not replay ──
+    # Runs before the replay pools so tail0[0] is the day's best when they freeze against it.
+    dir_best_slot, dir_stats = 0, {}
+    if n_win > 0:
+        dir_best_slot, dir_stats = _upkeep_dir_pool(
+            tail_prefixes[0], model_dir, industry, concats[-1], actual_d, dir_sigma, ind_rs)
+        # Slot 0 is the deployed direction tail by convention everywhere downstream, but identity
+        # is positional-free here: copy the ranked best into slot 0 rather than reordering the pool.
+        if dir_best_slot != 0:
+            best_m = load_slot_model(tail_prefixes[0], model_dir, dir_best_slot, MT1Tail)
+            save_slot_model(tail_prefixes[0], model_dir, 0, best_m)
+            del best_m
+
+    # ── Tail phase (every run): freeze head0 + tail0, evolve the acc/rng/cfd replay pools ──
     for comp, prefix in enumerate(tail_prefixes):
+        if comp == 0:
+            continue          # direction handled above by _upkeep_dir_pool
         scores = []; dir_ncorr = {}; dir_today = {}; dir_max_correct = 0
         for slot in range(MT1_COMP_SLOTS):
             m = load_slot_model(prefix, model_dir, slot, MT1Tail)
@@ -694,7 +926,19 @@ def upkeep_mt1_industry(industry, model_dir, in74_t, actual_d,
             sort_scores = scores
             hist_with_scores = [(hm, sc) for (hm, sc, _, _) in hist_cands]
         else:
-            # Direction two-half selection (mirror of C++ / old component path).
+            # Direction two-half selection.
+            #
+            # DELIBERATE DIVERGENCE FROM C++ (v0.4.1.0) — do NOT "re-sync" this away. The slot-0
+            # "got today right" filter below (`if cand[k][2]`) was removed from the batch trainer
+            # but is KEPT here. Rationale: getting the next call right is the real objective, and
+            # the windowed score is only an estimator of it — so the live path keeps expressing it.
+            # In the batch trainer `today` refers to the most recently MATURED day (MT1 lags the sim
+            # by MT1_FWD_DAYS via the forward-buffer ring), i.e. a call made ten sessions ago that is
+            # 9/10 overlapping with the rest of the window — a stale filter, so it was dropped there.
+            # NOTE: production_v2.py:~207 buffers predictions the same MT1_FWD_DAYS, so today this
+            # filter is equally lagged here and is effectively cosmetic; it is retained so the live
+            # path is already correct if/when upkeep moves to a shorter horizon.
+            # See the matching note in training_v4.cpp step_mt1_pool.
             cand = {}
             for slot, sc in scores:
                 cand[slot] = (sc, dir_ncorr.get(slot, 0), dir_today.get(slot, 0))
@@ -744,10 +988,10 @@ def upkeep_mt1_industry(industry, model_dir, in74_t, actual_d,
         def _score_head(cand):
             cand.eval(); total = 0.0
             with torch.inference_mode():
-                for di, (feat_t, ad) in enumerate(dir_hist):
+                for di, (feat_t, ad, vd) in enumerate(dir_hist):
                     c = cand(feat_t)
                     out4 = torch.tensor([tails_frozen[k](c).reshape(-1)[0].item() for k in range(4)])
-                    total += _mt1_score_breakdown(out4, ad, acc_floor, range_ceiling)[0] \
+                    total += _mt1_score_breakdown(out4, ad, acc_floor, vd, vol_floor)[0] \
                         * mt1_win_weight(di, n_win)
             return total
 
@@ -784,16 +1028,39 @@ def upkeep_mt1_industry(industry, model_dir, in74_t, actual_d,
     best_score = 0.0
     with torch.inference_mode():
         out4 = best(in74_t).squeeze(0)
-        for di, (feat_t, ad) in enumerate(dir_hist):
+        for di, (feat_t, ad, vd) in enumerate(dir_hist):
             o4d = best(feat_t).squeeze(0)
-            best_score += _mt1_score_breakdown(o4d, ad, acc_floor, range_ceiling)[0] \
+            best_score += _mt1_score_breakdown(o4d, ad, acc_floor, vd, vol_floor)[0] \
                 * mt1_win_weight(di, n_win)
-    slot0_conf      = torch.sigmoid(out4[0]).item()
-    slot0_delta_t   = torch.tanh(out4[1]).item()
-    slot0_range_pct = F.softplus(out4[2]).item()
-    slot0_conf4     = torch.sigmoid(out4[3]).item()
-    comp0_residual  = abs(actual_d - slot0_delta_t * MT1_SCALE_DOLLARS)
-    _rolling_update(ind_rs, abs(actual_d), comp0_residual)
+    slot0_conf      = _mt1_conf(out4[0].item())
+    slot0_delta_t   = _mt1_delta_t(out4[1].item())
+    slot0_range_pct = _mt1_range_pct(out4[2].item())
+    slot0_conf4     = _mt1_conf4(out4[3].item())
+    # Second buffer now feeds the vol floor, not the retired band ceiling.
+    _rolling_update(ind_rs, abs(actual_d), abs(vol_actual))
+
+    # ── Direction constant-collapse injection (mirror of C++ process_block detector) ──
+    # Once the direction window is full, test the deployed model over it: constant = every window
+    # day calls the same direction; imperfect = ≥1 window day wrong. MT1_DIR_CONST_TRIP consecutive
+    # constant+imperfect checks re-diversifies the direction tail. Streak + cooldown persist in
+    # ind_rs (mt1_rolling_state.json). Stochastic + daily-cadence, so NOT bit-parity with C++.
+    if len(dir_hist) == MT1_DIR_DAYS:
+        with torch.inference_mode():
+            calls = [( _mt1_conf(best(feat_t).squeeze(0)[0].item()) >= 0.5, ad >= 0.0)
+                     for feat_t, ad in dir_hist]
+        constant  = all(up == calls[0][0] for up, _ in calls)
+        imperfect = any(up != actual_up for up, actual_up in calls)
+        cooldown  = max(0, ind_rs.get('dir_inj_cooldown', 0) - 1)
+        streak    = ind_rs.get('dir_const_streak', 0) + 1 if (constant and imperfect) else 0
+        if streak >= MT1_DIR_CONST_TRIP and cooldown == 0:
+            best_dir_tail = load_slot_model(tail_prefixes[0], model_dir, 0, MT1Tail)
+            n_inj = _inject_dir_tail(tail_prefixes[0], model_dir, industry, best_dir_tail)
+            log(f"[mt1/{sn(industry)}:dir] constant-collapse — injected {n_inj} blended "
+                f"individuals (½ best + ½ random)")
+            del best_dir_tail
+            streak, cooldown = 0, MT1_DIR_INJ_COOLDOWN
+        ind_rs['dir_const_streak'] = streak
+        ind_rs['dir_inj_cooldown'] = cooldown
 
     log(f"[mt1/{sn(industry)}] best={best_score:.4f} actual_d=${actual_d:+.1f} "
         f"acc_floor=${acc_floor:.1f} head_cycle={'Y' if do_head else 'n'}")
@@ -827,10 +1094,13 @@ def upkeep_mt2(model_dir, mt1_slot0_outputs, actual_perf, industry_list,
     in48 = []
     for ind in industry_list:
         conf, delta_t, range_pct, conf4 = mt1_slot0_outputs.get(ind, (0.5, 0.0, 0.01, 0.5))
-        # Signed-magnitude reassembly: sign from direction confidence, |size| from the prediction
-        # (delta_t's own sign is ungraded under signless magnitude scoring).
-        delta_signed = abs(delta_t) if conf >= 0.5 else -abs(delta_t)
-        in48.extend([conf, delta_signed, range_pct, conf4])
+        # Magnitude only. delta_t's own sign is ungraded (magnitude scoring is signless), and the
+        # old signed reassembly folded conf's sign into the size channel — randomising it whenever
+        # conf is uninformative, which the v0.4.2.0 run showed it is. conf is already channel 0, so
+        # the two stay orthogonal and MT2 decides how to combine them. Mirrors training_v4.cpp.
+        # conf4 is ungraded as of v0.5.0.0 — forward a constant, not a frozen arbitrary
+        # function, which MT2 could otherwise fit as structured noise.
+        in48.extend([conf, abs(delta_t), range_pct, MT1_UNGRADED_FEED])
     in48_t = torch.tensor(in48, dtype=torch.float32).unsqueeze(0)   # (1, 48)
 
     # Bootstrap pool if slot files don't exist
@@ -910,18 +1180,18 @@ def upkeep_mt2(model_dir, mt1_slot0_outputs, actual_perf, industry_list,
                         h_pts        = sum(_master_points(h_tier_map[ind], opt_tiers[ind])
                                            for ind in industry_list)
                         mt2_hist_models.append((hm, h_pts))
-                    except Exception:
-                        pass
-    except Exception:
-        pass
+                    except (OSError, RuntimeError, EOFError, pickle.UnpicklingError) as e:
+                        log(f"WARNING: could not load MT2 history model {hp}: {e}")
+    except (OSError, json.JSONDecodeError) as e:
+        log(f"WARNING: could not read {mt2_hist_meta_path}: {e}")
 
     # Load 10-day post-injection hold counter
     inj_state_path = os.path.join(model_dir, 'mt2_inj_state.json')
     try:
         with open(inj_state_path) as _f:
             injection_hold = json.load(_f).get('injection_hold', 0)
-    except Exception:
-        injection_hold = 0
+    except (OSError, json.JSONDecodeError):
+        injection_hold = 0   # absent on first run — expected, not an error
     if injection_hold > 0:
         injection_hold -= 1
     injection_suppressed = injection_hold > 0
@@ -1008,7 +1278,8 @@ def upkeep_mt2(model_dir, mt1_slot0_outputs, actual_perf, industry_list,
                 mt2_hist_meta_out = json.load(_f)
             h_head_out  = mt2_hist_meta_out.get('head', 0)
             h_count_out = mt2_hist_meta_out.get('count', 0)
-        except Exception:
+        except (OSError, json.JSONDecodeError) as e:
+            log(f"WARNING: {mt2_hist_meta_path} unreadable, restarting ring at 0: {e}")
             h_head_out, h_count_out = 0, 0
         for k in range(HIST_ELITE):
             hp = os.path.join(model_dir, f'mt2_hist_{h_head_out}_{k}.pt')
@@ -1016,22 +1287,22 @@ def upkeep_mt2(model_dir, mt1_slot0_outputs, actual_perf, industry_list,
                 hm_save = load_slot_model(prefix, model_dir, k, MT2NN)
                 torch.save(hm_save.state_dict(), hp)
                 del hm_save
-            except Exception:
-                pass
+            except (OSError, RuntimeError, EOFError, pickle.UnpicklingError) as e:
+                log(f"WARNING: could not save MT2 history elite {hp}: {e}")
         for k in range(HIST_WAVG):
             hp = os.path.join(model_dir, f'mt2_hist_{h_head_out}_{HIST_ELITE + k}.pt')
             try:
                 wm_save = load_slot_model(prefix, model_dir, ELITE_COUNT + k, MT2NN)
                 torch.save(wm_save.state_dict(), hp)
                 del wm_save
-            except Exception:
-                pass
+            except (OSError, RuntimeError, EOFError, pickle.UnpicklingError) as e:
+                log(f"WARNING: could not save MT2 history wavg {hp}: {e}")
         h_head_out  = (h_head_out + 1) % HIST_DAYS
         h_count_out = min(h_count_out + 1, HIST_DAYS)
         try:
             with open(mt2_hist_meta_path, 'w') as _f:
                 json.dump({'head': h_head_out, 'count': h_count_out}, _f)
-        except Exception as e:
+        except OSError as e:
             log(f"WARNING: could not save mt2_hist_meta.json: {e}")
     else:
         injected = True
@@ -1048,7 +1319,7 @@ def upkeep_mt2(model_dir, mt1_slot0_outputs, actual_perf, industry_list,
     try:
         with open(inj_state_path, 'w') as _f:
             json.dump({'injection_hold': injection_hold}, _f)
-    except Exception as e:
+    except OSError as e:
         log(f"WARNING: could not save mt2_inj_state.json: {e}")
 
     del mt2_hist_models
@@ -1106,7 +1377,13 @@ def run_mt_inference(model_dir, industries, mkt_val_history, pf_val_history, zer
     # MT2_FEED_DIRECTION toggle is moot (Increment 4C).
     in48 = []
     for ind in industry_list:
-        in48.extend(list(mt1_outputs[ind]))
+        conf, delta_t, range_pct, conf4 = mt1_outputs[ind]
+        # Magnitude only, matching upkeep_mt2 and training_v4.cpp. This site previously forwarded
+        # delta_t's raw (ungraded) sign while upkeep_mt2 forwarded conf's sign — the two MT2 feeds
+        # disagreed on what channel 1 meant.
+        # conf4 is ungraded as of v0.5.0.0 — forward a constant, not a frozen arbitrary
+        # function, which MT2 could otherwise fit as structured noise.
+        in48.extend([conf, abs(delta_t), range_pct, MT1_UNGRADED_FEED])
     in48_t = torch.tensor(in48, dtype=torch.float32).unsqueeze(0)   # (1, 48)
 
     mt2_path = os.path.join(model_dir, 'mt2_best.pt')

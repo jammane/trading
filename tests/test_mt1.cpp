@@ -1,7 +1,12 @@
 // tests/test_mt1.cpp — Unit tests for MT1 pure-math logic in training_v4.cpp
 //
-// Self-contained: no BLAS, no file I/O.  Replicates only the functions that
-// are pure arithmetic so the test links against nothing but libc/libm.
+// No BLAS, no file I/O — links against nothing but libc/libm.
+//
+// compute_mt1_scores and the MT1 decode helpers are NOT replicated here: they come from the shared
+// mt1_scoring.h that training_v4.cpp also includes. The replica they replaced had silently drifted
+// from production (different sc_acc formula, the retired 0.50/0.33/0.17 composite, 3 of 4
+// components), so these tests were green while testing a function that no longer existed. Anything
+// still copied below (PCG32, slot layout) is pure arithmetic with no production-drift risk.
 //
 // Build:  cmake --build build --target test_mt1_cpp
 // Run:    ./build/test_mt1_cpp   (or: ctest --test-dir build)
@@ -12,26 +17,26 @@
 #include <cstdio>
 #include <cstring>
 
+#include "mt1_scoring.h"
+
 // ── Constants (must match training_v4.cpp exactly) ─────────────────────────
 
 static constexpr int   ELITE_COUNT         = 17;
 static constexpr int   WAVG_COUNT          = 3;
-static constexpr int   MT1_COMP_INJECT     = 5;
-static constexpr int   MT1_RANGE_INJECT    = 5;
-static constexpr int   MT1_COMP_PARENTS    = ELITE_COUNT + WAVG_COUNT + MT1_COMP_INJECT; // 25
-static constexpr int   MT1_COMP_CHILDREN   = 7;
-static constexpr int   MT1_COMP_SLOTS      = MT1_COMP_PARENTS * (MT1_COMP_CHILDREN + 1); // 200
-static constexpr int   MT1_BLEND_SLOTS     = 200;
-static constexpr float MT1_RANGE_FLOOR     = 1.f;
-static constexpr float MT1_RANGE_CEIL_MULT = 4.f;
-static constexpr float MT1_SCALE_DOLLARS   = 10000.f;
+// Heads/tails layout (v0.4.0.0+). The legacy per-component pool had 25 parents (17 elites +
+// 3 wavg + 5 injection) x 8; injection slots were removed when the shared head took over
+// cross-component propagation, so parents = 20 and the freed capacity became mutations.
+static constexpr int   HT_PARENTS          = ELITE_COUNT + WAVG_COUNT;   // 20
+static constexpr int   MT1_COMP_SLOTS      = 200;
+static constexpr int   HT_MUTS             = MT1_COMP_SLOTS - HT_PARENTS; // 180
+// MT1_RANGE_CEIL_MULT / MT1_SCALE_DOLLARS / MT1_LOGIT_CAP come from mt1_scoring.h
 static constexpr float MT1_FLOOR_COLD      = 250.f;
 static constexpr int   MT1_ROLLING_DAYS    = 10;
 static constexpr int   HIST_DAYS           = 5;
 static constexpr int   HIST_PER_DAY        = 10;
 static constexpr int   HIST_ELITE          = 7;
 static constexpr int   HIST_WAVG           = 3;
-static constexpr int   MT1_DIR_DAYS        = 5;
+static constexpr int   MT1_DIR_DAYS        = 10;
 
 // ── Test harness ───────────────────────────────────────────────────────────
 
@@ -71,40 +76,6 @@ struct PCG32 {
     float next_float() { return (next() >> 8) * (1.0f / (1 << 24)); }
 };
 
-// ── MT1 score breakdown (exact copy from training_v4.cpp) ──────────────────
-
-struct MT1ScoreBreakdown { float composite, direction, range, accuracy, confidence; };
-
-static MT1ScoreBreakdown compute_mt1_scores(
-    float actual_d, const float raw4[4], float acc_floor, float range_ceiling)
-{
-    float conf      = 1.f / (1.f + expf(-raw4[0]));        // sigmoid
-    float delta_d   = tanhf(raw4[1]) * MT1_SCALE_DOLLARS;
-    float range_pct = log1pf(expf(raw4[2]));                // softplus
-    float conf4     = 1.f / (1.f + expf(-raw4[3]));
-
-    float sc_dir = (actual_d >= 0.f) ? conf : (1.f - conf);
-
-    float eff_delta = fmaxf(fabsf(delta_d), MT1_RANGE_FLOOR);
-    float r         = range_pct * eff_delta;
-    if (range_ceiling < 1e30f) r = fminf(r, range_ceiling);
-    float err    = fabsf(fabsf(actual_d) - fabsf(delta_d));  // signless (matches compute_mt1_scores)
-    float m      = (r > 1e-9f) ? err / r : (err > 0.f ? 1e9f : 0.f);
-    float sc_rng = (m < 1.f) ? m : 0.f;
-
-    float denom  = fmaxf(fabsf(actual_d), acc_floor);
-    float sc_acc = fmaxf(0.f, 1.f - err / denom);
-
-    float d      = err;
-    float dor    = (r > 1e-9f) ? d / r : (d > 0.f ? 1e9f : 0.f);
-    float ideal  = 1.f / (1.f + dor * dor);
-    float diff   = conf4 - ideal;
-    float sc_cfd = 1.f - diff * diff;
-    if (err > r) sc_cfd = 0.5f + 0.25f * sc_cfd;  // compress outside-range to [0.5, 0.75]
-
-    return {0.50f * sc_dir + 0.33f * sc_rng + 0.17f * sc_acc,
-            sc_dir, sc_rng, sc_acc, sc_cfd};
-}
 
 // ── Blend weight math (logic extracted from gen_mt1_blend in training_v4.cpp) ─
 
@@ -126,37 +97,39 @@ static void blend_draw(PCG32& rng, int* out_ranks, float* out_weights) {
     for (int k = 0; k < 8; k++) out_weights[k] /= wsum;
 }
 
+// Volatility-channel fixtures. Channel 2 predicts forward realized vol as of v0.5.0.0, so every
+// compute_mt1_scores call needs a vol target and a vol floor. These are deliberately neutral:
+// kVolA sits at exactly 2×kVolF, i.e. the naive "predict the rolling mean" answer, so the vol term
+// contributes its baseline and cannot skew the direction/accuracy assertions.
+static constexpr float kVolF = 100.f;   // vol_floor  (half the rolling mean)
+static constexpr float kVolA = 200.f;   // vol_actual (= the rolling mean itself)
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 static void test_constants()
 {
     SUITE("constants: compile-time arithmetic");
 
-    // Uniform pool: 25 parents × 8 (7 children + 1 parent) = 200 slots
-    CHECK(MT1_COMP_PARENTS  == ELITE_COUNT + WAVG_COUNT + MT1_COMP_INJECT);
-    CHECK(MT1_COMP_PARENTS  == 25);
-    CHECK(MT1_COMP_CHILDREN == 7);
-    CHECK(MT1_COMP_SLOTS    == MT1_COMP_PARENTS * (MT1_COMP_CHILDREN + 1));
-    CHECK(MT1_COMP_SLOTS    == 200);
-    CHECK(MT1_BLEND_SLOTS   == 200);
+    // Heads/tails pool: 20 parents (17 direct elites + 3 wavg) + 180 mutations = 200 slots.
+    // Injection slots were removed when the shared head took over cross-component propagation.
+    CHECK(HT_PARENTS     == ELITE_COUNT + WAVG_COUNT);
+    CHECK(HT_PARENTS     == 20);
+    CHECK(MT1_COMP_SLOTS == 200);
+    CHECK(HT_MUTS        == 180);
+    CHECK(HT_PARENTS + HT_MUTS == MT1_COMP_SLOTS);
     CHECK(HIST_DAYS == 5);
     CHECK(HIST_PER_DAY == 10);
     CHECK(HIST_ELITE + HIST_WAVG == HIST_PER_DAY);   // 7+3 == 10
 
-    // Slot layout: elites 0–16, wavg 17–19, injection 20–24, mutations 25–199
+    // Slot layout for the REPLAY pools (acc/rng/cfd/head): elites 0-16, wavg 17-19, muts 20-199
     CHECK(ELITE_COUNT               == 17);
-    CHECK(ELITE_COUNT + WAVG_COUNT  == 20);  // first injection slot
-    CHECK(ELITE_COUNT + WAVG_COUNT + MT1_COMP_INJECT - 1 == 24);  // last injection slot
+    CHECK(ELITE_COUNT + WAVG_COUNT  == 20);  // first mutation slot
 
     // MT1_FLOOR_COLD / 2 is the cold-start acc_floor
     CHECK(NEAR(MT1_FLOOR_COLD / 2.f, 125.f, 0.001f));
 
-    // Injection cascade counts
-    CHECK(MT1_COMP_INJECT  == 5);
-    CHECK(MT1_RANGE_INJECT == 5);
-
-    // Direction pool: multi-day scoring window
-    CHECK(MT1_DIR_DAYS == 5);
+    // Replay scoring window (acc/rng/cfd). Direction left this regime in v0.5.0.0.
+    CHECK(MT1_DIR_DAYS == 10);
     CHECK(MT1_DIR_DAYS > 1);        // must be multi-day
 }
 
@@ -203,60 +176,67 @@ static void test_pcg32()
     }
 }
 
+// Saturation ceiling of the bounded decode: conf can approach but never reach 1.0.
+// This is the whole point of MT1_LOGIT_CAP — a saturated sigmoid has zero derivative, so weight
+// mutations stop changing the output and the pool freezes genetically.
+static const float kConfMax = mt1_conf(1e6f);   // = sigmoid(MT1_LOGIT_CAP) ≈ 0.982
+
 static void test_scores_direction()
 {
     SUITE("compute_mt1_scores: direction component");
 
     float acc_floor = 125.f;
 
-    // High conf, actual positive → sc_dir = conf ≈ 1.0
+    // High conf, actual positive → sc_dir = conf ≈ kConfMax (bounded, never 1.0)
     {
         float raw4[4] = {10.f, 0.f, 0.f, 0.f};
-        auto s = compute_mt1_scores(100.f, raw4, acc_floor, 1e30f);
-        CHECK(NEAR(s.direction, 1.f, 0.001f));
+        auto s = compute_mt1_scores(100.f, kVolA, raw4, acc_floor, kVolF);
+        CHECK(NEAR(s.direction, kConfMax, 0.001f));
     }
-    // Low conf, actual positive → sc_dir = conf ≈ 0.0
+    // Low conf, actual positive → sc_dir = conf ≈ kConfMin (bounded, never 0)
     {
         float raw4[4] = {-10.f, 0.f, 0.f, 0.f};
-        auto s = compute_mt1_scores(100.f, raw4, acc_floor, 1e30f);
-        CHECK(NEAR(s.direction, 0.f, 0.001f));
+        auto s = compute_mt1_scores(100.f, kVolA, raw4, acc_floor, kVolF);
+        CHECK(NEAR(s.direction, 1.f - kConfMax, 0.001f));
     }
-    // Low conf, actual negative → sc_dir = 1 - conf ≈ 1.0
+    // Low conf, actual negative → sc_dir = 1 - conf ≈ kConfMax
     {
         float raw4[4] = {-10.f, 0.f, 0.f, 0.f};
-        auto s = compute_mt1_scores(-100.f, raw4, acc_floor, 1e30f);
-        CHECK(NEAR(s.direction, 1.f, 0.001f));
+        auto s = compute_mt1_scores(-100.f, kVolA, raw4, acc_floor, kVolF);
+        CHECK(NEAR(s.direction, kConfMax, 0.001f));
     }
-    // High conf, actual negative → sc_dir = 1 - conf ≈ 0.0
+    // High conf, actual negative → sc_dir = 1 - conf ≈ 1 - kConfMax
     {
         float raw4[4] = {10.f, 0.f, 0.f, 0.f};
-        auto s = compute_mt1_scores(-100.f, raw4, acc_floor, 1e30f);
-        CHECK(NEAR(s.direction, 0.f, 0.001f));
+        auto s = compute_mt1_scores(-100.f, kVolA, raw4, acc_floor, kVolF);
+        CHECK(NEAR(s.direction, 1.f - kConfMax, 0.001f));
     }
     // Neutral (conf=0.5) → sc_dir = 0.5 regardless of sign — random baseline
     {
         float raw4[4] = {0.f, 0.f, 0.f, 0.f};
-        auto s = compute_mt1_scores(100.f, raw4, acc_floor, 1e30f);
+        auto s = compute_mt1_scores(100.f, kVolA, raw4, acc_floor, kVolF);
         CHECK(NEAR(s.direction, 0.5f, 0.001f));
-        auto s2 = compute_mt1_scores(-100.f, raw4, acc_floor, 1e30f);
+        auto s2 = compute_mt1_scores(-100.f, kVolA, raw4, acc_floor, kVolF);
         CHECK(NEAR(s2.direction, 0.5f, 0.001f));
-        auto s3 = compute_mt1_scores(0.f, raw4, acc_floor, 1e30f);
+        auto s3 = compute_mt1_scores(0.f, kVolA, raw4, acc_floor, kVolF);
         CHECK(NEAR(s3.direction, 0.5f, 0.001f));
     }
-    // Known exact value: sigmoid(log(3)) = 0.75
-    // actual positive → sc_dir = 0.75; actual negative → sc_dir = 0.25
+    // Known exact value under the bounded decode: conf = sigmoid(CAP*tanh(raw/CAP)).
+    // actual positive → sc_dir = conf; actual negative → sc_dir = 1 - conf (complements).
     {
         float raw4[4] = {logf(3.f), 0.f, 0.f, 0.f};
-        auto sp = compute_mt1_scores( 100.f, raw4, acc_floor, 1e30f);
-        auto sn = compute_mt1_scores(-100.f, raw4, acc_floor, 1e30f);
-        CHECK(NEAR(sp.direction, 0.75f, 0.001f));
-        CHECK(NEAR(sn.direction, 0.25f, 0.001f));
+        float want = mt1_conf(logf(3.f));
+        auto sp = compute_mt1_scores(100.f, kVolA, raw4, acc_floor, kVolF);
+        auto sn = compute_mt1_scores(-100.f, kVolA, raw4, acc_floor, kVolF);
+        CHECK(NEAR(sp.direction, want, 0.001f));
+        CHECK(NEAR(sn.direction, 1.f - want, 0.001f));
+        CHECK(want > 0.5f && want < 0.75f);   // squash pulls it in from the raw sigmoid's 0.75
     }
     // sc_dir always in [0, 1]
     {
         float raw4[4] = {5.f, 0.f, 0.f, 0.f};
-        auto sp = compute_mt1_scores( 200.f, raw4, acc_floor, 1e30f);
-        auto sn = compute_mt1_scores(-200.f, raw4, acc_floor, 1e30f);
+        auto sp = compute_mt1_scores(200.f, kVolA, raw4, acc_floor, kVolF);
+        auto sn = compute_mt1_scores(-200.f, kVolA, raw4, acc_floor, kVolF);
         CHECK(sp.direction >= 0.f && sp.direction <= 1.f);
         CHECK(sn.direction >= 0.f && sn.direction <= 1.f);
         // symmetric: dir(positive) + dir(negative) == 1.0
@@ -264,68 +244,72 @@ static void test_scores_direction()
     }
 }
 
-static void test_scores_range()
+static void test_scores_vol()
 {
-    SUITE("compute_mt1_scores: range component");
+    SUITE("compute_mt1_scores: volatility component (channel 2)");
 
-    // MT1_RANGE_FLOOR=1 is the eff_delta floor when delta_d=0
-    // raw4[2]=50 → softplus(50)≈50, eff_delta=1 (RANGE_FLOOR), r≈50
-    // actual_d=5 → err=5, m=5/50=0.1 < 1 → sc_rng=0.1
+    // Channel 2 predicts forward realized volatility as of v0.5.0.0:
+    //   vol_pred = softplus(raw4[2]) x MT1_SCALE_DOLLARS
+    //   sc_vol   = den / (|vol_pred - vol_actual| + den),  den = max(vol_actual, vol_floor)
+    // Same shape as sc_acc, so size and risk are graded on comparable footing.
+    const float acc_floor = 125.f, vf = 100.f;
+
+    // A perfect prediction scores exactly 1.
     {
-        float raw4[4] = {10.f, 0.f, 50.f, 0.f};
-        auto s = compute_mt1_scores(5.f, raw4, 1.f, 1e30f);
-        CHECK(s.range > 0.f && s.range < 1.f);
-        CHECK(NEAR(s.range, 0.1f, 0.002f));
+        // Pick raw so vol_pred lands on the target: softplus(raw) = va / SCALE.
+        float va  = 250.f;
+        float x   = logf(expf(va / MT1_VOL_SCALE) - 1.f);
+        float raw4[4] = {0.f, 0.f, x, 0.f};
+        auto s = compute_mt1_scores(100.f, va, raw4, acc_floor, vf);
+        CHECK(NEAR(s.range, 1.f, 0.005f));
     }
 
-    // Range miss: err > r → sc_rng = 0
+    // Predicting ~zero vol against a real target: err -> va, den = max(va, vf) = va, so sc -> 1/2.
     {
-        float raw4[4] = {10.f, 0.f, 0.f, 0.f};
-        // softplus(0)=ln2≈0.693, eff_delta=1, r≈0.693, err=100 → miss
-        auto s = compute_mt1_scores(100.f, raw4, 125.f, 1e30f);
-        CHECK(s.range == 0.f);
+        float va = 400.f;
+        float raw4[4] = {0.f, 0.f, -20.f, 0.f};        // softplus clamps to ~0
+        auto s = compute_mt1_scores(100.f, va, raw4, acc_floor, vf);
+        CHECK(NEAR(s.range, 0.5f, 0.01f));
     }
 
-    // Perfect prediction: err=0 → m=0 → sc_rng=0 (correct by design)
+    // Monotone: a closer prediction must score higher.
     {
-        float raw4[4] = {10.f, 0.f, 2.f, 0.f};
-        auto s = compute_mt1_scores(0.f, raw4, 1.f, 1e30f);
-        CHECK(s.range == 0.f);
+        float va = 300.f;
+        float near_x = logf(expf(280.f / MT1_VOL_SCALE) - 1.f);
+        float far_x  = logf(expf( 80.f / MT1_VOL_SCALE) - 1.f);
+        float rn[4] = {0.f, 0.f, near_x, 0.f};
+        float rf[4] = {0.f, 0.f, far_x,  0.f};
+        auto sn = compute_mt1_scores(100.f, va, rn, acc_floor, vf);
+        auto sf = compute_mt1_scores(100.f, va, rf, acc_floor, vf);
+        CHECK(sn.range > sf.range);
     }
 
-    // Range ceiling clamps r and converts a hit into a miss
-    // Without ceiling: actual_d=5, raw4[2]=50 → r≈50 → m=0.1 (hit)
-    // With ceiling=3:  r=min(50,3)=3 → m=5/3≈1.67 (miss)
+    // The floor protects a near-zero target: without den = max(va, vf) a tiny realized vol would
+    // make any error look catastrophic and the channel would grade pure noise.
     {
-        float raw4[4] = {10.f, 0.f, 50.f, 0.f};
-        auto s_no_ceil = compute_mt1_scores(5.f, raw4, 1.f, 1e30f);
-        auto s_ceil    = compute_mt1_scores(5.f, raw4, 1.f, 3.f);
-        CHECK(s_no_ceil.range > 0.f);   // hit without ceiling
-        CHECK(s_ceil.range == 0.f);      // miss with tight ceiling
+        float raw4[4] = {0.f, 0.f, -20.f, 0.f};
+        auto s_tiny = compute_mt1_scores(100.f, 1.f, raw4, acc_floor, vf);
+        CHECK(s_tiny.range > 0.9f);                     // err ~1 against den = vf = 100
+        CHECK(s_tiny.range <= 1.f);
     }
 
-    // eff_delta uses |delta_d| when it exceeds MT1_RANGE_FLOOR
-    // raw4[1] ≈ atanh(0.5) makes delta_d ≈ 5000 (tanh(0.5494)*10000)
-    // raw4[2]=0 → range_pct=ln(2)≈0.693, eff_delta=max(5000,1)=5000, r=3466
-    // actual_d=100, err=4900, m=4900/3466≈1.41 → miss
-    {
-        float raw4[4] = {10.f, 0.5494f, 0.f, 0.f};  // tanh(0.5494)≈0.5 → delta_d≈5000
-        auto s = compute_mt1_scores(100.f, raw4, 10.f, 1e30f);
-        CHECK(s.range == 0.f);
+    // Score is bounded in (0,1] for any raw input.
+    for (float x = -25.f; x <= 25.f; x += 5.f) {
+        float raw4[4] = {0.f, 0.f, x, 0.f};
+        auto s = compute_mt1_scores(100.f, 300.f, raw4, acc_floor, vf);
+        CHECK(s.range > 0.f && s.range <= 1.f);
     }
 
-    // Range score in (0,1) is proportional to tightness: smaller m → smaller sc_rng.
-    // Higher score = tighter range that still covers (m near 1.0 = best; m near 0.0 = worst).
-    // Use raw4[2] values small enough to avoid float overflow in softplus:
-    //   loose: softplus(50) ≈ 50, eff_delta=1 → r≈50, m=5/50=0.10 (hit, loose)
-    //   tight: softplus(6)  ≈  6, eff_delta=1 → r≈6,  m=5/6≈0.83  (hit, tight)
+    // Degenerate all-zero vol history: vol_actual and vol_floor both 0 would make den_vol 0 and
+    // sc_vol = 0/0 = NaN, which then propagates through the composite into every selection for the
+    // rest of the run. The guard must keep every channel finite.
     {
-        float raw4_loose[4] = {10.f, 0.f, 50.f, 0.f};
-        float raw4_tight[4] = {10.f, 0.f,  6.f, 0.f};
-        auto s_loose = compute_mt1_scores(5.f, raw4_loose, 1.f, 1e30f);
-        auto s_tight = compute_mt1_scores(5.f, raw4_tight, 1.f, 1e30f);
-        CHECK(s_loose.range > 0.f && s_tight.range > 0.f);  // both hit
-        CHECK(s_tight.range > s_loose.range);                // tighter range → higher score
+        float raw4[4] = {0.f, 0.f, -20.f, 0.f};
+        auto s = compute_mt1_scores(100.f, 0.f, raw4, acc_floor, 0.f);
+        CHECK(s.range == s.range);            // not NaN
+        CHECK(s.composite == s.composite);
+        CHECK(s.range >= 0.f && s.range <= 1.f);
+        CHECK(s.composite >= 0.f && s.composite <= 1.f);
     }
 }
 
@@ -333,27 +317,31 @@ static void test_scores_accuracy()
 {
     SUITE("compute_mt1_scores: accuracy component");
 
-    // acc_floor active: |actual_d|=50 < acc_floor=200, denom=200
-    // delta_d=0, err=50 → sc_acc = 1 - 50/200 = 0.75
+    // sc_acc = denom / (err + denom) — smooth, always in (0, 1]. (The old replica in this file
+    // had max(0, 1 - err/denom), which production has not used for some time.)
+
+    // acc_floor active: |actual_d|=50 < acc_floor=200 → denom=200
+    // delta_d=0, err=50 → sc_acc = 200/(50+200) = 0.8
     {
         float raw4[4] = {0.f, 0.f, 0.f, 0.f};
-        auto s = compute_mt1_scores(50.f, raw4, 200.f, 1e30f);
-        CHECK(NEAR(s.accuracy, 0.75f, 0.001f));
+        auto s = compute_mt1_scores(50.f, kVolA, raw4, 200.f, kVolF);
+        CHECK(NEAR(s.accuracy, 0.8f, 0.001f));
     }
 
-    // |actual_d| > acc_floor: denom = actual_d
-    // actual_d=500, acc_floor=100, delta_d=0, err=500 → sc_acc = max(0, 1-500/500) = 0
+    // |actual_d| > acc_floor: denom = |actual_d|
+    // actual_d=500, acc_floor=100, delta_d=0, err=500 → sc_acc = 500/(500+500) = 0.5.
+    // This is the predict-nothing null model: it scores exactly 0.5, never 0.
     {
         float raw4[4] = {0.f, 0.f, 0.f, 0.f};
-        auto s = compute_mt1_scores(500.f, raw4, 100.f, 1e30f);
-        CHECK(NEAR(s.accuracy, 0.f, 0.001f));
+        auto s = compute_mt1_scores(500.f, kVolA, raw4, 100.f, kVolF);
+        CHECK(NEAR(s.accuracy, 0.5f, 0.001f));
     }
 
     // Perfect prediction (actual_d == delta_d): err=0, sc_acc=1.0
     // raw4[1]=atanh(0.01)≈0.01 → delta_d≈100, actual_d=100
     {
         float raw4[4] = {0.f, 0.01f, 0.f, 0.f};
-        auto s = compute_mt1_scores(100.f, raw4, 10.f, 1e30f);
+        auto s = compute_mt1_scores(100.f, kVolA, raw4, 10.f, kVolF);
         // err = |100 - tanh(0.01)*10000| = |100 - 99.9967...| ≈ 0.003
         CHECK(s.accuracy > 0.999f);
     }
@@ -362,7 +350,7 @@ static void test_scores_accuracy()
     // actual_d=10, delta_d=0, err=10, acc_floor=5, denom=10: sc_acc=0 (not negative)
     {
         float raw4[4] = {0.f, 0.f, 0.f, 0.f};
-        auto s = compute_mt1_scores(10.f, raw4, 5.f, 1e30f);
+        auto s = compute_mt1_scores(10.f, kVolA, raw4, 5.f, kVolF);
         CHECK(s.accuracy >= 0.f);
     }
 }
@@ -371,100 +359,68 @@ static void test_scores_composite()
 {
     SUITE("compute_mt1_scores: composite formula");
 
-    // composite = 0.50*dir + 0.33*rng + 0.17*acc
-    // Use several inputs and verify the formula exactly
-
+    // composite = equal-weight mean of the THREE graded components' SECONDARY [0,1] normalizations
+    // (direction, accuracy, volatility), each mapping its own naive baseline B -> 0 and ideal -> 1:
+    //   sec = clamp((raw - B) / (1 - B), 0, 1)
+    // conf4 was dropped from the composite in v0.5.0.0 along with the band it was graded against.
     float acc_floor = 125.f;
-    float ceiling   = 1e30f;
 
     float raw4_cases[][4] = {
-        {10.f,  0.f, 0.f, 0.f},    // dir=1, rng=0, acc varies
-        {-10.f, 0.f, 0.f, 0.f},    // dir=0
-        {0.f,   0.f, 0.f, 0.f},    // dir boundary
-        {10.f,  0.f, 50.f, 0.f},   // rng hit
-        {10.f,  0.f, 0.f, 5.f},    // conf4=sigmoid(5)≈0.993
+        {10.f,  0.f, 0.f, 0.f},
+        {-10.f, 0.f, 0.f, 0.f},
+        {0.f,   0.f, 0.f, 0.f},
+        {10.f,  0.f, 50.f, 0.f},
+        {10.f,  0.f, 0.f, 5.f},
     };
     float actual_ds[] = {100.f, 100.f, 0.f, 5.f, 100.f};
     int n = 5;
 
     for (int i = 0; i < n; i++) {
-        auto s = compute_mt1_scores(actual_ds[i], raw4_cases[i], acc_floor, ceiling);
-        float expected = 0.50f * s.direction + 0.33f * s.range + 0.17f * s.accuracy;
-        CHECK(NEAR(s.composite, expected, 1e-5f));
-        // All components in [0,1]
+        auto s = compute_mt1_scores(actual_ds[i], kVolA, raw4_cases[i], acc_floor, kVolF);
+        CHECK(s.composite  >= 0.f && s.composite  <= 1.f);
         CHECK(s.direction  >= 0.f && s.direction  <= 1.f);
         CHECK(s.range      >= 0.f && s.range      <= 1.f);
         CHECK(s.accuracy   >= 0.f && s.accuracy   <= 1.f);
-        CHECK(s.confidence >= 0.f && s.confidence <= 1.f);
-        CHECK(s.composite  >= 0.f && s.composite  <= 1.f);
     }
 
-    // Known numeric case: actual_d=0, raw4[0]=10 → conf≈1, actual_d>=0 → sc_dir≈1
-    // sc_rng=0 (err=0→m=0), sc_acc=1 (err=0), composite≈0.5+0+0.17=0.67
+    // Known numeric case. actual_d = 0 so the predict-0 null model is already perfect: b_acc = 1
+    // and sec_acc = 0, i.e. accuracy earns nothing for matching a null it could not have lost.
+    // kVolA == 2*kVolF is exactly the naive vol predictor, so sec_vol = 0 as well. Only direction
+    // contributes, and the composite is now a THIRD of it rather than a quarter.
     {
         float raw4[4] = {10.f, 0.f, 1.f, 0.f};
-        auto s = compute_mt1_scores(0.f, raw4, 125.f, 1e30f);
-        CHECK(NEAR(s.direction, 1.f, 0.001f));
-        CHECK(s.range     == 0.f);
-        CHECK(s.accuracy  == 1.f);
-        CHECK(NEAR(s.composite, 0.67f, 0.001f));
+        auto s = compute_mt1_scores(0.f, kVolA, raw4, 125.f, kVolF);
+        CHECK(NEAR(s.direction, kConfMax, 0.001f));
+        CHECK(s.accuracy == 1.f);
+        CHECK(NEAR(s.composite, (kConfMax - 0.5f) / 0.5f / 3.f, 0.002f));
     }
 }
 
 static void test_scores_confidence()
 {
-    SUITE("compute_mt1_scores: confidence component (ideal=1/(1+(d/r)²), score=1-(conf4-ideal)²)");
+    SUITE("compute_mt1_scores: conf4 is present but UNGRADED");
 
-    // Perfect prediction (d=0): ideal=1.0
-    // conf4=sigmoid(10)≈1.0  → diff≈0  → sc_cfd≈1.0
-    // conf4=sigmoid(0)=0.5   → diff=−0.5 → sc_cfd=1−0.25=0.75
-    {
-        float raw4_hi[4] = {0.f, 0.f, 1.f, 10.f};  // conf4≈1
-        auto s_hi = compute_mt1_scores(0.f, raw4_hi, 1.f, 1e30f);
-        CHECK(NEAR(s_hi.confidence, 1.f, 0.002f));
+    // Channel 3 graded conf4 against the band geometry that channel 2 used to produce. With the
+    // band retired there is nothing to grade it against, and its old optimum was degenerate anyway
+    // (err > r always => ideal ~ 0 => conf4 = 0 wins; 89% of values fell below 0.01, pool spread
+    // 0.05%). The tail stays in the model so MT1NN and the .bin/.pt layouts are unchanged, but it
+    // contributes nothing to any score.
+    const float acc_floor = 125.f, vf = 100.f;
 
-        float raw4_lo[4] = {0.f, 0.f, 1.f, 0.f};   // conf4=0.5
-        auto s_lo = compute_mt1_scores(0.f, raw4_lo, 1.f, 1e30f);
-        CHECK(NEAR(s_lo.confidence, 0.75f, 0.002f));
-    }
+    float lo[4] = {0.f, 0.f, 0.f, -10.f};
+    float mid[4] = {0.f, 0.f, 0.f, 0.f};
+    float hi[4] = {0.f, 0.f, 0.f, 10.f};
+    auto s_lo  = compute_mt1_scores(100.f, 300.f, lo,  acc_floor, vf);
+    auto s_mid = compute_mt1_scores(100.f, 300.f, mid, acc_floor, vf);
+    auto s_hi  = compute_mt1_scores(100.f, 300.f, hi,  acc_floor, vf);
 
-    // Error on range boundary (d=r): ideal=1/(1+1)=0.5
-    // conf4=sigmoid(0)=0.5 → diff=0 → sc_cfd=1.0
-    // We need actual_d such that err==r.  Use raw4={0, x, 0, 0}: delta_d=tanh(x)*10000,
-    // r=softplus(0)*max(|delta_d|,1)=ln(2)*1≈0.693.  Set actual_d=0.693+delta_d (err=r).
-    {
-        float r_val = log1pf(expf(0.f));           // softplus(0)*eff_delta=1 ≈ 0.6931
-        float raw4[4] = {0.f, 0.f, 0.f, 0.f};     // delta_d=0, r=0.6931, conf4=0.5
-        auto s = compute_mt1_scores(r_val, raw4, 1.f, 1e30f);  // actual_d=r → err=r → dor=1
-        CHECK(NEAR(s.confidence, 1.f, 0.002f));  // conf4=0.5==ideal=0.5 → sc_cfd=1
-    }
-
-    // Large miss (d>>r, err>r): scores compressed to [0.5, 0.75]
-    // d=100, r≈0.693: dor≈144 → ideal≈0.000048
-    // conf4≈0: diff≈0 → raw sc_cfd≈1.0 → compressed: 0.5+0.25*1.0=0.75
-    // conf4=0.5: diff≈0.5 → raw sc_cfd=0.75 → compressed: 0.5+0.25*0.75=0.6875
-    {
-        float raw4_lo[4] = {0.f, 0.f, 0.f, -10.f};  // conf4≈0
-        auto s_lo = compute_mt1_scores(100.f, raw4_lo, 1.f, 1e30f);
-        CHECK(NEAR(s_lo.confidence, 0.75f, 0.002f));   // compressed: 0.5+0.25*1.0
-
-        float raw4_mid[4] = {0.f, 0.f, 0.f, 0.f};   // conf4=0.5
-        auto s_mid = compute_mt1_scores(100.f, raw4_mid, 1.f, 1e30f);
-        CHECK(NEAR(s_mid.confidence, 0.6875f, 0.002f)); // compressed: 0.5+0.25*0.75
-    }
-
-    // sc_cfd always in [0,1]: outside-range cases compress to [0.5,0.75], still in [0,1]
-    float raw4_set[][4] = {
-        {10.f, 0.f, 0.f, 10.f},   // conf4≈1, perfect pred (d=0) → inside range → sc_cfd≈1
-        {10.f, 0.f, 0.f, -10.f},  // conf4≈0, big miss (err>r) → compressed → sc_cfd∈[0.5,0.75]
-        {10.f, 0.f, 5.f, 0.f},    // conf4=0.5, hit case
-        {0.f,  0.f, 0.f, 0.f},    // boundaries
-    };
-    float actuals[] = {50.f, 50.f, 5.f, 0.f};
-    for (int i = 0; i < 4; i++) {
-        auto s = compute_mt1_scores(actuals[i], raw4_set[i], 10.f, 1e30f);
-        CHECK(s.confidence >= 0.f && s.confidence <= 1.f);
-    }
+    // Reported as a constant 0 regardless of the tail's output...
+    CHECK(s_lo.confidence  == 0.f);
+    CHECK(s_mid.confidence == 0.f);
+    CHECK(s_hi.confidence  == 0.f);
+    // ...and it cannot move the composite either, which is what "ungraded" has to mean.
+    CHECK(NEAR(s_lo.composite, s_hi.composite, 1e-6f));
+    CHECK(NEAR(s_mid.composite, s_hi.composite, 1e-6f));
 }
 
 static void test_blend_weights()
@@ -532,45 +488,42 @@ static void test_blend_weights()
 
 static void test_mutation_parent_assignment()
 {
-    SUITE("component pool: mutation parent round-robin (7 children × 25 parents)");
+    SUITE("replay pool: weighted children table");
 
-    // Slots 0..MT1_COMP_PARENTS-1 are parents (elites + wavg + inject, no mutation)
-    // Slot s >= MT1_COMP_PARENTS: mut_i = s - MT1_COMP_PARENTS, parent = mut_i % MT1_COMP_PARENTS
-    auto parent_of = [](int slot) -> int {
-        if (slot < MT1_COMP_PARENTS) return slot;  // is a parent
-        int mut_i = slot - MT1_COMP_PARENTS;
-        return mut_i % MT1_COMP_PARENTS;
+    // step_mt1_pool concentrates breeding on proven elites rather than assigning parents
+    // round-robin. kChildren must sum to exactly HT_MUTS or the tail of the mutation range
+    // silently falls back to idx % HT_PARENTS.
+    static const int kChildren[20] = {
+        16, 13, 13, 12, 12,
+        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+        6, 6, 6
     };
+    int total = 0;
+    for (int p = 0; p < HT_PARENTS; p++) total += kChildren[p];
+    CHECK(total == HT_MUTS);
+    CHECK(total == 180);
 
-    // First mutation slot → parent 0
-    CHECK(parent_of(MT1_COMP_PARENTS) == 0);
-    // Second → parent 1
-    CHECK(parent_of(MT1_COMP_PARENTS + 1) == 1);
-    // 25th mutation slot (index 24) → parent 24 (last parent)
-    CHECK(parent_of(MT1_COMP_PARENTS + 24) == 24);
-    // 26th mutation slot (index 25) → wraps to parent 0
-    CHECK(parent_of(MT1_COMP_PARENTS + MT1_COMP_PARENTS) == 0);
-    // Last slot overall: slot 199, mut_i = 199-25 = 174, parent = 174 % 25 = 24
-    CHECK(parent_of(MT1_COMP_SLOTS - 1) == (MT1_COMP_SLOTS - 1 - MT1_COMP_PARENTS) % MT1_COMP_PARENTS);
-    CHECK(parent_of(MT1_COMP_SLOTS - 1) == 24);
+    // Expand the table the way step_mt1_pool does and check the boundaries.
+    int parent_of_mut[180];
+    int idx = 0;
+    for (int p = 0; p < HT_PARENTS && idx < HT_MUTS; p++)
+        for (int c = 0; c < kChildren[p] && idx < HT_MUTS; c++)
+            parent_of_mut[idx++] = p;
+    CHECK(idx == HT_MUTS);
+    CHECK(parent_of_mut[0]  == 0);    // first 16 children belong to slot 0
+    CHECK(parent_of_mut[15] == 0);
+    CHECK(parent_of_mut[16] == 1);    // slot 1 starts at child 16
+    CHECK(parent_of_mut[HT_MUTS - 1] == 19);   // last child belongs to the last wavg blend
 
-    // Total mutations = MT1_COMP_SLOTS - MT1_COMP_PARENTS = 175
-    int mutation_count = 0;
-    for (int s = MT1_COMP_PARENTS; s < MT1_COMP_SLOTS; s++) mutation_count++;
-    CHECK(mutation_count == 175);
-    CHECK(mutation_count == MT1_COMP_PARENTS * MT1_COMP_CHILDREN);
-
-    // Every parent (0..24) is used at least once
-    bool used[MT1_COMP_PARENTS] = {};
-    for (int s = MT1_COMP_PARENTS; s < MT1_COMP_SLOTS; s++)
-        used[(s - MT1_COMP_PARENTS) % MT1_COMP_PARENTS] = true;
-    for (int p = 0; p < MT1_COMP_PARENTS; p++)
-        CHECK(used[p]);
+    // Slot 0 gets 16 of 180 children — 8.9% of every generation from one model. That
+    // concentration is why the direction pool moved to flat round-robin backfill.
+    CHECK(kChildren[0] == 16);
+    CHECK(kChildren[0] > kChildren[19] * 2);
 }
 
 static void test_elite_slot_layout()
 {
-    SUITE("component pool: elite slot layout (17 direct + 3 wavg + 5 injection)");
+    SUITE("replay pool: elite slot layout (17 direct + 3 wavg, no injection)");
 
     // Direct elites: slots 0..ELITE_COUNT-1 = 0..16
     CHECK(ELITE_COUNT == 17);
@@ -579,21 +532,15 @@ static void test_elite_slot_layout()
         int slot = ELITE_COUNT + b;
         CHECK(slot >= 17 && slot <= 19);
     }
-    // Injection slots: ELITE_COUNT + WAVG_COUNT + 0..MT1_COMP_INJECT-1 = 20..24
-    for (int k = 0; k < MT1_COMP_INJECT; k++) {
-        int slot = ELITE_COUNT + WAVG_COUNT + k;
-        CHECK(slot >= 20 && slot <= 24);
-    }
-    // Last injection slot = 24 = MT1_COMP_PARENTS - 1
-    CHECK(ELITE_COUNT + WAVG_COUNT + MT1_COMP_INJECT - 1 == 24);
-    CHECK(ELITE_COUNT + WAVG_COUNT + MT1_COMP_INJECT - 1 == MT1_COMP_PARENTS - 1);
-    // Mutations start at slot 25
-    CHECK(MT1_COMP_PARENTS == 25);
+    // Parents end at 19; mutations start at 20 and run to 199. There are no injection slots —
+    // the shared head propagates cross-component learning instead.
+    CHECK(HT_PARENTS == 20);
+    CHECK(MT1_COMP_SLOTS - HT_PARENTS == 180);
 }
 
 static void test_rolling_buffers()
 {
-    SUITE("rolling buffers: acc_floor and range_ceiling computation");
+    SUITE("rolling buffers: acc_floor and vol_floor computation");
 
     // acc_floor = mean(rolling_actual) / 2
     {
@@ -609,15 +556,18 @@ static void test_rolling_buffers()
     // Cold-start: rolling_count=0 → use MT1_FLOOR_COLD/2 = 125
     CHECK(NEAR(MT1_FLOOR_COLD / 2.f, 125.f, 0.01f));
 
-    // range_ceiling = MT1_RANGE_CEIL_MULT × mean(rolling_residual)
+    // vol_floor = mean(rolling_vol) / 2 — same shape as acc_floor, because the vol channel is
+    // graded with the same denominator form. 2 x vol_floor is the naive "predict the mean" answer,
+    // which is what sec_vol normalizes against.
     {
         float buf[MT1_ROLLING_DAYS] = {100.f, 200.f, 300.f, 400.f};
         int count = 4;
         float sum = 0.f;
         for (int k = 0; k < count; k++) sum += buf[k];
-        float ceiling = MT1_RANGE_CEIL_MULT * sum / (float)count;
-        // (100+200+300+400)/4 = 250, × 4 = 1000
-        CHECK(NEAR(ceiling, 1000.f, 0.01f));
+        float vfloor = sum / (float)count / 2.f;
+        // (100+200+300+400)/4 = 250, /2 = 125
+        CHECK(NEAR(vfloor, 125.f, 0.01f));
+        CHECK(NEAR(2.f * vfloor, 250.f, 0.01f));   // naive predictor == the rolling mean
     }
 
     // Rolling circular buffer wrap-around: head advances modulo MT1_ROLLING_DAYS
@@ -695,7 +645,7 @@ static void test_pool_score_dispatch()
     // Verify with a score where all components differ
     float raw4[4] = {10.f, 0.f, 50.f, 0.f};
     // actual_d=5: sc_dir=conf≈1 (actual positive), sc_rng≈0.1, sc_acc=0, sc_cfd varies
-    auto s = compute_mt1_scores(5.f, raw4, 1.f, 1e30f);
+    auto s = compute_mt1_scores(5.f, kVolA, raw4, 1.f, kVolF);
 
     // Scores are distinguishable
     CHECK(s.direction != s.range);    // 1.0 != 0.1
@@ -714,17 +664,17 @@ static void test_pool_score_dispatch()
 
 static void test_blend_slots_count()
 {
-    SUITE("composite pool: blend count and pool size");
+    SUITE("replay pool: candidate count per step");
 
-    CHECK(MT1_BLEND_SLOTS == 200);
-    // History: 5 days × 10 models = 50 max candidates from history
+    CHECK(MT1_COMP_SLOTS == 200);
+    // History: 5 days x 10 models = 50 max candidates from history
     CHECK(HIST_DAYS * HIST_PER_DAY == 50);
-    // Max candidates per composite step: 200 blends + 50 history = 250
-    CHECK(MT1_BLEND_SLOTS + HIST_DAYS * HIST_PER_DAY == 250);
-    // Top 5 saved as comp_inject (composite→direction + range slots 20–24)
-    CHECK(MT1_COMP_INJECT == 5);
-    // Top 10 saved to composite history
+    // Max candidates per replay step: 200 slots + 50 history = 250
+    CHECK(MT1_COMP_SLOTS + HIST_DAYS * HIST_PER_DAY == 250);
+    // Top 10 pushed to history each step (7 direct elites + 3 wavg blends)
     CHECK(HIST_PER_DAY == 10);
+    CHECK(HIST_ELITE == 7);
+    CHECK(HIST_WAVG == 3);
 }
 
 // ── Drift study ±1 metric (replica of drift_rel_metric in training_v4.cpp) ──
@@ -775,31 +725,198 @@ static float balanced_dir_total(const int* up, const float* w, const float* day_
     return total;
 }
 
-static void test_direction_balanced_weighting() {
-    SUITE("direction balanced weighting");
-    // Skewed window: 8 up-days, 2 down-days; arbitrary positive recency weights.
-    int   up[10] = {1,1,1,1,1,1,1,1,0,0};
-    float w[10]  = {1.0f,1.1f,1.2f,1.3f,1.4f,1.5f,1.6f,1.7f,1.8f,1.9f};
-    float W = 0.f; for (int i = 0; i < 10; i++) W += w[i];
+static void test_direction_balanced_weighting()
+{
+    SUITE("retired: class-balanced direction weighting");
 
-    // Constant "always up" at confidence c → no-skill baseline W/2 for ANY c (the whole point).
-    const float cs[4] = {0.5f, 0.7f, 0.9f, 0.99f};
-    for (int ci = 0; ci < 4; ci++) { float c = cs[ci];
-        float ds[10]; for (int i = 0; i < 10; i++) ds[i] = up[i] ? c : (1.f - c);
-        CHECK(NEAR(balanced_dir_total(up, w, ds, 10), W / 2.f, 1e-3f));
+    // Kept as a record of WHY the direction pool was redesigned, not as a test of live code.
+    // Under class-balanced day weights every constant predictor scored exactly dir_W/2 regardless
+    // of its confidence — a flat plateau of enormous volume in weight space, which is where the
+    // pool sat. The arithmetic below reproduces that plateau; the code that implemented it was
+    // deleted in v0.5.0.0 when direction moved to forward accumulation (step_mt1_dir_pool).
+    const int dc = MT1_DIR_DAYS;
+    float w[MT1_DIR_DAYS], dir_W = 0.f, w_up = 0.f, w_down = 0.f;
+    bool up[MT1_DIR_DAYS];
+    for (int di = 0; di < dc; di++) {
+        int age = dc - 1 - di;
+        w[di] = 2.f - (float)age / (float)(MT1_DIR_DAYS - 1);
+        up[di] = (di % 3 == 0);                    // a lopsided 4/6 split
+        dir_W += w[di];
+        if (up[di]) w_up += w[di]; else w_down += w[di];
     }
-    // Perfect → W, worst → 0.
-    { float ds[10]; for (int i=0;i<10;i++) ds[i]=1.f; CHECK(NEAR(balanced_dir_total(up,w,ds,10), W, 1e-3f)); }
-    { float ds[10]; for (int i=0;i<10;i++) ds[i]=0.f; CHECK(NEAR(balanced_dir_total(up,w,ds,10), 0.f, 1e-3f)); }
-    // Genuine skill (correct on both classes at 0.9) → 0.9·W, strictly above no-skill.
-    { float ds[10]; for (int i=0;i<10;i++) ds[i]=0.9f; float t=balanced_dir_total(up,w,ds,10);
-      CHECK(NEAR(t, 0.9f*W, 1e-3f)); CHECK(t > W/2.f); }
-    // Single-class window (all up) → balancing disabled, plain weighted sum.
-    { int u[3]={1,1,1}; float ww[3]={1.f,1.f,1.f}; float ds[3]={0.8f,0.8f,0.8f};
-      CHECK(NEAR(balanced_dir_total(u, ww, ds, 3), 0.8f*3.f, 1e-3f)); }
+    // Any constant confidence scores exactly dir_W/2 — the no-skill baseline, for every c.
+    for (float c = 0.f; c <= 1.0001f; c += 0.25f) {
+        float total = 0.f;
+        for (int di = 0; di < dc; di++) {
+            float dw = w[di] * (up[di] ? dir_W / (2.f * w_up) : dir_W / (2.f * w_down));
+            total += dw * (up[di] ? c : (1.f - c));
+        }
+        CHECK(NEAR(total, dir_W / 2.f, 0.01f));
+    }
+    // Which is the defect: confidence 0.0 and 1.0 are indistinguishable to selection.
+    CHECK(NEAR(dir_W / 2.f, 7.5f, 0.01f));
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────
+
+
+// ── Direction pool: forward accumulation (v0.5.0.0) ────────────────────────────────
+// These grade mt1_dir_record_scores / mt1_dir_better straight out of mt1_scoring.h, so the test
+// and the trainer cannot drift apart. The lifecycle arithmetic below mirrors step_mt1_dir_pool.
+
+static void test_dir_record_scoring()
+{
+    SUITE("direction pool: 16-bit record scoring");
+
+    float p, s, t;
+
+    // Empty record scores zero on every key rather than dividing by zero.
+    mt1_dir_record_scores(0x0000, 0, &p, &s, &t);
+    CHECK(NEAR(p, 0.f, 1e-6f) && NEAR(s, 0.f, 1e-6f) && NEAR(t, 0.f, 1e-6f));
+
+    // All 16 correct: primary and secondary both 1.0, so the blend is 1.0 too.
+    mt1_dir_record_scores(0xFFFF, 16, &p, &s, &t);
+    CHECK(NEAR(p, 1.f, 1e-6f));
+    CHECK(NEAR(s, 1.f, 1e-6f));
+    CHECK(NEAR(t, 1.f, 1e-6f));
+
+    // All 16 wrong.
+    mt1_dir_record_scores(0x0000, 16, &p, &s, &t);
+    CHECK(NEAR(p, 0.f, 1e-6f) && NEAR(s, 0.f, 1e-6f) && NEAR(t, 0.f, 1e-6f));
+
+    // Half right, but WHICH half decides the secondary. Newest 8 correct (bits 0-7):
+    // weighted = 4*1.0 + 4*0.8 = 7.2 of 11.2 = 0.642857
+    mt1_dir_record_scores(0x00FF, 16, &p, &s, &t);
+    CHECK(NEAR(p, 0.5f, 1e-6f));
+    CHECK(NEAR(s, 7.2f / 11.2f, 1e-5f));
+    CHECK(s > p);                                   // recency rewards fresh correctness
+
+    // Oldest 8 correct (bits 8-15): weighted = 4*0.6 + 4*0.4 = 4.0 of 11.2
+    mt1_dir_record_scores(0xFF00, 16, &p, &s, &t);
+    CHECK(NEAR(p, 0.5f, 1e-6f));
+    CHECK(NEAR(s, 4.0f / 11.2f, 1e-5f));
+    CHECK(s < p);                                   // and punishes stale correctness
+
+    // Same primary, opposite secondary -> the ordering is decided by recency.
+    DirSlotMeta fresh{0x00FF, 16, 0, 0}, stale{0xFF00, 16, 0, 0};
+    CHECK(mt1_dir_better(fresh, stale));
+    CHECK(!mt1_dir_better(stale, fresh));
+
+    // Full-record weight sum is exactly 11.2.
+    float wsum = 0.f;
+    for (int i = 0; i < MT1_DIR_HIST_BITS; i++) wsum += MT1_DIR_RECENCY_W[i / 4];
+    CHECK(NEAR(wsum, 11.2f, 1e-5f));
+}
+
+static void test_dir_partial_record()
+{
+    SUITE("direction pool: partial records normalize by actual count");
+
+    float p, s, t;
+
+    // 11 predictions, all correct. Both scores must read 1.0 — normalizing by a full 16 slots or
+    // a full 11.2 of weight would score a perfect young model below a perfect old one.
+    mt1_dir_record_scores(0x07FF, 11, &p, &s, &t);
+    CHECK(NEAR(p, 1.f, 1e-6f));
+    CHECK(NEAR(s, 1.f, 1e-6f));
+
+    // 11 predictions, newest 4 correct: primary 4/11; weighted 4*1.0 of (4*1.0 + 4*0.8 + 3*0.6)
+    mt1_dir_record_scores(0x000F, 11, &p, &s, &t);
+    CHECK(NEAR(p, 4.f / 11.f, 1e-5f));
+    CHECK(NEAR(s, 4.0f / (4.0f + 3.2f + 1.8f), 1e-5f));
+
+    // Bits beyond n_pred are ignored, so stale garbage above the fill mark cannot inflate a score.
+    mt1_dir_record_scores(0xFF0F, 4, &p, &s, &t);
+    CHECK(NEAR(p, 1.f, 1e-6f));      // only the newest 4 bits count, and all 4 are set
+
+    // A model at exactly the minimum age is scoreable.
+    mt1_dir_record_scores(0x00FF, MT1_DIR_MIN_AGE, &p, &s, &t);
+    CHECK(NEAR(p, 1.f, 1e-6f));      // 8 predictions, all 8 correct
+}
+
+static void test_dir_tertiary_is_inert_as_third_key()
+{
+    SUITE("direction pool: tertiary blend can never break a (primary, secondary) tie");
+
+    // tertiary = 0.4*primary + 0.6*secondary is a function of the other two, so whenever both are
+    // equal it is equal as well. It is computed and logged, but as a third sort key it never fires.
+    float p1, s1, t1, p2, s2, t2;
+    mt1_dir_record_scores(0x0F0F, 16, &p1, &s1, &t1);
+    mt1_dir_record_scores(0x0F0F, 16, &p2, &s2, &t2);
+    CHECK(NEAR(p1, p2, 1e-9f) && NEAR(s1, s2, 1e-9f) && NEAR(t1, t2, 1e-9f));
+
+    // And it is the stated 60/40 blend.
+    CHECK(NEAR(t1, 0.4f * p1 + 0.6f * s1, 1e-6f));
+}
+
+static void test_dir_lifecycle_arithmetic()
+{
+    SUITE("direction pool: cull rate, mature share, lineage cap");
+
+    // Steady state: mature/N = 1 / (1 + MIN_AGE * CULL_PCT). The chosen constants target ~60%.
+    float mature_frac = 1.f / (1.f + (float)MT1_DIR_MIN_AGE * MT1_DIR_CULL_PCT);
+    CHECK(mature_frac > 0.58f && mature_frac < 0.62f);
+
+    float mature = mature_frac * (float)MT1_COMP_SLOTS;
+    CHECK(mature > 115.f && mature < 125.f);          // ~120 of 200
+
+    float births = mature * MT1_DIR_CULL_PCT;
+    CHECK(births > 8.f && births < 12.f);             // ~10 per day
+
+    // Expected lifespan = min age + 1/cull rate, in predictions.
+    float lifespan = (float)MT1_DIR_MIN_AGE + 1.f / MT1_DIR_CULL_PCT;
+    CHECK(lifespan > 18.f && lifespan < 22.f);        // ~20
+
+    // Parents = top 10% of mature, plus the 3 ephemeral wavg blends.
+    int want = (int)(mature * MT1_DIR_ELITE_PCT + 0.5f);
+    CHECK(want == 12);
+    CHECK(want + 3 == 15);
+
+    // Bound on MT1Scratch::dir_barred. Shares are strictly greater-than, so at most
+    // ceil(1/CAP)-1 lineages can exceed the cap at once. Under hysteresis a barred lineage stays
+    // barred all the way down to RESUME, so the real bound is driven by RESUME, not CAP — that is
+    // the one that must fit the array (16 slots).
+    int max_over_cap    = (int)ceilf(1.f / MT1_DIR_LINEAGE_CAP) - 1;
+    int max_barred      = (int)ceilf(1.f / MT1_DIR_LINEAGE_RESUME) - 1;
+    CHECK(max_over_cap == 7);
+    CHECK(max_barred == 9);
+    CHECK(max_barred >= max_over_cap);   // hysteresis can only widen the barred set
+    CHECK(max_barred <= 16);             // sizeof(dir_barred)
+
+    // Hysteresis: release must sit strictly below the bar, or a lineage parked near the cap
+    // flips state every rep and the bar suppresses nothing. The first --dir-reps 20 run logged
+    // 1850 barrings against 1838 re-enables over 35 days with the thresholds equal.
+    CHECK(MT1_DIR_LINEAGE_RESUME < MT1_DIR_LINEAGE_CAP);
+    CHECK(MT1_DIR_LINEAGE_CAP - MT1_DIR_LINEAGE_RESUME > 0.02f);
+}
+
+static void test_dir_record_shift()
+{
+    SUITE("direction pool: record shifts newest-first and saturates age");
+
+    // step_mt1_dir_pool does: hist = (hist << 1) | correct, so bit 0 is always the newest call.
+    uint16_t h = 0;
+    h = (uint16_t)((h << 1) | 1u);      // correct
+    h = (uint16_t)((h << 1) | 0u);      // wrong
+    h = (uint16_t)((h << 1) | 1u);      // correct
+    CHECK(((h >> 0) & 1u) == 1u);       // newest
+    CHECK(((h >> 1) & 1u) == 0u);
+    CHECK(((h >> 2) & 1u) == 1u);       // oldest of the three
+
+    // 17 correct predictions leave a full register: the 17th pushed the 1st out.
+    h = 0;
+    for (int i = 0; i < 17; i++) h = (uint16_t)((h << 1) | 1u);
+    CHECK(h == 0xFFFF);
+
+    float p, s, t;
+    mt1_dir_record_scores(h, 17, &p, &s, &t);
+    CHECK(NEAR(p, 1.f, 1e-6f));         // n clamps to 16, so a longer life does not dilute
+
+    // Age saturates rather than wrapping to 0 and making an old model look newborn.
+    uint16_t n = 0xFFFF;
+    if (n < 0xFFFFu) n++;
+    CHECK(n == 0xFFFF);
+}
 
 int main()
 {
@@ -809,7 +926,7 @@ int main()
     test_constants();
     test_pcg32();
     test_scores_direction();
-    test_scores_range();
+    test_scores_vol();
     test_scores_accuracy();
     test_scores_composite();
     test_scores_confidence();
@@ -822,6 +939,11 @@ int main()
     test_blend_slots_count();
     test_drift_rel_metric();
     test_direction_balanced_weighting();
+    test_dir_record_scoring();
+    test_dir_partial_record();
+    test_dir_tertiary_is_inert_as_third_key();
+    test_dir_lifecycle_arithmetic();
+    test_dir_record_shift();
 
     printf("\n==================\n");
     printf("%d passed, %d failed\n", pass_count, fail_count);

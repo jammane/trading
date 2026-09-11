@@ -3,25 +3,23 @@ training_lib.py — Shared evolutionary training functions used by
 upkeep.py and production_v2.py.  Not a standalone training script.
 """
 
+import contextlib
 import copy
 import gc
 import json
-import math
 import os
 import random
 import shutil
+import sys
 from collections import defaultdict
 from datetime import datetime
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
-from fees import BUY_FILL, FINRA_TAF_MAX, FINRA_TAF_PER_SHARE, SEC_FEE_RATE, SELL_FILL, SLIPPAGE_RATE, _sell_net
+from fees import BUY_FILL, SLIPPAGE_RATE, _sell_net
 from models import MasterNN, StockNN
-from universe import INDUSTRIES
-
 
 DUMP_DIR = 'data_dump'  # overridden by production_v2.py to logs/ACCOUNT/SUBTYPE/data_dump
 
@@ -41,8 +39,15 @@ MT1_COMP_PARENTS     = ELITE_COUNT + WAVG_COUNT + MT1_COMP_INJECT  # 25
 MT1_COMP_CHILDREN    = 7            # mutations per parent
 MT1_COMP_SLOTS       = MT1_COMP_PARENTS * (MT1_COMP_CHILDREN + 1)  # 200
 MT1_BLEND_SLOTS      = 200          # composite blend pool size per day
-MT1_RANGE_FLOOR      = 1.0          # $1 — effectively no range floor
-MT1_RANGE_CEIL_MULT  = 4.0          # ceiling = 4 × max(mean, today) |actual−comp0_delta|
+# Band scale: r = range_pct × max(|delta_d|, acc_floor). The floor is acc_floor (the per-industry
+# adaptive |actual_d| scale), NOT a flat dollar amount — the retired MT1_RANGE_FLOOR = $1 let r
+# collapse to cents whenever the delta head predicted ~0, which is what killed the range pool.
+MT1_RANGE_CEIL_MULT  = 4.0          # ceiling = 4 × mean |actual−comp0_delta| (clamp on r; backward-looking)
+# Pre-activation cap for the sigmoid outputs (direction conf + conf4). Without it raw logits blow up,
+# sigmoid saturates to exactly 0/1, and weight mutations stop changing the output — the pool freezes
+# genetically (96.7% of conf values were exactly 0 or 1 by pass 5 of the v0.4.0.0 run).
+MT1_LOGIT_CAP        = 4.0          # conf ∈ (0.018, 0.982), always mobile under mutation
+MT1_SOFTPLUS_CLAMP   = 20.0         # guards softplus(raw) → inf
 MT1_DIR_BACKFILL     = 0.65         # (legacy) skip direction pool update when best score < this
 MT1_DIR_DAYS         = 10           # scoring window (all pools): linear-weighted last N days (oldest=1.0 → today=2.0)
 MT1_DIR_SKILL_FLOOR  = 0.52         # (legacy — superseded by MT1_DIR_MIN_CORRECT)
@@ -50,6 +55,13 @@ MT1_DIR_MIN_CORRECT  = 3            # direction collapse floor: freeze/inject on
 MT1_FWD_DAYS         = 10           # prediction horizon: target = cumulative relative return over next N sessions
 MT2_FEED_DIRECTION   = True         # MT2 input from direction-pool slot0 (True) vs composite slot0 (False)
 MT1_POOL_NAMES       = ('dir', 'acc', 'rng', 'cfd')
+# Direction constant-collapse injection (v0.4.2.0): re-diversify the direction tail when the deployed
+# model has gone constant (all-up or all-down over its MT1_DIR_DAYS window) for N consecutive daily
+# checks AND ≥1 of those window days is wrong. MT1 tail pools were the only pools with no
+# re-diversification trigger, which is why 9/12 direction pools froze in the v0.4.1.0 run.
+MT1_DIR_CONST_TRIP   = 3            # consecutive constant+imperfect checks → inject
+MT1_DIR_INJ_COOLDOWN = MT1_DIR_DAYS  # checks to wait before another injection
+MT1_DIR_INJ_BLEND    = 0.5          # injected dir tail = BLEND*best + (1-BLEND)*random
 
 IND_STARTING_CASH     = 25_000.0    # per-industry portfolio starting capital
 MST_STARTING_CASH     = 300_000.0   # master starting capital (12 × IND_STARTING_CASH)
@@ -557,6 +569,7 @@ def sn(industry):
 _console_log_lines = []
 _console_log_path  = None   # set at startup by main()
 _CONSOLE_LOG_MAX   = 200
+_console_log_failed = False  # one-shot latch: log() cannot report its own write failure via log()
 
 
 def log(msg):
@@ -568,11 +581,17 @@ def log(msg):
     if len(_console_log_lines) > _CONSOLE_LOG_MAX:
         _console_log_lines = _console_log_lines[-_CONSOLE_LOG_MAX:]
     if _console_log_path:
+        global _console_log_failed
         try:
             with open(_console_log_path, 'w') as f:
                 f.write('\n'.join(_console_log_lines) + '\n')
-        except Exception:
-            pass
+        except OSError as e:
+            # Cannot route this through log() — that is this function. Warn once to stderr and
+            # latch, so a broken log path does not emit a line per call for the whole run.
+            if not _console_log_failed:
+                _console_log_failed = True
+                print(f"WARNING: console log file {_console_log_path} is not writable "
+                      f"({e}); continuing without it", file=sys.stderr, flush=True)
 
 
 # ── Evolution helpers ──────────────────────────────────────────────────────────
@@ -776,7 +795,7 @@ def compute_alloc_from_predicted(predicted, industry_list):
     depths   = vals[12:24] if len(vals) >= 24 else [0.5]*12
     triggers = vals[24:36] if len(vals) >= 36 else [0.5]*12
 
-    w_map   = dict(zip(industry_list, weights))
+    w_map   = dict(zip(industry_list, weights, strict=True))
     top_ind = max(w_map, key=lambda k: w_map[k])
 
     # Top industry gets full cap; all others start at floor
@@ -835,8 +854,8 @@ def _load_hist_meta(industry, directory):
             with open(path) as f:
                 meta = json.load(f)
             return max(0, min(meta.get('head', 0), HIST_DAYS - 1)), max(0, min(meta.get('count', 0), HIST_DAYS))
-        except Exception:
-            pass
+        except (OSError, json.JSONDecodeError) as e:
+            log(f"WARNING: history meta {path} unreadable, restarting ring at 0: {e}")
     return 0, 0
 
 def _save_hist_meta(industry, directory, head, count):
@@ -870,7 +889,7 @@ def save_top10_meta(prefix, directory, top10_meta):
     try:
         with open(_meta_path(prefix, directory), 'w') as f:
             json.dump(top10_meta, f, indent=2)
-    except Exception as e:
+    except OSError as e:
         log(f"WARNING: could not save top10 meta: {e}")
 
 
@@ -881,7 +900,7 @@ def load_top10_meta(prefix, directory):
         try:
             with open(path) as f:
                 return json.load(f)
-        except Exception as e:
+        except (OSError, json.JSONDecodeError) as e:
             log(f"WARNING: could not load top10 meta: {e}")
     return []
 
@@ -918,7 +937,7 @@ def compute_weighted_avg_model(prefix, directory, slots, values, model_class):
     avg_state = None
     int_state = {}
     with torch.no_grad():
-        for slot, weight in zip(slots, weights):
+        for slot, weight in zip(slots, weights, strict=True):
             m     = load_slot_model(prefix, directory, slot, model_class)
             state = m.state_dict()
             if avg_state is None:
@@ -945,11 +964,11 @@ def compute_weighted_avg_portfolio(portfolios, values):
     for key in portfolios[0]:
         if isinstance(portfolios[0][key], dict):
             result[key] = {
-                sym: sum(float(p[key].get(sym, 0.0)) * w for p, w in zip(portfolios, weights))
+                sym: sum(float(p[key].get(sym, 0.0)) * w for p, w in zip(portfolios, weights, strict=True))
                 for sym in portfolios[0][key]
             }
         elif isinstance(portfolios[0][key], (int, float)):
-            result[key] = sum(float(p[key]) * w for p, w in zip(portfolios, weights))
+            result[key] = sum(float(p[key]) * w for p, w in zip(portfolios, weights, strict=True))
         else:
             result[key] = copy.deepcopy(portfolios[0][key])
     return result
@@ -1061,7 +1080,7 @@ def selection_and_mutation(
     elite_ports  = [copy.deepcopy(portfolios[s]) for s in elite_slots]
 
     # Write elites in rank order to slots 0–16
-    for rank, (model, port) in enumerate(zip(elite_models, elite_ports)):
+    for rank, (model, port) in enumerate(zip(elite_models, elite_ports, strict=True)):
         save_slot_model(prefix, directory, rank, model)
         portfolios[rank] = port
         del model
@@ -1201,7 +1220,7 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
         ])
         today_dl.append(dlt_t)
     if today_dl:
-        tr = list(zip(*today_dl))
+        tr = list(zip(*today_dl, strict=True))
         for tp in tr:
             today_row += [max(tp), min(tp), sum(tp) / len(tp)]
     else:
@@ -1352,7 +1371,7 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
             d      = day_data[sym]
             raw    = [d['open'], d['close'], d['high'], d['low'], d['volume']]
             prev   = histories[sym][-1][:5] if histories[sym] else None
-            deltas = [r - p for r, p in zip(raw, prev)] if prev else [0.0] * 5
+            deltas = [r - p for r, p in zip(raw, prev, strict=True)] if prev else [0.0] * 5
             histories[sym].append(raw + deltas)
             if len(histories[sym]) > 15:
                 histories[sym].pop(0)
@@ -1433,7 +1452,6 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
     # The hard reset triggers if yesterday's best model itself falls below $1,500.
     survival_floor = baseline_score * 0.9
     abs_floor      = IND_STARTING_CASH * 0.9
-    ranked_scores  = sorted(scores, key=lambda x: x[1], reverse=True)
     log(f"[{sn(industry)}] Day {actual_day + 1}/{total_avail} | "
         f"best Δ${best_delta:+.2f}  worst Δ${worst_delta:+.2f} | "
         f"shares(buy/sell)={buy_exec_count:.0f}/{sell_exec_count:.0f} | "
@@ -1546,10 +1564,8 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
     # Remove virtual slot files and trim extended portfolios list.
     for h, _, _ in hist_scored:
         vpath = _model_path(industry, output_dir, pool_size + h)
-        try:
+        with contextlib.suppress(FileNotFoundError):
             os.remove(vpath)
-        except FileNotFoundError:
-            pass
     del portfolios[pool_size:]
 
     # ── Diversity injection if all-zero streak ≥ 2 ───────────────────────────
@@ -1560,7 +1576,12 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
         source_slots = [s for s, _ in ranked_for_inj[:half]]
         inject_slots = [s for s, _ in ranked_for_inj[half:]]
         log(f"[{sn(industry)}]   Diversity injection: replacing bottom {len(inject_slots)} elites with half-random blends")
-        for inject_slot, source_slot in zip(inject_slots, source_slots):
+        # strict=False preserves EXISTING behaviour, which is subtly wrong and left unchanged
+        # deliberately (changing it would alter training dynamics mid-investigation).
+        # ELITE_COUNT=17 is odd, so half=8: source_slots has 8 entries but inject_slots has 9.
+        # zip() truncates to 8, so the LAST inject slot is silently never replaced — the log line
+        # above claims 9. Decide whether to pair 8 or extend source_slots, then switch to strict=True.
+        for inject_slot, source_slot in zip(inject_slots, source_slots, strict=False):
             elite = load_slot_model(industry, output_dir, source_slot, StockNN)
             blend = blend_model_halfway(elite, StockNN)
             save_slot_model(industry, output_dir, inject_slot, blend)

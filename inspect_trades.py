@@ -46,7 +46,7 @@ from datetime import datetime, timedelta
 import torch
 import yfinance as yf
 
-from fees import BUY_FILL, FINRA_TAF_MAX, FINRA_TAF_PER_SHARE, SEC_FEE_RATE, SELL_FILL, SLIPPAGE_RATE, _sell_net
+from fees import BUY_FILL, SLIPPAGE_RATE, _sell_net
 from models import StockNN
 from universe import INDUSTRIES
 
@@ -168,7 +168,7 @@ def fetch_history(symbols, target_date_str, stock_data_dir, fetch_days=17):
             e    = local_by_date[d][sym]
             raw  = [e['open'], e['close'], e['high'], e['low'], e['volume']]
             prev = history[sym][-1][:5] if history[sym] else None
-            deltas = [r - p for r, p in zip(raw, prev)] if prev else [0.0] * 5
+            deltas = [r - p for r, p in zip(raw, prev, strict=True)] if prev else [0.0] * 5
             history[sym].append(raw + deltas)
 
     return history, day_data, next_day_data, all_dates, target_idx
@@ -251,7 +251,7 @@ def build_input(symbols, histories, day_data, cash, holdings):
         ])
         today_dl.append(dlt_t)
     if today_dl:
-        tr = list(zip(*today_dl))
+        tr = list(zip(*today_dl, strict=True))
         for tp in tr:
             today_row += [max(tp), min(tp), sum(tp) / len(tp)]
     else:

@@ -21,19 +21,19 @@ class TestFeeConstants:
         assert SELL_FILL == 1.0, "Alpaca charges no commission — SELL_FILL must be 1.0"
 
     def test_sec_fee_rate(self):
-        assert SEC_FEE_RATE == pytest.approx(0.0000278), \
+        assert pytest.approx(0.0000278) == SEC_FEE_RATE, \
             "SEC Section 31 rate must be $0.0000278 per $ of proceeds"
 
     def test_finra_taf_per_share(self):
-        assert FINRA_TAF_PER_SHARE == pytest.approx(0.000166), \
+        assert pytest.approx(0.000166) == FINRA_TAF_PER_SHARE, \
             "FINRA TAF must be $0.000166 per share sold"
 
     def test_finra_taf_max(self):
-        assert FINRA_TAF_MAX == pytest.approx(8.30), \
+        assert pytest.approx(8.30) == FINRA_TAF_MAX, \
             "FINRA TAF per-trade cap must be $8.30"
 
     def test_slippage_rate(self):
-        assert SLIPPAGE_RATE == pytest.approx(0.001), \
+        assert pytest.approx(0.001) == SLIPPAGE_RATE, \
             "Slippage rate must be 0.10%"
 
     def test_sec_fee_rate_positive(self):
@@ -86,9 +86,7 @@ class TestSellNet:
     def test_high_price_increases_sec_fee(self):
         net_low  = _sell_net(10.0, 10.0)
         net_high = _sell_net(10.0, 100.0)
-        # Gross for high_price is 10× greater; SEC fee scales with proceeds
-        gross_low  = 10.0 * 10.0
-        gross_high = 10.0 * 100.0
+        # Gross for high_price is 10× greater (10*10 vs 10*100); SEC fee scales with proceeds
         # Net proceeds should scale roughly with price (minus proportional SEC fee)
         assert net_high > net_low
 
@@ -101,7 +99,6 @@ class TestSellNet:
     def test_finra_cap_exact_boundary(self):
         cap_shares = FINRA_TAF_MAX / FINRA_TAF_PER_SHARE
         price      = 1.0
-        gross      = cap_shares * price * SELL_FILL
 
         # Just below cap: FINRA fee = cap_shares * FINRA_TAF_PER_SHARE < MAX
         net_below = _sell_net(cap_shares - 1, price)
