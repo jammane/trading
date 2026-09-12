@@ -24,6 +24,7 @@ MODULES = [
     "models",
     "plot_training",
     "prepare_models",
+    "production_v2",
     "read_mt_log",
     "swap_symbols",
     "training_lib",
@@ -38,20 +39,6 @@ MODULES = [
 def test_module_imports(module_name):
     """The module imports without raising."""
     assert importlib.import_module(module_name) is not None
-
-
-@pytest.mark.xfail(
-    reason="KNOWN BROKEN, deferred: production_v2 imports load_mt2_norm_stats/save_mt2_norm_stats "
-           "from upkeep, but both were deleted in eb70bea (v0.2.0.0, 'MT2 48-feature no-norm "
-           "input'). Fix is slotted for the next change to production_v2.py — see the comment on "
-           "its import block. When fixed this XPASSes: delete this marker and fold production_v2 "
-           "into MODULES above.",
-    raises=ImportError,
-    strict=False,
-)
-def test_production_v2_imports():
-    """production_v2 is the live/paper trading entry point — it must be importable."""
-    assert importlib.import_module("production_v2") is not None
 
 
 def test_download_5y_data_is_excluded_deliberately():
