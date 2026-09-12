@@ -5,6 +5,9 @@ Entries are prepended automatically on each commit via the Claude commit hook.
 
 ---
 
+## [efd7a97] — 2026-09-12
+Stage (H-L)/A as a future MT1 vol-channel input
+
 ## [d2d7a43] — 2026-09-12
 v0.6.2.0: --flat-allocation for paper; fix the production_v2 import break
 
