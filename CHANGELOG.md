@@ -5,6 +5,9 @@ Entries are prepended automatically on each commit via the Claude commit hook.
 
 ---
 
+## [a79f007] — 2026-09-12
+download_daily: detect dead tickers instead of reporting them as healthy
+
 ## [2570e6b] — 2026-09-12
 v0.6.1.0: StockNN close_pos + close_vs_wap per-symbol features (BREAKING)
 

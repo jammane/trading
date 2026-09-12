@@ -11,9 +11,30 @@ in the current universe:
 All symbols end up with at most MAX_HISTORY_DAYS (1255) days of history,
 so older data is pruned automatically on each run.
 
+Dead-ticker detection
+---------------------
+A delisted symbol does not raise: yfinance returns an empty frame, the merge is
+a no-op, and the symbol reports `+ 0 day(s)` exactly like a healthy symbol on a
+weekend. The file keeps its full MAX_HISTORY_DAYS, so nothing downstream looks
+wrong either — but the days are the WRONG days, frozen at the delisting date.
+
+That matters more than it looks: the C++ trainer indexes over the UNION of all
+symbols' dates, so one frozen file with an older start stretches the union and
+pushes `--stop-day` backwards, silently discarding the most recent sessions for
+every healthy symbol.
+
+Detection is cohort-relative rather than calendar-based: all symbols trade the
+same sessions, so the newest date across the universe is the reference, and any
+symbol lagging it by more than MAX_STALE_DAYS is dead or halted. This needs no
+market-holiday table and is correct on weekends, when every symbol lags "today"
+but none lags the cohort.
+
+Exits non-zero when anything is stale or errored, so cron surfaces it.
+
 Usage:
   python download_daily.py
 """
+import datetime as dt
 import json
 import os
 import time
@@ -25,6 +46,7 @@ from universe import ALL_SYMBOLS
 MAX_HISTORY_DAYS = 1255
 STOCK_DATA_DIR   = 'stock_data'
 FETCH_LOOKBACK   = '7d'   # covers weekends and the current day robustly
+MAX_STALE_DAYS   = 7      # calendar days a symbol may lag the cohort before it is called dead
 
 
 def _load_existing(sym: str) -> list:
@@ -72,12 +94,37 @@ def _save(sym: str, days: list) -> None:
         json.dump({'days': days}, f)
 
 
-def main() -> None:
+def find_stale_symbols(last_dates: dict, max_stale_days: int = MAX_STALE_DAYS) -> tuple:
+    """Symbols whose newest bar lags the universe's newest bar by too much.
+
+    `last_dates` maps symbol -> 'YYYY-MM-DD' of its most recent bar. Returns
+    (cohort_last, {sym: (last_date, days_behind)}) sorted most-stale first.
+    The cohort maximum is the reference, so this is correct on weekends and
+    holidays, when every symbol lags today's date but none lags the cohort.
+    Returns (None, {}) when there is nothing to compare.
+    """
+    if not last_dates:
+        return None, {}
+    parsed = {s: dt.date.fromisoformat(d) for s, d in last_dates.items()}
+    cohort_last = max(parsed.values())
+    stale = {}
+    for sym, d in parsed.items():
+        behind = (cohort_last - d).days
+        if behind > max_stale_days:
+            stale[sym] = (d.isoformat(), behind)
+    ordered = dict(sorted(stale.items(), key=lambda kv: -kv[1][1]))
+    return cohort_last.isoformat(), ordered
+
+
+def main() -> int:
     os.makedirs(STOCK_DATA_DIR, exist_ok=True)
     symbols = ALL_SYMBOLS
     print(f'Updating {len(symbols)} symbols → trimmed to {MAX_HISTORY_DAYS} days each.')
 
     updated = new_sym = errors = 0
+    last_dates: dict = {}
+    no_rows: list = []
+
     for i, sym in enumerate(symbols, 1):
         existing = _load_existing(sym)
         try:
@@ -87,13 +134,23 @@ def main() -> None:
                 added   = len(merged) - len(existing)
                 _save(sym, merged)
                 total   = min(len(merged), MAX_HISTORY_DAYS)
-                print(f'  [{i:3d}/{len(symbols)}] {sym:<6s}  +{added:2d} day(s)  → {total} days')
+                last    = merged[-1]['date']
+                last_dates[sym] = last
+                # An empty fetch is the direct delisting signal: yfinance returns no rows rather
+                # than raising. Distinguish it here from a genuine "no new sessions" result.
+                flag = ''
+                if not fetched:
+                    no_rows.append(sym)
+                    flag = '  ** no rows returned (delisted/halted?)'
+                print(f'  [{i:3d}/{len(symbols)}] {sym:<6s}  +{added:2d} day(s)  '
+                      f'→ {total} days  last={last}{flag}')
                 updated += 1
             else:
                 print(f'  [{i:3d}/{len(symbols)}] {sym:<6s}  new — full 5-year download...')
                 fetched = _fetch(sym, '5y')
                 if fetched:
                     _save(sym, fetched)
+                    last_dates[sym] = fetched[-1]['date']
                     print(f'    saved {min(len(fetched), MAX_HISTORY_DAYS)} days')
                     new_sym += 1
                 else:
@@ -104,8 +161,31 @@ def main() -> None:
             errors += 1
         time.sleep(1.2)
 
+    cohort_last, stale = find_stale_symbols(last_dates)
     print(f'\nDone: {updated} updated, {new_sym} new, {errors} errors.')
+    if cohort_last:
+        print(f'Newest session across the universe: {cohort_last}')
+
+    if stale:
+        print(f'\n{"=" * 72}')
+        print(f'DEAD / STALE TICKERS — {len(stale)} symbol(s) lag the universe by '
+              f'more than {MAX_STALE_DAYS} days')
+        print('=' * 72)
+        for sym, (last, behind) in stale.items():
+            print(f'  {sym:<6s} last bar {last}  ({behind} days behind {cohort_last})')
+        print('\nA stale file keeps its full history, so nothing downstream errors — but the')
+        print('trainer indexes over the UNION of all symbols\' dates, so a frozen file pushes')
+        print('--stop-day backwards and silently drops recent sessions for every other symbol.')
+        print('\nPer the swap rules a defunct ticker is an immediate swap, not a watch:')
+        for sym in stale:
+            print(f"  ./swap_symbols.sh '{{\"{sym}\": \"REPLACEMENT\"}}'")
+    elif no_rows:
+        # Fetched nothing but not yet behind the cohort — e.g. a halt that started today.
+        print(f'\nNOTE: {len(no_rows)} symbol(s) returned no rows this run but are not yet stale: '
+              f'{", ".join(no_rows)}')
+
+    return 1 if (stale or errors) else 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())
