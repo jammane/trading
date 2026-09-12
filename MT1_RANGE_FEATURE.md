@@ -88,11 +88,12 @@ Feature count goes 37 → 38, dual input 74 → 76, master vector 888 → 912.
   Called twice at ~1974-1975 with offsets 0 and 37; both offsets shift.
 - `models.MT1Head` — slices `x[:, 0:10], x[:, 10:17], x[:, 17:37]`; the third slice widens.
 - `models.MT1DualHead` — input 74 → 76; `self.mkt` reads `x[:, 0:37]`, that boundary moves.
-- Param constants **disagree today and must be reconciled during implementation**: CLAUDE.md says
-  MT1NN is "37→4, ~3,412 params" (the 37 is already stale — it is 74), `models.py` docstring says
-  9,208, `training_v4.cpp` says `MT1NN_PARAMS = 2218`. `load_bin` validates by exact element count
-  and **falls back to random init silently** on mismatch, so a wrong constant produces a run that
-  looks fine and has learned nothing.
+- Param sizes (reconciled 2026-09-12, no longer in conflict): `HEADNN_SUB` 998 per trunk,
+  `HEADNN_PARAMS` 1996 dual, `TAILNN_PARAMS` 1803, composed MT1NN 9208 — C++ and `models.py`
+  agree, pinned by `tests/test_models.py::TestMT1NN::test_param_count` and by `static_assert`
+  in `training_v4.cpp`. Widening the input changes the **head** only (37→38 per trunk), so
+  `HEADNN_SUB`/`HEADNN_PARAMS` move and `TAILNN_PARAMS` does not. `load_bin` validates by exact
+  element count and **falls back to random init silently**, so update both sides together.
 - Tests: mirror the `TestTodayLayout` pattern — pin the offsets on both sides so a Python/C++
   divergence fails loudly instead of misaligning every feature past the first block.
 - Regenerate MT1 models from scratch. Every `mt1_*.bin` / `.pt` from v0.6.x and earlier becomes

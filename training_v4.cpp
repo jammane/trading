@@ -157,8 +157,8 @@ static constexpr int HIST_PER_DAY = 10;
 static constexpr int HIST_ELITE   = 7;   // top-7 direct elite slots saved per day
 static constexpr int HIST_WAVG    = 3;   // wavg slots (17,18,19) saved per day
 
-// MT1NN: branched FC (blocks A/B/C → concat 28 → D taper), per-industry preprocessor (12 pools)
-static constexpr int   MT1NN_PARAMS        = 2218;
+// MT1: per-industry preprocessor (12 pools). Sizes live with the heads/tails split below —
+// HEADNN_PARAMS + 4 × TAILNN_PARAMS. There is no single MT1NN_PARAMS constant by design.
 static constexpr int   MT1_START_DAY       = 25;
 static constexpr int   MT1_FWD_DAYS        = 10;       // prediction horizon: target = cumulative relative return over next N sessions
 static constexpr int   MT1_BLOCK_DAYS      = 25;       // heads/tails block-alternating training: days per block (T1/H/T2/M phases replay the same block)
@@ -170,19 +170,6 @@ static constexpr int   MT1_ROLLING_DAYS    = 10;       // days in per-industry |
 // grade a genuinely unseen model against a constant baseline, so they need to be low-variance to be
 // worth reading — and because Increment C would weight the composite by them.
 static constexpr int   MT1_SKILL_DAYS      = 250;
-// MT1 branched weight layout (weight+bias consecutively per layer, order = MT1_LAYER_DEFS).
-// A: a1 20→20, a2 20→20 | B: b1 10→6, b2 6→4 | C: c1 7→5, c2 5→4 | D: d1 28→22, d2 22→16, d3 16→10, d4 10→4
-static constexpr int MT1_A1_W=0,    MT1_A1_B=400;    // 20×20
-static constexpr int MT1_A2_W=420,  MT1_A2_B=820;    // 20×20
-static constexpr int MT1_B1_W=840,  MT1_B1_B=900;    // 6×10
-static constexpr int MT1_B2_W=906,  MT1_B2_B=930;    // 4×6
-static constexpr int MT1_C1_W=934,  MT1_C1_B=969;    // 5×7
-static constexpr int MT1_C2_W=974,  MT1_C2_B=994;    // 4×5
-static constexpr int MT1_D1_W=998,  MT1_D1_B=1614;   // 22×28
-static constexpr int MT1_D2_W=1636, MT1_D2_B=1988;   // 16×22
-static constexpr int MT1_D3_W=2004, MT1_D3_B=2164;   // 10×16
-static constexpr int MT1_D4_W=2174, MT1_D4_B=2214;   // 4×10  (ends at 2218)
-
 // ── Heads/tails split (Part C dual head): TWO 37→28 trunks (market ‖ portfolio) → concat56,
 //    + specialized 1-output tails (56→1). Input per industry = 74 = [market37 ‖ portfolio37]. ──
 // Head buffer = mkt sub-head (a1..c2, 998) then pf sub-head (a1..c2, 998) = 1996. HD_* offsets
@@ -190,6 +177,13 @@ static constexpr int MT1_D4_W=2174, MT1_D4_B=2214;   // 4×10  (ends at 2218)
 static constexpr int   HEADNN_SUB    = 998;              // one MT1Head trunk (37→28)
 static constexpr int   HEADNN_PARAMS = 2 * HEADNN_SUB;   // dual trunk = 1996
 static constexpr int   TAILNN_PARAMS = 1803;
+// The composed production model is head0 + tail0[4]. load_bin validates by exact element count
+// and falls back to random init SILENTLY, so a drift here costs a whole run. Pinned on the Python
+// side by tests/test_models.py::TestMT1NN::test_param_count (998 / 1996 / 1803 / 9208).
+static_assert(HEADNN_SUB == 998 && HEADNN_PARAMS == 1996 && TAILNN_PARAMS == 1803,
+              "MT1 head/tail sizes drifted from models.py");
+static_assert(HEADNN_PARAMS + 4 * TAILNN_PARAMS == 9208,
+              "composed MT1NN size drifted from models.MT1NN");
 static constexpr int HD_A1_W=0,   HD_A1_B=400;   static constexpr int HD_A2_W=420, HD_A2_B=820;   // 20×20, 20×20
 static constexpr int HD_B1_W=840, HD_B1_B=900;   static constexpr int HD_B2_W=906, HD_B2_B=930;   // 6×10, 4×6
 static constexpr int HD_C1_W=934, HD_C1_B=969;   static constexpr int HD_C2_W=974, HD_C2_B=994;   // 5×7, 4×5  (ends 998)
@@ -886,19 +880,6 @@ static void init_master_weights(float* W, PCG32& rng) {
     kaiming_init(W + MAST_FC3_W, 312, 444, rng);
     kaiming_init(W + MAST_FC4_W, 180, 312, rng);
     kaiming_init(W + MAST_OUT_W,  48, 180, rng);
-}
-
-static void init_mt1_weights(float* W, PCG32& rng) {
-    kaiming_init(W + MT1_A1_W, 20, 20, rng);
-    kaiming_init(W + MT1_A2_W, 20, 20, rng);
-    kaiming_init(W + MT1_B1_W,  6, 10, rng);
-    kaiming_init(W + MT1_B2_W,  4,  6, rng);
-    kaiming_init(W + MT1_C1_W,  5,  7, rng);
-    kaiming_init(W + MT1_C2_W,  4,  5, rng);
-    kaiming_init(W + MT1_D1_W, 22, 28, rng);
-    kaiming_init(W + MT1_D2_W, 16, 22, rng);
-    kaiming_init(W + MT1_D3_W, 10, 16, rng);
-    kaiming_init(W + MT1_D4_W,  4, 10, rng);
 }
 
 static void init_head_weights(float* W, PCG32& rng) {
