@@ -46,7 +46,7 @@ kubectl create secret generic alpaca-credentials-acct0-prod \
     --from-literal=ALPACA_SECRET_KEY="..." \
     --dry-run=client -o yaml | kubectl apply -f -
 ```
-All 157 pytest tests (including `test_models.py`) run on the droplet where torch is available.
+All 176 pytest tests (including `test_models.py`) run on the droplet where torch is available.
 The pre-commit hook runs the full suite automatically before every `git commit`.
 
 **Lint:**
@@ -178,7 +178,7 @@ require a droplet upgrade.
 30 16 * * 1-5 cd /root/trading && mkdir -p logs/data && source .venv/bin/activate && python download_daily.py >> logs/data/download_daily.log 2>&1
 0  0  * * 0   cd /root/trading && mkdir -p logs/data && source .venv/bin/activate && python cleanup_stock_data.py >> logs/data/cleanup_stock_data.log 2>&1
 # acct0 paper trading: 5:05 PM ET; prod: 5:35 PM ET
-#5 17 * * 1-5 cd /root/trading && mkdir -p logs/acct0 && export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d) && export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d) && source .venv/bin/activate && python production_v2.py --paper --account acct0 >> logs/acct0/paper.log 2>&1
+#5 17 * * 1-5 cd /root/trading && mkdir -p logs/acct0 && export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d) && export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d) && source .venv/bin/activate && python production_v2.py --paper --account acct0 --flat-allocation >> logs/acct0/paper.log 2>&1
 #35 17 * * 1-5 cd /root/trading && mkdir -p logs/acct0 && export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d) && export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d) && source .venv/bin/activate && python production_v2.py --account acct0 >> logs/acct0/prod.log 2>&1
 # acct1 (future): 30 16 download_daily if diff universe; 5 18 paper, 35 18 prod
 # acct2 (future): 5 19 paper, 35 19 prod
@@ -188,13 +188,28 @@ require a droplet upgrade.
 # Manual run (paper)
 export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d)
 export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d)
-python production_v2.py --paper --account acct0
+python production_v2.py --paper --account acct0 --flat-allocation
 
 # Manual run (live, future)
 export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d)
 export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d)
 python production_v2.py --account acct0
 ```
+
+**`--flat-allocation` (paper only, v0.6.2.0).** Splits deployed capital evenly across all 12
+industries and skips MT1/MT2 inference entirely. In force for paper while MT1/MT2 have no
+demonstrated out-of-sample skill (direction 52–53% OOS vs 81–84% in-sample, per-channel skill
+negative in all 12 industries), so paper results measure the StockNN layer rather than an
+unvalidated allocator. **Remove the flag from the paper crontab line once MT1/MT2 are confirmed.**
+Prod does not pass it and keeps the MT1/MT2 path.
+
+It is a deliberate override, not a fallback — the "equal allocation" fallback in
+`run_master_allocation`'s docstring allocates **$0.00** to every industry, because with no MT2 and
+no MasterNN `tier_map` stays all-zero and `tiers_to_alloc` returns zeros (`n_pos == 0`). Nor can
+`tiers_to_alloc` express it: it re-ranks positives into terciles weighted 1.0/1.5/2.25, so even a
+uniform positive `tier_map` comes back unequal. The flat path also **clears** `zero_counts` — three
+consecutive tier-0 readings liquidate an industry's holdings, so letting it accumulate would sell
+the book off on day 3.
 
 Training output (`training_v4_cpp`) writes to `models/acct#/training`; after training run
 `python convert_weights.py --account acct0`, then copy `_best.pt` files to `.../prod`.
@@ -240,14 +255,22 @@ Runs all five steps: updates `universe_acct0.py` and regenerates `universe.json`
 
 ## Tests
 
-157 pytest tests (+1 xfail) across five files in `tests/`:
+176 pytest tests across seven files in `tests/`:
 - `test_models.py` — output shapes, output constraints (ReLU/sigmoid/softmax), serialization roundtrip, inject-layer growth dimensions; MT1NN/MT2NN shape + activation + forward tests; `stock_close_pos` value/identity/scale-free/degenerate-bar tests and `TestTodayLayout` section-offset tests (both must mirror the C++ twins)
 - `test_universe.py` — industry count, symbols per industry, no duplicates, formatting
 - `test_fees.py` — fee constant values, `_sell_net` calculations, FINRA cap boundary
 - `test_imports.py` — every module must import. Added after `production_v2.py` sat unimportable for
-  many versions (a symbol deleted from `upkeep` with the stale import left behind) with no test
-  reaching it. `production_v2` is currently **xfail** pending that deferred fix; `download_5y_data`
-  is excluded because it runs its download loops at import.
+  many versions (`load_mt2_norm_stats`/`save_mt2_norm_stats` deleted from `upkeep` in eb70bea with
+  the stale import left behind) with no test reaching it. That deferred fix landed in v0.6.2.0 —
+  the norm-stats plumbing is gone, `production_v2` is in `MODULES` like every other module, and the
+  xfail marker is retired. `download_5y_data` is excluded because it runs its download loops at
+  import.
+- `test_download_daily.py` — `find_stale_symbols` boundary cases: healthy cohort, the weekend
+  false-positive a calendar-based check would produce, the real frozen-ticker shape, threshold
+  exclusivity, ordering, empty input, and the single-symbol case that must not flag itself.
+- `test_flat_allocation.py` — `--flat-allocation`: even split, positive tiers, `zero_counts`
+  cleared (pre-seeded above the liquidation threshold), MasterNN never called, and the two
+  contrast cases proving flat cannot be expressed as the no-models fallback or via `tiers_to_alloc`.
 - `test_zip_strict.py` — parallel-array guards for the `zip(..., strict=True)` conversion (ruff
   B905). Bare `zip` truncates silently, so a length mismatch yielded a plausible wrong number
   instead of an error; these assert `ValueError` on mismatch and pin the cross-module industry-list
@@ -586,7 +609,7 @@ Version string is defined in `version.py` (`VERSION`) and mirrored as `TRAINER_V
 - `FEATURE` — increment for any new capability or significant improvement; resets `BUILD` to 0.
 - `BUILD` — increment for bug fixes and minor changes within a `FEATURE`.
 
-Current version: **0.6.1.0**
+Current version: **0.6.2.0**
 
 To bump the version, edit `VERSION` in `version.py` and `TRAINER_VERSION` in `training_v4.cpp`, then rebuild the C++ binary.
 

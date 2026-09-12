@@ -28,20 +28,8 @@ import training_lib
 from fees import BUY_FILL, SELL_FILL, _sell_net
 from models import MasterNN, StockNN, stock_close_pos, stock_close_vs_wap
 from universe import INDUSTRIES
-
-# BROKEN — FIX WITH THE NEXT CHANGE TO THIS FILE.
-# `load_mt2_norm_stats` / `save_mt2_norm_stats` no longer exist in upkeep.py: they were deleted in
-# eb70bea (v0.2.0.0, "MT2 48-feature no-norm input") but the import and call sites here were left
-# behind, so `import production_v2` raises ImportError and this module cannot run at all. This is
-# why the 5C production mirror was never runtime-validated — it could not be. `main` is unaffected;
-# the break is specific to the mt1-heads-tails lineage.
-# Fix = remove the norm-stats plumbing entirely (MT2 takes raw MT1 activations, no normalization —
-# see CLAUDE.md). It threads through _load_master_state(), _save_master_state() and
-# run_master_allocation(norm_stats=...). Add a test that merely imports this module so it can't recur.
 from upkeep import (
-    load_mt2_norm_stats,
     run_mt_inference,
-    save_mt2_norm_stats,
     upkeep_industry,
     upkeep_mt1_industry,
     upkeep_mt2,
@@ -126,8 +114,7 @@ def _load_master_state(model_dir, industry_list):
         hist     = {ind: [] for ind in industry_list}
         mkt_hist = {ind: [] for ind in industry_list}
         zcnt     = {ind: 0  for ind in industry_list}
-    norm_stats = load_mt2_norm_stats(model_dir)
-    return hist, mkt_hist, zcnt, norm_stats
+    return hist, mkt_hist, zcnt
 
 def _save_master_state(model_dir, ind_value_history, mkt_val_history, zero_counts):
     try:
@@ -177,7 +164,7 @@ def train_industry_one_day_prod(industry, symbols, yesterday_data, primed_portfo
 
 
 def train_mt_one_day_prod(industries, model_dir, mkt_val_history, pf_val_history,
-                          slot0_deltas, mkt_ret, norm_stats, mt1_outputs_prev=None):
+                          slot0_deltas, mkt_ret, mt1_outputs_prev=None):
     """
     Upkeep training for MT1 (12 dual-head pools) and MT2 (Part C — mirrors the C++ trainer).
 
@@ -458,14 +445,14 @@ def compute_industry_current_values(industries, holdings, histories):
 
 
 def run_master_allocation(master_model, industries, mkt_val_history, pf_val_history, zero_counts,
-                          total_cash, norm_stats=None, model_dir=None):
+                          total_cash, model_dir=None, flat=False):
     """
     Run master inference to get tier classification and capital allocation.
     Mutates zero_counts in place.
 
     mkt_val_history: {ind: [cumulative_market_index]}  — market feature source.
     pf_val_history:  {ind: [cumulative_slot0_portfolio_index]} — portfolio feature source (Part C).
-    Priority: MT2 (mt2_best.pt exists) → legacy MasterNN (market-only 444) → equal allocation.
+    Priority: flat override → MT2 (mt2_best.pt exists) → legacy MasterNN (market-only 444).
     Returns (allocations, tier_map, mt1_outputs).
       allocations:  {ind: dollar_amount}
       tier_map:     {ind: 0-3}
@@ -475,6 +462,26 @@ def run_master_allocation(master_model, industries, mkt_val_history, pf_val_hist
     industry_list = list(industries.keys())
     tier_map      = {ind: 0 for ind in industry_list}
     mt1_outputs   = None
+
+    # Flat override (--flat-allocation): equal weight to every industry, MT1/MT2 skipped.
+    # Deliberately NOT expressed as a fallback. Two traps make the "no models" path unusable
+    # as a stand-in for flat:
+    #   1. With no MT2 and no MasterNN, tier_map stays all-zero and tiers_to_alloc returns
+    #      $0.00 for every industry (n_pos == 0) — an empty book, not an even one.
+    #   2. tiers_to_alloc re-ranks into terciles, so even a uniform positive tier_map comes
+    #      back weighted 1.0/1.5/2.25, not equal. The split has to be done explicitly.
+    # zero_counts is cleared rather than incremented: 3 consecutive tier-0 readings liquidate
+    # an industry's holdings, so leaving it to accumulate would sell the book off on day 3.
+    if flat:
+        n     = len(industry_list)
+        share = total_cash / n if n else 0.0
+        tier_map    = {ind: 1 for ind in industry_list}
+        allocations = {ind: share for ind in industry_list}
+        for ind in industry_list:
+            zero_counts[ind] = 0
+        print(f"Flat allocation: {n} industries x ${share:,.2f} "
+              f"(${total_cash:,.2f} total) — MT1/MT2 inference skipped")
+        return allocations, tier_map, None
 
     # MT2 path — preferred if mt2_best.pt exists (MT2 consumes raw MT1 activations, no norm stats).
     mt2_path = os.path.join(model_dir, 'mt2_best.pt') if model_dir else None
@@ -603,6 +610,9 @@ def main():
     parser.add_argument('--account', default='acct0', help='Account identifier (e.g. acct0); derives models/ACCOUNT/paper|prod and logs/ACCOUNT/paper|prod')
     parser.add_argument('--capital', type=float, default=None, help='Cap total deployed capital regardless of Alpaca account balance')
     parser.add_argument('--withdraw', type=float, help='Amount to withdraw from portfolio')
+    parser.add_argument('--flat-allocation', action='store_true',
+                        help='Allocate capital evenly across all industries, skipping MT1/MT2 '
+                             'inference. Use while MT1/MT2 are unconfirmed.')
     args = parser.parse_args()
 
     subtype   = 'paper' if args.paper else 'prod'
@@ -716,11 +726,11 @@ def main():
 
         # ── Master: predict tier allocations (MT2 preferred, MasterNN fallback) ──
         industry_list     = list(industries.keys())
-        ind_value_history, mkt_val_history, zero_counts, norm_stats = _load_master_state(model_dir, industry_list)
+        ind_value_history, mkt_val_history, zero_counts = _load_master_state(model_dir, industry_list)
         master = load_weighted_model(MasterNN, model_dir, 'master')
         allocations, tier_map, _mt1_inf_outputs = run_master_allocation(
             master, industries, mkt_val_history, ind_value_history, zero_counts, cash,
-            norm_stats=norm_stats, model_dir=model_dir)
+            model_dir=model_dir, flat=args.flat_allocation)
 
         # Liquidate industries with 3+ consecutive tier-0 predictions
         ind_current_values = compute_industry_current_values(industries, holdings, histories)
@@ -1082,8 +1092,7 @@ def main():
             print(f"Running MT1/MT2 upkeep ({min_real_days} history days) ...")
             train_mt_one_day_prod(
                 industries, model_dir, mkt_val_history, ind_value_history,
-                slot0_deltas, mkt_ret, norm_stats)
-            save_mt2_norm_stats(model_dir, norm_stats)
+                slot0_deltas, mkt_ret)
         elif os.path.exists(f"{model_dir}/master_best.pt"):
             # Legacy MasterNN upkeep during transition period (≤15 real days)
             from training_lib import train_master_one_day
