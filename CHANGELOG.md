@@ -5,6 +5,9 @@ Entries are prepended automatically on each commit via the Claude commit hook.
 
 ---
 
+## [104c1cd] — 2026-09-12
+Reconcile the MT1 param constants; delete the dead single-trunk block
+
 ## [efd7a97] — 2026-09-12
 Stage (H-L)/A as a future MT1 vol-channel input
 
