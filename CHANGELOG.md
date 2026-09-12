@@ -5,6 +5,9 @@ Entries are prepended automatically on each commit via the Claude commit hook.
 
 ---
 
+## [3884674] — 2026-09-12
+Swap TMHC -> CCS: Taylor Morrison delisted
+
 ## [a79f007] — 2026-09-12
 download_daily: detect dead tickers instead of reporting them as healthy
 
