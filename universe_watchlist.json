@@ -29,6 +29,14 @@
       "swap_date": "2026-06-20",
       "reason": "Ticker reassigned to unrelated company (People Inc), tradeable=False since 2026-06-12",
       "tko_price_at_swap": 198.78
+    },
+    "TMHC": {
+      "industry": "real_estate",
+      "replaced_with": "CCS",
+      "swap_date": "2026-09-12",
+      "reason": "Delisted/halted \u2014 no yfinance price data since 2026-07-23 ('possibly delisted; no price data found'). Defunct ticker triggers immediate swap, not a watch.",
+      "ccs_price_at_swap": 60.54,
+      "notes": "Century Communities, mid-cap production homebuilder \u2014 closest analog to Taylor Morrison. Ann. vol 42.0% vs real_estate peer range 34.8-52.7%. GRBK ($68.42, 42.2%) and MHO ($139.89, 38.6%) also met all four criteria."
     }
   }
 }

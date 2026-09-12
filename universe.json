@@ -1,175 +1,5 @@
 {
-  "industries": {
-    "tech_hardware": [
-      "NVDA",
-      "AMD",
-      "MU",
-      "SMCI",
-      "MRVL",
-      "ON",
-      "AMAT",
-      "LRCX",
-      "KLAC",
-      "TSM",
-      "SWKS",
-      "MPWR"
-    ],
-    "tech_software_ai": [
-      "PLTR",
-      "SNOW",
-      "DDOG",
-      "NET",
-      "CRWD",
-      "ZS",
-      "PANW",
-      "NOW",
-      "ADBE",
-      "CRM",
-      "FTNT",
-      "OKTA"
-    ],
-    "financials": [
-      "XYZ",
-      "PYPL",
-      "AFRM",
-      "UPST",
-      "MELI",
-      "COIN",
-      "GS",
-      "SCHW",
-      "C",
-      "COF",
-      "BX",
-      "APO"
-    ],
-    "consumer_discretionary": [
-      "TSLA",
-      "RCL",
-      "XPEV",
-      "LI",
-      "APTV",
-      "GM",
-      "LEA",
-      "WYNN",
-      "BKNG",
-      "ABNB",
-      "UBER",
-      "LYFT"
-    ],
-    "consumer_services": [
-      "NFLX",
-      "ROKU",
-      "SPOT",
-      "META",
-      "TKO",
-      "PINS",
-      "DASH",
-      "RBLX",
-      "TTWO",
-      "LYV",
-      "MTCH",
-      "WBD"
-    ],
-    "health_care": [
-      "MRNA",
-      "BNTX",
-      "IMVT",
-      "CRSP",
-      "ARWR",
-      "IONS",
-      "NTRA",
-      "INMD",
-      "HIMS",
-      "BEAM",
-      "ACAD",
-      "BMRN"
-    ],
-    "industrials": [
-      "BA",
-      "GE",
-      "CAT",
-      "DE",
-      "DAL",
-      "UAL",
-      "XPO",
-      "LUV",
-      "ALK",
-      "GNRC",
-      "BTU",
-      "STLD"
-    ],
-    "consumer_staples": [
-      "CELH",
-      "SFM",
-      "ELF",
-      "LULU",
-      "DECK",
-      "YETI",
-      "NKE",
-      "CROX",
-      "DKNG",
-      "PENN",
-      "MGM",
-      "CZR"
-    ],
-    "energy": [
-      "FANG",
-      "DVN",
-      "OXY",
-      "APA",
-      "AR",
-      "EQT",
-      "RRC",
-      "SM",
-      "SLB",
-      "COP",
-      "EOG",
-      "VLO"
-    ],
-    "utilities": [
-      "ENPH",
-      "FSLR",
-      "SEDG",
-      "CWEN",
-      "VST",
-      "BE",
-      "BEP",
-      "DQ",
-      "CSIQ",
-      "JKS",
-      "HASI",
-      "NRG"
-    ],
-    "real_estate": [
-      "DHI",
-      "LEN",
-      "PHM",
-      "TOL",
-      "MTH",
-      "KBH",
-      "BZH",
-      "TMHC",
-      "LGIH",
-      "CSGP",
-      "Z",
-      "SKY"
-    ],
-    "materials": [
-      "NEM",
-      "AEM",
-      "FCX",
-      "SCCO",
-      "TECK",
-      "AA",
-      "SQM",
-      "WPM",
-      "AU",
-      "PAAS",
-      "GFI",
-      "CDE"
-    ]
-  },
-  "all_symbols": [
+  "tech_hardware": [
     "NVDA",
     "AMD",
     "MU",
@@ -181,7 +11,9 @@
     "KLAC",
     "TSM",
     "SWKS",
-    "MPWR",
+    "MPWR"
+  ],
+  "tech_software_ai": [
     "PLTR",
     "SNOW",
     "DDOG",
@@ -193,7 +25,9 @@
     "ADBE",
     "CRM",
     "FTNT",
-    "OKTA",
+    "OKTA"
+  ],
+  "financials": [
     "XYZ",
     "PYPL",
     "AFRM",
@@ -205,7 +39,9 @@
     "C",
     "COF",
     "BX",
-    "APO",
+    "APO"
+  ],
+  "consumer_discretionary": [
     "TSLA",
     "RCL",
     "XPEV",
@@ -217,7 +53,9 @@
     "BKNG",
     "ABNB",
     "UBER",
-    "LYFT",
+    "LYFT"
+  ],
+  "consumer_services": [
     "NFLX",
     "ROKU",
     "SPOT",
@@ -229,7 +67,9 @@
     "TTWO",
     "LYV",
     "MTCH",
-    "WBD",
+    "WBD"
+  ],
+  "health_care": [
     "MRNA",
     "BNTX",
     "IMVT",
@@ -241,7 +81,9 @@
     "HIMS",
     "BEAM",
     "ACAD",
-    "BMRN",
+    "BMRN"
+  ],
+  "industrials": [
     "BA",
     "GE",
     "CAT",
@@ -253,7 +95,9 @@
     "ALK",
     "GNRC",
     "BTU",
-    "STLD",
+    "STLD"
+  ],
+  "consumer_staples": [
     "CELH",
     "SFM",
     "ELF",
@@ -265,7 +109,9 @@
     "DKNG",
     "PENN",
     "MGM",
-    "CZR",
+    "CZR"
+  ],
+  "energy": [
     "FANG",
     "DVN",
     "OXY",
@@ -277,7 +123,9 @@
     "SLB",
     "COP",
     "EOG",
-    "VLO",
+    "VLO"
+  ],
+  "utilities": [
     "ENPH",
     "FSLR",
     "SEDG",
@@ -289,7 +137,9 @@
     "CSIQ",
     "JKS",
     "HASI",
-    "NRG",
+    "NRG"
+  ],
+  "real_estate": [
     "DHI",
     "LEN",
     "PHM",
@@ -297,11 +147,13 @@
     "MTH",
     "KBH",
     "BZH",
-    "TMHC",
+    "CCS",
     "LGIH",
     "CSGP",
     "Z",
-    "SKY",
+    "SKY"
+  ],
+  "materials": [
     "NEM",
     "AEM",
     "FCX",
@@ -314,19 +166,5 @@
     "PAAS",
     "GFI",
     "CDE"
-  ],
-  "industry_names": [
-    "tech_hardware",
-    "tech_software_ai",
-    "financials",
-    "consumer_discretionary",
-    "consumer_services",
-    "health_care",
-    "industrials",
-    "consumer_staples",
-    "energy",
-    "utilities",
-    "real_estate",
-    "materials"
   ]
 }
