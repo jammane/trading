@@ -9,20 +9,80 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# ── StockNN `today` vector layout ──────────────────────────────────────────────
+# Mirrors TODAY_PER_SYM / TODAY_AGG_OFF / TODAY_STATE_OFF / STOCK_RESERVED in
+# training_v4.cpp. The three Python builders (training_lib, production_v2,
+# inspect_trades) append sections in this order, so these are the contract those
+# builders must satisfy — not indices they read.
+TODAY_PER_SYM   = 17                        # per-symbol block width
+TODAY_CLOSE_POS = 15                        # close_pos slot within a block
+TODAY_CLOSE_WAP = 16                        # close vs weighted average price (v0.6.1.0)
+TODAY_RESERVED  = TODAY_CLOSE_WAP           # back-compat alias; slot is no longer reserved
+TODAY_N_SYMS    = 12
+TODAY_AGG_OFF   = TODAY_N_SYMS * TODAY_PER_SYM    # 204 — cross-symbol aggregates start
+TODAY_AGG_LEN   = 15
+TODAY_STATE_OFF = TODAY_AGG_OFF + TODAY_AGG_LEN   # 219 — cash, then 12 holdings
+TODAY_WIDTH     = TODAY_STATE_OFF + 1 + TODAY_N_SYMS   # 232
+
+
+def stock_close_vs_wap(open_, high, low, close):
+    """Close relative to the day's weighted average price (v0.6.1.0, today feature 16).
+
+        A = (2O + 3C + H + L) / 7                 the weighted average price
+        out = (C - A) / A = (4C - 2O - H - L) / (2O + 3C + H + L)
+
+    Shares its NUMERATOR with stock_close_pos; only the denominator differs — 7A here versus
+    7(H-L) there. A sits close to C, so this is effectively the /C normalization, which measured
+    weaker on the tradeable next-intraday leg (within-industry t +0.93 vs +2.54). It is carried
+    anyway because the two together encode (H-L)/A, the range as a fraction of price, which
+    neither gives alone and which the net cannot form itself (no division in a linear layer).
+
+    Mirrors stock_close_vs_wap() in training_v4.cpp. Returns 0.0 on a degenerate bar.
+    """
+    denom = 2.0 * open_ + 3.0 * close + high + low
+    if not denom > 1e-9:
+        return 0.0
+    return (4.0 * close - 2.0 * open_ - high - low) / denom
+
+
+def stock_close_pos(open_, high, low, close):
+    """Intraday position of the close within today's bar (v0.6.0.0, StockNN today feature 15).
+
+        close_pos = (4C - 2O - H - L) / (7(H - L))  ==  2*(C-O)/(H-L) + CLV
+
+    Mirrors stock_close_pos() in training_v4.cpp — keep the two in sync. Returns 0.0 for a
+    zero-range or invalid bar. The denominator is (H-L) rather than C: measured within-industry,
+    normalizing by C leaves the tradeable O->C leg insignificant (t +0.93 vs t +2.54).
+    """
+    rng = high - low
+    if not rng > 1e-9:
+        return 0.0
+    return (4.0 * close - 2.0 * open_ - high - low) / (7.0 * rng)
+
 
 class StockNN(nn.Module):
     """
     FC injection architecture — no LSTM.
 
     history: (1, 15, 60)  — 15 days oldest→newest, OHLCV × 12 stocks
-    today:   (1, 208)     — current day full features:
+    today:   (1, 232)     — current day full features:
                OHLCV×12 (60) + ΔOHLCV×12 (60) + price_pos×12 (12)
                + momentum×12 (12) + volatility×12 (12) + vol_ratio×12 (12)
-               + dvol_ratio×12 (12) + ind_agg (15) + state (13) = 208
+               + dvol_ratio×12 (12) + close_pos×12 (12) + close_vs_wap×12 (12)
+               + ind_agg (15) + state (13) = 232
+
+    close_pos = (4C − 2O − H − L) / (7(H − L)), the intraday position of the close
+    (v0.6.0.0). Equivalently 2·(C−O)/(H−L) + CLV. The raw O/H/L/C above are dollar
+    amounts, so the net can already form this numerator in fc_today but cannot divide;
+    the scale-free normalization is what is outside its span.
+
+    Slot 16 carries close_vs_wap as of v0.6.1.0 = (C - A)/A with A = (2O+3C+H+L)/7. It was
+    held reserved (constant 0.0) in v0.6.0.0 specifically so it could be filled without another
+    breaking retrain: dimensions, offsets and STOCKNN_PARAMS are unchanged between the two.
 
     Seed   (day 15):  60              → FC → 120
     Inject (×14):     (180+5i)+60     → FC → 125+5i  (grows 120→190)
-    Today:            190+208=398     → FC → 300
+    Today:            190+232=422     → FC → 300
     Flat:             300             → FC → 300  (×2)
     Funnel:           300→237→174→111→48
 
@@ -39,7 +99,7 @@ class StockNN(nn.Module):
         self.fc_inject = nn.ModuleList([
             nn.Linear(180 + 5 * i, 125 + 5 * i) for i in range(14)
         ])
-        self.fc_today  = nn.Linear(398, 300)
+        self.fc_today  = nn.Linear(422, 300)
         self.fc_flat1  = nn.Linear(300, 300)
         self.fc_flat2  = nn.Linear(300, 300)
         self.fc_fc1    = nn.Linear(300, 237)
