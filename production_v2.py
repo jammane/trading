@@ -26,7 +26,7 @@ from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, MarketO
 
 import training_lib
 from fees import BUY_FILL, SELL_FILL, _sell_net
-from models import MasterNN, StockNN
+from models import MasterNN, StockNN, stock_close_pos, stock_close_vs_wap
 from universe import INDUSTRIES
 
 # BROKEN — FIX WITH THE NEXT CHANGE TO THIS FILE.
@@ -806,7 +806,7 @@ def main():
             if industry not in active_industries:
                 continue
 
-            # Step 3: normal industry model inference — new 208-feature input, 48 outputs
+            # Step 3: normal industry model inference — 232-feature input, 48 outputs
             model = load_weighted_model(StockNN, model_dir, industry)
             if model is None:
                 print(f"Model for {industry} not found.")
@@ -862,7 +862,7 @@ def main():
                     history_rows.append(row)
                 history_t = torch.tensor(history_rows, dtype=torch.float32).unsqueeze(0)  # (1,15,60)
 
-                # today_t: (1,208) — full features for current day
+                # today_t: (1,232) — full features for current day
                 state_vec = [allocated_cash] + [holdings.get(sym, 0.0) for sym in symbols]
                 today_row = []
                 today_dl  = []
@@ -880,7 +880,11 @@ def main():
                                    raw_t[1] / st['avg_c'],
                                    st['volatility'],
                                    raw_t[4] / st['avg_v'],
-                                   (raw_t[0] * raw_t[4]) / st['avg_dv']])
+                                   (raw_t[0] * raw_t[4]) / st['avg_dv'],
+                                   stock_close_pos(raw_t[0], raw_t[2],
+                                                   raw_t[3], raw_t[1]),
+                                   stock_close_vs_wap(raw_t[0], raw_t[2],
+                                                      raw_t[3], raw_t[1])])
                     today_dl.append(dlt_t)
                 if today_dl:
                     tr = list(zip(*today_dl, strict=True))
@@ -888,7 +892,7 @@ def main():
                 else:
                     today_row += [0.0] * 15
                 today_row += state_vec
-                today_t = torch.tensor(today_row, dtype=torch.float32).unsqueeze(0)  # (1,208)
+                today_t = torch.tensor(today_row, dtype=torch.float32).unsqueeze(0)  # (1,232)
 
                 with torch.no_grad():
                     out = model(history_t, today_t)

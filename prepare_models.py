@@ -23,7 +23,7 @@ STOCK_LAYER_DEFS = [
     ('fc_seed',  120,  60),
     # inject layers 0..13: fc_inject.{i}
     *[(f'fc_inject.{i}', 125 + 5 * i, 180 + 5 * i) for i in range(14)],
-    ('fc_today', 300, 398),
+    ('fc_today', 300, 422),
     ('fc_flat1', 300, 300),
     ('fc_flat2', 300, 300),
     ('fc_fc1',   237, 300),

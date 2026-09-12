@@ -3,7 +3,7 @@
 // Run:   ./build/training_v4_cpp --output models [--load-dir DIR] [--start-day N] [--stop-day N]
 //        [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F] [--workers N]
 
-#define TRAINER_VERSION "0.5.0.1"
+#define TRAINER_VERSION "0.6.1.0"
 
 #include <algorithm>
 #include <atomic>
@@ -143,7 +143,7 @@ static constexpr float FINRA_TAF_PER_SHARE = 0.000166f;
 static constexpr float FINRA_TAF_MAX       = 8.30f;
 static constexpr float SLIPPAGE_RATE       = 0.001f;
 
-static constexpr int   STOCKNN_PARAMS  = 921625;
+static constexpr int   STOCKNN_PARAMS  = 928825;
 // New flat 5-layer MasterNN: 444→444→444→312→180→48
 // fc1: 444×444+444=197580  fc2: +197580=395160  fc3: 444×312+312=138840→534000
 // fc4: 312×180+180=56340→590340  fc_out: 180×48+48=8688→599028
@@ -229,6 +229,13 @@ static int  g_dir_reps = 20;
 
 // ── Layer dimensions ───────────────────────────────────────────────────────────
 
+// today vector width, and the fc_today input width it implies. The `cat` scratch buffer in
+// stock_forward is reused for BOTH the inject-layer concatenations (max in_sz 245) and the today
+// concatenation, so it must be sized for the larger of the two — it was a bare literal (420) and
+// a 232-wide today vector overflowed it by two floats, segfaulting only once the width grew.
+static constexpr int STOCK_TODAY_DIM = 232;                      // today_arr width
+static constexpr int STOCK_TODAY_IN  = 190 + STOCK_TODAY_DIM;    // 422 = fc_today inputs
+
 static constexpr int STOCK_INJ_IN [14] = {180,185,190,195,200,205,210,215,220,225,230,235,240,245};
 static constexpr int STOCK_INJ_OUT[14] = {125,130,135,140,145,150,155,160,165,170,175,180,185,190};
 
@@ -244,19 +251,19 @@ static constexpr int STOCK_INJ_B[14] = {
     270960,309375,349795,392270,436850,483585
 };
 static constexpr int STOCK_TODAY_W = 483775;
-static constexpr int STOCK_TODAY_B = 603175;
-static constexpr int STOCK_FLAT1_W = 603475;
-static constexpr int STOCK_FLAT1_B = 693475;
-static constexpr int STOCK_FLAT2_W = 693775;
-static constexpr int STOCK_FLAT2_B = 783775;
-static constexpr int STOCK_FC1_W   = 784075;
-static constexpr int STOCK_FC1_B   = 855175;
-static constexpr int STOCK_FC2_W   = 855412;
-static constexpr int STOCK_FC2_B   = 896650;
-static constexpr int STOCK_FC3_W   = 896824;
-static constexpr int STOCK_FC3_B   = 916138;
-static constexpr int STOCK_OUT_W   = 916249;
-static constexpr int STOCK_OUT_B   = 921577;
+static constexpr int STOCK_TODAY_B = 610375;
+static constexpr int STOCK_FLAT1_W = 610675;
+static constexpr int STOCK_FLAT1_B = 700675;
+static constexpr int STOCK_FLAT2_W = 700975;
+static constexpr int STOCK_FLAT2_B = 790975;
+static constexpr int STOCK_FC1_W   = 791275;
+static constexpr int STOCK_FC1_B   = 862375;
+static constexpr int STOCK_FC2_W   = 862612;
+static constexpr int STOCK_FC2_B   = 903850;
+static constexpr int STOCK_FC3_W   = 904024;
+static constexpr int STOCK_FC3_B   = 923338;
+static constexpr int STOCK_OUT_W   = 923449;
+static constexpr int STOCK_OUT_B   = 928777;
 
 // Float offsets into the flat weight array for MasterNN (5-layer flat FC)
 static constexpr int MAST_FC1_W   = 0;
@@ -318,12 +325,44 @@ static inline float sigmoidf(float x) { return 1.f / (1.f + expf(-x)); }
 
 // MT1 decode helpers (mt1_conf / mt1_conf4 / mt1_range_pct / mt1_delta_t) live in mt1_scoring.h
 
+// Close relative to the day's weighted average price (v0.6.1.0, StockNN today feature 16).
+//   A   = (2O + 3C + H + L) / 7
+//   out = (C - A)/A = (4C - 2O - H - L) / (2O + 3C + H + L)
+// Shares its NUMERATOR with stock_close_pos below; only the denominator differs (7A vs 7(H-L)).
+// A sits close to C, so this is effectively the /C normalization — measured weaker on the
+// tradeable next-intraday leg (within-industry t +0.93 vs +2.54). Carried anyway because the two
+// together encode (H-L)/A, the range as a fraction of price, which a linear layer cannot form
+// from either alone. Occupies the slot held reserved in v0.6.0.0, so STOCKNN_PARAMS, every
+// offset and every .bin layout are UNCHANGED from v0.6.0.0 — that was the point of reserving it.
+static inline float stock_close_vs_wap(float o, float h, float l, float c) {
+    float denom = 2.f * o + 3.f * c + h + l;
+    if (!(denom > 1e-9f)) return 0.f;
+    return (4.f * c - 2.f * o - h - l) / denom;
+}
+
+// Intraday position of the close within today's bar (v0.6.0.0, StockNN today feature 15).
+//   close_pos = (4C - 2O - H - L) / (7(H - L))  ==  2*(C-O)/(H-L) + CLV
+// Measured within-industry rank IC vs next-day targets (144 syms x 1254 days, one obs/day):
+//   overnight gap C->O  -0.0371 (t -10.90);  next intraday O->C  +0.0081 (t +2.54),
+//   and +0.0129 (t +4.49) after orthogonalizing against the prior-day return, which carries
+//   none of it (t -0.28). A strong close gaps down, then reverts during the next session —
+//   the O->C leg is the one the fill model can reach.
+// The raw O/H/L/C inputs are dollar amounts, so fc_today can already form this numerator;
+// it cannot divide, so the scale-free normalization is what this feature actually adds.
+// Denominator is (H-L), not C: with /C the O->C leg is not significant (t +0.93).
+static inline float stock_close_pos(float o, float h, float l, float c) {
+    float rng = h - l;
+    if (!(rng > 1e-9f)) return 0.f;          // zero-range or invalid bar
+    return (4.f * c - 2.f * o - h - l) / (7.f * rng);
+}
+
 // StockNN forward — weights[] is STOCKNN_PARAMS floats in the offset layout above.
-// hist15x60 is row-major [15][60], row 0 = oldest.  today208 is [208].
+// hist15x60 is row-major [15][60], row 0 = oldest.  today232 is [232].
 // Output out48 is [48] = reshape of [12][4]; activations applied per column.
 static void stock_forward(const float* W, const float* hist15x60,
-                          const float* today208, float* out48) {
-    float x[300], y[300], cat[420], fc1[237], fc2[174], fc3[111];
+                          const float* today232, float* out48) {
+    float x[300], y[300], cat[STOCK_TODAY_IN], fc1[237], fc2[174], fc3[111];
+    static_assert(STOCK_TODAY_IN >= STOCK_INJ_IN[13], "cat too small for inject concat");
 
     // Seed: hist[0][60] → 120
     sgemv_relu(W + STOCK_SEED_W, W + STOCK_SEED_B, hist15x60, x, 120, 60);
@@ -340,10 +379,10 @@ static void stock_forward(const float* W, const float* hist15x60,
         xsz = out_sz;  // 125, 130, ..., 190
     }
 
-    // Today: cat(x[190], today[208]) = 398 → 300
+    // Today: cat(x[190], today[STOCK_TODAY_DIM]) = STOCK_TODAY_IN → 300
     memcpy(cat, x, 190 * sizeof(float));
-    memcpy(cat + 190, today208, 208 * sizeof(float));
-    sgemv_relu(W + STOCK_TODAY_W, W + STOCK_TODAY_B, cat, x, 300, 398);
+    memcpy(cat + 190, today232, STOCK_TODAY_DIM * sizeof(float));
+    sgemv_relu(W + STOCK_TODAY_W, W + STOCK_TODAY_B, cat, x, 300, STOCK_TODAY_IN);
 
     // Flat layers
     sgemv_relu(W + STOCK_FLAT1_W, W + STOCK_FLAT1_B, x, y, 300, 300);
@@ -832,7 +871,7 @@ static void init_stock_weights(float* W, PCG32& rng) {
         for (int k = 0; k < out_sz; k++)
             W[STOCK_INJ_B[i] + k] = (rng.next_float() * 2.f - 1.f) * bound;
     }
-    kaiming_init(W + STOCK_TODAY_W, 300, 398, rng);
+    kaiming_init(W + STOCK_TODAY_W, 300, STOCK_TODAY_IN, rng);
     kaiming_init(W + STOCK_FLAT1_W, 300, 300, rng);
     kaiming_init(W + STOCK_FLAT2_W, 300, 300, rng);
     kaiming_init(W + STOCK_FC1_W,   237, 300, rng);
@@ -1177,10 +1216,19 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         }
     }
 
-    // today_arr: [208]
+    // today_arr: [232]
     // per sym: 5 raw + 5 delta + 5 normalized = 15 × 12 = 180
     // + 15 cross-sym delta aggs + 13 state
-    float today_arr[208] = {};
+    // Slot 16: reserved in v0.6.0.0, filled in v0.6.1.0 with close_vs_wap. Filling it changed
+    // no dimension, no offset and no file format — which is exactly what reserving it bought.
+    static constexpr int STOCK_CLOSE_WAP = 16;
+
+    // Section offsets into today_arr. Per-symbol blocks occupy [0, TODAY_AGG_OFF).
+    static constexpr int TODAY_PER_SYM   = 17;                          // v0.6.0.0: was 15
+    static constexpr int TODAY_AGG_OFF   = IND_SYMS * TODAY_PER_SYM;    // 204
+    static constexpr int TODAY_STATE_OFF = TODAY_AGG_OFF + 15;          // 219
+    static_assert(TODAY_STATE_OFF + 1 + IND_SYMS == STOCK_TODAY_DIM, "today_arr layout drift");
+    float today_arr[STOCK_TODAY_DIM] = {};
     float today_dl[IND_SYMS][5] = {};  // raw delta per sym, for cross-sym aggs
 
     for (int j = 0; j < IND_SYMS; j++) {
@@ -1197,17 +1245,19 @@ static IndResult step_industry(int ind_i, IndustryState& state,
 
         const SymStats& st = sym_stats[j];
         float rng_15 = std::max(st.hi15 - st.lo15, 1e-9f);
-        int base = j * 15;
+        int base = j * TODAY_PER_SYM;
         // raw(5)
         for (int k = 0; k < 5; k++) today_arr[base + k]     = raw_t[k];
         // delta(5)
         for (int k = 0; k < 5; k++) today_arr[base + 5 + k] = dlt_t[k];
-        // normalized(5)
+        // normalized(7)
         today_arr[base + 10] = (raw_t[1] - st.lo15) / rng_15;
         today_arr[base + 11] = raw_t[1] / st.avg_c;
         today_arr[base + 12] = st.volatility;
         today_arr[base + 13] = raw_t[4] / st.avg_v;
         today_arr[base + 14] = (raw_t[0] * raw_t[4]) / st.avg_dv;
+        today_arr[base + 15] = stock_close_pos(raw_t[0], raw_t[2], raw_t[3], raw_t[1]);
+        today_arr[base + STOCK_CLOSE_WAP] = stock_close_vs_wap(raw_t[0], raw_t[2], raw_t[3], raw_t[1]);
     }
     // Cross-sym aggs: for each of 5 delta channels: max, min, mean
     for (int k = 0; k < 5; k++) {
@@ -1217,13 +1267,13 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             if (today_dl[j][k] < mn) mn = today_dl[j][k];
             sm += today_dl[j][k];
         }
-        today_arr[180 + k * 3 + 0] = mx;
-        today_arr[180 + k * 3 + 1] = mn;
-        today_arr[180 + k * 3 + 2] = sm / IND_SYMS;
+        today_arr[TODAY_AGG_OFF + k * 3 + 0] = mx;
+        today_arr[TODAY_AGG_OFF + k * 3 + 1] = mn;
+        today_arr[TODAY_AGG_OFF + k * 3 + 2] = sm / IND_SYMS;
     }
     // State: [cash, holdings[12]]
-    today_arr[195] = ref_cash;
-    for (int j = 0; j < IND_SYMS; j++) today_arr[196 + j] = ref_hold[j];
+    today_arr[TODAY_STATE_OFF] = ref_cash;
+    for (int j = 0; j < IND_SYMS; j++) today_arr[TODAY_STATE_OFF + 1 + j] = ref_hold[j];
 
     // ── Inference + trade loop ────────────────────────────────────────────────
     float slot_scores[N_SLOTS];

@@ -5,6 +5,9 @@ Entries are prepended automatically on each commit via the Claude commit hook.
 
 ---
 
+## [2570e6b] — 2026-09-12
+v0.6.1.0: StockNN close_pos + close_vs_wap per-symbol features (BREAKING)
+
 ## [8b27044] — 2026-06-01
 Correct development status: paper trading untested
 

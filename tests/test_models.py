@@ -4,7 +4,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from models import MT1NN, MT2NN, MasterNN, MT1DualHead, MT1Head, MT1Tail, StockNN
+import models
+from models import MT1NN, MT2NN, MasterNN, MT1DualHead, MT1Head, MT1Tail, StockNN, stock_close_pos, stock_close_vs_wap
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
 
@@ -12,7 +13,7 @@ from models import MT1NN, MT2NN, MasterNN, MT1DualHead, MT1Head, MT1Tail, StockN
 def stock_inputs():
     torch.manual_seed(0)
     history = torch.randn(1, 15, 60)
-    today   = torch.randn(1, 208)
+    today   = torch.randn(1, 232)
     return history, today
 
 
@@ -103,7 +104,7 @@ class TestStockNN:
 
     def test_today_layer_dims(self):
         model = StockNN()
-        assert model.fc_today.in_features  == 398  # 190 (final hidden) + 208 (today features)
+        assert model.fc_today.in_features  == 422  # 190 (final hidden) + 232 (today features)
         assert model.fc_today.out_features == 300
 
     def test_output_layer_dims(self):
@@ -383,3 +384,126 @@ class TestMT2NN:
     def test_no_inf(self, mt2_inputs):
         assert not torch.isinf(MT2NN()(mt2_inputs)).any()
 
+
+class TestStockClosePos:
+    """close_pos = (4C - 2O - H - L) / (7(H - L)) — StockNN today feature 15 (v0.6.0.0).
+
+    Must stay identical to stock_close_pos() in training_v4.cpp.
+    """
+
+    def test_close_at_high_of_a_bar_that_opened_at_the_low(self):
+        # O=L=0, H=C=1  ->  (4 - 0 - 1 - 0) / 7 = 3/7
+        assert stock_close_pos(0.0, 1.0, 0.0, 1.0) == pytest.approx(3.0 / 7.0)
+
+    def test_close_at_low_of_a_bar_that_opened_at_the_high(self):
+        # O=H=1, C=L=0  ->  (0 - 2 - 1 - 0) / 7 = -3/7
+        assert stock_close_pos(1.0, 1.0, 0.0, 0.0) == pytest.approx(-3.0 / 7.0)
+
+    def test_unchanged_midrange_bar_is_zero(self):
+        # O=C=0.5, H=1, L=0  ->  (2 - 1 - 1 - 0) / 7 = 0
+        assert stock_close_pos(0.5, 1.0, 0.0, 0.5) == pytest.approx(0.0)
+
+    def test_zero_range_bar_returns_zero_not_nan(self):
+        assert stock_close_pos(10.0, 10.0, 10.0, 10.0) == 0.0
+
+    def test_invalid_bar_returns_zero(self):
+        assert stock_close_pos(0.0, 0.0, 0.0, 0.0) == 0.0
+
+    def test_scale_free(self):
+        """Same bar shape at two price levels must give the same value — the whole point of
+        dividing by (H-L) rather than feeding the raw dollar numerator."""
+        cheap = stock_close_pos(10.0, 11.0, 9.0, 10.5)
+        rich  = stock_close_pos(400.0, 440.0, 360.0, 420.0)
+        assert cheap == pytest.approx(rich)
+
+    def test_equals_two_intraday_plus_clv(self):
+        """Identity: close_pos == (2*(C-O)/(H-L) + CLV) / 7 * 7 ... i.e. 2A + B over 7."""
+        o, hi, lo, c = 12.0, 15.0, 11.0, 14.0
+        a = (c - o) / (hi - lo)
+        clv = ((c - lo) - (hi - c)) / (hi - lo)
+        assert stock_close_pos(o, hi, lo, c) == pytest.approx((2 * a + clv) / 7.0)
+
+    def test_bounded_for_real_bars(self):
+        """L <= O,C <= H implies close_pos in [-3/7, 3/7]."""
+        for o, hi, lo, c in [(1, 2, 0.5, 1.5), (5, 5.2, 4.1, 4.2), (100, 140, 99, 139)]:
+            v = stock_close_pos(float(o), float(hi), float(lo), float(c))
+            assert -3.0 / 7.0 - 1e-9 <= v <= 3.0 / 7.0 + 1e-9
+
+
+class TestTodayLayout:
+    """The `today` vector's section arithmetic (v0.6.0.0).
+
+    These constants mirror training_v4.cpp; a change on one side that is not mirrored on the
+    other silently misaligns every feature past the first symbol block, which stays in bounds
+    and so produces plausible wrong numbers rather than a crash.
+    """
+
+    def test_width_matches_the_model_input(self):
+        model = StockNN()
+        assert model.fc_today.in_features == 190 + models.TODAY_WIDTH
+
+    def test_sections_tile_the_vector_without_gap_or_overlap(self):
+        per_sym = models.TODAY_N_SYMS * models.TODAY_PER_SYM
+        assert per_sym == models.TODAY_AGG_OFF
+        assert models.TODAY_AGG_OFF + models.TODAY_AGG_LEN == models.TODAY_STATE_OFF
+        state_len = 1 + models.TODAY_N_SYMS
+        assert models.TODAY_STATE_OFF + state_len == models.TODAY_WIDTH
+
+    def test_close_pos_and_reserved_are_the_last_two_slots_of_each_block(self):
+        assert models.TODAY_RESERVED == models.TODAY_PER_SYM - 1
+        assert models.TODAY_CLOSE_POS == models.TODAY_PER_SYM - 2
+
+    def test_reserved_indices_stay_inside_the_symbol_region(self):
+        for j in range(models.TODAY_N_SYMS):
+            assert j * models.TODAY_PER_SYM + models.TODAY_RESERVED < models.TODAY_AGG_OFF
+
+    def test_expected_absolute_indices(self):
+        """Pinned literals — if these move, every .bin on disk is invalidated."""
+        assert models.TODAY_WIDTH == 232
+        assert models.TODAY_AGG_OFF == 204
+        assert models.TODAY_STATE_OFF == 219
+        close_pos = [j * models.TODAY_PER_SYM + models.TODAY_CLOSE_POS
+                     for j in range(models.TODAY_N_SYMS)]
+        assert close_pos == [15, 32, 49, 66, 83, 100, 117, 134, 151, 168, 185, 202]
+
+
+class TestStockCloseVsWap:
+    """close_vs_wap = (C − A)/A with A = (2O+3C+H+L)/7 — today feature 16 (v0.6.1.0).
+
+    Must stay identical to stock_close_vs_wap() in training_v4.cpp.
+    """
+
+    def test_matches_the_explicit_definition(self):
+        o, hi, lo, c = 12.0, 15.0, 11.0, 14.0
+        a = (2 * o + 3 * c + hi + lo) / 7.0
+        assert stock_close_vs_wap(o, hi, lo, c) == pytest.approx((c - a) / a)
+
+    def test_shares_the_numerator_with_close_pos(self):
+        """Both features are (4C−2O−H−L) over a different denominator; the ratio between them
+        is (H−L)/A, the range as a fraction of price. That relationship is the reason both slots
+        are carried, so pin it."""
+        o, hi, lo, c = 20.0, 23.0, 19.0, 22.0
+        a = (2 * o + 3 * c + hi + lo) / 7.0
+        assert (stock_close_pos(o, hi, lo, c) / stock_close_vs_wap(o, hi, lo, c)
+                == pytest.approx(a / (hi - lo)))
+
+    def test_flat_bar_is_zero(self):
+        assert stock_close_vs_wap(10.0, 10.0, 10.0, 10.0) == pytest.approx(0.0)
+
+    def test_strong_close_is_positive_weak_close_negative(self):
+        assert stock_close_vs_wap(10.0, 11.0, 9.5, 11.0) > 0     # closes at the high
+        assert stock_close_vs_wap(11.0, 11.0, 9.5, 9.5) < 0      # closes at the low
+
+    def test_scale_free(self):
+        cheap = stock_close_vs_wap(10.0, 11.0, 9.0, 10.5)
+        rich = stock_close_vs_wap(400.0, 440.0, 360.0, 420.0)
+        assert cheap == pytest.approx(rich)
+
+    def test_degenerate_bar_returns_zero_not_nan(self):
+        assert stock_close_vs_wap(0.0, 0.0, 0.0, 0.0) == 0.0
+
+    def test_slot_16_is_no_longer_reserved(self):
+        assert models.TODAY_CLOSE_WAP == 16
+        assert models.TODAY_RESERVED == models.TODAY_CLOSE_WAP   # alias kept
+        assert models.TODAY_PER_SYM == 17                        # unchanged by filling the slot
+        assert models.TODAY_WIDTH == 232                         # unchanged — that was the point

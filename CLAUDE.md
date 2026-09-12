@@ -46,7 +46,7 @@ kubectl create secret generic alpaca-credentials-acct0-prod \
     --from-literal=ALPACA_SECRET_KEY="..." \
     --dry-run=client -o yaml | kubectl apply -f -
 ```
-All 128 pytest tests (including `test_models.py`) run on the droplet where torch is available.
+All 157 pytest tests (including `test_models.py`) run on the droplet where torch is available.
 The pre-commit hook runs the full suite automatically before every `git commit`.
 
 **Lint:**
@@ -110,6 +110,10 @@ Always use real disk paths (`models/acct0/training`, `logs/`, `/root/diag_logs`)
 MT1 trains via direction/delta/range scoring starting at `actual_day >= 25`; MT2 trains via tier-classification starting at `actual_day >= 30`.
 `convert_weights.py` is required after C++ training before using `inspect_trades.py` or `production_v2.py`.
 Note: existing master `.bin` files are incompatible after the MT1/MT2 architecture change — regenerate with `prepare_models.py`.
+**v0.6.0.0 is BREAKING for StockNN too:** `STOCKNN_PARAMS` changed 921625 → 928825, so every
+industry `.bin`/`.pt`, every elite pool and every `{ind}_hist.bin` ring from v0.5.0.0 or earlier is
+unloadable. `load_bin` validates by exact element count and falls back to **random init silently**,
+so a stale run directory looks like it works. Start from a clean `--output` directory and retrain.
 
 **Inspect MT1/MT2 training log:**
 
@@ -236,8 +240,8 @@ Runs all five steps: updates `universe_acct0.py` and regenerates `universe.json`
 
 ## Tests
 
-128 pytest tests (+1 xfail) across five files in `tests/`:
-- `test_models.py` — output shapes, output constraints (ReLU/sigmoid/softmax), serialization roundtrip, inject-layer growth dimensions; MT1NN/MT2NN shape + activation + forward tests
+157 pytest tests (+1 xfail) across five files in `tests/`:
+- `test_models.py` — output shapes, output constraints (ReLU/sigmoid/softmax), serialization roundtrip, inject-layer growth dimensions; MT1NN/MT2NN shape + activation + forward tests; `stock_close_pos` value/identity/scale-free/degenerate-bar tests and `TestTodayLayout` section-offset tests (both must mirror the C++ twins)
 - `test_universe.py` — industry count, symbols per industry, no duplicates, formatting
 - `test_fees.py` — fee constant values, `_sell_net` calculations, FINRA cap boundary
 - `test_imports.py` — every module must import. Added after `production_v2.py` sat unimportable for
@@ -258,7 +262,45 @@ A `PreToolUse` hook in `.claude/settings.json` runs the suite automatically befo
 
 All model classes are defined in `models.py` (single source of truth) and imported everywhere:
 
-- **`StockNN`** — one instance per industry sector (12 sectors). FC injection architecture: seed day → 14 inject layers → today layer → 2 flat layers → funnel. Output is `(12, 4)` — one row per stock in the sector, columns are `[buy_qty, buy_price_frac, sell_all_price_frac, sell_qty]`.
+- **`StockNN`** — one instance per industry sector (12 sectors). FC injection architecture: seed day → 14 inject layers → today layer → 2 flat layers → funnel. Output is `(12, 4)` — one row per stock in the sector, columns are `[buy_qty, buy_price_frac, sell_all_price_frac, sell_qty]`. The `today` vector is **232** wide as of v0.6.0.0 (was 208): 17 features per symbol × 12 + 15 cross-sym aggs + 13 state. `STOCKNN_PARAMS = 928825` (was 921625; `fc_today` is 422→300).
+
+  **`close_pos` (today feature 15, v0.6.0.0 — BREAKING).** `(4C − 2O − H − L) / (7(H − L))`, the
+  intraday position of the close within today's bar; equivalently `2·(C−O)/(H−L) + CLV`. Defined in
+  `models.stock_close_pos` and mirrored by `stock_close_pos()` in `training_v4.cpp` — **keep the two
+  in sync**; returns 0.0 for a zero-range or invalid bar. Measured within-industry rank IC vs
+  next-day targets (144 symbols × 1254 days, one observation per day): overnight gap C→O
+  **−0.0371 (t −10.90)**; next intraday O→C **+0.0081 (t +2.54)**, rising to **+0.0129 (t +4.49)**
+  after orthogonalizing against the prior-day return, which carries none of it (t −0.28). A strong
+  close gaps down overnight and reverts during the next session; the O→C leg is the one the fill
+  model can reach. It is additive because `today` already holds O/H/L/C as **raw dollars**, so
+  `fc_today` can form the numerator in its first layer but cannot divide — the scale-free
+  normalization is what lies outside its span, and nothing else in the normalized block
+  (`base+10..14`) describes position within *today's* bar. The denominator is `(H−L)` and not `C`:
+  with `/C` the tradeable O→C leg is not significant (t +0.93 vs t +2.54). Rejected alternatives
+  (weighted price bases, range features as separate inputs, free-weighted two-input split) are
+  recorded in the v0.6.0.0 changelog entry.
+
+  **`close_vs_wap` (today feature 16, v0.6.1.0).** `(C − A)/A` where `A = (2O+3C+H+L)/7` is the
+  weighted average price; equals `(4C − 2O − H − L)/(2O + 3C + H + L)`. It **shares its numerator
+  with `close_pos`** and differs only in denominator — `7A` versus `7(H−L)`. Since `A` sits close
+  to `C` this is effectively the `/C` normalization, which measured *weaker* on the tradeable
+  next-intraday leg (within-industry t +0.93 vs +2.54). It is carried anyway because the two
+  together encode `(H−L)/A`, the range as a fraction of price: their ratio is exactly `A/(H−L)`,
+  a relationship no linear layer can form from either feature alone. Defined in
+  `models.stock_close_vs_wap`, mirrored by `stock_close_vs_wap()` in `training_v4.cpp`.
+
+  Slot 16 was held **reserved** (constant `0.0`) in v0.6.0.0 precisely so it could be filled
+  later. Filling it in v0.6.1.0 changed **no dimension, no offset, no file format and no
+  `STOCKNN_PARAMS`** — v0.6.0.0 and v0.6.1.0 models are binary-compatible, and the reservation is
+  what bought that. `models.TODAY_RESERVED` remains as an alias for `TODAY_CLOSE_WAP`.
+
+  Section offsets in `today_arr` are named constants (`STOCK_RESERVED`, `TODAY_PER_SYM`,
+  `TODAY_AGG_OFF`, `TODAY_STATE_OFF`) guarded by a `static_assert` — they were bare literals
+  (`180`, `195`, `196`) before v0.6.0.0 and are the thing that silently breaks if the per-symbol
+  block changes width. The Python side mirrors them as module constants in `models.py`
+  (`TODAY_PER_SYM`, `TODAY_CLOSE_POS`, `TODAY_CLOSE_WAP`, `TODAY_AGG_OFF`, `TODAY_STATE_OFF`,
+  `TODAY_WIDTH`), pinned by `TestTodayLayout`. A mismatch between the two sides misaligns every
+  feature past the first symbol block while staying in bounds — plausible wrong numbers, no crash.
 - **`MasterNN`** — legacy single cross-sector allocator (444→48). Kept for backward compatibility; superseded by MT1+MT2 in production once MT2 models are available.
 - **`MT1NN`** (37→4, ~3,412 params per slot) — per-industry preprocessor. **Five independent 200-slot pools per industry** (composite, direction, accuracy, range, confidence); see "MT1 pools" under MT1 scoring formulas. Input: one industry's 37-feature slice of the 444-feature master vector. Outputs (raw logits, activations applied at score time): `sigmoid(out[0])` = direction confidence P(positive return), `tanh(out[1])×$10K` = dollar P&L prediction, `softplus(out[2])` = range as fraction of effective delta, `sigmoid(out[3])` = calibrated confidence. Activates at `actual_day >= 25`; scored over a 10-day linear-weighted window. Files: `mt1_{industry}_model_{n}.pt` / `mt1_{industry}_best.pt`.
 - **`MT2NN`** (FC+LSTM→48, ~34,572 params per slot) — cross-industry allocator. Replaces `MasterNN`. Input: 48 raw MT1 slot0 activations (4 per industry × 12 industries, no normalization — dollar magnitude IS the allocation signal). Parallel FC branch (48→36→36) + 2-layer LSTM (input=4, hidden=36) → concat 72 → taper (72→66→60→54→48). Activates at `actual_day >= 30`. Files: `mt2_model_{n}.pt` / `mt2_best.pt`.
@@ -544,7 +586,7 @@ Version string is defined in `version.py` (`VERSION`) and mirrored as `TRAINER_V
 - `FEATURE` — increment for any new capability or significant improvement; resets `BUILD` to 0.
 - `BUILD` — increment for bug fixes and minor changes within a `FEATURE`.
 
-Current version: **0.5.0.0**
+Current version: **0.6.1.0**
 
 To bump the version, edit `VERSION` in `version.py` and `TRAINER_VERSION` in `training_v4.cpp`, then rebuild the C++ binary.
 

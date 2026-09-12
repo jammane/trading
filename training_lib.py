@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from fees import BUY_FILL, SLIPPAGE_RATE, _sell_net
-from models import MasterNN, StockNN
+from models import MasterNN, StockNN, stock_close_pos, stock_close_vs_wap
 
 DUMP_DIR = 'data_dump'  # overridden by production_v2.py to logs/ACCOUNT/SUBTYPE/data_dump
 
@@ -1198,7 +1198,7 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
         history_rows.append(row)
     history_t = torch.tensor(history_rows, dtype=torch.float32).unsqueeze(0)  # (1,15,60)
 
-    # today_t: (1, 208) — full feature set for current day
+    # today_t: (1, 232) — full feature set for current day
     port0     = portfolios[0]
     state_vec = [port0['cash']] + [port0['holdings'].get(sym, 0.0) for sym in symbols]
     today_row = []
@@ -1217,6 +1217,8 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
             st['volatility'],
             raw_t[4] / st['avg_v'],
             (raw_t[0] * raw_t[4]) / st['avg_dv'],
+            stock_close_pos(raw_t[0], raw_t[2], raw_t[3], raw_t[1]),
+            stock_close_vs_wap(raw_t[0], raw_t[2], raw_t[3], raw_t[1]),
         ])
         today_dl.append(dlt_t)
     if today_dl:
@@ -1226,7 +1228,7 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
     else:
         today_row += [0.0] * 15
     today_row += state_vec
-    today_t = torch.tensor(today_row, dtype=torch.float32).unsqueeze(0)    # (1,208)
+    today_t = torch.tensor(today_row, dtype=torch.float32).unsqueeze(0)    # (1,232)
 
     # ── Step 2: sequential load → infer → trade → evict ──────────────────────
     buy_exec_count   = 0

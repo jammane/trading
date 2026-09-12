@@ -47,7 +47,7 @@ import torch
 import yfinance as yf
 
 from fees import BUY_FILL, SLIPPAGE_RATE, _sell_net
-from models import StockNN
+from models import StockNN, stock_close_pos, stock_close_vs_wap
 from universe import INDUSTRIES
 
 
@@ -193,7 +193,7 @@ def resolve_date_from_index(day_index, stock_data_dir, all_symbols):
 
 # ── Feature builder (mirrors step_industry in training_v2.py) ─────────────────
 def build_input(symbols, histories, day_data, cash, holdings):
-    """Build history_t (1,15,60) and today_t (1,208) tensors for one forward pass.
+    """Build history_t (1,15,60) and today_t (1,232) tensors for one forward pass.
     Mirrors the feature engineering in training_v2.step_industry exactly.
     Returns (history_t, today_t, sym_stats)."""
     sym_stats = {}
@@ -230,7 +230,7 @@ def build_input(symbols, histories, day_data, cash, holdings):
         history_rows.append(row)
     history_t = torch.tensor(history_rows, dtype=torch.float32).unsqueeze(0)  # (1,15,60)
 
-    # today_t: (1, 208) — full feature set for current day
+    # today_t: (1, 232) — full feature set for current day
     state_vec = [cash] + [holdings.get(sym, 0.0) for sym in symbols]
     today_row = []
     today_dl  = []
@@ -248,6 +248,8 @@ def build_input(symbols, histories, day_data, cash, holdings):
             st['volatility'],
             raw_t[4] / st['avg_v'],
             (raw_t[0] * raw_t[4]) / st['avg_dv'],
+            stock_close_pos(raw_t[0], raw_t[2], raw_t[3], raw_t[1]),
+            stock_close_vs_wap(raw_t[0], raw_t[2], raw_t[3], raw_t[1]),
         ])
         today_dl.append(dlt_t)
     if today_dl:
@@ -257,7 +259,7 @@ def build_input(symbols, histories, day_data, cash, holdings):
     else:
         today_row += [0.0] * 15
     today_row += state_vec
-    today_t = torch.tensor(today_row, dtype=torch.float32).unsqueeze(0)    # (1,208)
+    today_t = torch.tensor(today_row, dtype=torch.float32).unsqueeze(0)    # (1,232)
 
     return history_t, today_t, sym_stats
 
