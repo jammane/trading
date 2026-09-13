@@ -5,6 +5,9 @@ Entries are prepended automatically on each commit via the Claude commit hook.
 
 ---
 
+## [f44c685] — 2026-09-13
+Stage per-industry proportional pass-boundary seeding (StockNN)
+
 ## [104c1cd] — 2026-09-12
 Reconcile the MT1 param constants; delete the dead single-trunk block
 
