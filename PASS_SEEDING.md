@@ -64,11 +64,83 @@ each set, degenerate 0%/100% terminate cleanly, no infinite loop.
 Mutations generate normally. After day 1 is scored, `selection_and_mutation` imposes the standard
 layout (0–16 elites, 17–19 wavg, 20–199 mutations) as usual. No special ranking pass is needed.
 
-**5. Champion.** The better of the two passes becomes the new `pass_old`; the other is not
-retained. Two snapshots live at any time.
+**5. Champion.** The better of the two passes becomes the new reference for the next boundary.
+Because each boundary compares the champion against the finishing pass, the champion is already a
+running maximum under the metric — so it doubles as the **reserve** for the final deliverable and
+only one store is needed. A wrong gate call can therefore never cost the best models.
 
-**6. Reserve.** The best ending model set is held separately for the final deliverable,
-independent of seeding, so a wrong gate call can never cost the best models.
+## Persistence
+
+The design above is not implementable without somewhere to record *what the champion scored* and
+*where its weights live*. Two facts force this:
+
+- The metric is otherwise recoverable only by regex-scraping `prod=$` out of a 39 MB `train.log`.
+  The trainer would be reading back its own console output as load-bearing state.
+- **After the first boundary the champion is a per-industry composite.** `energy`'s champion may
+  come from pass 2 while `financials`' comes from pass 1, so no single pass directory or log
+  section describes "the champion". Per-industry scores must be recorded when crowned and carried
+  forward.
+
+### `pass_reference.csv`
+
+Lives in the run's model directory (`models/acct#/training/`) beside the weights — it is
+load-bearing state that must travel with them, not a log.
+
+```
+pass,industry,day_start,day_end,champ_pass,champ_pct,chal_pass,chal_pct,regime,share_new,slots_new,new_champ_pass,new_champ_pct
+```
+
+Append-only, one row per industry per boundary. The reader takes the **last row per industry** and
+reads `new_champ_pass` / `new_champ_pct` — the champion entering the next comparison. Everything
+earlier is audit trail: every decision the gate made, the inputs it made it on, and what it did.
+
+CSV rather than the `mt1_{ind}_tail_dir_meta.bin` binary-sidecar pattern because this is a decision
+record meant to be read by eye and by pandas. Writing is `fprintf`, reading is `getline` +
+`sscanf`; `training_log.csv` is the precedent. Twelve rows per boundary.
+
+### `champion/`
+
+A sibling directory holding `{ind}_elite_{0..19}.bin` per industry, each copied from whichever pass
+won *that industry*. 20 x 12 x 3.54 MB = **850 MB**, one store serving both champion and reserve.
+
+`convert_weights.py` should target this directory rather than the live training directory when
+producing the deliverable — the last pass is not necessarily the best. On the v0.6.2.1 run's first
+boundary, pass 2 finished **6.2% behind** pass 1.
+
+### Boundary sequence — and its ordering hazard
+
+`load_or_init_industry` reads `{dir}/{ind}_elite_{slot}.bin` from the live output directory and
+`save_industry_elites` writes there, so at the end of pass N **that directory is pass N's elites**.
+Writing the blend into it destroys exactly the models the crowning step then needs. Order matters:
+
+1. Capture the metric: slot-0 baseline at `stop_day - 15` and at `stop_day`, both already in memory
+   during the pass. `pct = end/start - 1`.
+2. Read the last row for this industry from `pass_reference.csv` -> `champ_pass`, `champ_pct`.
+3. **Stage** pass N's 20 elites to a scratch directory (file copies, 71 MB per industry).
+4. Compute `share_new` from `(champ_pct, chal_pct)`, then interleave `champion/` with the staged
+   copies into the live output directory — that is pass N+1's seed.
+5. Crown: if pass N won, replace `champion/{ind}_elite_*` from the staged copies.
+6. Append the row to `pass_reference.csv`.
+
+Stage to disk, not memory: two full sets is 142 MB per industry on a box already mlocking ~720 MB
+with ~500 MB free. Disk is the cheaper resource.
+
+### Edge cases
+
+- **No reference file** (first boundary, after pass 1): pass 1 is champion by default, seed 100%
+  from it, write the row with an empty `chal_pct`. Matches today's behaviour.
+- **Pass shorter than 15 days** (diagnostic runs): skip the gate, seed 100% from the finishing
+  pass, write no row.
+- **`--no-save`**: write neither the reference file nor the champion store.
+- **`--master-only`**: StockNN is not trained, so the gate is meaningless — skip.
+- **Missing or corrupt champion file**: fall back to 100% from the finishing pass and log it
+  loudly. Silent fallback is precisely `load_bin`'s failure mode, and it has cost a run before.
+
+### Acceptance criteria for the implementation
+
+After a 2-pass run: `pass_reference.csv` holds 12 rows, `champion/` holds 240 files, and replaying
+the recorded `champ_pct` / `chal_pct` through the branch rule reproduces the recorded `slots_new`
+exactly.
 
 ## Mechanics that constrain the design (verified in `training_v4.cpp`)
 
@@ -86,7 +158,9 @@ independent of seeding, so a wrong gate call can never cost the best models.
 - **No slot-0 dependency at pass start.** All 200 portfolios reset identical, so `baseline` is
   `IND_STARTING_CASH` regardless of ordering.
 
-Storage: 20 × 12 × 3.54 MB = **850 MB per snapshot**, ~1.7 GB for champion plus current.
+Storage: 20 × 12 × 3.54 MB = **850 MB** for the champion store. The finishing pass's elites
+already sit in the run directory, and the staging copies add another 850 MB transiently
+during a boundary only — so peak additional cost is ~1.7 GB against 44 GB free.
 
 ## Measured expectations
 
