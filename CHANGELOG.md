@@ -5,6 +5,9 @@ Entries are prepended automatically on each commit via the Claude commit hook.
 
 ---
 
+## [04cfd44] — 2026-09-13
+PASS_SEEDING: specify the pass-reference file and champion store
+
 ## [f44c685] — 2026-09-13
 Stage per-industry proportional pass-boundary seeding (StockNN)
 
