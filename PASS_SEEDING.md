@@ -1,10 +1,18 @@
 # Staged: per-industry proportional pass-boundary seeding (StockNN)
 
-**Status: STAGED — do not implement yet.**
+**Status: IMPLEMENTED in v0.6.3.0.**
 
-Gated on the five-pass v0.6.2.1 run finishing. This changes pass-boundary logic in the trainer;
-rebuilding `build/training_v4_cpp` mid-run would leave passes 3–5 inconsistent with 1–2, and the
-running process would not pick it up regardless.
+The five-pass v0.6.2.1 run was stopped at pass 3 / day 976 to build this, because the evidence it
+produced argued against continuing: the three passes read **+86.3% → +83.8% → +53.9%** at day 969,
+a monotonic decline. Repeated passes over the same 1,238 days were degrading the models, and
+without a champion store the best models — pass 1's — were already overwritten and lost.
+
+Pure logic lives in `pass_seeding.h` (shared with `tests/test_pass_seeding.cpp`); the file
+shuffling and CSV live in `pass_boundary()` in `training_v4.cpp`.
+
+Not a breaking change: existing `.bin` files load unchanged, and a run directory with no
+`pass_reference.csv` simply crowns its first pass and leaves the seed alone — the pre-v0.6.3.0
+behaviour.
 
 Scope is **StockNN only**. MT1 is deferred (see the end).
 
