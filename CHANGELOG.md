@@ -5,6 +5,9 @@ Entries are prepended automatically on each commit via the Claude commit hook.
 
 ---
 
+## [a24e124] — 2026-09-15
+convert_weights: select the source directory by parameter
+
 ## [b130eee] — 2026-09-14
 v0.6.4.0: clock-seed the RNG, re-seeded at the start of every pass
 
