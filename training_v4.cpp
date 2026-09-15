@@ -3,7 +3,7 @@
 // Run:   ./build/training_v4_cpp --output models [--load-dir DIR] [--start-day N] [--stop-day N]
 //        [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F] [--workers N]
 
-#define TRAINER_VERSION "0.6.3.1"
+#define TRAINER_VERSION "0.6.4.0"
 
 #include <algorithm>
 #include <atomic>
@@ -216,6 +216,32 @@ static constexpr int MT2_T3_W  = 28638;  static constexpr int MT2_T3_B  = 31878;
 static constexpr int MT2_OUT_W = 31932;  static constexpr int MT2_OUT_B = 34524;  // +54, 54×48+48=34572
 
 static bool g_no_save = false;  // --no-save: skip all model writes (diagnostic mode)
+
+// ── Run seed (v0.6.4.0) ────────────────────────────────────────────────────────
+// Every PCG32 in this file used to be seeded from hardcoded constants plus loop indices, with no
+// entropy anywhere — so "random init" produced byte-identical weights on every run and two runs of
+// the same binary could not differ. That made a noise floor impossible to measure: a 55-point gap
+// between versions and a gap caused by one lucky initialisation were indistinguishable.
+//
+// g_run_seed defaults to the clock and is mixed into every seed site through mix_seed(). It is
+// LOGGED at startup, and --seed N reproduces a run exactly when that is what you want.
+// RE-SEEDED AT THE TOP OF EVERY PASS, not once per run. The per-day/per-industry seeds carry no
+// pass component — seed_rng.seed(actual_day * 1000007 + ind_i * 13) — so before v0.6.4.0 pass 1
+// day 17 and pass 5 day 17 applied the IDENTICAL perturbation vector. Every pass re-walked the
+// same noise sequence, differing only in which parents it was applied to. That is a plausible
+// contributor to extra passes failing to help.
+static uint64_t g_run_seed = 0;
+static uint64_t g_seed_arg = 0;   // --seed N; 0 = unset, derive each pass from the clock
+
+// splitmix64 finaliser: decorrelates the run seed from the per-day / per-industry structure, so
+// adjacent seeds do not yield correlated streams.
+static inline uint64_t splitmix64(uint64_t z) {
+    z += 0x9E3779B97F4A7C15ULL;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+static inline uint64_t mix_seed(uint64_t base) { return splitmix64(base + g_run_seed); }
 // --dir-reps: how many times the direction pool replays each block. The gentle 8.3% cull only turns
 // over ~10 of 200 slots a day, so reps are what restore evolutionary throughput. They also mean N
 // epochs over the same 25 days, which is an overfitting risk — hence a flag, so it can be swept and
@@ -1269,7 +1295,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     // Assign mutation seeds at start of day
     {
         PCG32 seed_rng;
-        seed_rng.seed((uint64_t)actual_day * 1000007ULL + (uint64_t)ind_i * 13ULL);
+        seed_rng.seed(mix_seed((uint64_t)actual_day * 1000007ULL + (uint64_t)ind_i * 13ULL));
         for (int i = 0; i < N_SLOTS - ELITE_POOL; i++)
             mut_seeds[i] = ((uint64_t)seed_rng.next() << 32) | seed_rng.next();
     }
@@ -1749,7 +1775,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         // Diversity injection for all-zero streak >= 2
         if (all_inactive && new_streak >= 2) {
             int half = ELITE_COUNT / 2;
-            PCG32 div_rng; div_rng.seed((uint64_t)actual_day * 99991ULL + ind_i);
+            PCG32 div_rng; div_rng.seed(mix_seed((uint64_t)actual_day * 99991ULL + ind_i));
             for (int k = half; k < ELITE_COUNT; k++) {
                 // blend top half with random: 0.5 * elite + 0.5 * random (reuse mut_buf)
                 init_stock_weights(scratch.mut_buf, div_rng);
@@ -2066,7 +2092,7 @@ static MT1CompResult step_mt1_pool(
     // Deterministic mutation seeds (per day + industry; pool distinguished by its own buffers)
     {
         PCG32 seed_rng;
-        seed_rng.seed((uint64_t)actual_day * 987017ULL + (uint64_t)ind_i * 10007ULL + 22222ULL);
+        seed_rng.seed(mix_seed((uint64_t)actual_day * 987017ULL + (uint64_t)ind_i * 10007ULL + 22222ULL));
         for (int i = 0; i < pool_muts; i++)
             mut_seeds[i] = ((uint64_t)seed_rng.next() << 32) | seed_rng.next();
     }
@@ -2320,8 +2346,8 @@ static MT1DirResult step_mt1_dir_pool(
     sc.dir_culled_today = n_cull;
 
     PCG32 rng;
-    rng.seed((uint64_t)actual_day * 987017ULL + (uint64_t)ind_i * 10007ULL +
-             (uint64_t)rep * 1300081ULL + 4242ULL);
+    rng.seed(mix_seed((uint64_t)actual_day * 987017ULL + (uint64_t)ind_i * 10007ULL +
+             (uint64_t)rep * 1300081ULL + 4242ULL));
 
     for (int k = 0; k < n_cull; k++) {
         int dead = mature[mature.size() - 1 - k];
@@ -2477,7 +2503,7 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
     }
 
     {
-        PCG32 seed_rng; seed_rng.seed((uint64_t)actual_day * 777017ULL + 99999ULL);
+        PCG32 seed_rng; seed_rng.seed(mix_seed((uint64_t)actual_day * 777017ULL + 99999ULL));
         for (int i = 0; i < N_SLOTS - ELITE_POOL; i++)
             scratch.mut_seeds[i] = ((uint64_t)seed_rng.next() << 32) | seed_rng.next();
     }
@@ -2836,7 +2862,7 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
         state.mt2_injection_hold = 10;  // suppress re-injection for 10 days
         log_msg("[mt2     ] " + std::to_string(below_thresh) + "/" + std::to_string(N_SLOTS) +
                 " slots < " + fmt_pts(MT2_INJ_THRESHOLD) + " — injecting diversity");
-        PCG32 div_rng; div_rng.seed((uint64_t)actual_day * 55555ULL + 77777ULL);
+        PCG32 div_rng; div_rng.seed(mix_seed((uint64_t)actual_day * 55555ULL + 77777ULL));
         int half = ELITE_COUNT / 2;
         for (int k = half; k < ELITE_COUNT; k++) {
             init_mt2_weights(scratch.mut_buf, div_rng);
@@ -3089,7 +3115,7 @@ static void save_master_elites(const std::string& dir, const float* elite_buf) {
 
 static void load_or_init_industry(const std::string& dir, const std::string& load_dir,
                                    int ind_i, float* elite_buf) {
-    PCG32 rng; rng.seed((uint64_t)ind_i * 987654321ULL + 123456789ULL);
+    PCG32 rng; rng.seed(mix_seed((uint64_t)ind_i * 987654321ULL + 123456789ULL));
     for (int slot = 0; slot < ELITE_POOL; slot++) {
         float* e = elite_buf + (size_t)slot * STOCKNN_PARAMS;
         bool loaded = false;
@@ -3111,7 +3137,7 @@ static void load_or_init_industry(const std::string& dir, const std::string& loa
 
 static void load_or_init_master(const std::string& dir, const std::string& load_dir,
                                  float* elite_buf) {
-    PCG32 rng; rng.seed(0xDEADBEEFCAFEBABEULL);
+    PCG32 rng; rng.seed(mix_seed(0xDEADBEEFCAFEBABEULL));
     for (int slot = 0; slot < ELITE_POOL; slot++) {
         float* e = elite_buf + (size_t)slot * MASTERNN_PARAMS;
         bool loaded = false;
@@ -3247,7 +3273,7 @@ static void save_mt1_ht(const std::string& dir, int ind_i, const MT1Scratch& scr
 static void load_or_init_mt1_ht(const std::string& dir, const std::string& load_dir,
                                  int ind_i, MT1Scratch& scratch) {
     const char* ind = g_ind_names[ind_i].c_str();
-    PCG32 rng; rng.seed((uint64_t)(ind_i + 2 * N_IND) * 777777777ULL + 271828182ULL);
+    PCG32 rng; rng.seed(mix_seed((uint64_t)(ind_i + 2 * N_IND) * 777777777ULL + 271828182ULL));
     char path[512];
 
     auto try_load = [&](const char* fmt_suffix, float* dst, int n, auto... args) -> bool {
@@ -3529,7 +3555,7 @@ static void save_mt2_elites(const std::string& dir, MT2Scratch& scratch) {
 
 static void load_or_init_mt2(const std::string& dir, const std::string& load_dir,
                                MT2Scratch& scratch) {
-    PCG32 rng; rng.seed(0xCAFED00DBEEF1234ULL);
+    PCG32 rng; rng.seed(mix_seed(0xCAFED00DBEEF1234ULL));
     for (int slot = 0; slot < ELITE_POOL; slot++) {
         float* e = scratch.elite_buf + (size_t)slot * MT2NN_PARAMS;
         bool loaded = false;
@@ -3755,6 +3781,7 @@ static void print_usage(const char* prog) {
         "          [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F]\n"
         "          [--dir-sigma F] [--rng-sigma F] [--acc-sigma F] [--cfd-sigma F] [--mt2-sigma F]\n"
         "          [--workers N] [--master-only] [--preserve-stock-data] [--no-save]\n"
+        "          [--seed N]   (default: clock, RE-SEEDED EVERY PASS; N derives passes from N)\n"
         "       %s --output DIR [--load-dir DIR] ...  (diagnostic/override)\n"
         "       %s --drift-study --load-dir SEED --drift-scratch DIR  (phase-3 calibration)\n",
         prog, prog, prog);
@@ -3917,7 +3944,7 @@ static bool drift_advance_day(int run_day_num, int actual_day, int total_days,
     const bool fwd_valid = (fwd_ptr != nullptr);
 
     bool seq_flags[N_SYMS];
-    PCG32 seq_rng; seq_rng.seed((uint64_t)actual_day * 0xABCDEF01234567ULL);
+    PCG32 seq_rng; seq_rng.seed(mix_seed((uint64_t)actual_day * 0xABCDEF01234567ULL));
     for (int si = 0; si < N_SYMS; si++) seq_flags[si] = (seq_rng.next() & 1);
 
     // StockNN ×12 (serial — study trades CPU for RAM, §5)
@@ -4199,6 +4226,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--master-only") master_only = true;
         else if (arg == "--preserve-stock-data") preserve_stock = true;
         else if (arg == "--no-save") g_no_save = true;
+        else if (arg == "--seed"     && a+1<argc) { g_seed_arg = strtoull(argv[++a], nullptr, 10); }
         else if (arg == "--dir-reps" && a+1<argc) { g_dir_reps = std::max(1, atoi(argv[++a])); }
         else if (arg == "--drift-study") drift_study = true;
         else if (arg == "--drift-scratch" && a+1<argc) { drift_scratch = argv[++a]; }
@@ -4225,6 +4253,8 @@ int main(int argc, char* argv[]) {
 
     log_msg(std::string("training_v4_cpp v") + TRAINER_VERSION +
             "  account=" + (account.empty() ? "(diagnostic)" : account));
+    log_msg(g_seed_arg ? "RNG: --seed " + std::to_string(g_seed_arg) + " (per-pass, derived)"
+                       : std::string("RNG: clock-seeded per pass — runs will not repeat"));
 
     if (!load_universe_json("universe.json")) return 1;
 
@@ -4307,6 +4337,13 @@ int main(int argc, char* argv[]) {
         float cur_acc_sigma = acc_sigma    * decay;
         float cur_cfd_sigma = cfd_sigma    * decay;
         float cur_mt2_sigma = mt2_sigma_arg* decay;
+        // Fresh entropy per pass. Without this the per-day seeds repeat every pass and each pass
+        // replays the same perturbation vectors over different parents.
+        g_run_seed = g_seed_arg
+            ? splitmix64(g_seed_arg + (uint64_t)(pass + 1) * 0x9E3779B97F4A7C15ULL)
+            : (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
+        log_msg("  pass seed: " + std::to_string(g_run_seed));
+
         log_msg("===== PASS " + std::to_string(pass+1) + "/" + std::to_string(passes) +
                 " | sigma=" + std::to_string(cur_sigma).substr(0,6) +
                 " | mst=" + std::to_string(cur_mst_sigma).substr(0,6) +
@@ -4550,7 +4587,7 @@ int main(int argc, char* argv[]) {
                 if (!dir_inject_flag[i]) continue;
                 MT1Scratch& sc = mt1_scratches[i];
                 PCG32 inj_rng;
-                inj_rng.seed((uint64_t)blk_actual_day[blk_len - 1] * 77003ULL + (uint64_t)i * 131ULL + 55555ULL);
+                inj_rng.seed(mix_seed((uint64_t)blk_actual_day[blk_len - 1] * 77003ULL + (uint64_t)i * 131ULL + 55555ULL));
 
                 std::vector<int> mature;
                 for (int s = 0; s < MT1_COMP_SLOTS; s++)
@@ -4667,7 +4704,7 @@ int main(int argc, char* argv[]) {
             const DayData* fill_ptr = (actual_day + 1 < total_days) ? &all_days[actual_day + 1] : nullptr;
 
             // Generate seq_flags for this day
-            seq_rng.seed((uint64_t)actual_day * 0xABCDEF01234567ULL);
+            seq_rng.seed(mix_seed((uint64_t)actual_day * 0xABCDEF01234567ULL));
             for (int si = 0; si < N_SYMS; si++)
                 seq_flags[si] = (seq_rng.next() & 1);
 
