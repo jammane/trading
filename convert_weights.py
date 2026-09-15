@@ -7,6 +7,19 @@ Run this after a C++ training run to make the trained models available to the Py
 
 Usage:
   python convert_weights.py --account acct0
+  python convert_weights.py --account acct0 --industry-dir models/acct0/training/champion
+  python convert_weights.py --source-dir /root/some_run --output-dir /tmp/pt
+
+Directory selection:
+  --source-dir    where the .bin files are read from (default: models/ACCOUNT/training)
+  --industry-dir  overrides the source for the StockNN industry elites ONLY
+  --output-dir    where the .pt files are written    (default: --source-dir)
+
+--industry-dir exists for the champion store written by the v0.6.3.0 pass-boundary seeding
+(PASS_SEEDING.md). `champion/` holds the per-industry best StockNN elites and NOTHING ELSE —
+master, MT1 and MT2 are saved to the run root — so pointing --source-dir at it would convert the
+industries and silently skip everything else. Splitting the two is what makes the deliverable
+correct: StockNN from champion/, master/MT1/MT2 from the run root.
 """
 
 import argparse
@@ -161,12 +174,29 @@ def _convert_mt1_pools(ind, models_dir, output_dir):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Convert .bin C++ elite models to .pt for Python stack')
-    parser.add_argument('--account', default='acct0', help='Account identifier (e.g. acct0); derives models/ACCOUNT/training as source and output dir')
+    parser = argparse.ArgumentParser(
+        description='Convert .bin C++ elite models to .pt for the Python stack',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='With pass-boundary seeding active the last pass is NOT necessarily the best;\n'
+               'convert the champion store with --industry-dir <run>/champion.')
+    parser.add_argument('--account', default='acct0',
+                        help='Account identifier (e.g. acct0); derives models/ACCOUNT/training')
+    parser.add_argument('--source-dir', default=None,
+                        help='Read .bin from here instead of the --account path')
+    parser.add_argument('--industry-dir', default=None,
+                        help='Override the source for StockNN industry elites only '
+                             '(e.g. .../training/champion, which holds nothing else)')
+    parser.add_argument('--output-dir', default=None,
+                        help='Write .pt here (default: the source directory)')
     args = parser.parse_args()
 
-    models_dir = os.path.join('models', args.account, 'training')
-    output_dir = models_dir
+    models_dir   = args.source_dir   or os.path.join('models', args.account, 'training')
+    industry_dir = args.industry_dir or models_dir
+    output_dir   = args.output_dir   or models_dir
+
+    for label, d in (('source', models_dir), ('industry source', industry_dir)):
+        if not os.path.isdir(d):
+            parser.error(f'{label} directory does not exist: {d}')
     os.makedirs(output_dir, exist_ok=True)
 
     industries = [
@@ -175,9 +205,27 @@ def main():
         'energy', 'utilities', 'real_estate', 'materials',
     ]
 
-    print(f'Converting industry elite models from {models_dir} → {output_dir}')
+    # A mistyped path would otherwise convert nothing and still exit 0, which is exactly how the
+    # wrong models get deployed. Fail loudly instead.
+    present = [i for i in industries
+               if os.path.exists(os.path.join(industry_dir, f'{i}_elite_0.bin'))]
+    if not present:
+        parser.error(f'no industry *_elite_0.bin files in {industry_dir} — wrong directory?')
+    if len(present) < len(industries):
+        missing = [i for i in industries if i not in present]
+        print(f'\n  *** WARNING: only {len(present)}/{len(industries)} industries found in '
+              f'{industry_dir}')
+        print(f'  *** missing: {", ".join(missing)}')
+        print('  *** those industries will have NO .pt written and production would fall back to '
+              'whatever is already there.\n')
+
+    if industry_dir != models_dir:
+        print(f'StockNN industries  <- {industry_dir}')
+        print(f'master / MT1 / MT2  <- {models_dir}')
+
+    print(f'Converting industry elite models from {industry_dir} → {output_dir}')
     for ind in industries:
-        convert_industry(ind, models_dir, output_dir, STOCK_LAYER_DEFS, StockNN, ind)
+        convert_industry(ind, industry_dir, output_dir, STOCK_LAYER_DEFS, StockNN, ind)
 
     print(f'Converting master elite models from {models_dir} → {output_dir}')
     convert_industry('master', models_dir, output_dir, MASTER_LAYER_DEFS, MasterNN, 'master')

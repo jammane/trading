@@ -109,6 +109,21 @@ runs while preserving every log, and skips a run detected in flight. Run it befo
 Always use real disk paths (`models/acct0/training`, `logs/`, `/root/diag_logs`) — never `/tmp` which is a 978 MB RAM-backed tmpfs on the droplet. Training and production can run concurrently; both write to real disk only.
 MT1 trains via direction/delta/range scoring starting at `actual_day >= 25`; MT2 trains via tier-classification starting at `actual_day >= 30`.
 `convert_weights.py` is required after C++ training before using `inspect_trades.py` or `production_v2.py`.
+
+**Choosing which models to convert (v0.6.4.1).** `--source-dir DIR` reads `.bin` from anywhere,
+`--output-dir DIR` writes `.pt` anywhere, and `--industry-dir DIR` overrides the source for the
+StockNN industry elites **only**. That last one exists for the champion store: with pass-boundary
+seeding active (see `PASS_SEEDING.md`) the final pass is **not** necessarily the best, and
+`models/acct#/training/champion/` holds the per-industry best — but *nothing else*, since master,
+MT1 and MT2 are saved to the run root. So the deliverable is:
+
+```bash
+python convert_weights.py --account acct0 --industry-dir models/acct0/training/champion
+```
+
+Pointing `--source-dir` at `champion/` instead would convert the industries and silently skip
+master/MT1/MT2. The script errors out if the industry directory has no elite files at all, and
+warns loudly if it holds fewer than 12 industries.
 Note: existing master `.bin` files are incompatible after the MT1/MT2 architecture change — regenerate with `prepare_models.py`.
 **v0.6.0.0 is BREAKING for StockNN too:** `STOCKNN_PARAMS` changed 921625 → 928825, so every
 industry `.bin`/`.pt`, every elite pool and every `{ind}_hist.bin` ring from v0.5.0.0 or earlier is
