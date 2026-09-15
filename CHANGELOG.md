@@ -5,6 +5,9 @@ Entries are prepended automatically on each commit via the Claude commit hook.
 
 ---
 
+## [b130eee] — 2026-09-14
+v0.6.4.0: clock-seed the RNG, re-seeded at the start of every pass
+
 ## [373a77e] — 2026-09-14
 v0.6.3.0: per-industry proportional pass-boundary seeding
 
