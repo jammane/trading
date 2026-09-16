@@ -3,7 +3,7 @@
 // Run:   ./build/training_v4_cpp --output models [--load-dir DIR] [--start-day N] [--stop-day N]
 //        [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F] [--workers N]
 
-#define TRAINER_VERSION "0.6.6.1"
+#define TRAINER_VERSION "0.6.7.0"
 
 #include <algorithm>
 #include <atomic>
@@ -1166,6 +1166,13 @@ struct IndResult {
     float top_hold, top_cash;
     int   new_streak;
     float elite_max_val, elite_min_val, elite_mean_val;
+    // Rechenberg's 1/5 statistic: fraction of the 180 mutations that BEAT THEIR OWN PARENT.
+    // Read-only instrumentation — nothing selects on it. It answers two open questions at once:
+    // whether sigma is in the usable band on the CURRENT architecture (the 0.0055-0.009 range was
+    // measured many versions and one breaking param change ago), and whether the regime-optimal
+    // sigma moves. Far above 1/5 means steps are too small and the pool is degenerate; far below
+    // means most mutations are damage and selection is picking survivors of noise.
+    float mut_success;
 };
 
 struct MasterResult {
@@ -1636,6 +1643,17 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     float best_delta  = best_score - baseline;
     float worst_delta = *std::min_element(slot_scores, slot_scores + N_SLOTS) - baseline;
 
+    // Mutation success rate: each mutation slot against the parent it was mutated FROM, matching
+    // the parent assignment in the forward pass (uniform, MUTATIONS_PER_PARENT children each).
+    int mut_wins = 0, mut_total = 0;
+    for (int slot = ELITE_POOL; slot < N_SLOTS; slot++) {
+        int parent = (slot - ELITE_POOL) / MUTATIONS_PER_PARENT;
+        if (parent >= ELITE_POOL) continue;
+        mut_total++;
+        if (slot_scores[slot] > slot_scores[parent]) mut_wins++;
+    }
+    float mut_success = mut_total > 0 ? (float)mut_wins / (float)mut_total : 0.f;
+
     // Elite stats (slots 0..ELITE_COUNT-1 portfolio values)
     float elite_max_val = *std::max_element(slot_scores, slot_scores + ELITE_COUNT);
     float elite_min_val = *std::min_element(slot_scores, slot_scores + ELITE_COUNT);
@@ -1649,7 +1667,8 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             " worst Δ" + (worst_delta >= 0 ? "+" : "") + std::to_string((int)worst_delta) +
             " | buys=" + std::to_string((int)buy_exec) +
             " sells=" + std::to_string((int)sell_exec) +
-            " | prod=$" + std::to_string((int)baseline));
+            " | prod=$" + std::to_string((int)baseline) +
+            " | mut_ok=" + std::to_string((int)(mut_success * 100.f + 0.5f)) + "%");
 
     // Hard floor reset
     float abs_floor = IND_STARTING_CASH * 0.9f;
@@ -1894,6 +1913,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     res.top_hold      = top_hold;
     res.top_cash      = slot0_own.cash;
     res.new_streak    = new_streak;
+    res.mut_success   = mut_success;
     res.elite_max_val = elite_max_val;
     res.elite_min_val = elite_min_val;
     res.elite_mean_val= elite_mean_val;
@@ -3789,8 +3809,9 @@ static void write_csv_row(FILE* csv, int pass_num, int actual_day,
                            const float mkt_ret[N_IND], const float mkt_val[N_IND]) {
     fprintf(csv, "%d,%d", pass_num + 1, actual_day + 1);
     for (int i = 0; i < N_IND; i++)
-        fprintf(csv, ",%+10.2f,%+10.2f,%+10.2f",
-                res[i].elite_max_val, res[i].elite_min_val, res[i].elite_mean_val);
+        fprintf(csv, ",%+10.2f,%+10.2f,%+10.2f,%.4f",
+                res[i].elite_max_val, res[i].elite_min_val, res[i].elite_mean_val,
+                res[i].mut_success);
     fprintf(csv, ",%+.2f,%+.2f,%+.2f,%+.2f",
             mst.elite_max_pts, mst.elite_min_pts, mst.elite_mean_pts, mst.ideal_pts);
     fprintf(csv, ",%+.2f,%+.2f", mst.consensus_flat_pts, mst.consensus_wtd_pts);
@@ -4394,8 +4415,9 @@ int main(int argc, char* argv[]) {
     if (csv) {
         fprintf(csv, "pass,day");
         for (int i = 0; i < N_IND; i++)
-            fprintf(csv, ",%s_elite_max,%s_elite_min,%s_elite_mean",
-                    g_ind_names[i].c_str(), g_ind_names[i].c_str(), g_ind_names[i].c_str());
+            fprintf(csv, ",%s_elite_max,%s_elite_min,%s_elite_mean,%s_mut_success",
+                    g_ind_names[i].c_str(), g_ind_names[i].c_str(),
+                    g_ind_names[i].c_str(), g_ind_names[i].c_str());
         fprintf(csv, ",mt2_elite_max_pts,mt2_elite_min_pts,mt2_elite_mean_pts,mt2_ideal_pts");
         fprintf(csv, ",mt2_consensus_flat_pts,mt2_consensus_wtd_pts");
         fprintf(csv, ",mt2_slot0_pts_pf,mt2_slot0_pts_mkt");

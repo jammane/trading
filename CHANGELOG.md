@@ -5,6 +5,9 @@ Entries are prepended automatically on each commit via the Claude commit hook.
 
 ---
 
+## [f4e4a7f] — 2026-09-16
+v0.6.7.0: log the mutation success rate (Rechenberg's 1/5 statistic)
+
 ## [0eae448] — 2026-09-16
 v0.6.6.0: --no-save no longer disables training; --load-dir is a seed again
 
