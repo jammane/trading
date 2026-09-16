@@ -5,6 +5,9 @@ Entries are prepended automatically on each commit via the Claude commit hook.
 
 ---
 
+## [0eae448] — 2026-09-16
+v0.6.6.0: --no-save no longer disables training; --load-dir is a seed again
+
 ## [4800edf] — 2026-09-16
 v0.6.5.0: training pauses while a production cycle is running
 
