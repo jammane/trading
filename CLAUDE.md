@@ -96,14 +96,31 @@ mkdir -p /root/diag_logs
 # After training, convert back to .pt before inspect_trades.py or production_v2.py:
 python convert_weights.py --account acct0
 ```
-`--no-save` suppresses all model writes (industry elites, history, master, MT1, MT2).
-**Always use it for diagnostic runs.** A run directory is **~3.0 GB**, of which 70% is the StockNN
+`--no-save` trains into `<output>.nosave` and **deletes it at exit** — the canonical model
+directory is untouched, and no 3 GB run directory is left behind.
+
+**This changed in v0.6.6.0, and the old behaviour was a silent correctness bug.** `--no-save` used
+to suppress the writes themselves, which disabled StockNN training entirely: `step_industry`
+reloads `elite_buf` and `hist_buf` from disk at the top of **every day**, so with nothing written
+they were re-random-initialised daily from the same seed. Measured on the v0.6.0.0-A run:
+**297,120 random-init lines = 20 slots × 12 industries × 1238 days**. Nothing learned; the
+portfolio grew only from picking the best of 200 fresh random models each day. Any StockNN
+"diagnostic" taken under the old `--no-save` measured that, not training — including the
+v0.6.0.0-A results and the v0.5-vs-v0.6 comparison built on them.
+
+Note `--no-save` now does the same disk I/O as a normal run, because that I/O *is* training. It is
+no longer "free". A run directory is **~3.0 GB**, of which 70% is the StockNN
 5-day elite history: `HIST_DAYS × HIST_PER_DAY = 50` full copies of a ~921K-parameter model per
 industry (176 MB × 12 = 2.1 GB), plus 851 MB of elites. MT1 heads + tails + MT2 together are under
 40 MB, so MT1 work is nearly free on disk — the cost is entirely the StockNN layer. Thirteen
 accumulated run directories took the droplet's 58 GB disk to 92% full.
 Analysis only needs the logs (`mt_training_log.bin`, `training_log.csv`, `train.log`, 3–5 MB);
-weights are only needed to seed a run (`--load-dir`) or convert to `.pt`. `/root/prune_runs.sh [KEEP]`
+weights are only needed to seed a run (`--load-dir`) or convert to `.pt`.
+
+**`--load-dir` is a SEED, consulted only when the working store has nothing** (fixed v0.6.6.0).
+It used to be checked *first, every day*, so a run seeded from a populated directory reloaded that
+seed daily and never made progress — the same root cause as the `--no-save` bug: neither path had
+any notion of "first day only". `/root/prune_runs.sh [KEEP]`
 (default 2, `--dry-run` previews) strips weights from all but the N most recent `/root/ht_train*`
 runs while preserving every log, and skips a run detected in flight. Run it before a full pass.
 Always use real disk paths (`models/acct0/training`, `logs/`, `/root/diag_logs`) — never `/tmp` which is a 978 MB RAM-backed tmpfs on the droplet. Training and production can run concurrently; both write to real disk only.

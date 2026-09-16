@@ -3,7 +3,7 @@
 // Run:   ./build/training_v4_cpp --output models [--load-dir DIR] [--start-day N] [--stop-day N]
 //        [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F] [--workers N]
 
-#define TRAINER_VERSION "0.6.5.1"
+#define TRAINER_VERSION "0.6.6.0"
 
 #include <algorithm>
 #include <atomic>
@@ -219,7 +219,18 @@ static constexpr int MT2_T2_W  = 24618;  static constexpr int MT2_T2_B  = 28578;
 static constexpr int MT2_T3_W  = 28638;  static constexpr int MT2_T3_B  = 31878;  // +60, 60×54
 static constexpr int MT2_OUT_W = 31932;  static constexpr int MT2_OUT_B = 34524;  // +54, 54×48+48=34572
 
-static bool g_no_save = false;  // --no-save: skip all model writes (diagnostic mode)
+// --no-save (v0.6.6.0): train into a scratch directory and delete it at exit.
+//
+// It used to mean "skip all model writes", which silently DISABLED StockNN training entirely:
+// step_industry reloads elite_buf and hist_buf from disk at the top of EVERY day, so with nothing
+// written they were re-random-initialised every day from the same seed. Measured on the v0.6.0.0-A
+// run: 297,120 random-init lines == 20 slots x 12 industries x 1238 days. Nothing ever learned;
+// only the portfolio carried forward, growing purely from picking the best of 200 fresh random
+// models each day. Every "diagnostic" run taken under --no-save measured that, not training.
+//
+// The point of the flag was never "do not write" — it was "do not leave a 3 GB run directory
+// behind". So it now writes to <output>.nosave and removes it on exit.
+static bool g_no_save = false;
 
 // ── Trading lock (v0.6.5.0) ───────────────────────────────────────────────────
 // The droplet has 2 cores and a training run uses ~150% CPU. When training and a production cycle
@@ -1870,11 +1881,11 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         top_hold += slot0_own.holdings[j] * price;
     }
 
-    // Save updated elites and history back to disk
-    if (!g_no_save) {
-        save_industry_elites(models_dir, ind_i, scratch.elite_buf);
-        save_ind_history(models_dir, ind_i, scratch);
-    }
+    // Save updated elites and history back to disk. ALWAYS — these are reloaded at the top of
+    // the next day, so skipping the write is what broke --no-save. Under --no-save models_dir is
+    // already redirected to the scratch directory.
+    save_industry_elites(models_dir, ind_i, scratch.elite_buf);
+    save_ind_history(models_dir, ind_i, scratch);
 
     IndResult res;
     res.baseline      = baseline;
@@ -3177,13 +3188,17 @@ static void load_or_init_industry(const std::string& dir, const std::string& loa
     PCG32 rng; rng.seed(mix_seed((uint64_t)ind_i * 987654321ULL + 123456789ULL));
     for (int slot = 0; slot < ELITE_POOL; slot++) {
         float* e = elite_buf + (size_t)slot * STOCKNN_PARAMS;
+        // WORKING STORE FIRST, seed second. The order used to be reversed, and because this runs
+        // at the top of EVERY day a populated --load-dir was re-read daily — so a run seeded from
+        // a previous one reloaded that seed every day and never made progress. --load-dir is a
+        // seed: it should only be reached while the working store has nothing for this slot.
         bool loaded = false;
-        if (!load_dir.empty()) {
-            std::string p = elite_path(load_dir, g_ind_names[ind_i].c_str(), slot);
+        {
+            std::string p = elite_path(dir, g_ind_names[ind_i].c_str(), slot);
             loaded = load_bin(p, e, STOCKNN_PARAMS);
         }
-        if (!loaded) {
-            std::string p = elite_path(dir, g_ind_names[ind_i].c_str(), slot);
+        if (!loaded && !load_dir.empty()) {
+            std::string p = elite_path(load_dir, g_ind_names[ind_i].c_str(), slot);
             loaded = load_bin(p, e, STOCKNN_PARAMS);
         }
         if (!loaded) {
@@ -4320,6 +4335,25 @@ int main(int argc, char* argv[]) {
 
     if (!load_universe_json("universe.json")) return 1;
 
+    // --no-save: train into a scratch directory and drop it at exit. Writing is REQUIRED for
+    // training to work at all — elite_buf and hist_buf are reloaded from disk every day — so the
+    // flag redirects the writes instead of suppressing them. Real disk, never /tmp: a run
+    // directory is ~3 GB and /tmp here is a 978 MB tmpfs.
+    std::string nosave_scratch;
+    if (g_no_save) {
+        std::error_code ec;
+        nosave_scratch = output_dir + ".nosave";
+        fs::remove_all(nosave_scratch, ec);
+        fs::create_directories(nosave_scratch, ec);
+        if (ec) {
+            fprintf(stderr, "FATAL: --no-save could not create scratch %s\n", nosave_scratch.c_str());
+            return 1;
+        }
+        output_dir = nosave_scratch;
+        log_msg("--no-save: training into scratch " + nosave_scratch +
+                " (~3 GB, removed at exit); canonical models untouched");
+    }
+
     // Disable OpenBLAS internal threading: N workers × M BLAS threads = N×M threads on N CPUs
     openblas_set_num_threads(1);
 
@@ -4748,11 +4782,9 @@ int main(int argc, char* argv[]) {
                     write_mt_log_record(mt_log, rec);
                 }
             }
-            // 5. Save (per block ≈ 25 days)
-            if (!g_no_save) {
-                for (int i = 0; i < N_IND; i++) save_mt1_ht(output_dir, i, mt1_scratches[i]);
-                save_mt2_elites(output_dir, *mt2_scratch);
-            }
+            // 5. Save (per block ≈ 25 days). Always — under --no-save output_dir is the scratch.
+            for (int i = 0; i < N_IND; i++) save_mt1_ht(output_dir, i, mt1_scratches[i]);
+            save_mt2_elites(output_dir, *mt2_scratch);
         };
 
         for (int day_num = 0; day_num < num_days; day_num++) {
@@ -4942,7 +4974,7 @@ int main(int argc, char* argv[]) {
         }
 
         // Save MT1/MT2 after each pass (industry elites already saved by step_industry)
-        if (!g_no_save) {
+        {
             log_msg("Pass " + std::to_string(pass+1) + " complete — saving MT1/MT2 elites");
             for (int i = 0; i < N_IND; i++)
                 save_mt1_ht(output_dir, i, mt1_scratches[i]);
@@ -4965,6 +4997,14 @@ int main(int argc, char* argv[]) {
 
     if (csv)    fclose(csv);
     if (mt_log) fclose(mt_log);
+
+    if (!nosave_scratch.empty()) {
+        std::error_code ec;
+        fs::remove_all(nosave_scratch, ec);
+        log_msg(ec ? "WARNING: could not remove scratch " + nosave_scratch
+                   : "--no-save: removed scratch " + nosave_scratch);
+    }
+
     log_msg("Training complete.");
     return 0;
 }
