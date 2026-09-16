@@ -5,6 +5,9 @@ Entries are prepended automatically on each commit via the Claude commit hook.
 
 ---
 
+## [7ef9dc1] — 2026-09-16
+v0.6.8.0: --no-orders for catch-up runs
+
 ## [f4e4a7f] — 2026-09-16
 v0.6.7.0: log the mutation success rate (Rechenberg's 1/5 statistic)
 
