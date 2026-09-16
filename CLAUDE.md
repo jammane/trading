@@ -164,6 +164,22 @@ industry `.bin`/`.pt`, every elite pool and every `{ind}_hist.bin` ring from v0.
 unloadable. `load_bin` validates by exact element count and falls back to **random init silently**,
 so a stale run directory looks like it works. Start from a clean `--output` directory and retrain.
 
+**Mutation success rate (v0.6.7.0).** Each per-day industry line carries `mut_ok=NN%`, and
+`training_log.csv` gains a `{ind}_mut_success` column: the fraction of the 180 mutations that beat
+**their own parent**. Read-only — nothing selects on it.
+
+It is Rechenberg's 1/5 statistic, and it answers two open questions cheaply:
+
+- **Is sigma in the usable band on the current architecture?** The 0.0055–0.009 range was measured
+  many versions and one breaking parameter change ago. Far above 1/5 means steps are too small and
+  the pool is degenerate; far below means most mutations are damage and selection is mostly picking
+  survivors of noise. The measured pool spread — `best-of-200 +604` vs `worst-of-200 +573`, ~5% of
+  a ~$590 common move — is consistent with either, and this statistic separates them.
+- **Does the regime-optimal sigma move?** Plot it against market volatility. If it spikes when the
+  market shifts (existing weights suddenly wrong, so more mutations help) and falls in calm
+  periods, a fixed sigma is leaving value on the table and a sigma ladder has a case. If it is
+  stationary, one sigma suffices.
+
 **Inspect MT1/MT2 training log:**
 
 As of v0.4.1.0 the binary log is one record **per block-day** (was one per 25-day block — 50
