@@ -3,11 +3,15 @@
 // Run:   ./build/training_v4_cpp --output models [--load-dir DIR] [--start-day N] [--stop-day N]
 //        [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F] [--workers N]
 
-#define TRAINER_VERSION "0.6.4.2"
+#define TRAINER_VERSION "0.6.5.0"
 
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <csignal>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -216,6 +220,20 @@ static constexpr int MT2_T3_W  = 28638;  static constexpr int MT2_T3_B  = 31878;
 static constexpr int MT2_OUT_W = 31932;  static constexpr int MT2_OUT_B = 34524;  // +54, 54×48+48=34572
 
 static bool g_no_save = false;  // --no-save: skip all model writes (diagnostic mode)
+
+// ── Trading lock (v0.6.5.0) ───────────────────────────────────────────────────
+// The droplet has 2 cores and a training run uses ~150% CPU. When training and a production cycle
+// compete, the loser slows 3-5x — measured: training fell from 34 s/day to 1-3 min/day with two
+// short jobs alongside it. Production is the time-sensitive side (fetch, decide, submit orders),
+// so the trainer yields: it polls this lock between training days and sleeps while it is held.
+//
+// Written by trading_lock() in production_v2.py — THE DEFAULT PATH MUST MATCH THE ONE THERE.
+// Absolute because the two run from different worktrees (/root/trading-ht vs /root/trading).
+// Line 1 of the file is the holder's PID.
+static std::string g_trade_lock = "/run/trading/trading_active.lock";
+static constexpr int TRADE_LOCK_STALE_SEC = 1800;   // 30 min; a production cycle takes minutes
+static constexpr int TRADE_LOCK_POLL_SEC  = 15;
+
 
 // ── Run seed (v0.6.4.0) ────────────────────────────────────────────────────────
 // Every PCG32 in this file used to be seeded from hardcoded constants plus loop indices, with no
@@ -964,6 +982,47 @@ static bool save_bin(const std::string& path, const float* W, int n_params) {
     size_t wrote = fwrite(W, sizeof(float), n_params, f);
     fclose(f);
     return (int)wrote == n_params;
+}
+
+static void log_msg(const std::string& msg);   // defined below, in the Logging section
+
+// A crashed production run must not stall training forever, so a lock is honoured only while its
+// holder is alive AND it is recent. Overrides are logged — silently ignoring a lock would be the
+// worse failure of the two.
+static bool trade_lock_active() {
+    struct stat st;
+    if (stat(g_trade_lock.c_str(), &st) != 0) return false;      // no lock: run freely
+
+    if (time(nullptr) - st.st_mtime > TRADE_LOCK_STALE_SEC) {
+        log_msg("WARNING: trading lock " + g_trade_lock + " is older than " +
+                std::to_string(TRADE_LOCK_STALE_SEC / 60) + " min — ignoring it as stale");
+        return false;
+    }
+    long pid = 0;
+    if (FILE* f = fopen(g_trade_lock.c_str(), "r")) {
+        if (fscanf(f, "%ld", &pid) != 1) pid = 0;
+        fclose(f);
+    }
+    if (pid > 0 && kill((pid_t)pid, 0) != 0 && errno == ESRCH) {
+        log_msg("WARNING: trading lock holder pid " + std::to_string(pid) +
+                " is gone — ignoring stale lock " + g_trade_lock);
+        return false;
+    }
+    return true;
+}
+
+// Called between training days, never mid-day: the worker threads are parked on their semaphore
+// at that point, so sleeping here idles all of them.
+static void wait_while_trading() {
+    bool paused = false;
+    while (trade_lock_active()) {
+        if (!paused) {
+            log_msg("PAUSED — production is running (" + g_trade_lock + ")");
+            paused = true;
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(TRADE_LOCK_POLL_SEC));
+    }
+    if (paused) log_msg("RESUMED — production finished, training continues");
 }
 
 static std::string elite_path(const std::string& dir, const char* prefix, int slot) {
@@ -3782,6 +3841,7 @@ static void print_usage(const char* prog) {
         "          [--dir-sigma F] [--rng-sigma F] [--acc-sigma F] [--cfd-sigma F] [--mt2-sigma F]\n"
         "          [--workers N] [--master-only] [--preserve-stock-data] [--no-save]\n"
         "          [--seed N]   (default: clock, RE-SEEDED EVERY PASS; N derives passes from N)\n"
+        "          [--trade-lock PATH | --no-trade-lock]  pause while production holds the lock\n"
         "       %s --output DIR [--load-dir DIR] ...  (diagnostic/override)\n"
         "       %s --drift-study --load-dir SEED --drift-scratch DIR  (phase-3 calibration)\n",
         prog, prog, prog);
@@ -4227,6 +4287,8 @@ int main(int argc, char* argv[]) {
         else if (arg == "--preserve-stock-data") preserve_stock = true;
         else if (arg == "--no-save") g_no_save = true;
         else if (arg == "--seed"     && a+1<argc) { g_seed_arg = strtoull(argv[++a], nullptr, 10); }
+        else if (arg == "--trade-lock" && a+1<argc) { g_trade_lock = argv[++a]; }
+        else if (arg == "--no-trade-lock") { g_trade_lock.clear(); }
         else if (arg == "--dir-reps" && a+1<argc) { g_dir_reps = std::max(1, atoi(argv[++a])); }
         else if (arg == "--drift-study") drift_study = true;
         else if (arg == "--drift-scratch" && a+1<argc) { drift_scratch = argv[++a]; }
@@ -4695,6 +4757,10 @@ int main(int argc, char* argv[]) {
 
         for (int day_num = 0; day_num < num_days; day_num++) {
             int actual_day = day_start + day_num;
+
+            // Yield the box to a production cycle if one is running. Between days only — worker
+            // threads are parked here, so this idles the whole trainer.
+            wait_while_trading();
 
             // Pass-boundary metric: slot-0 value PASS_JUDGE_DAYS before the end, and on the final
             // day. Logged "Day N" is actual_day + 1, so the window matches days
