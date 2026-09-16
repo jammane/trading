@@ -5,6 +5,9 @@ Entries are prepended automatically on each commit via the Claude commit hook.
 
 ---
 
+## [4800edf] — 2026-09-16
+v0.6.5.0: training pauses while a production cycle is running
+
 ## [a24e124] — 2026-09-15
 convert_weights: select the source directory by parameter
 

@@ -107,6 +107,23 @@ weights are only needed to seed a run (`--load-dir`) or convert to `.pt`. `/root
 (default 2, `--dry-run` previews) strips weights from all but the N most recent `/root/ht_train*`
 runs while preserving every log, and skips a run detected in flight. Run it before a full pass.
 Always use real disk paths (`models/acct0/training`, `logs/`, `/root/diag_logs`) — never `/tmp` which is a 978 MB RAM-backed tmpfs on the droplet. Training and production can run concurrently; both write to real disk only.
+
+**Training pauses for production (v0.6.5.0).** The droplet has 2 cores and a training run uses
+~150% CPU, so the two compete: measured, training fell from 34 s/day to 1–3 min/day with other
+jobs alongside it. Production is the time-sensitive side, so `production_v2.py` writes
+`/run/trading/trading_active.lock` (PID on line 1) for the whole cycle — orders *and* upkeep — and
+the trainer polls it **between training days**, sleeping 15 s at a time and logging `PAUSED` /
+`RESUMED`. Worker threads are parked at that point, so the whole trainer idles.
+
+The default path is hardcoded in both `production_v2.TRADING_LOCK_PATH` and `g_trade_lock` in
+`training_v4.cpp` — **keep the two in sync**. It is absolute because the two processes run from
+different worktrees (`/root/trading` vs `/root/trading-ht`), and under `/run` (tmpfs) so a reboot
+cannot strand a lock. Override with `TRADING_LOCK_PATH=` and `--trade-lock PATH`; disable the
+pause entirely with `--no-trade-lock`.
+
+A stale lock is ignored if its **PID is dead** or it is **older than 30 minutes**, and the override
+is logged loudly — a crashed production run must not idle training indefinitely. Failure to *write*
+the lock never blocks a production run; the only cost is continued CPU competition.
 MT1 trains via direction/delta/range scoring starting at `actual_day >= 25`; MT2 trains via tier-classification starting at `actual_day >= 30`.
 `convert_weights.py` is required after C++ training before using `inspect_trades.py` or `production_v2.py`.
 
