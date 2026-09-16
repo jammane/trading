@@ -651,6 +651,10 @@ def main():
     parser.add_argument('--account', default='acct0', help='Account identifier (e.g. acct0); derives models/ACCOUNT/paper|prod and logs/ACCOUNT/paper|prod')
     parser.add_argument('--capital', type=float, default=None, help='Cap total deployed capital regardless of Alpaca account balance')
     parser.add_argument('--withdraw', type=float, help='Amount to withdraw from portfolio')
+    parser.add_argument('--no-orders', action='store_true',
+                        help='Run the full cycle — fetch, allocate, decide, and train the daily '
+                             'upkeep step — but submit NOTHING to Alpaca and cancel nothing. For '
+                             'catching the models up on missed sessions without trading.')
     parser.add_argument('--flat-allocation', action='store_true',
                         help='Allocate capital evenly across all industries, skipping MT1/MT2 '
                              'inference. Use while MT1/MT2 are unconfirmed.')
@@ -966,8 +970,10 @@ def main():
                     span           = max(high - low, 1e-9)
                     sell_all_price = low + sell_all_price_frac * span
 
-                    # Cancel existing GTC stop orders
-                    if cur_qty > 0:
+                    # Cancel existing GTC stop orders. Skipped under --no-orders: cancelling a
+                    # live stop while submitting no replacement would strip protection from a real
+                    # position, which is the one destructive thing this mode must not do.
+                    if cur_qty > 0 and not args.no_orders:
                         try:
                             get_orders_request = GetOrdersRequest(
                                 status=QueryOrderStatus.OPEN, symbols=[sym])
@@ -1148,8 +1154,18 @@ def main():
         else:
             print(f"MT upkeep deferred: {min_real_days}/15 days of real history")
 
-        # Submit orders to Alpaca (paper or live depending on --paper flag)
+        # Submit orders to Alpaca (paper or live depending on --paper flag).
+        # --no-orders stops here: everything above (allocation, decisions) and the upkeep training
+        # step below still run, so the models advance a day without anything reaching the market.
         mode = 'paper' if args.paper else 'live'
+        if args.no_orders:
+            print(f"--no-orders: {len(orders)} order(s) computed, NONE submitted")
+            for o in orders[:20]:
+                print(f"    would {o['action']:<9} {o['symbol']:<6} qty={o.get('quantity')}"
+                      f" price={o.get('price')}")
+            if len(orders) > 20:
+                print(f"    ... and {len(orders) - 20} more")
+            orders = []
         for order in orders:
             try:
                 if order['action'] == 'buy':

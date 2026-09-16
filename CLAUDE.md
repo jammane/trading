@@ -249,6 +249,20 @@ require a droplet upgrade.
 # acct2 (future): 5 19 paper, 35 19 prod
 ```
 
+**`--no-orders` (v0.6.8.0).** Runs the full cycle — fetch, allocate, decide, and the daily upkeep
+training step — but submits nothing to Alpaca and cancels nothing. For catching the models up on
+missed sessions without trading, which is step 3 of the paper rollout.
+
+It guards **both** mutating paths: order submission *and* the existing-stop cancellation. Cancelling
+a live stop while submitting no replacement would strip protection from a real position, which is
+the one destructive thing this mode must not do.
+
+Training is unaffected by the missing fills: `build_primed_portfolios` seeds from real Alpaca
+positions, but `upkeep_industry` then **simulates** fills against `day_data`/`next_day_data`, so the
+evolution step is driven by market data. The one real consequence is that positions stay flat, so
+those runs train buy-side behaviour only and never exercise sell or stop-loss decisions — fine for a
+few catch-up sessions, an argument against a long one.
+
 ```bash
 # Manual run (paper)
 export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d)
