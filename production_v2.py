@@ -37,7 +37,8 @@ from upkeep import (
 )
 from version import VERSION
 
-MAX_SINGLE_STOCK_PCT = 0.60   # max fraction of industry cash in one stock
+# MAX_SINGLE_STOCK_PCT lives in training_lib and is applied inside size_buy(). It was
+# duplicated here and never used, which is exactly how production lost the cap.
 
 MODEL_DIR = 'models'  # legacy; superseded by --account in main()
 STOCK_DATA_DIR = 'stock_data'
@@ -866,6 +867,8 @@ def main():
         #     not a ramp -- and the old universe hid that, because unlock points ran from $140
         #     to $1,825 and so supplied an accidental ordering. Inside the $30-$90 band every
         #     industry unlocks at roughly the same figure, so the order must now be explicit.
+        from training_lib import size_buy   # shared sizing arithmetic — see its docstring
+
         active_industries = set()
         inactive_log      = []
         total_value       = compute_total_portfolio_value(cash, holdings, day_data, histories)
@@ -1089,16 +1092,13 @@ def main():
                     stop_loss_at = buy_price * 0.9   # GTC stop at 10% below entry
 
                     if buy_qty > 1e-6 and buy_price > 0 and low <= buy_price <= high:
-                        affordable = remaining_cash / (buy_price * BUY_FILL)
-                        amount     = min(buy_qty, affordable)
-                        # MAX_SINGLE_STOCK_PCT was defined in this module (line ~40) and never
-                        # applied here, so production had NO single-stock ceiling while the
-                        # models were trained under one — an unenforced risk control and a
-                        # train/serve divergence.
-                        cur_sym_val = holdings.get(sym, 0.0) * buy_price
-                        max_spend   = max(0.0,
-                                          MAX_SINGLE_STOCK_PCT * ind_port_value - cur_sym_val)
-                        amount      = int(min(amount, max_spend / (buy_price * BUY_FILL)))
+                        # Shared with the simulator: size_buy is the ONE place the request /
+                        # cash / single-stock-cap arithmetic lives. It used to exist in seven
+                        # copies and production's was the one no test reached, so production was
+                        # the copy that drifted — no cap, no cash decrement, fractional shares.
+                        amount = int(size_buy(
+                            buy_qty, buy_price, remaining_cash, ind_port_value,
+                            holdings.get(sym, 0.0) * buy_price))
                         if amount >= 1:
                             orders.append({'symbol': sym, 'action': 'buy',
                                            'quantity': amount, 'price': buy_price})
