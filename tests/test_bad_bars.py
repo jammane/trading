@@ -102,3 +102,30 @@ class TestTrainerSourceGuards:
         """Silence is what made this expensive — a count must reach the log."""
         src = open('training_v4.cpp').read()
         assert 'g_bad_bars' in src and 'rejected " + std::to_string(g_bad_bars)' in src
+
+
+class TestHoldingsLog:
+    """slot-0's COMPOSITION, not just its value.
+
+    prod=$ gives the deployed book's value but never what it holds, so the only market-side
+    regressor available was the equal-weight industry index — while the book may hold 60% in one
+    name. That mismatch is why the P&L decomposition returned R^2 ~ 0.0001: a broken regressor,
+    not a finding about predictability. Unblocks M1, the (H-L)/A gate and the portfolio-vol
+    validation together.
+    """
+
+    def test_holdings_are_carried_out_of_step_industry(self):
+        src = open('training_v4.cpp').read()
+        assert 'float hold[IND_SYMS];' in src and 'float hold_cash;' in src
+        assert 'res.hold[j] = slot0_own.holdings[j]' in src, 'holdings not captured from slot 0'
+
+    def test_a_row_is_written_per_industry_per_day(self):
+        src = open('training_v4.cpp').read()
+        assert 'holdings_log.csv' in src
+        assert 'for (int j = 0; j < IND_SYMS; j++) fprintf(g_hold_csv' in src
+
+    def test_it_is_flushed(self):
+        """training_log.csv and control_log.csv sit at 0 bytes for an entire 70h run because
+        nothing flushes them. This log must be readable while the run is still going."""
+        src = open('training_v4.cpp').read()
+        assert 'fflush(g_hold_csv)' in src, 'holdings log would be unreadable until fclose'
