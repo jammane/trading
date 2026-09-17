@@ -829,17 +829,24 @@ def main():
                 continue
             sorted_asc   = sorted(prices_today.items(), key=lambda x: x[1])
             top1         = max(prices_today.items(), key=lambda x: x[1])
-            bottom2      = sorted_asc[:2]
+            # The two cheapest OTHER than the priciest, so a 3-symbol industry cannot count the
+            # same name twice.
+            bottom2      = [x for x in sorted_asc if x[0] != top1[0]][:2]
             entry_min    = top1[1] + sum(p for _, p in bottom2)  # priciest + 2 cheapest
             top3         = [top1] + bottom2
-            max_price    = top3[0][1]
-            if ind_capital >= max_price:
+            # Gate on the 3-stock entry, not on one share of the priciest. Affording a single
+            # share of the dearest symbol does not make an industry tradeable -- the model
+            # allocates across the whole industry, and a book that can hold exactly one position
+            # cannot express that. The log line always described this rule ("3-stock entry");
+            # the gate was checking the weaker `>= max_price` and letting industries in that
+            # could not build a position.
+            if ind_capital >= entry_min:
                 active_industries.add(ind)
             else:
                 top3_str = ', '.join(f"{s}=${p:.0f}" for s, p in top3)
                 inactive_log.append(
-                    f"{ind}: have ${ind_capital:.0f}, need ${max_price:.0f} to enter "
-                    f"(3-stock entry=${entry_min:.0f}: {top3_str})")
+                    f"{ind}: have ${ind_capital:.0f}, need ${entry_min:.0f} to enter "
+                    f"(3-stock entry: {top3_str})")
         if inactive_log:
             print("Inactive industries (below 1-share floor):")
             for msg in inactive_log:
@@ -999,6 +1006,20 @@ def main():
                         cur_qty = 0.0
 
                 # ── Buys after sells: stop anchored to buy_price ─────────────
+                # allocated_cash is the industry's budget for the WHOLE loop, so it has to be
+                # spent down as orders are queued. Reading it fresh per symbol sized every
+                # position against the full allocation: measured 2026-09-17, tech_hardware
+                # queued ~$12,800 against a $1,666.67 allocation (ON 99%, LRCX 96%, SWKS 96%,
+                # KLAC 94%, NVDA 91% ... each of the full budget). Live, Alpaca would fill those
+                # in arbitrary order until buying power ran out and the resulting book would not
+                # reflect the model's intent. training_lib.step_industry spends its cash down
+                # correctly; this path did not.
+                remaining_cash = allocated_cash
+                # Industry portfolio value for the single-stock cap, on the same basis the model
+                # was fed (allocated_cash + holdings), mirroring training_lib.step_industry.
+                ind_port_value = allocated_cash + sum(
+                    holdings.get(s, 0.0) * day_data.get(s, {}).get('close', 0.0)
+                    for s in symbols)
                 for j, sym in enumerate(symbols):
                     if sym not in day_data:
                         continue
@@ -1012,13 +1033,22 @@ def main():
                     stop_loss_at = buy_price * 0.9   # GTC stop at 10% below entry
 
                     if buy_qty > 1e-6 and buy_price > 0 and low <= buy_price <= high:
-                        affordable = allocated_cash / (buy_price * BUY_FILL)
-                        amount     = int(min(buy_qty, affordable))
+                        affordable = remaining_cash / (buy_price * BUY_FILL)
+                        amount     = min(buy_qty, affordable)
+                        # MAX_SINGLE_STOCK_PCT was defined in this module (line ~40) and never
+                        # applied here, so production had NO single-stock ceiling while the
+                        # models were trained under one — an unenforced risk control and a
+                        # train/serve divergence.
+                        cur_sym_val = holdings.get(sym, 0.0) * buy_price
+                        max_spend   = max(0.0,
+                                          MAX_SINGLE_STOCK_PCT * ind_port_value - cur_sym_val)
+                        amount      = int(min(amount, max_spend / (buy_price * BUY_FILL)))
                         if amount >= 1:
                             orders.append({'symbol': sym, 'action': 'buy',
                                            'quantity': amount, 'price': buy_price})
                             orders.append({'symbol': sym, 'action': 'stop_loss',
                                            'quantity': amount, 'price': stop_loss_at})
+                            remaining_cash -= amount * buy_price * BUY_FILL
 
             except Exception as e:
                 print(f"Error processing industry {industry}: {e}")
