@@ -116,6 +116,39 @@ def compute_total_portfolio_value(cash, holdings, day_data, histories):
                 total_value += qty * price
     return total_value
 
+def load_activation_order(model_dir, entry_by_ind):
+    """Industry priority for the cumulative entry gate: which industries to fund first.
+
+    Read from {model_dir}/activation_order.json — a list of industry names, best first. It is
+    meant to come from estimated per-industry returns measured on a full dev run, refreshed when
+    a new run completes.
+
+    IMPORTANT: derive it from several passes, not one. Measured 2026-09-17 on a 5-pass run, a
+    single pass agreed with the 5-pass mean in only 2 of 12 positions, and one industry swung 3.9x
+    between replicates of identical days. Coarse bands are the most the data supports.
+
+    Falls back to cheapest-entry-first, which unlocks the most industries per dollar and
+    reproduces the ordering the old price spread used to supply by accident.
+    """
+    path = os.path.join(model_dir, 'activation_order.json')
+    known = list(entry_by_ind)
+    try:
+        with open(path) as f:
+            order = json.load(f)
+        order = [i for i in order if i in entry_by_ind]
+        missing = [i for i in known if i not in order]
+        if missing:
+            print(f"  activation_order.json omits {missing} — appended by cheapest entry")
+            missing.sort(key=lambda i: entry_by_ind[i][0])
+            order += missing
+        return order
+    except FileNotFoundError:
+        print("  no activation_order.json — falling back to cheapest-entry-first")
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"  activation_order.json unreadable ({e}) — falling back to cheapest-entry-first")
+    return sorted(known, key=lambda i: entry_by_ind[i][0])
+
+
 def update_owners_file(total_value, model_dir):
     """Update the total_value field in {model_dir}/owners.json."""
     owners_file = os.path.join(model_dir, 'owners.json')
@@ -819,34 +852,57 @@ def main():
                 print(f"  {_sym}: queued market sell {int(_qty)} shares "
                       f"(last known ~${_price:.2f})")
 
-        # ── Industry activity flags: skip trading if capital < priciest stock ─
+        # ── Industry activity: CUMULATIVE entry gate, walked in activation order ─
+        #
+        # Two rules, both of which the previous version got wrong:
+        #
+        #  1. entry_min is the 3-stock entry (priciest + 2 cheapest), not one share of the
+        #     priciest. Affording a single share of the dearest name does not make an industry
+        #     tradeable -- the model allocates across the whole industry.
+        #  2. The gate is CUMULATIVE against the TOTAL portfolio (cash + holdings), not each
+        #     industry against its own slice. Opening the Nth industry requires covering the
+        #     summed entry_min of all N, taken in activation order. Checking each industry
+        #     independently let every one open the moment it cleared its own floor, which is
+        #     not a ramp -- and the old universe hid that, because unlock points ran from $140
+        #     to $1,825 and so supplied an accidental ordering. Inside the $30-$90 band every
+        #     industry unlocks at roughly the same figure, so the order must now be explicit.
         active_industries = set()
         inactive_log      = []
+        total_value       = compute_total_portfolio_value(cash, holdings, day_data, histories)
+
+        entry_by_ind = {}
         for ind, syms in industries.items():
-            ind_capital  = allocations.get(ind, 0.0)
             prices_today = {s: day_data.get(s, {}).get('close', 0.0) for s in syms if day_data.get(s, {}).get('close', 0.0) > 0}
             if not prices_today:
                 continue
-            sorted_asc   = sorted(prices_today.items(), key=lambda x: x[1])
-            top1         = max(prices_today.items(), key=lambda x: x[1])
+            sorted_asc = sorted(prices_today.items(), key=lambda x: x[1])
+            top1       = max(prices_today.items(), key=lambda x: x[1])
             # The two cheapest OTHER than the priciest, so a 3-symbol industry cannot count the
             # same name twice.
-            bottom2      = [x for x in sorted_asc if x[0] != top1[0]][:2]
-            entry_min    = top1[1] + sum(p for _, p in bottom2)  # priciest + 2 cheapest
-            top3         = [top1] + bottom2
-            # Gate on the 3-stock entry, not on one share of the priciest. Affording a single
-            # share of the dearest symbol does not make an industry tradeable -- the model
-            # allocates across the whole industry, and a book that can hold exactly one position
-            # cannot express that. The log line always described this rule ("3-stock entry");
-            # the gate was checking the weaker `>= max_price` and letting industries in that
-            # could not build a position.
-            if ind_capital >= entry_min:
+            bottom2    = [x for x in sorted_asc if x[0] != top1[0]][:2]
+            entry_by_ind[ind] = (top1[1] + sum(p for _, p in bottom2), [top1] + bottom2)
+
+        # PROD ONLY. Paper runs every industry — its job is to prove the models work across the
+        # whole universe in near-real conditions on money that is not real. The cumulative ramp
+        # exists because prod is real investment starting from one industry and earning its way
+        # into more; applying it to paper would just shrink the thing paper is meant to test.
+        if args.paper:
+            active_industries = set(entry_by_ind)
+            order = []
+        else:
+            order = load_activation_order(model_dir, entry_by_ind)
+        running = 0.0
+        for ind in order:
+            entry_min, top3 = entry_by_ind[ind]
+            need = running + entry_min
+            if total_value >= need:
                 active_industries.add(ind)
+                running = need
             else:
                 top3_str = ', '.join(f"{s}=${p:.0f}" for s, p in top3)
                 inactive_log.append(
-                    f"{ind}: have ${ind_capital:.0f}, need ${entry_min:.0f} to enter "
-                    f"(3-stock entry: {top3_str})")
+                    f"{ind}: portfolio ${total_value:.0f}, need ${need:.0f} cumulative "
+                    f"(+${entry_min:.0f} for this industry; 3-stock entry: {top3_str})")
         if inactive_log:
             print("Inactive industries (below 1-share floor):")
             for msg in inactive_log:
