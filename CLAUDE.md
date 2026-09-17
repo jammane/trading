@@ -180,6 +180,44 @@ It is Rechenberg's 1/5 statistic, and it answers two open questions cheaply:
   periods, a fixed sigma is leaving value on the table and a sigma ladder has a case. If it is
   stationary, one sigma suffices.
 
+**`--control-untrained` (v0.6.9.0) — the no-learning control.** Re-randomises every industry's 20
+StockNN elites at the start of **every day** instead of loading them, so the pool accumulates
+nothing while the market data, the fill simulation, selection, scoring and logging stay byte-for-byte
+the ordinary path. It measures the baseline that nothing in this repo has ever measured: how much of
+a run's portfolio growth comes from **training** versus from the selection mechanism operating on
+arbitrary models.
+
+The question is not hypothetical. An accidental version of this ran for months as the `--no-save`
+defect (fixed in v0.6.6.0), and it scored **+151.4%** against trained runs' **+127-142%** — the
+control *beat* the real thing. Either that was luck in one run, or the scoring cannot distinguish
+model quality at all, in which case every pass-level conclusion drawn from portfolio value is
+unsupported. One control run per few real runs settles it.
+
+Intended cadence is occasional, not routine — it costs a full run to produce a number that only
+means anything next to a trained run over the *same* day range.
+
+```bash
+./build/training_v4_cpp --account acct0 --control-untrained \
+  --passes 5 --sigma 0.008 --start-day 17 --stop-day 1255
+```
+
+Deliberately hard to mistake for a real run, because its output is otherwise indistinguishable:
+
+- A banner at startup and the per-day lines unchanged, so read the banner.
+- The CSV is **`training_log_CONTROL.csv`**, not `training_log.csv` — every plotting and analysis
+  script reads the latter by exact name, so a control can never be picked up by accident.
+- A `CONTROL_UNTRAINED` marker file is written into the output directory.
+- Industry elites and history are **not saved** (tomorrow re-randomises rather than loads, so the
+  write would only burn ~3 GB of I/O and leave a directory of weights that look trained).
+- The pass-boundary champion gate is **skipped** — crowning a champion from random weights would
+  write them into `champion/`, where the next real run would seed from them.
+
+Seeding is per-day *and* per-industry (`day × 7919 + ind × 104729`), so the parents genuinely differ
+day to day. The accidental `--no-save` version re-drew the *same* models every day, which left a
+fixed 200-slot pool that selection could still exploit; this is the cleaner null. MT1/MT2 still
+train normally, but on top of a random-StockNN portfolio, so their weights from a control run are
+not usable either.
+
 **Inspect MT1/MT2 training log:**
 
 As of v0.4.1.0 the binary log is one record **per block-day** (was one per 25-day block — 50
@@ -688,7 +726,7 @@ Version string is defined in `version.py` (`VERSION`) and mirrored as `TRAINER_V
 - `FEATURE` — increment for any new capability or significant improvement; resets `BUILD` to 0.
 - `BUILD` — increment for bug fixes and minor changes within a `FEATURE`.
 
-Current version: **0.6.2.0**
+Current version: **0.6.9.0**
 
 To bump the version, edit `VERSION` in `version.py` and `TRAINER_VERSION` in `training_v4.cpp`, then rebuild the C++ binary.
 
