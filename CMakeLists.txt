@@ -27,3 +27,10 @@ target_include_directories(test_mt1_cpp PRIVATE ${CMAKE_SOURCE_DIR})
 target_compile_options(test_mt1_cpp PRIVATE -O2 -Wall -Wextra)
 target_link_libraries(test_mt1_cpp m)
 add_test(NAME test_mt1 COMMAND test_mt1_cpp)
+
+# Pass-boundary seeding unit tests — also pure math, no BLAS
+add_executable(test_pass_seeding_cpp tests/test_pass_seeding.cpp)
+target_include_directories(test_pass_seeding_cpp PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_options(test_pass_seeding_cpp PRIVATE -O2 -Wall -Wextra)
+target_link_libraries(test_pass_seeding_cpp m)
+add_test(NAME test_pass_seeding COMMAND test_pass_seeding_cpp)

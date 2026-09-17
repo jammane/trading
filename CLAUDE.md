@@ -96,24 +96,127 @@ mkdir -p /root/diag_logs
 # After training, convert back to .pt before inspect_trades.py or production_v2.py:
 python convert_weights.py --account acct0
 ```
-`--no-save` suppresses all model writes (industry elites, history, master, MT1, MT2).
-**Always use it for diagnostic runs.** A run directory is **~3.0 GB**, of which 70% is the StockNN
+`--no-save` trains into `<output>.nosave` and **deletes it at exit** — the canonical model
+directory is untouched, and no 3 GB run directory is left behind.
+
+**This changed in v0.6.6.0, and the old behaviour was a silent correctness bug.** `--no-save` used
+to suppress the writes themselves, which disabled StockNN training entirely: `step_industry`
+reloads `elite_buf` and `hist_buf` from disk at the top of **every day**, so with nothing written
+they were re-random-initialised daily from the same seed. Measured on the v0.6.0.0-A run:
+**297,120 random-init lines = 20 slots × 12 industries × 1238 days**. Nothing learned; the
+portfolio grew only from picking the best of 200 fresh random models each day. Any StockNN
+"diagnostic" taken under the old `--no-save` measured that, not training — including the
+v0.6.0.0-A results and the v0.5-vs-v0.6 comparison built on them.
+
+Note `--no-save` now does the same disk I/O as a normal run, because that I/O *is* training. It is
+no longer "free". A run directory is **~3.0 GB**, of which 70% is the StockNN
 5-day elite history: `HIST_DAYS × HIST_PER_DAY = 50` full copies of a ~921K-parameter model per
 industry (176 MB × 12 = 2.1 GB), plus 851 MB of elites. MT1 heads + tails + MT2 together are under
 40 MB, so MT1 work is nearly free on disk — the cost is entirely the StockNN layer. Thirteen
 accumulated run directories took the droplet's 58 GB disk to 92% full.
 Analysis only needs the logs (`mt_training_log.bin`, `training_log.csv`, `train.log`, 3–5 MB);
-weights are only needed to seed a run (`--load-dir`) or convert to `.pt`. `/root/prune_runs.sh [KEEP]`
+weights are only needed to seed a run (`--load-dir`) or convert to `.pt`.
+
+**`--load-dir` is a SEED, consulted only when the working store has nothing** (fixed v0.6.6.0).
+It used to be checked *first, every day*, so a run seeded from a populated directory reloaded that
+seed daily and never made progress — the same root cause as the `--no-save` bug: neither path had
+any notion of "first day only". `/root/prune_runs.sh [KEEP]`
 (default 2, `--dry-run` previews) strips weights from all but the N most recent `/root/ht_train*`
 runs while preserving every log, and skips a run detected in flight. Run it before a full pass.
 Always use real disk paths (`models/acct0/training`, `logs/`, `/root/diag_logs`) — never `/tmp` which is a 978 MB RAM-backed tmpfs on the droplet. Training and production can run concurrently; both write to real disk only.
+
+**Training pauses for production (v0.6.5.0).** The droplet has 2 cores and a training run uses
+~150% CPU, so the two compete: measured, training fell from 34 s/day to 1–3 min/day with other
+jobs alongside it. Production is the time-sensitive side, so `production_v2.py` writes
+`/run/trading/trading_active.lock` (PID on line 1) for the whole cycle — orders *and* upkeep — and
+the trainer polls it **between training days**, sleeping 15 s at a time and logging `PAUSED` /
+`RESUMED`. Worker threads are parked at that point, so the whole trainer idles.
+
+The default path is hardcoded in both `production_v2.TRADING_LOCK_PATH` and `g_trade_lock` in
+`training_v4.cpp` — **keep the two in sync**. It is absolute because the two processes run from
+different worktrees (`/root/trading` vs `/root/trading-ht`), and under `/run` (tmpfs) so a reboot
+cannot strand a lock. Override with `TRADING_LOCK_PATH=` and `--trade-lock PATH`; disable the
+pause entirely with `--no-trade-lock`.
+
+A stale lock is ignored if its **PID is dead** or it is **older than 30 minutes**, and the override
+is logged loudly — a crashed production run must not idle training indefinitely. Failure to *write*
+the lock never blocks a production run; the only cost is continued CPU competition.
 MT1 trains via direction/delta/range scoring starting at `actual_day >= 25`; MT2 trains via tier-classification starting at `actual_day >= 30`.
 `convert_weights.py` is required after C++ training before using `inspect_trades.py` or `production_v2.py`.
+
+**Choosing which models to convert (v0.6.4.1).** `--source-dir DIR` reads `.bin` from anywhere,
+`--output-dir DIR` writes `.pt` anywhere, and `--industry-dir DIR` overrides the source for the
+StockNN industry elites **only**. That last one exists for the champion store: with pass-boundary
+seeding active (see `PASS_SEEDING.md`) the final pass is **not** necessarily the best, and
+`models/acct#/training/champion/` holds the per-industry best — but *nothing else*, since master,
+MT1 and MT2 are saved to the run root. So the deliverable is:
+
+```bash
+python convert_weights.py --account acct0 --industry-dir models/acct0/training/champion
+```
+
+Pointing `--source-dir` at `champion/` instead would convert the industries and silently skip
+master/MT1/MT2. The script errors out if the industry directory has no elite files at all, and
+warns loudly if it holds fewer than 12 industries.
 Note: existing master `.bin` files are incompatible after the MT1/MT2 architecture change — regenerate with `prepare_models.py`.
 **v0.6.0.0 is BREAKING for StockNN too:** `STOCKNN_PARAMS` changed 921625 → 928825, so every
 industry `.bin`/`.pt`, every elite pool and every `{ind}_hist.bin` ring from v0.5.0.0 or earlier is
 unloadable. `load_bin` validates by exact element count and falls back to **random init silently**,
 so a stale run directory looks like it works. Start from a clean `--output` directory and retrain.
+
+**Mutation success rate (v0.6.7.0).** Each per-day industry line carries `mut_ok=NN%`, and
+`training_log.csv` gains a `{ind}_mut_success` column: the fraction of the 180 mutations that beat
+**their own parent**. Read-only — nothing selects on it.
+
+It is Rechenberg's 1/5 statistic, and it answers two open questions cheaply:
+
+- **Is sigma in the usable band on the current architecture?** The 0.0055–0.009 range was measured
+  many versions and one breaking parameter change ago. Far above 1/5 means steps are too small and
+  the pool is degenerate; far below means most mutations are damage and selection is mostly picking
+  survivors of noise. The measured pool spread — `best-of-200 +604` vs `worst-of-200 +573`, ~5% of
+  a ~$590 common move — is consistent with either, and this statistic separates them.
+- **Does the regime-optimal sigma move?** Plot it against market volatility. If it spikes when the
+  market shifts (existing weights suddenly wrong, so more mutations help) and falls in calm
+  periods, a fixed sigma is leaving value on the table and a sigma ladder has a case. If it is
+  stationary, one sigma suffices.
+
+**`--control-untrained` (v0.6.9.0) — the no-learning control.** Re-randomises every industry's 20
+StockNN elites at the start of **every day** instead of loading them, so the pool accumulates
+nothing while the market data, the fill simulation, selection, scoring and logging stay byte-for-byte
+the ordinary path. It measures the baseline that nothing in this repo has ever measured: how much of
+a run's portfolio growth comes from **training** versus from the selection mechanism operating on
+arbitrary models.
+
+The question is not hypothetical. An accidental version of this ran for months as the `--no-save`
+defect (fixed in v0.6.6.0), and it scored **+151.4%** against trained runs' **+127-142%** — the
+control *beat* the real thing. Either that was luck in one run, or the scoring cannot distinguish
+model quality at all, in which case every pass-level conclusion drawn from portfolio value is
+unsupported. One control run per few real runs settles it.
+
+Intended cadence is occasional, not routine — it costs a full run to produce a number that only
+means anything next to a trained run over the *same* day range.
+
+```bash
+./build/training_v4_cpp --account acct0 --control-untrained \
+  --passes 5 --sigma 0.008 --start-day 17 --stop-day 1255
+```
+
+Deliberately hard to mistake for a real run, because its output is otherwise indistinguishable:
+
+- A banner at startup and the per-day lines unchanged, so read the banner.
+- The CSV is **`training_log_CONTROL.csv`**, not `training_log.csv` — every plotting and analysis
+  script reads the latter by exact name, so a control can never be picked up by accident.
+- A `CONTROL_UNTRAINED` marker file is written into the output directory.
+- Industry elites and history are **not saved** (tomorrow re-randomises rather than loads, so the
+  write would only burn ~3 GB of I/O and leave a directory of weights that look trained).
+- The pass-boundary champion gate is **skipped** — crowning a champion from random weights would
+  write them into `champion/`, where the next real run would seed from them.
+
+Seeding is per-day *and* per-industry (`day × 7919 + ind × 104729`), so the parents genuinely differ
+day to day. The accidental `--no-save` version re-drew the *same* models every day, which left a
+fixed 200-slot pool that selection could still exploit; this is the cleaner null. MT1/MT2 still
+train normally, but on top of a random-StockNN portfolio, so their weights from a control run are
+not usable either.
 
 **Inspect MT1/MT2 training log:**
 
@@ -183,6 +286,20 @@ require a droplet upgrade.
 # acct1 (future): 30 16 download_daily if diff universe; 5 18 paper, 35 18 prod
 # acct2 (future): 5 19 paper, 35 19 prod
 ```
+
+**`--no-orders` (v0.6.8.0).** Runs the full cycle — fetch, allocate, decide, and the daily upkeep
+training step — but submits nothing to Alpaca and cancels nothing. For catching the models up on
+missed sessions without trading, which is step 3 of the paper rollout.
+
+It guards **both** mutating paths: order submission *and* the existing-stop cancellation. Cancelling
+a live stop while submitting no replacement would strip protection from a real position, which is
+the one destructive thing this mode must not do.
+
+Training is unaffected by the missing fills: `build_primed_portfolios` seeds from real Alpaca
+positions, but `upkeep_industry` then **simulates** fills against `day_data`/`next_day_data`, so the
+evolution step is driven by market data. The one real consequence is that positions stay flat, so
+those runs train buy-side behaviour only and never exercise sell or stop-loss decisions — fine for a
+few catch-up sessions, an argument against a long one.
 
 ```bash
 # Manual run (paper)
@@ -325,7 +442,7 @@ All model classes are defined in `models.py` (single source of truth) and import
   `TODAY_WIDTH`), pinned by `TestTodayLayout`. A mismatch between the two sides misaligns every
   feature past the first symbol block while staying in bounds — plausible wrong numbers, no crash.
 - **`MasterNN`** — legacy single cross-sector allocator (444→48). Kept for backward compatibility; superseded by MT1+MT2 in production once MT2 models are available.
-- **`MT1NN`** (37→4, ~3,412 params per slot) — per-industry preprocessor. **Five independent 200-slot pools per industry** (composite, direction, accuracy, range, confidence); see "MT1 pools" under MT1 scoring formulas. Input: one industry's 37-feature slice of the 444-feature master vector. Outputs (raw logits, activations applied at score time): `sigmoid(out[0])` = direction confidence P(positive return), `tanh(out[1])×$10K` = dollar P&L prediction, `softplus(out[2])` = range as fraction of effective delta, `sigmoid(out[3])` = calibrated confidence. Activates at `actual_day >= 25`; scored over a 10-day linear-weighted window. Files: `mt1_{industry}_model_{n}.pt` / `mt1_{industry}_best.pt`.
+- **`MT1NN`** (74→4, **9,208 params** composed) — per-industry preprocessor. Composed = one shared `MT1DualHead` (1,996 = two 37→28 trunks) + four `MT1Tail` (1,803 each). There is deliberately no single `MT1NN_PARAMS` constant: the C++ allocates and saves heads and tails separately (`HEADNN_PARAMS`, `TAILNN_PARAMS`), and a stale composed constant is exactly the kind of thing `load_bin` turns into a silent random-init. Pinned by `tests/test_models.py::TestMT1NN::test_param_count` and by `static_assert` in `training_v4.cpp`. **Five independent 200-slot pools per industry** (composite, direction, accuracy, range, confidence); see "MT1 pools" under MT1 scoring formulas. Input: one industry's 74-feature slice `[37 market ‖ 37 portfolio]` of the 888-feature master vector. Outputs (raw logits, activations applied at score time): `sigmoid(out[0])` = direction confidence P(positive return), `tanh(out[1])×$10K` = dollar P&L prediction, `softplus(out[2])` = range as fraction of effective delta, `sigmoid(out[3])` = calibrated confidence. Activates at `actual_day >= 25`; scored over a 10-day linear-weighted window. Files: `mt1_{industry}_model_{n}.pt` / `mt1_{industry}_best.pt`.
 - **`MT2NN`** (FC+LSTM→48, ~34,572 params per slot) — cross-industry allocator. Replaces `MasterNN`. Input: 48 raw MT1 slot0 activations (4 per industry × 12 industries, no normalization — dollar magnitude IS the allocation signal). Parallel FC branch (48→36→36) + 2-layer LSTM (input=4, hidden=36) → concat 72 → taper (72→66→60→54→48). Activates at `actual_day >= 30`. Files: `mt2_model_{n}.pt` / `mt2_best.pt`.
 
 ### MT1 scoring formulas
@@ -609,7 +726,7 @@ Version string is defined in `version.py` (`VERSION`) and mirrored as `TRAINER_V
 - `FEATURE` — increment for any new capability or significant improvement; resets `BUILD` to 0.
 - `BUILD` — increment for bug fixes and minor changes within a `FEATURE`.
 
-Current version: **0.6.2.0**
+Current version: **0.6.9.0**
 
 To bump the version, edit `VERSION` in `version.py` and `TRAINER_VERSION` in `training_v4.cpp`, then rebuild the C++ binary.
 
