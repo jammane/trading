@@ -143,6 +143,19 @@ static constexpr float IND_STARTING_CASH   = 25000.0f;
 static constexpr float MST_STARTING_CASH   = 300000.0f;
 static constexpr float IND_UNIT_PRICE      = 25000.0f;
 static constexpr float MAX_SINGLE_STOCK_PCT = 0.60f;
+
+// Whole shares only. Every Alpaca order is submitted with qty= (never notional=), and the
+// stop-loss orders forbid fractional trading outright — so production floors to int
+// (production_v2.py: 'quantity': int(_qty)) while the simulator traded continuous quantities.
+// That let training buy 0.7 of a share and collect exposure where production buys NOTHING,
+// and because int() truncates DOWN the bias was directional: production always deployed less
+// than training assumed. The error scales inversely with capital (~3% at $25,000/industry,
+// ~47% at a $2,000 single-industry start), i.e. worst exactly where production starts.
+// The epsilon absorbs float error so 2.9999997 does not become 2.
+static inline float whole_shares(float q) {
+    float w = std::floor(q + 1e-4f);
+    return w > 0.f ? w : 0.f;
+}
 static constexpr float SEC_FEE_RATE        = 0.0000278f;
 static constexpr float FINRA_TAF_PER_SHARE = 0.000166f;
 static constexpr float FINRA_TAF_MAX       = 8.30f;
@@ -1458,7 +1471,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
 
             // Partial sell at open
             if (sell_qty > 1e-6f && port.holdings[j] > 1e-6f) {
-                float amt = std::min(sell_qty, port.holdings[j]);
+                float amt = whole_shares(std::min(sell_qty, port.holdings[j]));
                 port.holdings[j] -= amt;
                 port.cash        += sell_net(amt, nd_open);
                 local_sell       += amt;
@@ -1522,6 +1535,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                         float max_spend   = std::max(0.f, MAX_SINGLE_STOCK_PCT * port_value - cur_sym_val);
                         buy_amount = std::min(buy_amount, max_spend / fill_price);
                     }
+                    buy_amount = whole_shares(buy_amount);
                     if (buy_amount > 1e-6f) {
                         port.holdings[j]    += buy_amount;
                         port.cash           -= buy_amount * fill_price;
@@ -1593,7 +1607,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             float nd_high = fill_sym[j].valid ? fill_sym[j].high  : day_sym[j].high;
             bool low_first = seq_flags[ind_i * IND_SYMS + j];
             if (sell_qty > 1e-6f && port.holdings[j] > 1e-6f) {
-                float amt = std::min(sell_qty, port.holdings[j]);
+                float amt = whole_shares(std::min(sell_qty, port.holdings[j]));
                 port.holdings[j] -= amt;
                 port.cash        += sell_net(amt, nd_open);
                 local_sell       += amt;
@@ -1647,6 +1661,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                         float max_spend   = std::max(0.f, MAX_SINGLE_STOCK_PCT * port_value - cur_sym_val);
                         buy_amount = std::min(buy_amount, max_spend / fill_price);
                     }
+                    buy_amount = whole_shares(buy_amount);
                     if (buy_amount > 1e-6f) {
                         port.holdings[j]    += buy_amount;
                         port.cash           -= buy_amount * fill_price;
