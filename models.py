@@ -221,6 +221,96 @@ class MT1Tail(nn.Module):
         return self.d4(h)   # (batch, 1)
 
 
+class MT1Net(nn.Module):
+    """Single-output MT1 — the rebuild. ONE network per industry, ONE number out.
+
+    Predicts that industry's NEXT-DAY StockNN P&L in dollars. Replaces MT1DualHead + four
+    MT1Tail (9,208 params across five 200-slot pools) with 3,501 params in one pool.
+
+    Why the head/tail split went: it existed so four components could share a trunk. conf4 was
+    ungraded and fed MT2 a constant; direction scored 52.25% OOS against 83.66% in-sample with
+    negative skill in all 12 industries; delta aimed at the same 10-day forward relative-return
+    target that nothing predicted — including the control MT1 already receives as features
+    [10..16]. With one output a shared trunk has one consumer, so it is indirection, not sharing.
+
+    Why the BLOCK STRUCTURE stayed: it is a real inductive bias, not decoration. The 37 features
+    are three contiguous kinds — daily returns [0:10], decade momentum [10:17], vol+poly [17:37] —
+    and keeping them apart for two layers stops layer one mixing 20 volatility features with 10
+    daily returns. It is also CHEAPER than dense: 998 params per trunk versus 2,100 for a plain
+    74->28. Two trunks (market, portfolio) preserve the same separation across the 74-feature
+    input, which is [37 market || 37 portfolio].
+
+      per trunk:  daily 10->6->4 | decade 7->5->4 | vol+poly 20->20->20  -> concat 28
+      two trunks: 56
+      tail:       56 -> 22 -> 10 -> 1        (was 4 layers; 3 because search is evolutionary,
+                                              not gradient — depth costs more here)
+
+    d2 takes 23 inputs, not 22. The 23rd is RESERVED, fed 0.0, held for (H-L)/A — range as a
+    fraction of price, which measured +0.0338 incremental R2 against forward vol and is outside
+    the span of these features by construction (all 37 derive from one cumulative close series,
+    with no high or low anywhere). Injected at d2 rather than d1 so a single mutation can reach
+    the output: under gradient-free search a feature buried behind three ReLUs is unlikely to be
+    found. Reserving the slot now means filling it later changes no dimension, no offset and no
+    file format — the same trick that let StockNN's slot 16 be filled in v0.6.1.0 with binary
+    compatibility intact.
+
+    3,501 params. Layer names/order MUST match MT1NET_LAYER_DEFS and the C++ offsets.
+    """
+
+    RESERVED_D2_INPUT = 22          # index of the held-open (H-L)/A slot
+
+    def __init__(self):
+        super().__init__()
+        # market trunk
+        self.m_a1 = nn.Linear(20, 20); self.m_a2 = nn.Linear(20, 20)
+        self.m_b1 = nn.Linear(10, 6);  self.m_b2 = nn.Linear(6, 4)
+        self.m_c1 = nn.Linear(7, 5);   self.m_c2 = nn.Linear(5, 4)
+        # portfolio trunk
+        self.p_a1 = nn.Linear(20, 20); self.p_a2 = nn.Linear(20, 20)
+        self.p_b1 = nn.Linear(10, 6);  self.p_b2 = nn.Linear(6, 4)
+        self.p_c1 = nn.Linear(7, 5);   self.p_c2 = nn.Linear(5, 4)
+        # tail
+        self.d1 = nn.Linear(56, 22)
+        self.d2 = nn.Linear(23, 10)   # 22 + 1 reserved
+        self.d3 = nn.Linear(10, 1)
+
+    @staticmethod
+    def _trunk(x, a1, a2, b1, b2, c1, c2):
+        xb, xc, xa = x[:, 0:10], x[:, 10:17], x[:, 17:37]
+        a = F.relu(a2(F.relu(a1(xa))))
+        b = F.relu(b2(F.relu(b1(xb))))
+        c = F.relu(c2(F.relu(c1(xc))))
+        return torch.cat([a, b, c], dim=1)          # (batch, 28)
+
+    def forward(self, x, extra=None):
+        """x: (batch, 74) = [37 market || 37 portfolio]. Returns (batch, 1) RAW logit.
+
+        `extra` is the reserved d2 input; None feeds 0.0, which is exactly inert (0 x w = 0).
+        Decode with mt1_pred(): tanh(raw) * MT1_PRED_SCALE.
+        """
+        m = self._trunk(x[:, 0:37],  self.m_a1, self.m_a2, self.m_b1,
+                        self.m_b2, self.m_c1, self.m_c2)
+        p = self._trunk(x[:, 37:74], self.p_a1, self.p_a2, self.p_b1,
+                        self.p_b2, self.p_c1, self.p_c2)
+        h = F.relu(self.d1(torch.cat([m, p], dim=1)))           # (batch, 22)
+        if extra is None:
+            extra = torch.zeros(h.shape[0], 1, dtype=h.dtype, device=h.device)
+        h = F.relu(self.d2(torch.cat([h, extra], dim=1)))       # (batch, 10)
+        return self.d3(h)                                       # (batch, 1) raw
+
+
+# (prefix, out_size, in_size) — mirrors the C++ offsets, same convention as HEAD/TAIL_LAYER_DEFS.
+MT1NET_LAYER_DEFS = [
+    ('m_a1', 20, 20), ('m_a2', 20, 20), ('m_b1', 6, 10),
+    ('m_b2', 4, 6),   ('m_c1', 5, 7),   ('m_c2', 4, 5),
+    ('p_a1', 20, 20), ('p_a2', 20, 20), ('p_b1', 6, 10),
+    ('p_b2', 4, 6),   ('p_c1', 5, 7),   ('p_c2', 4, 5),
+    ('d1', 22, 56), ('d2', 10, 23), ('d3', 1, 10),
+]
+
+MT1NET_PARAMS = sum(o * i + o for _, o, i in MT1NET_LAYER_DEFS)   # 3,501
+
+
 class MT1NN(nn.Module):
     """
     Composed MT1 net: one shared MT1DualHead (74→56) + four specialized MT1Tails → (batch, 4)
