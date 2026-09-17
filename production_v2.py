@@ -14,6 +14,7 @@ Usage:
 import argparse
 import contextlib
 import json
+import math
 import os
 import random
 from datetime import datetime
@@ -370,7 +371,15 @@ def load_stock_data(symbols):
             if os.path.exists(file_path):
                 with open(file_path) as f:
                     data = json.load(f)
-                histories[sym] = [[d['open'], d['close'], d['high'], d['low'], d['volume']] for d in data.get('days', [])[-15:]]
+                # Drop non-finite bars rather than feeding NaN into inference. yfinance
+                # writes NaN for a missing session; one such bar (SCCO 2026-08-11) reached
+                # the trainer's valuation and surfaced as prod=$-2147483648. download_daily
+                # now purges them at the source, but this path reads whatever is on disk.
+                histories[sym] = [
+                    [d['open'], d['close'], d['high'], d['low'], d['volume']]
+                    for d in data.get('days', [])[-15:]
+                    if all(isinstance(d.get(k), (int, float)) and math.isfinite(d[k])
+                           and d[k] > 0 for k in ('open', 'high', 'low', 'close'))]
             else:
                 histories[sym] = []
         except Exception as e:
