@@ -34,3 +34,10 @@ target_include_directories(test_pass_seeding_cpp PRIVATE ${CMAKE_SOURCE_DIR})
 target_compile_options(test_pass_seeding_cpp PRIVATE -O2 -Wall -Wextra)
 target_link_libraries(test_pass_seeding_cpp m)
 add_test(NAME test_pass_seeding COMMAND test_pass_seeding_cpp)
+
+# Single-output MT1 scoring + pool lifecycle (the rebuild) — pure math, no BLAS
+add_executable(test_mt1_pool_cpp tests/test_mt1_pool.cpp)
+target_include_directories(test_mt1_pool_cpp PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_options(test_mt1_pool_cpp PRIVATE -O2 -Wall -Wextra)
+target_link_libraries(test_mt1_pool_cpp m)
+add_test(NAME test_mt1_pool COMMAND test_mt1_pool_cpp)
