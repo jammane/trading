@@ -102,18 +102,22 @@ class TestProductionSourceGuards:
     """The three trading implementations drift; guard the one that isn't otherwise exercised."""
 
     def test_buy_loop_decrements_remaining_cash(self):
+        """Cash bookkeeping stays production's own job; only the arithmetic is shared."""
         src = open('production_v2.py').read()
         assert 'remaining_cash = allocated_cash' in src
         assert re.search(r'remaining_cash\s*-=\s*amount \* buy_price', src), \
             'buy loop no longer spends its budget down'
-        assert 'affordable = remaining_cash /' in src, \
-            'buy sizing must read remaining_cash, not allocated_cash'
+        assert re.search(r'size_buy\(\s*\n?\s*buy_qty, buy_price, remaining_cash', src), \
+            'sizing must be fed remaining_cash, not the full allocation'
 
-    def test_cap_is_actually_applied(self):
+    def test_cap_is_applied_via_the_shared_function(self):
+        """The cap moved into size_buy; production must pass the portfolio value to it."""
         src = open('production_v2.py').read()
-        uses = [ln for ln in src.splitlines()
-                if 'MAX_SINGLE_STOCK_PCT' in ln and not ln.strip().startswith('#')]
-        assert len(uses) >= 2, 'MAX_SINGLE_STOCK_PCT is defined but never applied'
+        assert 'ind_port_value' in src, 'production computes no portfolio value for the cap'
+        assert re.search(r'size_buy\([^)]*ind_port_value', src, re.S), \
+            'production must pass ind_port_value so the cap is enforced'
+        lib = open('training_lib.py').read()
+        assert 'MAX_SINGLE_STOCK_PCT * port_value' in lib, 'the cap left size_buy'
 
 
 class TestIndustryActivityGate:
@@ -215,3 +219,48 @@ class TestCumulativeEntryGate:
         src = open('production_v2.py').read()
         assert 'if args.paper:' in src and 'active_industries = set(entry_by_ind)' in src, \
             'paper must bypass the cumulative ramp'
+
+
+class TestSizingIsSharedNotCopied:
+    """The same buy-sizing arithmetic existed in SEVEN copies (training_lib x4,
+    training_v4.cpp x2, production_v2 x1). All three bugs found 2026-09-17 were in it, and each
+    fix had to be applied at every site. It now lives once, in training_lib.size_buy.
+    """
+
+    def test_training_lib_has_exactly_one_cap_calculation(self):
+        src = open('training_lib.py').read()
+        n = src.count('MAX_SINGLE_STOCK_PCT * port_value')
+        assert n == 1, f'cap arithmetic duplicated {n} times; it belongs only in size_buy()'
+
+    def test_all_python_sizing_goes_through_size_buy(self):
+        lib = open('training_lib.py').read()
+        assert lib.count('buy_amount = size_buy(') == 4, 'a simulator site stopped sharing'
+        assert "affordable = port['cash']" not in lib, 'an inlined sizing copy came back'
+        prod = open('production_v2.py').read()
+        assert 'size_buy(' in prod, 'production must use the shared sizing'
+        assert 'affordable = remaining_cash' not in prod, 'production re-inlined the arithmetic'
+
+    def test_production_no_longer_defines_its_own_cap_constant(self):
+        src = open('production_v2.py').read()
+        assert 'MAX_SINGLE_STOCK_PCT = 0.60' not in src, \
+            'two sources of truth for the cap is the bug being fixed'
+
+    def test_size_buy_enforces_all_three_bounds(self):
+        from training_lib import size_buy
+        # bounded by the model's request
+        assert size_buy(3.0, 10.0, 1e9, 1e9, 0.0) == 3.0
+        # bounded by cash
+        assert size_buy(1e9, 10.0, 55.0, 1e9, 0.0) == 5.0
+        # bounded by the single-stock cap (0.60 x 100 = 60 -> 6 shares at $10)
+        assert size_buy(1e9, 10.0, 1e9, 100.0, 0.0) == 6.0
+        # existing holding counts against the cap
+        assert size_buy(1e9, 10.0, 1e9, 100.0, 40.0) == 2.0
+        # always whole shares
+        assert size_buy(1e9, 10.0, 59.0, 1e9, 0.0) == 5.0
+
+    def test_size_buy_degenerate_inputs(self):
+        from training_lib import size_buy
+        assert size_buy(0.0, 10.0, 1e9, 1e9, 0.0) == 0.0
+        assert size_buy(5.0, 0.0, 1e9, 1e9, 0.0) == 0.0      # no price
+        assert size_buy(5.0, 10.0, 0.0, 1e9, 0.0) == 0.0     # no cash
+        assert size_buy(5.0, 10.0, 1e9, 0.0, 0.0) == 0.0     # cap leaves nothing
