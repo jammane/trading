@@ -54,6 +54,97 @@ static constexpr float MT1_PRED_SCALE = 10000.f;
 
 static inline float mt1_pred(float raw) { return tanhf(raw) * MT1_PRED_SCALE; }
 
+// ── MT1Net layout ────────────────────────────────────────────────────────────────
+// Mirrors models.py MT1Net / MT1NET_LAYER_DEFS exactly: one flat float array per model, layers in
+// defs order, each as [weights (out x in)] then [bias (out)]. KEEP THE TWO IN SYNC — load_bin
+// validates only by element count, so a layout drift with an unchanged total would load silently
+// and produce plausible wrong numbers. tests/test_mt1net_parity.py pins them against each other.
+//
+//   per trunk:  daily 10->6->4 | decade 7->5->4 | vol+poly 20->20->20 -> concat 28
+//   two trunks: 56          (market || portfolio)
+//   tail:       56 -> 22 -> 10 -> 1
+//
+// D2 takes 23 inputs: 22 from d1 plus one RESERVED slot fed 0.0, held for (H-L)/A. Inert by
+// construction (0 x w = 0), so filling it later changes no dimension, offset or file format.
+static constexpr int NT_M_A1_W = 0,    NT_M_A1_B = 400;    // 20x20
+static constexpr int NT_M_A2_W = 420,  NT_M_A2_B = 820;    // 20x20
+static constexpr int NT_M_B1_W = 840,  NT_M_B1_B = 900;    // 6x10
+static constexpr int NT_M_B2_W = 906,  NT_M_B2_B = 930;    // 4x6
+static constexpr int NT_M_C1_W = 934,  NT_M_C1_B = 969;    // 5x7
+static constexpr int NT_M_C2_W = 974,  NT_M_C2_B = 994;    // 4x5
+static constexpr int NT_P_A1_W = 998,  NT_P_A1_B = 1398;   // 20x20
+static constexpr int NT_P_A2_W = 1418, NT_P_A2_B = 1818;   // 20x20
+static constexpr int NT_P_B1_W = 1838, NT_P_B1_B = 1898;   // 6x10
+static constexpr int NT_P_B2_W = 1904, NT_P_B2_B = 1928;   // 4x6
+static constexpr int NT_P_C1_W = 1932, NT_P_C1_B = 1967;   // 5x7
+static constexpr int NT_P_C2_W = 1972, NT_P_C2_B = 1992;   // 4x5
+static constexpr int NT_D1_W   = 1996, NT_D1_B   = 3228;   // 22x56
+static constexpr int NT_D2_W   = 3250, NT_D2_B   = 3480;   // 10x23
+static constexpr int NT_D3_W   = 3490, NT_D3_B   = 3500;   // 1x10
+
+static constexpr int MT1NET_PARAMS       = 3501;
+static constexpr int MT1NET_D2_RESERVED  = 22;   // index of the held-open (H-L)/A input
+
+static_assert(NT_D3_B + 1 == MT1NET_PARAMS,
+              "MT1Net layout drifted from MT1NET_PARAMS — check models.py MT1NET_LAYER_DEFS");
+
+// ── MT1Net forward ───────────────────────────────────────────────────────────────
+// Plain loops rather than BLAS: every layer here is tiny (largest is 22x56) and sgemv call
+// overhead dominates at that size. The whole net is 3,501 params against the old composed
+// model's 9,208, so this is already 62% less arithmetic per forward pass.
+//
+// Weight layout matches torch.nn.Linear: W is (out x in) row-major, so element (o,i) is
+// W[o*in + i], followed by the bias vector.
+static inline void mt1net_matvec_relu(const float* W, const float* B, const float* x,
+                                      float* out, int n_out, int n_in) {
+    for (int o = 0; o < n_out; o++) {
+        float acc = B[o];
+        const float* row = W + (size_t)o * n_in;
+        for (int i = 0; i < n_in; i++) acc += row[i] * x[i];
+        out[o] = acc > 0.f ? acc : 0.f;
+    }
+}
+
+// One trunk: 37 features -> 28, keeping the three feature blocks separate for two layers.
+static inline void mt1net_trunk(const float* W, int base, const float* in37, float* out28) {
+    const float* xb = in37;        // daily    [0:10]
+    const float* xc = in37 + 10;   // decade   [10:17]
+    const float* xa = in37 + 17;   // vol+poly [17:37]
+    float a1[20], a2[20], b1[6], b2[4], c1[5], c2[4];
+    mt1net_matvec_relu(W + base + NT_M_A1_W, W + base + NT_M_A1_B, xa, a1, 20, 20);
+    mt1net_matvec_relu(W + base + NT_M_A2_W, W + base + NT_M_A2_B, a1, a2, 20, 20);
+    mt1net_matvec_relu(W + base + NT_M_B1_W, W + base + NT_M_B1_B, xb, b1,  6, 10);
+    mt1net_matvec_relu(W + base + NT_M_B2_W, W + base + NT_M_B2_B, b1, b2,  4,  6);
+    mt1net_matvec_relu(W + base + NT_M_C1_W, W + base + NT_M_C1_B, xc, c1,  5,  7);
+    mt1net_matvec_relu(W + base + NT_M_C2_W, W + base + NT_M_C2_B, c1, c2,  4,  5);
+    for (int i = 0; i < 20; i++) out28[i]      = a2[i];
+    for (int i = 0; i < 4;  i++) out28[20 + i] = b2[i];
+    for (int i = 0; i < 4;  i++) out28[24 + i] = c2[i];
+}
+
+// in74 = [market37 || portfolio37]. `extra` is the reserved d2 input — pass 0.f until (H-L)/A
+// lands. Returns the RAW logit; decode with mt1_pred().
+static inline float mt1net_forward(const float* W, const float* in74, float extra) {
+    float concat56[56];
+    mt1net_trunk(W, 0,          in74,      concat56);        // market    -> [0:28]
+    mt1net_trunk(W, NT_P_A1_W,  in74 + 37, concat56 + 28);   // portfolio -> [28:56]
+
+    float d1[22];
+    mt1net_matvec_relu(W + NT_D1_W, W + NT_D1_B, concat56, d1, 22, 56);
+
+    float d2_in[23];
+    for (int i = 0; i < 22; i++) d2_in[i] = d1[i];
+    d2_in[MT1NET_D2_RESERVED] = extra;
+
+    float d2[10];
+    mt1net_matvec_relu(W + NT_D2_W, W + NT_D2_B, d2_in, d2, 10, 23);
+
+    // final layer is linear — the output is a raw logit, squashed only at decode
+    float acc = W[NT_D3_B];
+    for (int i = 0; i < 10; i++) acc += W[NT_D3_W + i] * d2[i];
+    return acc;
+}
+
 // ── Baseline and floor windows ───────────────────────────────────────────────────
 //
 // CAUSALITY CONTRACT — both windows MUST end at day t, the same information the model had.

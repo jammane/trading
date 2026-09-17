@@ -210,7 +210,50 @@ static void test_scoring_delay_is_one_day() {
     CHECK(MT1_FLOOR_DAYS <= MT1_BASELINE_DAYS);
 }
 
+// ── layout ───────────────────────────────────────────────────────────────────────
+// load_bin validates only by element count, so a layout drift with an unchanged total would load
+// silently and produce plausible wrong numbers. These pin every offset.
+static void test_net_layout_is_contiguous() {
+    struct L { int w, b, out, in; };
+    const L ls[] = {
+        {NT_M_A1_W, NT_M_A1_B, 20, 20}, {NT_M_A2_W, NT_M_A2_B, 20, 20},
+        {NT_M_B1_W, NT_M_B1_B,  6, 10}, {NT_M_B2_W, NT_M_B2_B,  4,  6},
+        {NT_M_C1_W, NT_M_C1_B,  5,  7}, {NT_M_C2_W, NT_M_C2_B,  4,  5},
+        {NT_P_A1_W, NT_P_A1_B, 20, 20}, {NT_P_A2_W, NT_P_A2_B, 20, 20},
+        {NT_P_B1_W, NT_P_B1_B,  6, 10}, {NT_P_B2_W, NT_P_B2_B,  4,  6},
+        {NT_P_C1_W, NT_P_C1_B,  5,  7}, {NT_P_C2_W, NT_P_C2_B,  4,  5},
+        {NT_D1_W,   NT_D1_B,   22, 56}, {NT_D2_W,   NT_D2_B,   10, 23},
+        {NT_D3_W,   NT_D3_B,    1, 10},
+    };
+    const int n = (int)(sizeof(ls) / sizeof(ls[0]));
+    int cursor = 0;
+    for (int i = 0; i < n; i++) {
+        CHECK(ls[i].w == cursor);                    // weights start where the last layer ended
+        CHECK(ls[i].b == ls[i].w + ls[i].out * ls[i].in);   // bias follows its weights
+        cursor = ls[i].b + ls[i].out;
+    }
+    CHECK(cursor == MT1NET_PARAMS);                  // no gaps, no overlap, nothing left over
+}
+
+static void test_net_is_much_smaller_than_the_old_model() {
+    const int old_composed = 1996 + 4 * 1803;        // MT1DualHead + four MT1Tail
+    CHECK(MT1NET_PARAMS < old_composed / 2);
+    CHECK(MT1NET_PARAMS == 3501);
+}
+
+static void test_reserved_slot_has_room() {
+    // d2's input must be d1's output plus exactly one reserved slot
+    const int d1_out = (NT_D1_B - NT_D1_W) / 56;
+    const int d2_in  = (NT_D2_B - NT_D2_W) / 10;
+    CHECK(d1_out == 22);
+    CHECK(d2_in == d1_out + 1);
+    CHECK(MT1NET_D2_RESERVED == d1_out);
+}
+
 int main() {
+    test_net_layout_is_contiguous();
+    test_net_is_much_smaller_than_the_old_model();
+    test_reserved_slot_has_room();
     test_windows_must_be_causal();
     test_a_peeking_baseline_would_be_visible();
     test_scoring_delay_is_one_day();
