@@ -177,7 +177,43 @@ static void test_lifecycle_constants() {
     CHECK(MT1_BASELINE_DAYS > MT1_FLOOR_DAYS);                  // baseline is the slower estimate
 }
 
+// ── causality ────────────────────────────────────────────────────────────────────
+// A day-t prediction is scored at t+1. The baseline and floor windows must end at t, or they
+// have seen the outcome they are being used to judge.
+static void test_windows_must_be_causal() {
+    const int scored = 100;                       // outcome realised on day 100
+    CHECK(mt1_windows_are_causal(scored, 99, 99));   // both end the day before: fine
+    CHECK(mt1_windows_are_causal(scored, 80, 90));   // further back is fine too
+    CHECK(!mt1_windows_are_causal(scored, 100, 99)); // baseline saw the answer
+    CHECK(!mt1_windows_are_causal(scored, 99, 100)); // floor saw the answer
+    CHECK(!mt1_windows_are_causal(scored, 101, 99)); // baseline is ahead
+    CHECK(!mt1_windows_are_causal(scored, 99, 101)); // floor is ahead
+}
+
+static void test_a_peeking_baseline_would_be_visible() {
+    // If the baseline could see the outcome it would predict it exactly, base -> 0, and the
+    // model's score would collapse toward 0 no matter how good it was. This is what the contract
+    // prevents — pinned so the failure mode stays documented.
+    const float actual = 800.f, good_pred = 780.f;
+    const float honest = mt1_score(actual, good_pred, 25.f, 100.f);   // baseline = trailing mean
+    const float peeking = mt1_score(actual, good_pred, actual, 1e-6f); // baseline = the answer
+    CHECK(honest > 0.5f);        // a good prediction beats the honest baseline
+    CHECK(peeking < 0.1f);       // and looks terrible against a peeking one
+}
+
+static void test_scoring_delay_is_one_day() {
+    // Not a code path — a statement of the design. The old target needed MT1_FWD_DAYS=10 before a
+    // prediction could be graded; this needs t+1.
+    CHECK(MT1_BASELINE_DAYS > 1);      // the baseline is a window...
+    CHECK(MT1_FLOOR_DAYS > 1);         // ...and so is the floor
+    CHECK(MT1_BASELINE_DAYS <= 60);    // but neither is so long it cannot track a regime
+    CHECK(MT1_FLOOR_DAYS <= MT1_BASELINE_DAYS);
+}
+
 int main() {
+    test_windows_must_be_causal();
+    test_a_peeking_baseline_would_be_visible();
+    test_scoring_delay_is_one_day();
     test_score_anchor();
     test_score_symmetry();
     test_score_bounds();

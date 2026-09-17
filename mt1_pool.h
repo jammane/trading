@@ -55,9 +55,34 @@ static constexpr float MT1_PRED_SCALE = 10000.f;
 static inline float mt1_pred(float raw) { return tanhf(raw) * MT1_PRED_SCALE; }
 
 // ── Baseline and floor windows ───────────────────────────────────────────────────
+//
+// CAUSALITY CONTRACT — both windows MUST end at day t, the same information the model had.
+//
+// MT1 predicts on day t from day-t features; `actual` is the t->t+1 change, known at t+1. So a
+// day-t prediction is scored at t+1: a ONE-day delay, the minimum possible, against the old
+// design's 10 (and 20 for vol) which is what left a 10-day window holding ~1.6 independent
+// observations.
+//
+// The prediction path cannot look ahead. `baseline` and `floor` can, because both are windowed
+// statistics over the very series being predicted:
+//
+//   * a baseline whose window includes day t+1 has seen the answer, so it would beat the model
+//     for free and drive the score below 0.5 regardless of skill;
+//   * a floor whose window includes day t+1 lets a large move inflate its own denominator,
+//     flattering the score exactly on the days that matter most.
+//
+// Both must be computed from days <= t, BEFORE the day's scoring — the same ordering the old
+// acc_floor used. mt1_windows_are_causal() below is the assertion to call at the point of use.
 static constexpr int MT1_BASELINE_DAYS = 20;   // trailing mean = the predictor MT1 must beat
 static constexpr int MT1_FLOOR_DAYS    = 10;   // rolling window behind the score floor
 static constexpr float MT1_FLOOR_FRAC  = 0.5f; // floor = mean(|actual|) * frac, per industry
+
+// Guard for the call site: the last day feeding either window must be strictly before the day
+// whose outcome is being scored. Cheap enough to assert every day.
+static inline bool mt1_windows_are_causal(int scored_day, int baseline_last_day,
+                                          int floor_last_day) {
+    return baseline_last_day < scored_day && floor_last_day < scored_day;
+}
 
 // ── Per-day score ────────────────────────────────────────────────────────────────
 // `baseline` is the trailing-mean prediction for the same day; `floor` guards a near-zero
