@@ -68,6 +68,54 @@ MST_STARTING_CASH     = 300_000.0   # master starting capital (12 × IND_STARTIN
 IND_UNIT_PRICE        = 25_000.0    # fixed price per industry "unit" in master's portfolio
 MAX_SINGLE_STOCK_PCT  = 0.60        # no single stock may exceed 60% of portfolio value
 
+
+def portfolio_value(port, symbols, day_data, fill_data):
+    """Industry portfolio marked to fill-day closes, falling back to the decision day."""
+    return port['cash'] + sum(
+        port['holdings'].get(s, 0.0)
+        * fill_data.get(s, day_data.get(s, {})).get('close', 0.0)
+        for s in symbols)
+
+
+def size_buy(buy_qty, price, cash, port_value, cur_sym_value, buy_fill=None):
+    """Whole shares to buy: bounded by the model's request, available cash, and the
+    single-stock cap. THE one place this arithmetic lives.
+
+    It existed in seven copies (training_lib x4, training_v4.cpp x2, production_v2 x1) and all
+    three bugs found 2026-09-17 were in it -- fractional shares, the missing
+    MAX_SINGLE_STOCK_PCT cap, and cash that was never spent down. Each fix had to be applied at
+    every site, and the copy the tests did not reach was the one that drifted.
+
+    Deliberately pure and scalar: callers own the bookkeeping (how cash is tracked, how
+    port_value is marked) because that legitimately differs -- the simulator mutates a portfolio
+    as it fills, production projects against orders it has queued. Only the arithmetic is shared.
+    The C++ trainer keeps a twin; see training_v4.cpp and the parity test.
+    """
+    if buy_qty <= 1e-6 or price <= 0:
+        return 0.0
+    bf = BUY_FILL if buy_fill is None else buy_fill
+    amount = min(buy_qty, cash / (price * bf))
+    if amount <= 1e-6:
+        return 0.0
+    max_spend = max(0.0, MAX_SINGLE_STOCK_PCT * port_value - cur_sym_value)
+    return whole_shares(min(amount, max_spend / (price * bf)))
+
+
+def whole_shares(q):
+    """Whole shares only — the simulator must not trade what production cannot.
+
+    Every Alpaca order goes out with qty= (never notional=), and the stop-loss orders forbid
+    fractional trading outright, so production floors to int (production_v2: 'quantity':
+    int(_qty)). The fill simulation used continuous quantities, which let training buy 0.7 of a
+    share and collect exposure where production buys NOTHING -- and since int() truncates DOWN
+    the bias was directional: production always deployed less than training assumed. The error
+    scales inversely with capital (~3% at $25,000/industry, ~47% at a $2,000 single-industry
+    start), i.e. worst exactly where production starts. Mirrors whole_shares() in training_v4.cpp.
+    """
+    import math
+    w = math.floor(q + 1e-4)
+    return float(w) if w > 0 else 0.0
+
 MASTER_LOOKBACKS     = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30, 40, 50, 60, 90]
 MASTER_POLY3_WINDOWS = [10, 30, 60, 90]
 MASTER_START_DAY     = 30
@@ -238,7 +286,7 @@ def _fill_sym_from_bars(sym, port, bars, buy_qty, buy_price, sell_all_price,
     # Open: partial sell
     cur_qty = port['holdings'].get(sym, 0.0)
     if sell_qty > 1e-6 and cur_qty > 1e-6:
-        sell_amount = min(sell_qty, cur_qty)
+        sell_amount = whole_shares(min(sell_qty, cur_qty))
         port['holdings'][sym] -= sell_amount
         port['cash'] += _sell_net(sell_amount, nd_open)
         sells += sell_amount
@@ -262,16 +310,10 @@ def _fill_sym_from_bars(sym, port, bars, buy_qty, buy_price, sell_all_price,
     already_bought = False
     if buy_qty > 1e-6 and buy_price > 0 and nd_open <= buy_price:
         fill_price = nd_open
-        affordable = port['cash'] / (fill_price * BUY_FILL)
-        buy_amount = min(buy_qty, affordable)
-        if buy_amount > 1e-6:
-            port_value = port['cash'] + sum(
-                port['holdings'].get(s, 0.0)
-                * fill_data.get(s, day_data.get(s, {})).get('close', 0.0)
-                for s in symbols)
-            cur_sym_val = port['holdings'].get(sym, 0.0) * fill_price
-            max_spend = max(0.0, MAX_SINGLE_STOCK_PCT * port_value - cur_sym_val)
-            buy_amount = min(buy_amount, max_spend / (fill_price * BUY_FILL))
+        buy_amount = size_buy(
+            buy_qty, fill_price, port['cash'],
+            portfolio_value(port, symbols, day_data, fill_data),
+            port['holdings'].get(sym, 0.0) * fill_price)
         if buy_amount > 1e-6:
             port['holdings'][sym] = port['holdings'].get(sym, 0.0) + buy_amount
             port['cash'] -= buy_amount * fill_price * BUY_FILL
@@ -295,16 +337,10 @@ def _fill_sym_from_bars(sym, port, bars, buy_qty, buy_price, sell_all_price,
 
         if not already_bought and buy_qty > 1e-6 and buy_price > 0 and bar_low <= buy_price:
             fill_price = buy_price * (1.0 + SLIPPAGE_RATE)
-            affordable = port['cash'] / (fill_price * BUY_FILL)
-            buy_amount = min(buy_qty, affordable)
-            if buy_amount > 1e-6:
-                port_value = port['cash'] + sum(
-                    port['holdings'].get(s, 0.0)
-                    * fill_data.get(s, day_data.get(s, {})).get('close', 0.0)
-                    for s in symbols)
-                cur_sym_val = port['holdings'].get(sym, 0.0) * fill_price
-                max_spend = max(0.0, MAX_SINGLE_STOCK_PCT * port_value - cur_sym_val)
-                buy_amount = min(buy_amount, max_spend / (fill_price * BUY_FILL))
+            buy_amount = size_buy(
+                buy_qty, fill_price, port['cash'],
+                portfolio_value(port, symbols, day_data, fill_data),
+                port['holdings'].get(sym, 0.0) * fill_price)
             if buy_amount > 1e-6:
                 port['holdings'][sym] = port['holdings'].get(sym, 0.0) + buy_amount
                 port['cash'] -= buy_amount * fill_price * BUY_FILL
@@ -360,7 +396,7 @@ def _simulate_one_model(model, ref_cash, ref_hold, ref_stop, symbols,
 
         # Partial sell at open
         if sell_qty > 1e-6 and cur_qty > 1e-6:
-            sell_amount            = min(sell_qty, cur_qty)
+            sell_amount            = whole_shares(min(sell_qty, cur_qty))
             port['holdings'][sym] -= sell_amount
             port['cash']          += _sell_net(sell_amount, nd_open)
 
@@ -398,16 +434,10 @@ def _simulate_one_model(model, ref_cash, ref_hold, ref_stop, symbols,
             else:
                 fill_price = 0.0
             if fill_price > 0:
-                affordable = port['cash'] / (fill_price * BUY_FILL)
-                buy_amount = min(buy_qty, affordable)
-                if buy_amount > 1e-6:
-                    port_value    = port['cash'] + sum(
-                        port['holdings'].get(s, 0.0)
-                        * fill_data.get(s, day_data.get(s, {})).get('close', 0.0)
-                        for s in symbols)
-                    cur_sym_value = port['holdings'].get(sym, 0.0) * fill_price
-                    max_sym_spend = max(0.0, MAX_SINGLE_STOCK_PCT * port_value - cur_sym_value)
-                    buy_amount    = min(buy_amount, max_sym_spend / (fill_price * BUY_FILL))
+                buy_amount = size_buy(
+                    buy_qty, fill_price, port['cash'],
+                    portfolio_value(port, symbols, day_data, fill_data),
+                    port['holdings'].get(sym, 0.0) * fill_price)
                 if buy_amount > 1e-6:
                     port['holdings'][sym]     = port['holdings'].get(sym, 0.0) + buy_amount
                     port['cash']             -= buy_amount * fill_price * BUY_FILL
@@ -1277,7 +1307,7 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
 
             # Partial sell at open
             if sell_qty > 1e-6 and cur_qty > 1e-6:
-                sell_amount               = min(sell_qty, cur_qty)
+                sell_amount               = whole_shares(min(sell_qty, cur_qty))
                 port['holdings'][sym]    -= sell_amount
                 port['cash']             += _sell_net(sell_amount, nd_open)
                 local_sells              += sell_amount
@@ -1321,17 +1351,10 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
                     fill_price = 0.0
 
                 if fill_price > 0:
-                    affordable = port['cash'] / (fill_price * BUY_FILL)
-                    buy_amount = min(buy_qty, affordable)
-                    if buy_amount > 1e-6:
-                        # 60% single-stock concentration cap
-                        port_value    = port['cash'] + sum(
-                            port['holdings'].get(s, 0.0)
-                            * fill_data.get(s, day_data.get(s, {})).get('close', 0.0)
-                            for s in symbols)
-                        cur_sym_value = port['holdings'].get(sym, 0.0) * fill_price
-                        max_sym_spend = max(0.0, MAX_SINGLE_STOCK_PCT * port_value - cur_sym_value)
-                        buy_amount    = min(buy_amount, max_sym_spend / (fill_price * BUY_FILL))
+                    buy_amount = size_buy(
+                        buy_qty, fill_price, port['cash'],
+                        portfolio_value(port, symbols, day_data, fill_data),
+                        port['holdings'].get(sym, 0.0) * fill_price)
                     if buy_amount > 1e-6:
                         port['holdings'][sym]  += buy_amount
                         port['cash']           -= buy_amount * fill_price * BUY_FILL

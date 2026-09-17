@@ -36,6 +36,7 @@ Usage:
 """
 import datetime as dt
 import json
+import math
 import os
 import time
 
@@ -55,7 +56,17 @@ def _load_existing(sym: str) -> list:
         return []
     try:
         with open(path) as f:
-            return json.load(f).get('days', [])
+            days = json.load(f).get('days', [])
+        # Purge bars already written as non-finite. _merge keeps an existing bar when the fetch
+        # no longer returns it, so without this a bad bar survives every future run -- dropping
+        # it at the source only stops NEW ones. See _fetch for why they are poison.
+        clean = [d for d in days
+                 if all(isinstance(d.get(k), (int, float))
+                        and math.isfinite(d[k]) and d[k] > 0
+                        for k in ('open', 'high', 'low', 'close'))]
+        if len(clean) != len(days):
+            print(f'  {sym}: purged {len(days) - len(clean)} unusable bar(s) already on disk')
+        return clean
     except (OSError, json.JSONDecodeError) as e:
         # Returning [] triggers a full 5-year refetch for this symbol — say so, because silently
         # refetching every run would look like normal behaviour.
@@ -64,18 +75,35 @@ def _load_existing(sym: str) -> list:
 
 
 def _fetch(sym: str, period: str) -> list:
+    """Fetch daily bars, dropping any that are not usable.
+
+    yfinance returns NaN for a session it has no data for, and `json.dump` writes that as a bare
+    `NaN` literal. Downstream, the C++ trainer's `atof()` parses it happily, so the bar looked
+    valid and NaN entered the portfolio valuation -- `(int)NaN` is undefined behaviour and landed
+    on INT32_MIN, surfacing as `prod=$-2147483648` for SCCO 2026-08-11. It silently destroyed
+    every statistic computed over that industry-pass. Cheaper to never write it.
+    """
     ticker = yf.Ticker(sym)
     hist   = ticker.history(period=period, interval='1d')
     days   = []
+    dropped = 0
     for date, row in hist.iterrows():
+        o, h, low, c = (float(row['Open']), float(row['High']),
+                        float(row['Low']), float(row['Close']))
+        if not all(math.isfinite(v) and v > 0 for v in (o, h, low, c)) or h < low:
+            dropped += 1
+            continue
+        v = float(row['Volume'])
         days.append({
             'date':   date.strftime('%Y-%m-%d'),
-            'open':   float(row['Open']),
-            'high':   float(row['High']),
-            'low':    float(row['Low']),
-            'close':  float(row['Close']),
-            'volume': int(row['Volume']),
+            'open':   o,
+            'high':   h,
+            'low':    low,
+            'close':  c,
+            'volume': int(v) if math.isfinite(v) and v >= 0 else 0,
         })
+    if dropped:
+        print(f'    NOTE: dropped {dropped} unusable bar(s) for {sym} (non-finite or non-positive)')
     return days
 
 
