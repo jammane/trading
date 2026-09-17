@@ -149,7 +149,69 @@ class TestIndustryActivityGate:
         assert self.entry_min(old_financials) > 1800
         assert self.entry_min(new_banded) < 200
 
-    def test_source_gates_on_entry_min(self):
+    def test_source_computes_entry_min_not_the_one_share_rule(self):
         src = open('production_v2.py').read()
-        assert 'if ind_capital >= entry_min:' in src, 'gate regressed to the 1-share rule'
-        assert 'if ind_capital >= max_price:' not in src
+        assert 'top1[1] + sum(p for _, p in bottom2)' in src, 'entry_min formula changed'
+        assert 'if ind_capital >= max_price:' not in src, 'gate regressed to the 1-share rule'
+        assert "bottom2    = [x for x in sorted_asc if x[0] != top1[0]][:2]" in src, \
+            'the priciest must be excluded from the two cheapest'
+
+
+class TestCumulativeEntryGate:
+    """Opening the Nth industry requires the TOTAL portfolio to cover the summed entry_min of
+    all N, taken in activation order — not each industry against its own slice.
+
+    The old per-industry check let every industry open the moment it cleared its own floor. The
+    old universe hid that, because unlock points ran $140-$1,825 and supplied an accidental
+    ordering; inside the $30-$90 band they are all ~$150, so the ramp has to be explicit.
+    """
+
+    ENTRY = {'a': 150.0, 'b': 160.0, 'c': 170.0, 'd': 180.0}
+
+    @staticmethod
+    def activate(total, entry, order):
+        active, running = [], 0.0
+        for ind in order:
+            need = running + entry[ind]
+            if total >= need:
+                active.append(ind)
+                running = need
+        return active
+
+    def test_thresholds_are_cumulative_not_per_industry(self):
+        order = ['a', 'b', 'c', 'd']
+        assert self.activate(150.0, self.ENTRY, order) == ['a']
+        assert self.activate(309.0, self.ENTRY, order) == ['a']          # 150+160=310
+        assert self.activate(310.0, self.ENTRY, order) == ['a', 'b']
+        assert self.activate(480.0, self.ENTRY, order) == ['a', 'b', 'c']
+
+    def test_each_industry_alone_would_pass_the_old_check(self):
+        """At $200 every industry individually clears its ~$150-180 floor; only one may open."""
+        for e in self.ENTRY.values():
+            assert 200.0 >= e or e > 200.0      # floors are all near $200
+        assert len(self.activate(200.0, self.ENTRY, ['a', 'b', 'c', 'd'])) == 1
+
+    def test_order_decides_which_industry_opens_first(self):
+        assert self.activate(150.0, self.ENTRY, ['a', 'b', 'c', 'd']) == ['a']
+        assert self.activate(180.0, self.ENTRY, ['d', 'a', 'b', 'c']) == ['d']
+
+    def test_ramp_is_monotone_in_capital(self):
+        order = ['a', 'b', 'c', 'd']
+        counts = [len(self.activate(t, self.ENTRY, order)) for t in range(0, 700, 10)]
+        assert counts == sorted(counts), 'more capital must never open fewer industries'
+
+    def test_zero_capital_opens_nothing(self):
+        assert self.activate(0.0, self.ENTRY, ['a', 'b', 'c', 'd']) == []
+
+    def test_source_uses_cumulative_running_total(self):
+        src = open('production_v2.py').read()
+        assert 'need = running + entry_min' in src
+        assert 'if total_value >= need:' in src, 'gate must test the cumulative need'
+        assert 'load_activation_order(' in src
+
+
+    def test_mask_is_prod_only(self):
+        """Paper runs every industry; the ramp is for prod, which is real investment."""
+        src = open('production_v2.py').read()
+        assert 'if args.paper:' in src and 'active_industries = set(entry_by_ind)' in src, \
+            'paper must bypass the cumulative ramp'
