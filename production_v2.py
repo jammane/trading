@@ -14,6 +14,7 @@ Usage:
 import argparse
 import contextlib
 import json
+import math
 import os
 import random
 from datetime import datetime
@@ -37,7 +38,8 @@ from upkeep import (
 )
 from version import VERSION
 
-MAX_SINGLE_STOCK_PCT = 0.60   # max fraction of industry cash in one stock
+# MAX_SINGLE_STOCK_PCT lives in training_lib and is applied inside size_buy(). It was
+# duplicated here and never used, which is exactly how production lost the cap.
 
 MODEL_DIR = 'models'  # legacy; superseded by --account in main()
 STOCK_DATA_DIR = 'stock_data'
@@ -115,6 +117,39 @@ def compute_total_portfolio_value(cash, holdings, day_data, histories):
             if price > 0:
                 total_value += qty * price
     return total_value
+
+def load_activation_order(model_dir, entry_by_ind):
+    """Industry priority for the cumulative entry gate: which industries to fund first.
+
+    Read from {model_dir}/activation_order.json — a list of industry names, best first. It is
+    meant to come from estimated per-industry returns measured on a full dev run, refreshed when
+    a new run completes.
+
+    IMPORTANT: derive it from several passes, not one. Measured 2026-09-17 on a 5-pass run, a
+    single pass agreed with the 5-pass mean in only 2 of 12 positions, and one industry swung 3.9x
+    between replicates of identical days. Coarse bands are the most the data supports.
+
+    Falls back to cheapest-entry-first, which unlocks the most industries per dollar and
+    reproduces the ordering the old price spread used to supply by accident.
+    """
+    path = os.path.join(model_dir, 'activation_order.json')
+    known = list(entry_by_ind)
+    try:
+        with open(path) as f:
+            order = json.load(f)
+        order = [i for i in order if i in entry_by_ind]
+        missing = [i for i in known if i not in order]
+        if missing:
+            print(f"  activation_order.json omits {missing} — appended by cheapest entry")
+            missing.sort(key=lambda i: entry_by_ind[i][0])
+            order += missing
+        return order
+    except FileNotFoundError:
+        print("  no activation_order.json — falling back to cheapest-entry-first")
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"  activation_order.json unreadable ({e}) — falling back to cheapest-entry-first")
+    return sorted(known, key=lambda i: entry_by_ind[i][0])
+
 
 def update_owners_file(total_value, model_dir):
     """Update the total_value field in {model_dir}/owners.json."""
@@ -336,7 +371,15 @@ def load_stock_data(symbols):
             if os.path.exists(file_path):
                 with open(file_path) as f:
                     data = json.load(f)
-                histories[sym] = [[d['open'], d['close'], d['high'], d['low'], d['volume']] for d in data.get('days', [])[-15:]]
+                # Drop non-finite bars rather than feeding NaN into inference. yfinance
+                # writes NaN for a missing session; one such bar (SCCO 2026-08-11) reached
+                # the trainer's valuation and surfaced as prod=$-2147483648. download_daily
+                # now purges them at the source, but this path reads whatever is on disk.
+                histories[sym] = [
+                    [d['open'], d['close'], d['high'], d['low'], d['volume']]
+                    for d in data.get('days', [])[-15:]
+                    if all(isinstance(d.get(k), (int, float)) and math.isfinite(d[k])
+                           and d[k] > 0 for k in ('open', 'high', 'low', 'close'))]
             else:
                 histories[sym] = []
         except Exception as e:
@@ -819,27 +862,59 @@ def main():
                 print(f"  {_sym}: queued market sell {int(_qty)} shares "
                       f"(last known ~${_price:.2f})")
 
-        # ── Industry activity flags: skip trading if capital < priciest stock ─
+        # ── Industry activity: CUMULATIVE entry gate, walked in activation order ─
+        #
+        # Two rules, both of which the previous version got wrong:
+        #
+        #  1. entry_min is the 3-stock entry (priciest + 2 cheapest), not one share of the
+        #     priciest. Affording a single share of the dearest name does not make an industry
+        #     tradeable -- the model allocates across the whole industry.
+        #  2. The gate is CUMULATIVE against the TOTAL portfolio (cash + holdings), not each
+        #     industry against its own slice. Opening the Nth industry requires covering the
+        #     summed entry_min of all N, taken in activation order. Checking each industry
+        #     independently let every one open the moment it cleared its own floor, which is
+        #     not a ramp -- and the old universe hid that, because unlock points ran from $140
+        #     to $1,825 and so supplied an accidental ordering. Inside the $30-$90 band every
+        #     industry unlocks at roughly the same figure, so the order must now be explicit.
+        from training_lib import size_buy   # shared sizing arithmetic — see its docstring
+
         active_industries = set()
         inactive_log      = []
+        total_value       = compute_total_portfolio_value(cash, holdings, day_data, histories)
+
+        entry_by_ind = {}
         for ind, syms in industries.items():
-            ind_capital  = allocations.get(ind, 0.0)
             prices_today = {s: day_data.get(s, {}).get('close', 0.0) for s in syms if day_data.get(s, {}).get('close', 0.0) > 0}
             if not prices_today:
                 continue
-            sorted_asc   = sorted(prices_today.items(), key=lambda x: x[1])
-            top1         = max(prices_today.items(), key=lambda x: x[1])
-            bottom2      = sorted_asc[:2]
-            entry_min    = top1[1] + sum(p for _, p in bottom2)  # priciest + 2 cheapest
-            top3         = [top1] + bottom2
-            max_price    = top3[0][1]
-            if ind_capital >= max_price:
+            sorted_asc = sorted(prices_today.items(), key=lambda x: x[1])
+            top1       = max(prices_today.items(), key=lambda x: x[1])
+            # The two cheapest OTHER than the priciest, so a 3-symbol industry cannot count the
+            # same name twice.
+            bottom2    = [x for x in sorted_asc if x[0] != top1[0]][:2]
+            entry_by_ind[ind] = (top1[1] + sum(p for _, p in bottom2), [top1] + bottom2)
+
+        # PROD ONLY. Paper runs every industry — its job is to prove the models work across the
+        # whole universe in near-real conditions on money that is not real. The cumulative ramp
+        # exists because prod is real investment starting from one industry and earning its way
+        # into more; applying it to paper would just shrink the thing paper is meant to test.
+        if args.paper:
+            active_industries = set(entry_by_ind)
+            order = []
+        else:
+            order = load_activation_order(model_dir, entry_by_ind)
+        running = 0.0
+        for ind in order:
+            entry_min, top3 = entry_by_ind[ind]
+            need = running + entry_min
+            if total_value >= need:
                 active_industries.add(ind)
+                running = need
             else:
                 top3_str = ', '.join(f"{s}=${p:.0f}" for s, p in top3)
                 inactive_log.append(
-                    f"{ind}: have ${ind_capital:.0f}, need ${max_price:.0f} to enter "
-                    f"(3-stock entry=${entry_min:.0f}: {top3_str})")
+                    f"{ind}: portfolio ${total_value:.0f}, need ${need:.0f} cumulative "
+                    f"(+${entry_min:.0f} for this industry; 3-stock entry: {top3_str})")
         if inactive_log:
             print("Inactive industries (below 1-share floor):")
             for msg in inactive_log:
@@ -999,6 +1074,20 @@ def main():
                         cur_qty = 0.0
 
                 # ── Buys after sells: stop anchored to buy_price ─────────────
+                # allocated_cash is the industry's budget for the WHOLE loop, so it has to be
+                # spent down as orders are queued. Reading it fresh per symbol sized every
+                # position against the full allocation: measured 2026-09-17, tech_hardware
+                # queued ~$12,800 against a $1,666.67 allocation (ON 99%, LRCX 96%, SWKS 96%,
+                # KLAC 94%, NVDA 91% ... each of the full budget). Live, Alpaca would fill those
+                # in arbitrary order until buying power ran out and the resulting book would not
+                # reflect the model's intent. training_lib.step_industry spends its cash down
+                # correctly; this path did not.
+                remaining_cash = allocated_cash
+                # Industry portfolio value for the single-stock cap, on the same basis the model
+                # was fed (allocated_cash + holdings), mirroring training_lib.step_industry.
+                ind_port_value = allocated_cash + sum(
+                    holdings.get(s, 0.0) * day_data.get(s, {}).get('close', 0.0)
+                    for s in symbols)
                 for j, sym in enumerate(symbols):
                     if sym not in day_data:
                         continue
@@ -1012,13 +1101,19 @@ def main():
                     stop_loss_at = buy_price * 0.9   # GTC stop at 10% below entry
 
                     if buy_qty > 1e-6 and buy_price > 0 and low <= buy_price <= high:
-                        affordable = allocated_cash / (buy_price * BUY_FILL)
-                        amount     = int(min(buy_qty, affordable))
+                        # Shared with the simulator: size_buy is the ONE place the request /
+                        # cash / single-stock-cap arithmetic lives. It used to exist in seven
+                        # copies and production's was the one no test reached, so production was
+                        # the copy that drifted — no cap, no cash decrement, fractional shares.
+                        amount = int(size_buy(
+                            buy_qty, buy_price, remaining_cash, ind_port_value,
+                            holdings.get(sym, 0.0) * buy_price))
                         if amount >= 1:
                             orders.append({'symbol': sym, 'action': 'buy',
                                            'quantity': amount, 'price': buy_price})
                             orders.append({'symbol': sym, 'action': 'stop_loss',
                                            'quantity': amount, 'price': stop_loss_at})
+                            remaining_cash -= amount * buy_price * BUY_FILL
 
             except Exception as e:
                 print(f"Error processing industry {industry}: {e}")

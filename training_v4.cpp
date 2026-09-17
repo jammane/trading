@@ -3,7 +3,7 @@
 // Run:   ./build/training_v4_cpp --output models [--load-dir DIR] [--start-day N] [--stop-day N]
 //        [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F] [--workers N]
 
-#define TRAINER_VERSION "0.6.9.1"
+#define TRAINER_VERSION "0.7.0.1"
 
 #include <algorithm>
 #include <atomic>
@@ -143,6 +143,19 @@ static constexpr float IND_STARTING_CASH   = 25000.0f;
 static constexpr float MST_STARTING_CASH   = 300000.0f;
 static constexpr float IND_UNIT_PRICE      = 25000.0f;
 static constexpr float MAX_SINGLE_STOCK_PCT = 0.60f;
+
+// Whole shares only. Every Alpaca order is submitted with qty= (never notional=), and the
+// stop-loss orders forbid fractional trading outright — so production floors to int
+// (production_v2.py: 'quantity': int(_qty)) while the simulator traded continuous quantities.
+// That let training buy 0.7 of a share and collect exposure where production buys NOTHING,
+// and because int() truncates DOWN the bias was directional: production always deployed less
+// than training assumed. The error scales inversely with capital (~3% at $25,000/industry,
+// ~47% at a $2,000 single-industry start), i.e. worst exactly where production starts.
+// The epsilon absorbs float error so 2.9999997 does not become 2.
+static inline float whole_shares(float q) {
+    float w = std::floor(q + 1e-4f);
+    return w > 0.f ? w : 0.f;
+}
 static constexpr float SEC_FEE_RATE        = 0.0000278f;
 static constexpr float FINRA_TAF_PER_SHARE = 0.000166f;
 static constexpr float FINRA_TAF_MAX       = 8.30f;
@@ -243,6 +256,25 @@ static constexpr int MT2_OUT_W = 31932;  static constexpr int MT2_OUT_B = 34524;
 //
 // Deliberately LOUD: a banner at startup, a marker in the CSV header, and a per-pass reminder.
 // The whole hazard of this mode is that its output looks exactly like a real run.
+// --control-random (v0.6.10.0): the no-learning control, run IN-PROCESS as a paired
+// same-day comparison instead of as a separate run.
+//
+// After each day's scoring and mutation, spawn N genuinely random models, score them against the
+// SAME reference portfolio on the SAME day, record best/mean, and throw them away. Nothing is
+// persisted and nothing selects on them.
+//
+// Why paired rather than a second training run: two independent runs differ by the seed noise
+// floor (~30% sd per industry, 4.3% on totals), which is the same order as the effect being
+// measured — so a standalone control could not resolve it. Scored against the same reference
+// portfolio on the same day, the comparison is paired and that noise cancels. It also needs no
+// second process (the box has under 2 GB of RAM and one trainer already mlocks ~720 MB), no
+// extra disk, and one model buffer instead of a 928 MB pool.
+//
+// Pass 1 only: the control never learns, so passes 2-5 would be identical replicates at full cost.
+static bool g_control_random = false;
+static int  g_cur_pass = 0;      // set once per pass before workers start; read-only in workers
+static FILE* g_ctl_csv = nullptr;  // control_log.csv, long format, opened only with --control-random
+
 static bool g_control_untrained = false;
 static bool g_no_save = false;
 
@@ -1073,6 +1105,14 @@ static void log_msg(const std::string& msg) {
 // ── JSON stock data loader ──────────────────────────────────────────────────────
 // Each file: {"days": [{"date":"YYYY-MM-DD","open":f,"high":f,"low":f,"close":f,"volume":f},...]}
 
+// Bars rejected as non-finite or non-positive during load. Reported after loading so a data
+// problem is visible instead of silent — being silent is what made the SCCO case expensive.
+static long g_bad_bars = 0;
+
+// (int)NaN is UB and lands on INT32_MIN here. Belt-and-braces for anything that formats a
+// float as an int; the real fix is rejecting the bar above.
+static inline int safe_int(float v) { return std::isfinite(v) ? (int)v : 0; }
+
 static float parse_float_after(const char* buf, const char* key, float def = 0.f) {
     const char* p = strstr(buf, key);
     if (!p) return def;
@@ -1124,7 +1164,18 @@ static bool load_sym_data(const std::string& path,
         o.low    = parse_float_after(entry.c_str(), "\"low\"");
         o.close  = parse_float_after(entry.c_str(), "\"close\"");
         o.volume = parse_float_after(entry.c_str(), "\"volume\"");
-        o.valid  = true;
+        // A bar can arrive non-finite: yfinance returns NaN for a missing session and
+        // json.dump writes it as a bare `NaN` literal, which atof() parses happily. Marking
+        // such a bar valid let NaN into the portfolio valuation, and `(int)NaN` is undefined
+        // behaviour — observed as `prod=$-2147483648` (INT32_MIN) for SCCO 2026-08-11. It is
+        // not cosmetic: it silently destroys every statistic computed over that
+        // industry-pass (a quarter return came out as -4,047,374%).
+        o.valid = std::isfinite(o.open) && std::isfinite(o.high) &&
+                  std::isfinite(o.low)  && std::isfinite(o.close) &&
+                  o.open > 0.f && o.high > 0.f && o.low > 0.f && o.close > 0.f &&
+                  o.high >= o.low;
+        if (!std::isfinite(o.volume) || o.volume < 0.f) o.volume = 0.f;
+        if (!o.valid) g_bad_bars++;
         out_map[date] = o;
         p = entry_end + 1;
     }
@@ -1187,6 +1238,10 @@ struct IndResult {
     // sigma moves. Far above 1/5 means steps are too small and the pool is degenerate; far below
     // means most mutations are damage and selection is picking survivors of noise.
     float mut_success;
+    // --control-random: best/mean delta over ctl_n freshly random models scored on THIS day
+    // against THIS day's reference portfolio. ctl_n == 0 means the control did not run.
+    float ctl_best, ctl_mean;
+    int   ctl_n;
 };
 
 struct MasterResult {
@@ -1435,7 +1490,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
 
             // Partial sell at open
             if (sell_qty > 1e-6f && port.holdings[j] > 1e-6f) {
-                float amt = std::min(sell_qty, port.holdings[j]);
+                float amt = whole_shares(std::min(sell_qty, port.holdings[j]));
                 port.holdings[j] -= amt;
                 port.cash        += sell_net(amt, nd_open);
                 local_sell       += amt;
@@ -1499,6 +1554,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                         float max_spend   = std::max(0.f, MAX_SINGLE_STOCK_PCT * port_value - cur_sym_val);
                         buy_amount = std::min(buy_amount, max_spend / fill_price);
                     }
+                    buy_amount = whole_shares(buy_amount);
                     if (buy_amount > 1e-6f) {
                         port.holdings[j]    += buy_amount;
                         port.cash           -= buy_amount * fill_price;
@@ -1540,14 +1596,16 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     Portfolio hist_ports[HIST_DAYS * HIST_PER_DAY] = {};
     float hist_scores[HIST_DAYS * HIST_PER_DAY] = {};
     int n_hist = scratch.hist_count * HIST_PER_DAY;
-    for (int h = 0; h < n_hist; h++) {
-        Portfolio& port = hist_ports[h];
+    // Score one arbitrary weight vector against TODAY's reference portfolio and return the
+    // resulting portfolio value. Lifted out of the history loop unchanged so the control sampler
+    // can reuse it verbatim: this body IS the fill simulation, and a third hand-copy of it is
+    // exactly how two sides of a calculation drift apart in this codebase.
+    auto score_weights = [&](const float* W, Portfolio& port) -> float {
         port.cash = ref_cash;
         for (int j = 0; j < IND_SYMS; j++) {
             port.holdings[j]    = ref_hold[j];
             port.stop_prices[j] = ref_stop[j];
         }
-        const float* W = scratch.hist(h / HIST_PER_DAY, h % HIST_PER_DAY);
         stock_forward(W, history_arr, today_arr, out48);
         float local_buy = 0.f, local_sell = 0.f;
         // ── Phase 1: partial sells, gap sell_all, high-first sell_all, stops, buys ─
@@ -1568,7 +1626,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             float nd_high = fill_sym[j].valid ? fill_sym[j].high  : day_sym[j].high;
             bool low_first = seq_flags[ind_i * IND_SYMS + j];
             if (sell_qty > 1e-6f && port.holdings[j] > 1e-6f) {
-                float amt = std::min(sell_qty, port.holdings[j]);
+                float amt = whole_shares(std::min(sell_qty, port.holdings[j]));
                 port.holdings[j] -= amt;
                 port.cash        += sell_net(amt, nd_open);
                 local_sell       += amt;
@@ -1622,6 +1680,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                         float max_spend   = std::max(0.f, MAX_SINGLE_STOCK_PCT * port_value - cur_sym_val);
                         buy_amount = std::min(buy_amount, max_spend / fill_price);
                     }
+                    buy_amount = whole_shares(buy_amount);
                     if (buy_amount > 1e-6f) {
                         port.holdings[j]    += buy_amount;
                         port.cash           -= buy_amount * fill_price;
@@ -1648,9 +1707,13 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                 local_sell       += amt;
             }
         }
-        hist_scores[h] = compute_value_ind(port, day_sym, fill_sym);
         (void)local_buy; (void)local_sell;
-    }
+        return compute_value_ind(port, day_sym, fill_sym);
+    };
+
+    for (int h = 0; h < n_hist; h++)
+        hist_scores[h] = score_weights(scratch.hist(h / HIST_PER_DAY, h % HIST_PER_DAY),
+                                       hist_ports[h]);
 
     // ── Score, flags, floor check ────────────────────────────────────────────
     float best_score  = *std::max_element(slot_scores, slot_scores + N_SLOTS);
@@ -1677,11 +1740,11 @@ static IndResult step_industry(int ind_i, IndustryState& state,
 
     log_msg(std::string("[") + IND_SHORT[ind_i] + "] Day " +
             std::to_string(actual_day + 1) + "/" + std::to_string(total_avail) +
-            " | best Δ" + (best_delta >= 0 ? "+" : "") + std::to_string((int)best_delta) +
-            " worst Δ" + (worst_delta >= 0 ? "+" : "") + std::to_string((int)worst_delta) +
-            " | buys=" + std::to_string((int)buy_exec) +
-            " sells=" + std::to_string((int)sell_exec) +
-            " | prod=$" + std::to_string((int)baseline) +
+            " | best Δ" + (best_delta >= 0 ? "+" : "") + std::to_string(safe_int(best_delta)) +
+            " worst Δ" + (worst_delta >= 0 ? "+" : "") + std::to_string(safe_int(worst_delta)) +
+            " | buys=" + std::to_string(safe_int(buy_exec)) +
+            " sells=" + std::to_string(safe_int(sell_exec)) +
+            " | prod=$" + std::to_string(safe_int(baseline)) +
             " | mut_ok=" + std::to_string((int)(mut_success * 100.f + 0.5f)) + "%");
 
     // Hard floor reset
@@ -1906,6 +1969,40 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         if (scratch.hist_count < HIST_DAYS) scratch.hist_count++;
     }
 
+    // ── Untrained control: N random models, scored on today, then discarded ──────────────
+    // Runs AFTER selection and mutation so it cannot perturb them. It reads only the saved
+    // reference portfolio (ref_cash/ref_hold/ref_stop), which selection does not touch.
+    float ctl_best = 0.f, ctl_mean = 0.f;
+    int   ctl_n = 0;
+    if (g_control_random && g_cur_pass == 0) {
+        // Match the day's candidate count exactly. The trained side reports the best of
+        // N_SLOTS + n_hist, and max-of-N grows with N, so a smaller control pool would lose on
+        // pool size alone and that would read as a training effect.
+        ctl_n = N_SLOTS + n_hist;
+        static thread_local std::vector<float> ctl_buf;
+        if (ctl_buf.size() != (size_t)STOCKNN_PARAMS) ctl_buf.resize(STOCKNN_PARAMS);
+        PCG32 crng;
+        crng.seed(mix_seed((uint64_t)actual_day * 1000003ULL +
+                           (uint64_t)ind_i * 65537ULL + 7ULL));
+        Portfolio cport;
+        double sum = 0.0;
+        ctl_best = -1e30f;
+        for (int c = 0; c < ctl_n; c++) {
+            init_stock_weights(ctl_buf.data(), crng);
+            float d = score_weights(ctl_buf.data(), cport) - baseline;
+            sum += (double)d;
+            if (d > ctl_best) ctl_best = d;
+        }
+        ctl_mean = (float)(sum / (double)ctl_n);
+        log_msg(std::string("[") + IND_SHORT[ind_i] + "]   control: " +
+                std::to_string(ctl_n) + " random | best Δ" +
+                (ctl_best >= 0 ? "+" : "") + std::to_string((int)ctl_best) +
+                " mean Δ" + (ctl_mean >= 0 ? "+" : "") + std::to_string((int)ctl_mean) +
+                " | trained best Δ" + (best_delta >= 0 ? "+" : "") +
+                std::to_string(safe_int(best_delta)) +
+                (ctl_best >= best_delta ? "  <-- CONTROL WINS" : ""));
+    }
+
     // Report: top_hold = slot0 holdings value, top_cash = slot0 cash
     float top_hold = 0.f;
     for (int j = 0; j < IND_SYMS; j++) {
@@ -1935,6 +2032,9 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     res.elite_max_val = elite_max_val;
     res.elite_min_val = elite_min_val;
     res.elite_mean_val= elite_mean_val;
+    res.ctl_best      = ctl_best;
+    res.ctl_mean      = ctl_mean;
+    res.ctl_n         = ctl_n;
     state.streak      = new_streak;
     return res;
 }
@@ -3797,6 +3897,9 @@ static std::vector<DayData> load_all_stock_data(const std::string& data_dir,
     }
     log_msg("Loaded local data for " + std::to_string(loaded) + "/" +
             std::to_string(N_SYMS) + " symbols");
+    if (g_bad_bars > 0)
+        log_msg("  WARNING: rejected " + std::to_string(g_bad_bars) +
+                " non-finite/non-positive OHLC bar(s) — those sessions are skipped, not valued at 0");
 
     // Merge all dates
     std::map<std::string, int> date_index;
@@ -3842,6 +3945,13 @@ static void write_csv_row(FILE* csv, int pass_num, int actual_day,
         fprintf(csv, ",%+10.2f,%+10.2f,%+10.2f,%.4f",
                 res[i].elite_max_val, res[i].elite_min_val, res[i].elite_mean_val,
                 res[i].mut_success);
+    if (g_ctl_csv)
+        for (int i = 0; i < N_IND; i++)
+            if (res[i].ctl_n > 0)
+                fprintf(g_ctl_csv, "%d,%d,%s,%d,%.2f,%.2f,%.2f,%d\n",
+                        pass_num + 1, actual_day + 1, g_ind_names[i].c_str(),
+                        res[i].ctl_n, res[i].best_delta, res[i].ctl_best, res[i].ctl_mean,
+                        res[i].ctl_best >= res[i].best_delta ? 1 : 0);
     fprintf(csv, ",%+.2f,%+.2f,%+.2f,%+.2f",
             mst.elite_max_pts, mst.elite_min_pts, mst.elite_mean_pts, mst.ideal_pts);
     fprintf(csv, ",%+.2f,%+.2f", mst.consensus_flat_pts, mst.consensus_wtd_pts);
@@ -3909,6 +4019,7 @@ static void print_usage(const char* prog) {
         "          [--seed N]   (default: clock, RE-SEEDED EVERY PASS; N derives passes from N)\n"
         "          [--trade-lock PATH | --no-trade-lock]  pause while production holds the lock\n"
         "          [--control-untrained]  NO-LEARNING CONTROL: re-randomise StockNN daily\n"
+        "          [--control-random]  pass-1 paired control: score N random models/day\n"
         "       %s --output DIR [--load-dir DIR] ...  (diagnostic/override)\n"
         "       %s --drift-study --load-dir SEED --drift-scratch DIR  (phase-3 calibration)\n",
         prog, prog, prog);
@@ -4354,6 +4465,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--preserve-stock-data") preserve_stock = true;
         else if (arg == "--no-save") g_no_save = true;
         else if (arg == "--control-untrained") g_control_untrained = true;
+        else if (arg == "--control-random") g_control_random = true;
         else if (arg == "--seed"     && a+1<argc) { g_seed_arg = strtoull(argv[++a], nullptr, 10); }
         else if (arg == "--trade-lock" && a+1<argc) { g_trade_lock = argv[++a]; }
         else if (arg == "--no-trade-lock") { g_trade_lock.clear(); }
@@ -4488,6 +4600,18 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    if (g_control_random) {
+        std::string ctl_path = log_dir + "/control_log.csv";
+        g_ctl_csv = fopen(ctl_path.c_str(), "w");
+        if (g_ctl_csv) {
+            fprintf(g_ctl_csv, "pass,day,industry,n_control,trained_best_delta,"
+                               "control_best_delta,control_mean_delta,control_wins\n");
+            log_msg("--control-random: pass-1 paired control active -> " + ctl_path);
+        } else {
+            log_msg("WARNING: could not open " + ctl_path + " — control stats will only be in the log");
+        }
+    }
+
     // Open binary MT log (goes to log_dir, not output_dir)
     std::string mt_log_path = log_dir + "/mt_training_log.bin";
     FILE* mt_log = fopen(mt_log_path.c_str(), "wb");
@@ -4518,6 +4642,7 @@ int main(int argc, char* argv[]) {
         float cur_mt2_sigma = mt2_sigma_arg* decay;
         // Fresh entropy per pass. Without this the per-day seeds repeat every pass and each pass
         // replays the same perturbation vectors over different parents.
+        g_cur_pass = pass;   // written before workers start; read-only inside them
         g_run_seed = g_seed_arg
             ? splitmix64(g_seed_arg + (uint64_t)(pass + 1) * 0x9E3779B97F4A7C15ULL)
             : (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
