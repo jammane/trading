@@ -250,6 +250,79 @@ static void test_reserved_slot_has_room() {
     CHECK(MT1NET_D2_RESERVED == d1_out);
 }
 
+
+// ── Retirement-age histogram ─────────────────────────────────────────────────────
+//
+// Both of these failed on the first smoke run. mt1_step_day read the victim's age AFTER
+// mt1_slot_init had zeroed it, so every retirement was recorded as age 0: the mean retirement age
+// sat at exactly 0.0 for the whole run and the histogram stayed all zeros. Nothing crashed and no
+// other column moved, so only reading the log caught it.
+static void test_life_bucket_boundaries() {
+    // Buckets are 8-15 / 16-31 / 32-63 / 64-127 / 128+, so each boundary is an off-by-one risk.
+    CHECK(mt1_life_bucket(MT1_POOL_MIN_AGE) == 0);   // min age lands in bucket 0
+    CHECK(mt1_life_bucket(15) == 0);   // 15 -> bucket 0
+    CHECK(mt1_life_bucket(16) == 1);   // 16 -> bucket 1
+    CHECK(mt1_life_bucket(31) == 1);   // 31 -> bucket 1
+    CHECK(mt1_life_bucket(32) == 2);   // 32 -> bucket 2
+    CHECK(mt1_life_bucket(63) == 2);   // 63 -> bucket 2
+    CHECK(mt1_life_bucket(64) == 3);   // 64 -> bucket 3
+    CHECK(mt1_life_bucket(127) == 3);   // 127 -> bucket 3
+    CHECK(mt1_life_bucket(128) == 4);   // 128 -> bucket 4
+    CHECK(mt1_life_bucket(100000) == 4);   // a very old model stays in the last bucket
+}
+
+static void test_every_bucket_is_in_range() {
+    // An out-of-range index would corrupt whatever sits after retire_hist in MT1PoolScratch
+    // rather than producing a visible wrong number.
+    for (uint32_t age = 0; age < 300u; age++) {
+        const int b = mt1_life_bucket(age);
+        CHECK(b >= 0 && b < MT1_LIFE_BUCKETS);   // bucket index stays inside retire_hist
+    }
+}
+
+static void test_ages_below_min_age_do_not_underflow() {
+    // Culling never picks an immature model, but injection or a reset could, and a negative or
+    // out-of-range bucket there would be silent memory corruption.
+    for (uint32_t age = 0; age < (uint32_t)MT1_POOL_MIN_AGE; age++)
+        CHECK(mt1_life_bucket(age) == 0);   // an under-age retirement clamps into bucket 0
+}
+
+static void test_age_must_be_read_before_the_slot_is_reset() {
+    // The defect in one line: mt1_slot_init zeroes n_pred, so reading it afterwards always
+    // yields 0 no matter how long the model actually lived.
+    MT1SlotMeta m;
+    mt1_slot_init(m, 7);
+    for (int i = 0; i < 20; i++) mt1_slot_record(m, 0.5f);
+    CHECK(m.n_pred == 20);   // twenty predictions recorded
+
+    const uint32_t age_before = m.n_pred;
+    mt1_slot_init(m, 9);
+    CHECK(m.n_pred == 0);   // mt1_slot_init zeroes the age — this is why order matters
+    CHECK(age_before == 20);   // the age captured before the reset survives
+    CHECK(mt1_life_bucket(age_before) == 1);   // age 20 belongs in the 16-31 bucket
+    CHECK(mt1_life_bucket(m.n_pred) == 0);   // reading the age after the reset would file every retirement in bucket 0
+}
+
+static void test_a_run_of_retirements_fills_more_than_one_bucket() {
+    // At the designed ~20-prediction lifespan most retirements land in buckets 1-2. A histogram
+    // that is entirely in one bucket means either a broken read or a pool that is not turning over.
+    uint32_t hist[MT1_LIFE_BUCKETS] = {0, 0, 0, 0, 0};
+    const uint32_t ages[] = {8, 12, 14, 18, 20, 25, 31, 33, 40, 60, 70, 130};
+    double sum = 0.0;
+    for (uint32_t a : ages) { hist[mt1_life_bucket(a)]++; sum += a; }
+
+    int occupied = 0;
+    uint32_t total = 0;
+    for (int b = 0; b < MT1_LIFE_BUCKETS; b++) { if (hist[b]) occupied++; total += hist[b]; }
+    CHECK(total == sizeof(ages) / sizeof(ages[0]));   // every retirement is counted exactly once
+    CHECK(occupied == MT1_LIFE_BUCKETS);   // these ages span all five buckets
+    CHECK(hist[0] == 3 && hist[1] == 4 && hist[2] == 3 && hist[3] == 1 && hist[4] == 1);   // each age lands in the bucket its boundaries say it should
+
+    const double mean_age = sum / (double)(sizeof(ages) / sizeof(ages[0]));
+    CHECK(mean_age > 0.0);   // the mean retirement age is non-zero — 0.0 is the signature of the bug
+    CHECK(mean_age > (double)MT1_POOL_MIN_AGE);   // mean lifespan must exceed the maturity gate, or nothing is surviving to breed
+}
+
 int main() {
     test_net_layout_is_contiguous();
     test_net_is_much_smaller_than_the_old_model();
@@ -271,6 +344,11 @@ int main() {
     test_immature_never_outranks_a_record();
     test_ordering_is_a_strict_weak_ordering();
     test_lifecycle_constants();
+    test_life_bucket_boundaries();
+    test_every_bucket_is_in_range();
+    test_ages_below_min_age_do_not_underflow();
+    test_age_must_be_read_before_the_slot_is_reset();
+    test_a_run_of_retirements_fills_more_than_one_bucket();
 
     printf("\n==================\n%d passed, %d failed\n", g_checks - g_fails, g_fails);
     return g_fails ? 1 : 0;
