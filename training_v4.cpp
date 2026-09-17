@@ -3,11 +3,15 @@
 // Run:   ./build/training_v4_cpp --output models [--load-dir DIR] [--start-day N] [--stop-day N]
 //        [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F] [--workers N]
 
-#define TRAINER_VERSION "0.6.2.1"
+#define TRAINER_VERSION "0.6.9.0"
 
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <csignal>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -31,6 +35,7 @@
 #include <sys/mman.h>
 
 #include "mt1_scoring.h"   // MT1 decode helpers + compute_mt1_scores (shared with tests/test_mt1.cpp)
+#include "pass_seeding.h"   // pass-boundary share + interleave (shared with tests/test_pass_seeding.cpp)
 
 // Force OpenBLAS single-threaded: multi-threaded BLAS with N worker threads causes
 // 2×N threads competing for N CPUs, multiplying overhead 2-3× per forward pass.
@@ -157,8 +162,8 @@ static constexpr int HIST_PER_DAY = 10;
 static constexpr int HIST_ELITE   = 7;   // top-7 direct elite slots saved per day
 static constexpr int HIST_WAVG    = 3;   // wavg slots (17,18,19) saved per day
 
-// MT1NN: branched FC (blocks A/B/C → concat 28 → D taper), per-industry preprocessor (12 pools)
-static constexpr int   MT1NN_PARAMS        = 2218;
+// MT1: per-industry preprocessor (12 pools). Sizes live with the heads/tails split below —
+// HEADNN_PARAMS + 4 × TAILNN_PARAMS. There is no single MT1NN_PARAMS constant by design.
 static constexpr int   MT1_START_DAY       = 25;
 static constexpr int   MT1_FWD_DAYS        = 10;       // prediction horizon: target = cumulative relative return over next N sessions
 static constexpr int   MT1_BLOCK_DAYS      = 25;       // heads/tails block-alternating training: days per block (T1/H/T2/M phases replay the same block)
@@ -170,19 +175,6 @@ static constexpr int   MT1_ROLLING_DAYS    = 10;       // days in per-industry |
 // grade a genuinely unseen model against a constant baseline, so they need to be low-variance to be
 // worth reading — and because Increment C would weight the composite by them.
 static constexpr int   MT1_SKILL_DAYS      = 250;
-// MT1 branched weight layout (weight+bias consecutively per layer, order = MT1_LAYER_DEFS).
-// A: a1 20→20, a2 20→20 | B: b1 10→6, b2 6→4 | C: c1 7→5, c2 5→4 | D: d1 28→22, d2 22→16, d3 16→10, d4 10→4
-static constexpr int MT1_A1_W=0,    MT1_A1_B=400;    // 20×20
-static constexpr int MT1_A2_W=420,  MT1_A2_B=820;    // 20×20
-static constexpr int MT1_B1_W=840,  MT1_B1_B=900;    // 6×10
-static constexpr int MT1_B2_W=906,  MT1_B2_B=930;    // 4×6
-static constexpr int MT1_C1_W=934,  MT1_C1_B=969;    // 5×7
-static constexpr int MT1_C2_W=974,  MT1_C2_B=994;    // 4×5
-static constexpr int MT1_D1_W=998,  MT1_D1_B=1614;   // 22×28
-static constexpr int MT1_D2_W=1636, MT1_D2_B=1988;   // 16×22
-static constexpr int MT1_D3_W=2004, MT1_D3_B=2164;   // 10×16
-static constexpr int MT1_D4_W=2174, MT1_D4_B=2214;   // 4×10  (ends at 2218)
-
 // ── Heads/tails split (Part C dual head): TWO 37→28 trunks (market ‖ portfolio) → concat56,
 //    + specialized 1-output tails (56→1). Input per industry = 74 = [market37 ‖ portfolio37]. ──
 // Head buffer = mkt sub-head (a1..c2, 998) then pf sub-head (a1..c2, 998) = 1996. HD_* offsets
@@ -190,6 +182,13 @@ static constexpr int MT1_D4_W=2174, MT1_D4_B=2214;   // 4×10  (ends at 2218)
 static constexpr int   HEADNN_SUB    = 998;              // one MT1Head trunk (37→28)
 static constexpr int   HEADNN_PARAMS = 2 * HEADNN_SUB;   // dual trunk = 1996
 static constexpr int   TAILNN_PARAMS = 1803;
+// The composed production model is head0 + tail0[4]. load_bin validates by exact element count
+// and falls back to random init SILENTLY, so a drift here costs a whole run. Pinned on the Python
+// side by tests/test_models.py::TestMT1NN::test_param_count (998 / 1996 / 1803 / 9208).
+static_assert(HEADNN_SUB == 998 && HEADNN_PARAMS == 1996 && TAILNN_PARAMS == 1803,
+              "MT1 head/tail sizes drifted from models.py");
+static_assert(HEADNN_PARAMS + 4 * TAILNN_PARAMS == 9208,
+              "composed MT1NN size drifted from models.MT1NN");
 static constexpr int HD_A1_W=0,   HD_A1_B=400;   static constexpr int HD_A2_W=420, HD_A2_B=820;   // 20×20, 20×20
 static constexpr int HD_B1_W=840, HD_B1_B=900;   static constexpr int HD_B2_W=906, HD_B2_B=930;   // 6×10, 4×6
 static constexpr int HD_C1_W=934, HD_C1_B=969;   static constexpr int HD_C2_W=974, HD_C2_B=994;   // 5×7, 4×5  (ends 998)
@@ -220,7 +219,72 @@ static constexpr int MT2_T2_W  = 24618;  static constexpr int MT2_T2_B  = 28578;
 static constexpr int MT2_T3_W  = 28638;  static constexpr int MT2_T3_B  = 31878;  // +60, 60×54
 static constexpr int MT2_OUT_W = 31932;  static constexpr int MT2_OUT_B = 34524;  // +54, 54×48+48=34572
 
-static bool g_no_save = false;  // --no-save: skip all model writes (diagnostic mode)
+// --no-save (v0.6.6.0): train into a scratch directory and delete it at exit.
+//
+// It used to mean "skip all model writes", which silently DISABLED StockNN training entirely:
+// step_industry reloads elite_buf and hist_buf from disk at the top of EVERY day, so with nothing
+// written they were re-random-initialised every day from the same seed. Measured on the v0.6.0.0-A
+// run: 297,120 random-init lines == 20 slots x 12 industries x 1238 days. Nothing ever learned;
+// only the portfolio carried forward, growing purely from picking the best of 200 fresh random
+// models each day. Every "diagnostic" run taken under --no-save measured that, not training.
+//
+// The point of the flag was never "do not write" — it was "do not leave a 3 GB run directory
+// behind". So it now writes to <output>.nosave and removes it on exit.
+// --control-untrained (v0.6.9.0): a deliberate NO-LEARNING control. StockNN elites are
+// re-randomised every day instead of loaded, so the pool never accumulates anything, while the
+// market data, selection, scoring and logging stay identical. It answers a question this codebase
+// cannot currently answer: how much of the observed performance comes from TRAINING versus from
+// the selection mechanism operating on arbitrary models.
+//
+// The question is live because an accidental version of this ran for months as the --no-save
+// defect, and it scored comparably to trained runs (+151.4% against ~+127-142%). If a control
+// matches a trained run, the problem is not the passes — it is that the scoring cannot tell
+// models apart at all.
+//
+// Deliberately LOUD: a banner at startup, a marker in the CSV header, and a per-pass reminder.
+// The whole hazard of this mode is that its output looks exactly like a real run.
+static bool g_control_untrained = false;
+static bool g_no_save = false;
+
+// ── Trading lock (v0.6.5.0) ───────────────────────────────────────────────────
+// The droplet has 2 cores and a training run uses ~150% CPU. When training and a production cycle
+// compete, the loser slows 3-5x — measured: training fell from 34 s/day to 1-3 min/day with two
+// short jobs alongside it. Production is the time-sensitive side (fetch, decide, submit orders),
+// so the trainer yields: it polls this lock between training days and sleeps while it is held.
+//
+// Written by trading_lock() in production_v2.py — THE DEFAULT PATH MUST MATCH THE ONE THERE.
+// Absolute because the two run from different worktrees (/root/trading-ht vs /root/trading).
+// Line 1 of the file is the holder's PID.
+static std::string g_trade_lock = "/run/trading/trading_active.lock";
+static constexpr int TRADE_LOCK_STALE_SEC = 1800;   // 30 min; a production cycle takes minutes
+static constexpr int TRADE_LOCK_POLL_SEC  = 15;
+
+
+// ── Run seed (v0.6.4.0) ────────────────────────────────────────────────────────
+// Every PCG32 in this file used to be seeded from hardcoded constants plus loop indices, with no
+// entropy anywhere — so "random init" produced byte-identical weights on every run and two runs of
+// the same binary could not differ. That made a noise floor impossible to measure: a 55-point gap
+// between versions and a gap caused by one lucky initialisation were indistinguishable.
+//
+// g_run_seed defaults to the clock and is mixed into every seed site through mix_seed(). It is
+// LOGGED at startup, and --seed N reproduces a run exactly when that is what you want.
+// RE-SEEDED AT THE TOP OF EVERY PASS, not once per run. The per-day/per-industry seeds carry no
+// pass component — seed_rng.seed(actual_day * 1000007 + ind_i * 13) — so before v0.6.4.0 pass 1
+// day 17 and pass 5 day 17 applied the IDENTICAL perturbation vector. Every pass re-walked the
+// same noise sequence, differing only in which parents it was applied to. That is a plausible
+// contributor to extra passes failing to help.
+static uint64_t g_run_seed = 0;
+static uint64_t g_seed_arg = 0;   // --seed N; 0 = unset, derive each pass from the clock
+
+// splitmix64 finaliser: decorrelates the run seed from the per-day / per-industry structure, so
+// adjacent seeds do not yield correlated streams.
+static inline uint64_t splitmix64(uint64_t z) {
+    z += 0x9E3779B97F4A7C15ULL;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+static inline uint64_t mix_seed(uint64_t base) { return splitmix64(base + g_run_seed); }
 // --dir-reps: how many times the direction pool replays each block. The gentle 8.3% cull only turns
 // over ~10 of 200 slots a day, so reps are what restore evolutionary throughput. They also mean N
 // epochs over the same 25 days, which is an overfitting risk — hence a flag, so it can be swept and
@@ -888,19 +952,6 @@ static void init_master_weights(float* W, PCG32& rng) {
     kaiming_init(W + MAST_OUT_W,  48, 180, rng);
 }
 
-static void init_mt1_weights(float* W, PCG32& rng) {
-    kaiming_init(W + MT1_A1_W, 20, 20, rng);
-    kaiming_init(W + MT1_A2_W, 20, 20, rng);
-    kaiming_init(W + MT1_B1_W,  6, 10, rng);
-    kaiming_init(W + MT1_B2_W,  4,  6, rng);
-    kaiming_init(W + MT1_C1_W,  5,  7, rng);
-    kaiming_init(W + MT1_C2_W,  4,  5, rng);
-    kaiming_init(W + MT1_D1_W, 22, 28, rng);
-    kaiming_init(W + MT1_D2_W, 16, 22, rng);
-    kaiming_init(W + MT1_D3_W, 10, 16, rng);
-    kaiming_init(W + MT1_D4_W,  4, 10, rng);
-}
-
 static void init_head_weights(float* W, PCG32& rng) {
     // Two identical 37→28 sub-trunks (mkt at base 0, pf at base HEADNN_SUB).
     for (int s = 0; s < 2; s++) {
@@ -956,6 +1007,47 @@ static bool save_bin(const std::string& path, const float* W, int n_params) {
     size_t wrote = fwrite(W, sizeof(float), n_params, f);
     fclose(f);
     return (int)wrote == n_params;
+}
+
+static void log_msg(const std::string& msg);   // defined below, in the Logging section
+
+// A crashed production run must not stall training forever, so a lock is honoured only while its
+// holder is alive AND it is recent. Overrides are logged — silently ignoring a lock would be the
+// worse failure of the two.
+static bool trade_lock_active() {
+    struct stat st;
+    if (stat(g_trade_lock.c_str(), &st) != 0) return false;      // no lock: run freely
+
+    if (time(nullptr) - st.st_mtime > TRADE_LOCK_STALE_SEC) {
+        log_msg("WARNING: trading lock " + g_trade_lock + " is older than " +
+                std::to_string(TRADE_LOCK_STALE_SEC / 60) + " min — ignoring it as stale");
+        return false;
+    }
+    long pid = 0;
+    if (FILE* f = fopen(g_trade_lock.c_str(), "r")) {
+        if (fscanf(f, "%ld", &pid) != 1) pid = 0;
+        fclose(f);
+    }
+    if (pid > 0 && kill((pid_t)pid, 0) != 0 && errno == ESRCH) {
+        log_msg("WARNING: trading lock holder pid " + std::to_string(pid) +
+                " is gone — ignoring stale lock " + g_trade_lock);
+        return false;
+    }
+    return true;
+}
+
+// Called between training days, never mid-day: the worker threads are parked on their semaphore
+// at that point, so sleeping here idles all of them.
+static void wait_while_trading() {
+    bool paused = false;
+    while (trade_lock_active()) {
+        if (!paused) {
+            log_msg("PAUSED — production is running (" + g_trade_lock + ")");
+            paused = true;
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(TRADE_LOCK_POLL_SEC));
+    }
+    if (paused) log_msg("RESUMED — production finished, training continues");
 }
 
 static std::string elite_path(const std::string& dir, const char* prefix, int slot) {
@@ -1088,6 +1180,13 @@ struct IndResult {
     float top_hold, top_cash;
     int   new_streak;
     float elite_max_val, elite_min_val, elite_mean_val;
+    // Rechenberg's 1/5 statistic: fraction of the 180 mutations that BEAT THEIR OWN PARENT.
+    // Read-only instrumentation — nothing selects on it. It answers two open questions at once:
+    // whether sigma is in the usable band on the CURRENT architecture (the 0.0055-0.009 range was
+    // measured many versions and one breaking param change ago), and whether the regime-optimal
+    // sigma moves. Far above 1/5 means steps are too small and the pool is degenerate; far below
+    // means most mutations are damage and selection is picking survivors of noise.
+    float mut_success;
 };
 
 struct MasterResult {
@@ -1101,7 +1200,7 @@ struct MasterResult {
 
 // ── Forward declarations (needed because step_industry calls load/save defined later) ──
 static void load_or_init_industry(const std::string& dir, const std::string& load_dir,
-                                   int ind_i, float* elite_buf);
+                                   int ind_i, float* elite_buf, int actual_day);
 static void save_industry_elites(const std::string& dir, int ind_i, const float* elite_buf);
 static void load_ind_history(const std::string& dir, int ind_i, WorkerScratch& scratch);
 static void save_ind_history(const std::string& dir, int ind_i, const WorkerScratch& scratch);
@@ -1117,7 +1216,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                                int day_num, int num_days,
                                float sigma, bool freeze, const bool* seq_flags) {
     // Load this industry's elites from disk (or random init on first day)
-    load_or_init_industry(models_dir, load_dir, ind_i, scratch.elite_buf);
+    load_or_init_industry(models_dir, load_dir, ind_i, scratch.elite_buf, actual_day);
     // Load per-industry elite history (or reset at pass start)
     if (day_num == 0) {
         scratch.hist_head  = 0;
@@ -1287,7 +1386,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     // Assign mutation seeds at start of day
     {
         PCG32 seed_rng;
-        seed_rng.seed((uint64_t)actual_day * 1000007ULL + (uint64_t)ind_i * 13ULL);
+        seed_rng.seed(mix_seed((uint64_t)actual_day * 1000007ULL + (uint64_t)ind_i * 13ULL));
         for (int i = 0; i < N_SLOTS - ELITE_POOL; i++)
             mut_seeds[i] = ((uint64_t)seed_rng.next() << 32) | seed_rng.next();
     }
@@ -1558,6 +1657,17 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     float best_delta  = best_score - baseline;
     float worst_delta = *std::min_element(slot_scores, slot_scores + N_SLOTS) - baseline;
 
+    // Mutation success rate: each mutation slot against the parent it was mutated FROM, matching
+    // the parent assignment in the forward pass (uniform, MUTATIONS_PER_PARENT children each).
+    int mut_wins = 0, mut_total = 0;
+    for (int slot = ELITE_POOL; slot < N_SLOTS; slot++) {
+        int parent = (slot - ELITE_POOL) / MUTATIONS_PER_PARENT;
+        if (parent >= ELITE_POOL) continue;
+        mut_total++;
+        if (slot_scores[slot] > slot_scores[parent]) mut_wins++;
+    }
+    float mut_success = mut_total > 0 ? (float)mut_wins / (float)mut_total : 0.f;
+
     // Elite stats (slots 0..ELITE_COUNT-1 portfolio values)
     float elite_max_val = *std::max_element(slot_scores, slot_scores + ELITE_COUNT);
     float elite_min_val = *std::min_element(slot_scores, slot_scores + ELITE_COUNT);
@@ -1571,7 +1681,8 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             " worst Δ" + (worst_delta >= 0 ? "+" : "") + std::to_string((int)worst_delta) +
             " | buys=" + std::to_string((int)buy_exec) +
             " sells=" + std::to_string((int)sell_exec) +
-            " | prod=$" + std::to_string((int)baseline));
+            " | prod=$" + std::to_string((int)baseline) +
+            " | mut_ok=" + std::to_string((int)(mut_success * 100.f + 0.5f)) + "%");
 
     // Hard floor reset
     float abs_floor = IND_STARTING_CASH * 0.9f;
@@ -1767,7 +1878,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         // Diversity injection for all-zero streak >= 2
         if (all_inactive && new_streak >= 2) {
             int half = ELITE_COUNT / 2;
-            PCG32 div_rng; div_rng.seed((uint64_t)actual_day * 99991ULL + ind_i);
+            PCG32 div_rng; div_rng.seed(mix_seed((uint64_t)actual_day * 99991ULL + ind_i));
             for (int k = half; k < ELITE_COUNT; k++) {
                 // blend top half with random: 0.5 * elite + 0.5 * random (reuse mut_buf)
                 init_stock_weights(scratch.mut_buf, div_rng);
@@ -1803,8 +1914,12 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         top_hold += slot0_own.holdings[j] * price;
     }
 
-    // Save updated elites and history back to disk
-    if (!g_no_save) {
+    // Save updated elites and history back to disk. These are reloaded at the top of the next
+    // day, so skipping the write is what broke --no-save; under --no-save models_dir is already
+    // redirected to a scratch directory instead. The one case that genuinely skips the write is
+    // --control-untrained, where tomorrow re-randomises rather than loads, so saving would only
+    // burn 3 GB of I/O and leave a directory of weights that look trained.
+    if (!g_control_untrained) {
         save_industry_elites(models_dir, ind_i, scratch.elite_buf);
         save_ind_history(models_dir, ind_i, scratch);
     }
@@ -1816,6 +1931,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     res.top_hold      = top_hold;
     res.top_cash      = slot0_own.cash;
     res.new_streak    = new_streak;
+    res.mut_success   = mut_success;
     res.elite_max_val = elite_max_val;
     res.elite_min_val = elite_min_val;
     res.elite_mean_val= elite_mean_val;
@@ -2084,7 +2200,7 @@ static MT1CompResult step_mt1_pool(
     // Deterministic mutation seeds (per day + industry; pool distinguished by its own buffers)
     {
         PCG32 seed_rng;
-        seed_rng.seed((uint64_t)actual_day * 987017ULL + (uint64_t)ind_i * 10007ULL + 22222ULL);
+        seed_rng.seed(mix_seed((uint64_t)actual_day * 987017ULL + (uint64_t)ind_i * 10007ULL + 22222ULL));
         for (int i = 0; i < pool_muts; i++)
             mut_seeds[i] = ((uint64_t)seed_rng.next() << 32) | seed_rng.next();
     }
@@ -2338,8 +2454,8 @@ static MT1DirResult step_mt1_dir_pool(
     sc.dir_culled_today = n_cull;
 
     PCG32 rng;
-    rng.seed((uint64_t)actual_day * 987017ULL + (uint64_t)ind_i * 10007ULL +
-             (uint64_t)rep * 1300081ULL + 4242ULL);
+    rng.seed(mix_seed((uint64_t)actual_day * 987017ULL + (uint64_t)ind_i * 10007ULL +
+             (uint64_t)rep * 1300081ULL + 4242ULL));
 
     for (int k = 0; k < n_cull; k++) {
         int dead = mature[mature.size() - 1 - k];
@@ -2495,7 +2611,7 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
     }
 
     {
-        PCG32 seed_rng; seed_rng.seed((uint64_t)actual_day * 777017ULL + 99999ULL);
+        PCG32 seed_rng; seed_rng.seed(mix_seed((uint64_t)actual_day * 777017ULL + 99999ULL));
         for (int i = 0; i < N_SLOTS - ELITE_POOL; i++)
             scratch.mut_seeds[i] = ((uint64_t)seed_rng.next() << 32) | seed_rng.next();
     }
@@ -2854,7 +2970,7 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
         state.mt2_injection_hold = 10;  // suppress re-injection for 10 days
         log_msg("[mt2     ] " + std::to_string(below_thresh) + "/" + std::to_string(N_SLOTS) +
                 " slots < " + fmt_pts(MT2_INJ_THRESHOLD) + " — injecting diversity");
-        PCG32 div_rng; div_rng.seed((uint64_t)actual_day * 55555ULL + 77777ULL);
+        PCG32 div_rng; div_rng.seed(mix_seed((uint64_t)actual_day * 55555ULL + 77777ULL));
         int half = ELITE_COUNT / 2;
         for (int k = half; k < ELITE_COUNT; k++) {
             init_mt2_weights(scratch.mut_buf, div_rng);
@@ -2951,6 +3067,152 @@ static void save_industry_elites(const std::string& dir, int ind_i,
     }
 }
 
+// ── Pass-boundary seeding (v0.6.3.0) ──────────────────────────────────────────
+// At each pass boundary, judge the finishing pass against the standing champion on slot-0's
+// percent portfolio change over the last PASS_JUDGE_DAYS, PER INDUSTRY, and seed the next pass
+// with a rank-preserving proportional interleave of the two 20-elite sets.
+//
+// ORDERING HAZARD: load_or_init_industry reads, and save_industry_elites writes, the SAME output
+// directory — so at the end of pass N that directory IS pass N's elites. Writing the blend into it
+// destroys exactly the models the crowning step then needs. Pass N's elites are therefore staged
+// to a scratch directory first, on disk rather than in RAM: two full sets is 142 MB per industry
+// on a box already mlocking ~720 MB.
+//
+// The champion is a PER-INDUSTRY COMPOSITE — energy's may come from pass 2 while financials' comes
+// from pass 1 — so no pass directory or log section describes it. That is what pass_reference.csv
+// and champion/ exist for. See PASS_SEEDING.md.
+
+struct PassRefRow { int champ_pass = 0; float champ_pct = 0.f; bool found = false; };
+
+// Last recorded row for this industry. The carried-forward champion is new_champ_pass/new_champ_pct.
+static PassRefRow read_pass_ref(const std::string& path, const std::string& ind) {
+    PassRefRow r;
+    FILE* f = fopen(path.c_str(), "r");
+    if (!f) return r;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        char ind_buf[64], regime[32];
+        int p, ds, de, cp, chp, slots, ncp;
+        float cpct, chpct, share, npct;
+        if (sscanf(line, "%d,%63[^,],%d,%d,%d,%f,%d,%f,%31[^,],%f,%d,%d,%f",
+                   &p, ind_buf, &ds, &de, &cp, &cpct, &chp, &chpct,
+                   regime, &share, &slots, &ncp, &npct) == 13 && ind == ind_buf) {
+            r.champ_pass = ncp; r.champ_pct = npct; r.found = true;
+        }
+    }
+    fclose(f);
+    return r;
+}
+
+static bool copy_elites(const std::string& from, const std::string& to, const char* ind) {
+    for (int slot = 0; slot < ELITE_POOL; slot++) {
+        std::error_code ec;
+        fs::copy_file(elite_path(from, ind, slot), elite_path(to, ind, slot),
+                      fs::copy_options::overwrite_existing, ec);
+        if (ec) return false;
+    }
+    return true;
+}
+
+// seed_next=false on the final pass: crown and record, but skip the blend. Otherwise the run
+// would end with out_dir holding a seed built for a pass that never runs — neither the champion
+// nor the final pass's models. The deliverable is champion/ either way.
+static void pass_boundary(const std::string& out_dir, int pass_num,
+                          int day_start, int day_end,
+                          const float* judge_start, const float* judge_end,
+                          bool seed_next) {
+    const std::string champ_dir = out_dir + "/champion";
+    const std::string stage_dir = out_dir + "/stage";
+    const std::string ref_path  = out_dir + "/pass_reference.csv";
+    std::error_code ec;
+    fs::create_directories(champ_dir, ec);
+    fs::create_directories(stage_dir, ec);
+
+    // Read every industry's standing champion BEFORE opening the file for append, so buffered
+    // writes from this same boundary can never be read back as prior state.
+    PassRefRow prev[N_IND];
+    for (int i = 0; i < N_IND; i++) prev[i] = read_pass_ref(ref_path, g_ind_names[i]);
+
+    const bool fresh = !fs::exists(ref_path);
+    FILE* csv = fopen(ref_path.c_str(), "a");
+    if (!csv) {
+        log_msg("WARNING: cannot write " + ref_path + " — pass seeding skipped at this boundary");
+        return;
+    }
+    if (fresh)
+        fprintf(csv, "# pass_reference v%d — see PASS_SEEDING.md\n"
+                     "pass,industry,day_start,day_end,champ_pass,champ_pct,chal_pass,chal_pct,"
+                     "regime,share_new,slots_new,new_champ_pass,new_champ_pct\n", PASS_REF_VERSION);
+
+    for (int i = 0; i < N_IND; i++) {
+        const char* ind  = g_ind_names[i].c_str();
+        const bool  have = judge_start[i] > 1e-6f;
+        const float chal_pct = have ? (judge_end[i] / judge_start[i] - 1.f) : 0.f;
+        char msg[320];
+
+        if (!copy_elites(out_dir, stage_dir, ind)) {
+            log_msg(std::string("[") + IND_SHORT[i] +
+                    "]   pass-seed: cannot stage elites — seed left unchanged");
+            continue;
+        }
+
+        bool champ_ok = prev[i].found;
+        for (int slot = 0; slot < ELITE_POOL && champ_ok; slot++)
+            if (!fs::exists(elite_path(champ_dir, ind, slot))) champ_ok = false;
+        if (prev[i].found && !champ_ok)
+            log_msg(std::string("[") + IND_SHORT[i] +
+                    "]   pass-seed: champion weights MISSING — falling back to 100% from this pass");
+
+        if (!champ_ok || !have) {
+            // First boundary, missing champion, or no usable metric: this pass becomes the
+            // champion outright and the seed is left as-is — the pre-v0.6.3.0 behaviour.
+            copy_elites(stage_dir, champ_dir, ind);
+            fprintf(csv, "%d,%s,%d,%d,%d,%+.6f,%d,%+.6f,%s,%.4f,%d,%d,%+.6f\n",
+                    pass_num, ind, day_start + 1, day_end, pass_num, chal_pct, 0, 0.f,
+                    "seed", 1.0, ELITE_POOL, pass_num, chal_pct);
+            snprintf(msg, sizeof(msg), "   pass-seed: champion = pass %d (%+.2f%%), seed unchanged",
+                     pass_num, chal_pct * 100.f);
+            log_msg(std::string("[") + IND_SHORT[i] + "]" + msg);
+            continue;
+        }
+
+        const double share = pass_share_new(prev[i].champ_pct, chal_pct);
+        int src[ELITE_POOL], idx[ELITE_POOL];
+        pass_interleave(share, ELITE_POOL, src, idx);
+        int slots_new = 0;
+        for (int k = 0; k < ELITE_POOL; k++) slots_new += (src[k] == 1);
+
+        // Blend champion + staged challenger into the live directory — next pass's seed.
+        if (seed_next) {
+            for (int k = 0; k < ELITE_POOL; k++) {
+                const std::string from = (src[k] == 0) ? elite_path(champ_dir, ind, idx[k])
+                                                       : elite_path(stage_dir, ind, idx[k]);
+                fs::copy_file(from, elite_path(out_dir, ind, k),
+                              fs::copy_options::overwrite_existing, ec);
+            }
+        }
+
+        const bool  chal_wins = chal_pct > prev[i].champ_pct;
+        const int   nc_pass   = chal_wins ? pass_num : prev[i].champ_pass;
+        const float nc_pct    = chal_wins ? chal_pct : prev[i].champ_pct;
+        if (chal_wins) copy_elites(stage_dir, champ_dir, ind);
+
+        fprintf(csv, "%d,%s,%d,%d,%d,%+.6f,%d,%+.6f,%s,%.4f,%d,%d,%+.6f\n",
+                pass_num, ind, day_start + 1, day_end,
+                prev[i].champ_pass, prev[i].champ_pct, pass_num, chal_pct,
+                pass_regime(prev[i].champ_pct, chal_pct), share, slots_new, nc_pass, nc_pct);
+
+        snprintf(msg, sizeof(msg),
+                 "   pass-seed: p%d %+.2f%% vs p%d %+.2f%% [%s] -> %d/%d slots from p%d%s, champion = p%d",
+                 prev[i].champ_pass, prev[i].champ_pct * 100.f, pass_num, chal_pct * 100.f,
+                 pass_regime(prev[i].champ_pct, chal_pct), slots_new, ELITE_POOL, pass_num,
+                 seed_next ? "" : " (final pass — not seeded)", nc_pass);
+        log_msg(std::string("[") + IND_SHORT[i] + "]" + msg);
+    }
+    fclose(csv);
+    fs::remove_all(stage_dir, ec);
+}
+
 static void save_master_elites(const std::string& dir, const float* elite_buf) {
     for (int slot = 0; slot < ELITE_POOL; slot++) {
         std::string path = elite_path(dir, "master", slot);
@@ -2960,17 +3222,33 @@ static void save_master_elites(const std::string& dir, const float* elite_buf) {
 }
 
 static void load_or_init_industry(const std::string& dir, const std::string& load_dir,
-                                   int ind_i, float* elite_buf) {
-    PCG32 rng; rng.seed((uint64_t)ind_i * 987654321ULL + 123456789ULL);
+                                   int ind_i, float* elite_buf, int actual_day) {
+    PCG32 rng; rng.seed(mix_seed((uint64_t)ind_i * 987654321ULL + 123456789ULL));
+
+    // Control mode: fresh random weights every day, never loaded. Seeded by DAY as well as
+    // industry so the parents genuinely differ day to day — the accidental --no-save version
+    // re-drew the same models each day, which left a fixed pool that selection could still
+    // exploit. This is the cleaner null.
+    if (g_control_untrained) {
+        PCG32 crng;
+        crng.seed(mix_seed((uint64_t)actual_day * 7919ULL + (uint64_t)ind_i * 104729ULL + 31ULL));
+        for (int slot = 0; slot < ELITE_POOL; slot++)
+            init_stock_weights(elite_buf + (size_t)slot * STOCKNN_PARAMS, crng);
+        return;
+    }
     for (int slot = 0; slot < ELITE_POOL; slot++) {
         float* e = elite_buf + (size_t)slot * STOCKNN_PARAMS;
+        // WORKING STORE FIRST, seed second. The order used to be reversed, and because this runs
+        // at the top of EVERY day a populated --load-dir was re-read daily — so a run seeded from
+        // a previous one reloaded that seed every day and never made progress. --load-dir is a
+        // seed: it should only be reached while the working store has nothing for this slot.
         bool loaded = false;
-        if (!load_dir.empty()) {
-            std::string p = elite_path(load_dir, g_ind_names[ind_i].c_str(), slot);
+        {
+            std::string p = elite_path(dir, g_ind_names[ind_i].c_str(), slot);
             loaded = load_bin(p, e, STOCKNN_PARAMS);
         }
-        if (!loaded) {
-            std::string p = elite_path(dir, g_ind_names[ind_i].c_str(), slot);
+        if (!loaded && !load_dir.empty()) {
+            std::string p = elite_path(load_dir, g_ind_names[ind_i].c_str(), slot);
             loaded = load_bin(p, e, STOCKNN_PARAMS);
         }
         if (!loaded) {
@@ -2983,7 +3261,7 @@ static void load_or_init_industry(const std::string& dir, const std::string& loa
 
 static void load_or_init_master(const std::string& dir, const std::string& load_dir,
                                  float* elite_buf) {
-    PCG32 rng; rng.seed(0xDEADBEEFCAFEBABEULL);
+    PCG32 rng; rng.seed(mix_seed(0xDEADBEEFCAFEBABEULL));
     for (int slot = 0; slot < ELITE_POOL; slot++) {
         float* e = elite_buf + (size_t)slot * MASTERNN_PARAMS;
         bool loaded = false;
@@ -3119,7 +3397,7 @@ static void save_mt1_ht(const std::string& dir, int ind_i, const MT1Scratch& scr
 static void load_or_init_mt1_ht(const std::string& dir, const std::string& load_dir,
                                  int ind_i, MT1Scratch& scratch) {
     const char* ind = g_ind_names[ind_i].c_str();
-    PCG32 rng; rng.seed((uint64_t)(ind_i + 2 * N_IND) * 777777777ULL + 271828182ULL);
+    PCG32 rng; rng.seed(mix_seed((uint64_t)(ind_i + 2 * N_IND) * 777777777ULL + 271828182ULL));
     char path[512];
 
     auto try_load = [&](const char* fmt_suffix, float* dst, int n, auto... args) -> bool {
@@ -3401,7 +3679,7 @@ static void save_mt2_elites(const std::string& dir, MT2Scratch& scratch) {
 
 static void load_or_init_mt2(const std::string& dir, const std::string& load_dir,
                                MT2Scratch& scratch) {
-    PCG32 rng; rng.seed(0xCAFED00DBEEF1234ULL);
+    PCG32 rng; rng.seed(mix_seed(0xCAFED00DBEEF1234ULL));
     for (int slot = 0; slot < ELITE_POOL; slot++) {
         float* e = scratch.elite_buf + (size_t)slot * MT2NN_PARAMS;
         bool loaded = false;
@@ -3561,8 +3839,9 @@ static void write_csv_row(FILE* csv, int pass_num, int actual_day,
                            const float mkt_ret[N_IND], const float mkt_val[N_IND]) {
     fprintf(csv, "%d,%d", pass_num + 1, actual_day + 1);
     for (int i = 0; i < N_IND; i++)
-        fprintf(csv, ",%+10.2f,%+10.2f,%+10.2f",
-                res[i].elite_max_val, res[i].elite_min_val, res[i].elite_mean_val);
+        fprintf(csv, ",%+10.2f,%+10.2f,%+10.2f,%.4f",
+                res[i].elite_max_val, res[i].elite_min_val, res[i].elite_mean_val,
+                res[i].mut_success);
     fprintf(csv, ",%+.2f,%+.2f,%+.2f,%+.2f",
             mst.elite_max_pts, mst.elite_min_pts, mst.elite_mean_pts, mst.ideal_pts);
     fprintf(csv, ",%+.2f,%+.2f", mst.consensus_flat_pts, mst.consensus_wtd_pts);
@@ -3627,6 +3906,9 @@ static void print_usage(const char* prog) {
         "          [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F]\n"
         "          [--dir-sigma F] [--rng-sigma F] [--acc-sigma F] [--cfd-sigma F] [--mt2-sigma F]\n"
         "          [--workers N] [--master-only] [--preserve-stock-data] [--no-save]\n"
+        "          [--seed N]   (default: clock, RE-SEEDED EVERY PASS; N derives passes from N)\n"
+        "          [--trade-lock PATH | --no-trade-lock]  pause while production holds the lock\n"
+        "          [--control-untrained]  NO-LEARNING CONTROL: re-randomise StockNN daily\n"
         "       %s --output DIR [--load-dir DIR] ...  (diagnostic/override)\n"
         "       %s --drift-study --load-dir SEED --drift-scratch DIR  (phase-3 calibration)\n",
         prog, prog, prog);
@@ -3789,7 +4071,7 @@ static bool drift_advance_day(int run_day_num, int actual_day, int total_days,
     const bool fwd_valid = (fwd_ptr != nullptr);
 
     bool seq_flags[N_SYMS];
-    PCG32 seq_rng; seq_rng.seed((uint64_t)actual_day * 0xABCDEF01234567ULL);
+    PCG32 seq_rng; seq_rng.seed(mix_seed((uint64_t)actual_day * 0xABCDEF01234567ULL));
     for (int si = 0; si < N_SYMS; si++) seq_flags[si] = (seq_rng.next() & 1);
 
     // StockNN ×12 (serial — study trades CPU for RAM, §5)
@@ -4071,6 +4353,10 @@ int main(int argc, char* argv[]) {
         else if (arg == "--master-only") master_only = true;
         else if (arg == "--preserve-stock-data") preserve_stock = true;
         else if (arg == "--no-save") g_no_save = true;
+        else if (arg == "--control-untrained") g_control_untrained = true;
+        else if (arg == "--seed"     && a+1<argc) { g_seed_arg = strtoull(argv[++a], nullptr, 10); }
+        else if (arg == "--trade-lock" && a+1<argc) { g_trade_lock = argv[++a]; }
+        else if (arg == "--no-trade-lock") { g_trade_lock.clear(); }
         else if (arg == "--dir-reps" && a+1<argc) { g_dir_reps = std::max(1, atoi(argv[++a])); }
         else if (arg == "--drift-study") drift_study = true;
         else if (arg == "--drift-scratch" && a+1<argc) { drift_scratch = argv[++a]; }
@@ -4097,8 +4383,41 @@ int main(int argc, char* argv[]) {
 
     log_msg(std::string("training_v4_cpp v") + TRAINER_VERSION +
             "  account=" + (account.empty() ? "(diagnostic)" : account));
+    log_msg(g_seed_arg ? "RNG: --seed " + std::to_string(g_seed_arg) + " (per-pass, derived)"
+                       : std::string("RNG: clock-seeded per pass — runs will not repeat"));
+
+    if (g_control_untrained) {
+        log_msg("");
+        log_msg("################################################################");
+        log_msg("#  --control-untrained : THIS IS NOT A TRAINING RUN            #");
+        log_msg("#  StockNN elites are re-randomised every day and never saved. #");
+        log_msg("#  Any performance below is selection-on-noise, not learning.  #");
+        log_msg("#  CSV goes to training_log_CONTROL.csv; do not compare it to  #");
+        log_msg("#  a real run without saying which is which.                   #");
+        log_msg("################################################################");
+        log_msg("");
+    }
 
     if (!load_universe_json("universe.json")) return 1;
+
+    // --no-save: train into a scratch directory and drop it at exit. Writing is REQUIRED for
+    // training to work at all — elite_buf and hist_buf are reloaded from disk every day — so the
+    // flag redirects the writes instead of suppressing them. Real disk, never /tmp: a run
+    // directory is ~3 GB and /tmp here is a 978 MB tmpfs.
+    std::string nosave_scratch;
+    if (g_no_save) {
+        std::error_code ec;
+        nosave_scratch = output_dir + ".nosave";
+        fs::remove_all(nosave_scratch, ec);
+        fs::create_directories(nosave_scratch, ec);
+        if (ec) {
+            fprintf(stderr, "FATAL: --no-save could not create scratch %s\n", nosave_scratch.c_str());
+            return 1;
+        }
+        output_dir = nosave_scratch;
+        log_msg("--no-save: training into scratch " + nosave_scratch +
+                " (~3 GB, removed at exit); canonical models untouched");
+    }
 
     // Disable OpenBLAS internal threading: N workers × M BLAS threads = N×M threads on N CPUs
     openblas_set_num_threads(1);
@@ -4135,13 +4454,18 @@ int main(int argc, char* argv[]) {
     auto mt2_scratch  = std::make_unique<MT2Scratch>();            // ~5.5 MB
 
     // Open CSV log (goes to log_dir, not output_dir)
-    std::string csv_path = log_dir + "/training_log.csv";
+    // Deliberately NOT training_log.csv. Every plotting and analysis script in the repo reads
+    // that exact name, and a control run's numbers look entirely ordinary — the only thing that
+    // makes them safe is that nothing can load them by accident.
+    std::string csv_path = log_dir +
+        (g_control_untrained ? "/training_log_CONTROL.csv" : "/training_log.csv");
     FILE* csv = fopen(csv_path.c_str(), "w");
     if (csv) {
         fprintf(csv, "pass,day");
         for (int i = 0; i < N_IND; i++)
-            fprintf(csv, ",%s_elite_max,%s_elite_min,%s_elite_mean",
-                    g_ind_names[i].c_str(), g_ind_names[i].c_str(), g_ind_names[i].c_str());
+            fprintf(csv, ",%s_elite_max,%s_elite_min,%s_elite_mean,%s_mut_success",
+                    g_ind_names[i].c_str(), g_ind_names[i].c_str(),
+                    g_ind_names[i].c_str(), g_ind_names[i].c_str());
         fprintf(csv, ",mt2_elite_max_pts,mt2_elite_min_pts,mt2_elite_mean_pts,mt2_ideal_pts");
         fprintf(csv, ",mt2_consensus_flat_pts,mt2_consensus_wtd_pts");
         fprintf(csv, ",mt2_slot0_pts_pf,mt2_slot0_pts_mkt");
@@ -4149,6 +4473,19 @@ int main(int argc, char* argv[]) {
             fprintf(csv, ",%s_mkt_ret,%s_mkt_val",
                     g_ind_names[i].c_str(), g_ind_names[i].c_str());
         fprintf(csv, "\n");
+    }
+
+    if (g_control_untrained) {
+        FILE* mk = fopen((output_dir + "/CONTROL_UNTRAINED").c_str(), "w");
+        if (mk) {
+            fprintf(mk, "This directory is the output of a --control-untrained run (v%s).\n"
+                        "StockNN weights here are NOT trained: the elites were re-randomised\n"
+                        "every day. Do not seed a run from this directory and do not run\n"
+                        "convert_weights.py against it. MT1/MT2 here were trained, but on top\n"
+                        "of a random StockNN portfolio, so they are not usable either.\n",
+                    TRAINER_VERSION);
+            fclose(mk);
+        }
     }
 
     // Open binary MT log (goes to log_dir, not output_dir)
@@ -4179,6 +4516,13 @@ int main(int argc, char* argv[]) {
         float cur_acc_sigma = acc_sigma    * decay;
         float cur_cfd_sigma = cfd_sigma    * decay;
         float cur_mt2_sigma = mt2_sigma_arg* decay;
+        // Fresh entropy per pass. Without this the per-day seeds repeat every pass and each pass
+        // replays the same perturbation vectors over different parents.
+        g_run_seed = g_seed_arg
+            ? splitmix64(g_seed_arg + (uint64_t)(pass + 1) * 0x9E3779B97F4A7C15ULL)
+            : (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
+        log_msg("  pass seed: " + std::to_string(g_run_seed));
+
         log_msg("===== PASS " + std::to_string(pass+1) + "/" + std::to_string(passes) +
                 " | sigma=" + std::to_string(cur_sigma).substr(0,6) +
                 " | mst=" + std::to_string(cur_mst_sigma).substr(0,6) +
@@ -4187,6 +4531,11 @@ int main(int argc, char* argv[]) {
                 " | acc=" + std::to_string(cur_acc_sigma).substr(0,6) +
                 " | cfd=" + std::to_string(cur_cfd_sigma).substr(0,6) +
                 " | mt2=" + std::to_string(cur_mt2_sigma).substr(0,6) + " =====");
+
+        // Slot-0 portfolio value at the two ends of the pass-boundary judging window. Captured
+        // from results[i].baseline, which is what the log prints as prod=$ — the same quantity the
+        // offline study measured. Zeroed each pass so a short pass cannot reuse stale values.
+        float judge_start[N_IND] = {}, judge_end[N_IND] = {};
 
         // Init portfolios; industry elites are loaded per-day inside step_industry
         for (int i = 0; i < N_IND; i++) {
@@ -4417,7 +4766,7 @@ int main(int argc, char* argv[]) {
                 if (!dir_inject_flag[i]) continue;
                 MT1Scratch& sc = mt1_scratches[i];
                 PCG32 inj_rng;
-                inj_rng.seed((uint64_t)blk_actual_day[blk_len - 1] * 77003ULL + (uint64_t)i * 131ULL + 55555ULL);
+                inj_rng.seed(mix_seed((uint64_t)blk_actual_day[blk_len - 1] * 77003ULL + (uint64_t)i * 131ULL + 55555ULL));
 
                 std::vector<int> mature;
                 for (int s = 0; s < MT1_COMP_SLOTS; s++)
@@ -4516,20 +4865,27 @@ int main(int argc, char* argv[]) {
                     write_mt_log_record(mt_log, rec);
                 }
             }
-            // 5. Save (per block ≈ 25 days)
-            if (!g_no_save) {
-                for (int i = 0; i < N_IND; i++) save_mt1_ht(output_dir, i, mt1_scratches[i]);
-                save_mt2_elites(output_dir, *mt2_scratch);
-            }
+            // 5. Save (per block ≈ 25 days). Always — under --no-save output_dir is the scratch.
+            for (int i = 0; i < N_IND; i++) save_mt1_ht(output_dir, i, mt1_scratches[i]);
+            save_mt2_elites(output_dir, *mt2_scratch);
         };
 
         for (int day_num = 0; day_num < num_days; day_num++) {
             int actual_day = day_start + day_num;
+
+            // Yield the box to a production cycle if one is running. Between days only — worker
+            // threads are parked here, so this idles the whole trainer.
+            wait_while_trading();
+
+            // Pass-boundary metric: slot-0 value PASS_JUDGE_DAYS before the end, and on the final
+            // day. Logged "Day N" is actual_day + 1, so the window matches days
+            // (day_end - PASS_JUDGE_DAYS) .. day_end in log terms.
+            const bool judge_win = (day_end - day_start) > PASS_JUDGE_DAYS;
             const DayData* day_ptr  = &all_days[actual_day];
             const DayData* fill_ptr = (actual_day + 1 < total_days) ? &all_days[actual_day + 1] : nullptr;
 
             // Generate seq_flags for this day
-            seq_rng.seed((uint64_t)actual_day * 0xABCDEF01234567ULL);
+            seq_rng.seed(mix_seed((uint64_t)actual_day * 0xABCDEF01234567ULL));
             for (int si = 0; si < N_SYMS; si++)
                 seq_flags[si] = (seq_rng.next() & 1);
 
@@ -4622,6 +4978,10 @@ int main(int argc, char* argv[]) {
                     ? (mst->ind_hist_count < IND_HIST_CAP ? mst->ind_val_hist[i][mst->ind_hist_count - 1]
                                                           : mst->ind_val_hist[i][IND_HIST_CAP - 1])
                     : static_cast<float>(IND_STARTING_CASH);
+                if (judge_win) {
+                    if (actual_day == day_end - PASS_JUDGE_DAYS - 1) judge_start[i] = results[i].baseline;
+                    if (actual_day == day_end - 1)                   judge_end[i]   = results[i].baseline;
+                }
                 float slot0_ret = (results[i].baseline > 1e-6f)
                     ? (results[i].slot0_score / results[i].baseline - 1.f) : 0.f;
                 today_pf_val[i] = prev_pf * (1.f + slot0_ret);
@@ -4697,11 +5057,20 @@ int main(int argc, char* argv[]) {
         }
 
         // Save MT1/MT2 after each pass (industry elites already saved by step_industry)
-        if (!g_no_save) {
+        {
             log_msg("Pass " + std::to_string(pass+1) + " complete — saving MT1/MT2 elites");
             for (int i = 0; i < N_IND; i++)
                 save_mt1_ht(output_dir, i, mt1_scratches[i]);
             save_mt2_elites(output_dir, *mt2_scratch);
+
+            // Judge this pass against the standing champion and seed the next one. Skipped in
+            // --master-only (StockNN is frozen, so the metric is meaningless) and for passes
+            // shorter than the judging window.
+            // Never in control mode: crowning a champion from random weights would write those
+            // weights into champion/, where the NEXT real run would seed from them.
+            if (!master_only && !g_control_untrained && (day_end - day_start) > PASS_JUDGE_DAYS)
+                pass_boundary(output_dir, pass + 1, day_start, day_end,
+                              judge_start, judge_end, /*seed_next=*/pass + 1 < passes);
         }
     }
 
@@ -4713,6 +5082,14 @@ int main(int argc, char* argv[]) {
 
     if (csv)    fclose(csv);
     if (mt_log) fclose(mt_log);
+
+    if (!nosave_scratch.empty()) {
+        std::error_code ec;
+        fs::remove_all(nosave_scratch, ec);
+        log_msg(ec ? "WARNING: could not remove scratch " + nosave_scratch
+                   : "--no-save: removed scratch " + nosave_scratch);
+    }
+
     log_msg("Training complete.");
     return 0;
 }

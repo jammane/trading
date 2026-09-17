@@ -5,6 +5,39 @@ Entries are prepended automatically on each commit via the Claude commit hook.
 
 ---
 
+## [7ef9dc1] — 2026-09-16
+v0.6.8.0: --no-orders for catch-up runs
+
+## [f4e4a7f] — 2026-09-16
+v0.6.7.0: log the mutation success rate (Rechenberg's 1/5 statistic)
+
+## [0eae448] — 2026-09-16
+v0.6.6.0: --no-save no longer disables training; --load-dir is a seed again
+
+## [4800edf] — 2026-09-16
+v0.6.5.0: training pauses while a production cycle is running
+
+## [a24e124] — 2026-09-15
+convert_weights: select the source directory by parameter
+
+## [b130eee] — 2026-09-14
+v0.6.4.0: clock-seed the RNG, re-seeded at the start of every pass
+
+## [373a77e] — 2026-09-14
+v0.6.3.0: per-industry proportional pass-boundary seeding
+
+## [04cfd44] — 2026-09-13
+PASS_SEEDING: specify the pass-reference file and champion store
+
+## [f44c685] — 2026-09-13
+Stage per-industry proportional pass-boundary seeding (StockNN)
+
+## [104c1cd] — 2026-09-12
+Reconcile the MT1 param constants; delete the dead single-trunk block
+
+## [efd7a97] — 2026-09-12
+Stage (H-L)/A as a future MT1 vol-channel input
+
 ## [d2d7a43] — 2026-09-12
 v0.6.2.0: --flat-allocation for paper; fix the production_v2 import break
 

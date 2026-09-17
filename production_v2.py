@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import contextlib
 import json
 import os
 import random
@@ -40,6 +41,46 @@ MAX_SINGLE_STOCK_PCT = 0.60   # max fraction of industry cash in one stock
 
 MODEL_DIR = 'models'  # legacy; superseded by --account in main()
 STOCK_DATA_DIR = 'stock_data'
+
+# ── Trading lock (v0.6.5.0) ────────────────────────────────────────────────────
+# The droplet has 2 cores. A training run uses ~150% CPU, and when it competes with a production
+# cycle the loser slows by 3-5x — measured: training dropped from 34 s/day to 1-3 min/day while
+# two short jobs ran alongside it. Production is the time-sensitive side (it fetches, decides and
+# submits orders), so the trainer yields to it.
+#
+# This writes a lock the C++ trainer polls between training days; see trade_lock_active() in
+# training_v4.cpp, which must agree with the DEFAULT PATH BELOW. Absolute because the two run from
+# different worktrees (/root/trading vs /root/trading-ht), so a relative path would never match.
+# /run is tmpfs, so a reboot cannot leave a stale lock behind.
+TRADING_LOCK_PATH = os.environ.get('TRADING_LOCK_PATH', '/run/trading/trading_active.lock')
+
+
+@contextlib.contextmanager
+def trading_lock(mode, account):
+    """Hold the lock for the whole cycle so the trainer pauses; always release it."""
+    path = TRADING_LOCK_PATH
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w') as f:
+            f.write(f'{os.getpid()}\n')
+            f.write(f'production_v2.py {mode} {account} started '
+                    f'{datetime.now().isoformat(timespec="seconds")}\n')
+        print(f'Trading lock held: {path} (pid {os.getpid()}) — training will pause')
+    except OSError as e:
+        # Never block a production run because the lock could not be written; the cost is only
+        # that training keeps competing for CPU.
+        print(f'Warning: could not write trading lock {path}: {e} — continuing without it')
+        path = None
+    try:
+        yield
+    finally:
+        if path:
+            try:
+                os.remove(path)
+                print(f'Trading lock released: {path}')
+            except OSError as e:
+                print(f'Warning: could not remove trading lock {path}: {e}')
+
 
 def load_state(model_dir):
     """Load trading state from {model_dir}/state.json, or return default initial state if absent."""
@@ -610,6 +651,10 @@ def main():
     parser.add_argument('--account', default='acct0', help='Account identifier (e.g. acct0); derives models/ACCOUNT/paper|prod and logs/ACCOUNT/paper|prod')
     parser.add_argument('--capital', type=float, default=None, help='Cap total deployed capital regardless of Alpaca account balance')
     parser.add_argument('--withdraw', type=float, help='Amount to withdraw from portfolio')
+    parser.add_argument('--no-orders', action='store_true',
+                        help='Run the full cycle — fetch, allocate, decide, and train the daily '
+                             'upkeep step — but submit NOTHING to Alpaca and cancel nothing. For '
+                             'catching the models up on missed sessions without trading.')
     parser.add_argument('--flat-allocation', action='store_true',
                         help='Allocate capital evenly across all industries, skipping MT1/MT2 '
                              'inference. Use while MT1/MT2 are unconfirmed.')
@@ -622,8 +667,9 @@ def main():
     training_lib.DUMP_DIR = os.path.join(LOG_DIR, 'data_dump')
     print(f"[production_v2] v{VERSION}  account={args.account}  mode={subtype}")
 
-    # `if True:` preserves the existing indentation scope; all logic below runs unconditionally.
-    if True:
+    # Held for the whole cycle, including the upkeep training step at the end, so the C++ trainer
+    # stays paused until this process is completely done.
+    with trading_lock(subtype, args.account):
         # Retrieve API keys
         api_key = os.environ.get('ALPACA_API_KEY')
         secret_key = os.environ.get('ALPACA_SECRET_KEY')
@@ -924,8 +970,10 @@ def main():
                     span           = max(high - low, 1e-9)
                     sell_all_price = low + sell_all_price_frac * span
 
-                    # Cancel existing GTC stop orders
-                    if cur_qty > 0:
+                    # Cancel existing GTC stop orders. Skipped under --no-orders: cancelling a
+                    # live stop while submitting no replacement would strip protection from a real
+                    # position, which is the one destructive thing this mode must not do.
+                    if cur_qty > 0 and not args.no_orders:
                         try:
                             get_orders_request = GetOrdersRequest(
                                 status=QueryOrderStatus.OPEN, symbols=[sym])
@@ -1106,8 +1154,18 @@ def main():
         else:
             print(f"MT upkeep deferred: {min_real_days}/15 days of real history")
 
-        # Submit orders to Alpaca (paper or live depending on --paper flag)
+        # Submit orders to Alpaca (paper or live depending on --paper flag).
+        # --no-orders stops here: everything above (allocation, decisions) and the upkeep training
+        # step below still run, so the models advance a day without anything reaching the market.
         mode = 'paper' if args.paper else 'live'
+        if args.no_orders:
+            print(f"--no-orders: {len(orders)} order(s) computed, NONE submitted")
+            for o in orders[:20]:
+                print(f"    would {o['action']:<9} {o['symbol']:<6} qty={o.get('quantity')}"
+                      f" price={o.get('price')}")
+            if len(orders) > 20:
+                print(f"    ... and {len(orders) - 20} more")
+            orders = []
         for order in orders:
             try:
                 if order['action'] == 'buy':
