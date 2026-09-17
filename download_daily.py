@@ -42,7 +42,7 @@ import time
 
 import yfinance as yf
 
-from universe import ALL_SYMBOLS
+from universe import union_across_environments
 
 MAX_HISTORY_DAYS = 1255
 STOCK_DATA_DIR   = 'stock_data'
@@ -146,7 +146,17 @@ def find_stale_symbols(last_dates: dict, max_stale_days: int = MAX_STALE_DAYS) -
 
 def main() -> int:
     os.makedirs(STOCK_DATA_DIR, exist_ok=True)
-    symbols = ALL_SYMBOLS
+    # Fetch the UNION across environments, not just this worktree's universe. stock_data is
+    # shared by dev / paper / prod, which may hold different universes during a staged rollout.
+    # cleanup_stock_data keeps the union; if download fetched less, the difference would go
+    # stale, trip find_stale_symbols, and make this script exit non-zero every day.
+    symbols, per_env, unreadable = union_across_environments()
+    symbols = sorted(symbols)
+    print('Universes: ' + ', '.join(
+        f'{e}={"?" if v is None else len(v)}' for e, v in per_env.items()))
+    if unreadable:
+        print(f'  WARNING: could not read {", ".join(unreadable)} — those symbols will not be '
+              f'fetched and may go stale')
     print(f'Updating {len(symbols)} symbols → trimmed to {MAX_HISTORY_DAYS} days each.')
 
     updated = new_sym = errors = 0

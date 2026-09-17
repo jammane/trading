@@ -3,8 +3,12 @@
 cleanup_stock_data.py — Remove stock_data/*.json files for symbols no longer
 active in any account's universe or open positions.
 
-A symbol is kept if it appears in the current universe (universe.py) OR has a
-non-zero holding in any models/acct*/paper|prod/state.json. The second check
+A symbol is kept if it appears in ANY environment's universe (dev / paper / prod, read from
+their branches) OR has a non-zero holding in any models/acct*/paper|prod/state.json.
+
+The three environments may legitimately hold different universes — a staged rollout means prod
+trades a proven set while dev tests a new one — but they SHARE stock_data/, so a cleanup that
+sees only one of them deletes the others' symbols. The second check
 prevents purging a symbol that was swapped out of the universe but still has an
 open Alpaca position pending liquidation.
 
@@ -18,14 +22,14 @@ import argparse
 import json
 import os
 
-from universe import ALL_SYMBOLS
+from universe import union_across_environments
 
 STOCK_DATA_DIR = 'stock_data'
 
 
-def _active_symbols() -> set:
-    """Union of universe symbols and any currently held across all accounts."""
-    active = set(ALL_SYMBOLS)
+def _active_symbols(union: set) -> set:
+    """Union of every environment's universe plus anything currently held."""
+    active = set(union)
     models_root = 'models'
     if not os.path.isdir(models_root):
         return active
@@ -59,11 +63,37 @@ def main() -> None:
         print(f'{STOCK_DATA_DIR}/ not found — nothing to clean.')
         return
 
-    active    = _active_symbols()
+    # dev / paper / prod may legitimately hold DIFFERENT universes — a staged rollout means prod
+    # trades a proven set while dev tests a new one. They SHARE stock_data, so deleting on one
+    # environment's view destroys another's data. Union across all of them.
+    union, per_env, unreadable = union_across_environments()
+    print('Universes by environment:')
+    for env in ('prod', 'paper', 'dev', 'working'):
+        syms = per_env.get(env)
+        print(f'  {env:<8} {"UNREADABLE" if syms is None else str(len(syms)) + " symbols"}')
+    only = {env: sorted(s - set().union(*(v for e, v in per_env.items() if e != env and v)))
+            for env, s in per_env.items() if s}
+    for env, syms in only.items():
+        if syms:
+            print(f'  only in {env}: {len(syms)} — {", ".join(syms[:8])}'
+                  f'{"..." if len(syms) > 8 else ""}')
+
+    if unreadable:
+        # Refuse rather than delete on a partial view. That partial view is the whole bug: on
+        # 2026-09-17 a cleanup from the paper worktree would have deleted 102 symbols that only
+        # dev's universe knew about, mid-training-run.
+        print(f'\nREFUSING TO DELETE: could not read the universe for {", ".join(unreadable)}.')
+        print('stock_data is shared across environments; removing files without seeing every')
+        print('universe risks deleting another environment\'s symbols. Fix the branch(es) and')
+        print('re-run, or use --dry-run to preview.')
+        if not args.dry_run:
+            raise SystemExit(2)
+
+    active    = _active_symbols(union)
     all_files = sorted(f for f in os.listdir(STOCK_DATA_DIR) if f.endswith('.json'))
     stale     = [f for f in all_files if f[:-5] not in active]
 
-    print(f'Active symbols: {len(active)}  |  Files on disk: {len(all_files)}  |  Stale: {len(stale)}')
+    print(f'\nActive symbols (union): {len(active)}  |  Files on disk: {len(all_files)}  |  Stale: {len(stale)}')
 
     if not stale:
         print('Nothing to remove.')
