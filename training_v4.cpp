@@ -3,7 +3,7 @@
 // Run:   ./build/training_v4_cpp --output models [--load-dir DIR] [--start-day N] [--stop-day N]
 //        [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F] [--workers N]
 
-#define TRAINER_VERSION "0.6.11.1"
+#define TRAINER_VERSION "0.7.0.0"
 
 #include <algorithm>
 #include <atomic>
@@ -1105,6 +1105,14 @@ static void log_msg(const std::string& msg) {
 // ── JSON stock data loader ──────────────────────────────────────────────────────
 // Each file: {"days": [{"date":"YYYY-MM-DD","open":f,"high":f,"low":f,"close":f,"volume":f},...]}
 
+// Bars rejected as non-finite or non-positive during load. Reported after loading so a data
+// problem is visible instead of silent — being silent is what made the SCCO case expensive.
+static long g_bad_bars = 0;
+
+// (int)NaN is UB and lands on INT32_MIN here. Belt-and-braces for anything that formats a
+// float as an int; the real fix is rejecting the bar above.
+static inline int safe_int(float v) { return std::isfinite(v) ? (int)v : 0; }
+
 static float parse_float_after(const char* buf, const char* key, float def = 0.f) {
     const char* p = strstr(buf, key);
     if (!p) return def;
@@ -1156,7 +1164,18 @@ static bool load_sym_data(const std::string& path,
         o.low    = parse_float_after(entry.c_str(), "\"low\"");
         o.close  = parse_float_after(entry.c_str(), "\"close\"");
         o.volume = parse_float_after(entry.c_str(), "\"volume\"");
-        o.valid  = true;
+        // A bar can arrive non-finite: yfinance returns NaN for a missing session and
+        // json.dump writes it as a bare `NaN` literal, which atof() parses happily. Marking
+        // such a bar valid let NaN into the portfolio valuation, and `(int)NaN` is undefined
+        // behaviour — observed as `prod=$-2147483648` (INT32_MIN) for SCCO 2026-08-11. It is
+        // not cosmetic: it silently destroys every statistic computed over that
+        // industry-pass (a quarter return came out as -4,047,374%).
+        o.valid = std::isfinite(o.open) && std::isfinite(o.high) &&
+                  std::isfinite(o.low)  && std::isfinite(o.close) &&
+                  o.open > 0.f && o.high > 0.f && o.low > 0.f && o.close > 0.f &&
+                  o.high >= o.low;
+        if (!std::isfinite(o.volume) || o.volume < 0.f) o.volume = 0.f;
+        if (!o.valid) g_bad_bars++;
         out_map[date] = o;
         p = entry_end + 1;
     }
@@ -1721,11 +1740,11 @@ static IndResult step_industry(int ind_i, IndustryState& state,
 
     log_msg(std::string("[") + IND_SHORT[ind_i] + "] Day " +
             std::to_string(actual_day + 1) + "/" + std::to_string(total_avail) +
-            " | best Δ" + (best_delta >= 0 ? "+" : "") + std::to_string((int)best_delta) +
-            " worst Δ" + (worst_delta >= 0 ? "+" : "") + std::to_string((int)worst_delta) +
-            " | buys=" + std::to_string((int)buy_exec) +
-            " sells=" + std::to_string((int)sell_exec) +
-            " | prod=$" + std::to_string((int)baseline) +
+            " | best Δ" + (best_delta >= 0 ? "+" : "") + std::to_string(safe_int(best_delta)) +
+            " worst Δ" + (worst_delta >= 0 ? "+" : "") + std::to_string(safe_int(worst_delta)) +
+            " | buys=" + std::to_string(safe_int(buy_exec)) +
+            " sells=" + std::to_string(safe_int(sell_exec)) +
+            " | prod=$" + std::to_string(safe_int(baseline)) +
             " | mut_ok=" + std::to_string((int)(mut_success * 100.f + 0.5f)) + "%");
 
     // Hard floor reset
@@ -1980,7 +1999,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                 (ctl_best >= 0 ? "+" : "") + std::to_string((int)ctl_best) +
                 " mean Δ" + (ctl_mean >= 0 ? "+" : "") + std::to_string((int)ctl_mean) +
                 " | trained best Δ" + (best_delta >= 0 ? "+" : "") +
-                std::to_string((int)best_delta) +
+                std::to_string(safe_int(best_delta)) +
                 (ctl_best >= best_delta ? "  <-- CONTROL WINS" : ""));
     }
 
@@ -3878,6 +3897,9 @@ static std::vector<DayData> load_all_stock_data(const std::string& data_dir,
     }
     log_msg("Loaded local data for " + std::to_string(loaded) + "/" +
             std::to_string(N_SYMS) + " symbols");
+    if (g_bad_bars > 0)
+        log_msg("  WARNING: rejected " + std::to_string(g_bad_bars) +
+                " non-finite/non-positive OHLC bar(s) — those sessions are skipped, not valued at 0");
 
     // Merge all dates
     std::map<std::string, int> date_index;
