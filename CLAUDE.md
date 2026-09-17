@@ -46,7 +46,7 @@ kubectl create secret generic alpaca-credentials-acct0-prod \
     --from-literal=ALPACA_SECRET_KEY="..." \
     --dry-run=client -o yaml | kubectl apply -f -
 ```
-All 176 pytest tests (including `test_models.py`) run on the droplet where torch is available.
+The full pytest suite (including `test_models.py`) runs on the droplet where torch is available.
 The pre-commit hook runs the full suite automatically before every `git commit`.
 
 **Lint:**
@@ -141,7 +141,7 @@ pause entirely with `--no-trade-lock`.
 A stale lock is ignored if its **PID is dead** or it is **older than 30 minutes**, and the override
 is logged loudly — a crashed production run must not idle training indefinitely. Failure to *write*
 the lock never blocks a production run; the only cost is continued CPU competition.
-MT1 trains via direction/delta/range scoring starting at `actual_day >= 25`; MT2 trains via tier-classification starting at `actual_day >= 30`.
+MT1 trains one 200-slot pool per industry against the next session's StockNN P&L, starting at `actual_day >= 25`; MT2 trains via tier-classification starting at `actual_day >= 30`.
 `convert_weights.py` is required after C++ training before using `inspect_trades.py` or `production_v2.py`.
 
 **Choosing which models to convert (v0.6.4.1).** `--source-dir DIR` reads `.bin` from anywhere,
@@ -220,29 +220,29 @@ not usable either.
 
 **Inspect MT1/MT2 training log:**
 
-As of v0.4.1.0 the binary log is one record **per block-day** (was one per 25-day block — 50
-points/pass, which is why the MT1 pool collapse was only visible in aggregate), and each record
-carries `mt1_actual_d[12]`, the MT1 target, making a run re-gradable offline.
+**Record V12 (904 B), header version 12** as of v0.8.0.0 — one record per day, per the rebuilt MT1.
+Per industry it carries the prediction, the outcome it was made for, the baseline it had to beat,
+the score floor, the pool's score distribution (slot-0 / mean / max / min), the lifecycle stats
+(mature, culled, largest lineage, distinct lineages, mean retirement age) and the cumulative
+retirement-age histogram.
 
-As of v0.4.3.0 it is **record V10 (1684 B), header version 9**, which adds the piece that makes those
-grades *mean* anything:
+The V1–V11 parsers are **gone** from both `read_mt_log.py` and `plot_training.py`. Every column
+they decoded — four component pools × four stats, `mt1_slot0_act[12][4]`, the OOS activation twin
+`mt1_oos_act`, the per-channel `mt1_skill`, `mt1_dir_injected`, `mt1_dir_stats`/`mt1_dir_life` —
+names something the rebuild deleted, and no V1–V11 log survives (the old run directories were
+cleared when the universe was re-normalized). Both readers now **refuse** an older version rather
+than decode it into plausible wrong numbers.
 
-- `mt1_oos_act[12][4]` — the same four activations as `mt1_slot0_act`, but produced by the
-  head0/tail0 **snapshot taken at block start**, before the T1/H/T2 phases see any of the block's
-  days. `mt1_slot0_act` is in-sample by construction — the model that emits day *d*'s activation was
-  selected on a scoring window *containing* day *d* — so it cannot measure skill. Only the OOS twin
-  can. On the v0.4.2.0 run the in-sample magnitude correlation was 0.543, above the 0.245 that
-  perfect foresight of forward market volatility would give: proof of fit, not skill.
-- `mt1_skill[12][4]` — per-channel skill (dir, acc, rng, cfd) over the trailing `MT1_SKILL_DAYS=250`
-  OOS predictions: the fraction of a constant baseline's squared error removed. 1 = perfect,
-  0 = no better than the constant, negative = worse. One common unit across all four channels.
-- `mt1_dir_injected[12]` carries real values again — it was hardcoded to `0u` behind a stale
-  "retired" comment while the constant-collapse detector was in fact firing ~560 times per run, so
-  injection cadence was invisible to every offline tool.
+The OOS instrument those versions carried is not replaced because it is no longer needed: every
+prediction is parked before its outcome exists, so there is no in-sample twin to compare against.
+What it measured before it was retired is worth remembering — 49.54% OOS against 61.09% in-sample,
+negative skill in all 12 industries.
 
-`read_mt_log.py` prints an `MT1 OUT-OF-SAMPLE` block comparing OOS against in-sample side by side —
-the gap between the two *is* the overfit. Both readers still parse V1–V9, and now prefer the header's
-version stamp over size-sniffing (sizes are ambiguous: 421 V9 records divide evenly by the V10 size).
+`read_mt_log.py` prints, per pass: a **Target** block (mean, sd, mean/sd, % negative, mean baseline
+error, floor), an **MT1** block (score slot-0/mean/max/min, `corr`, % of days above 0.5, mature,
+lineages), a **Pool lifecycle** block, and an **MT2** block. Read the MEAN column, not `best` —
+`best` is max-of-200 and rises with pool size under a null. `corr` is the prediction on day *t*
+against the P&L realised on *t+1*, and is the only column selection on noise cannot manufacture.
 
 ```bash
 python read_mt_log.py logs/acct0/training/mt_training_log.bin
@@ -315,9 +315,10 @@ python production_v2.py --account acct0
 
 **`--flat-allocation` (paper only, v0.6.2.0).** Splits deployed capital evenly across all 12
 industries and skips MT1/MT2 inference entirely. In force for paper while MT1/MT2 have no
-demonstrated out-of-sample skill (direction 52–53% OOS vs 81–84% in-sample, per-channel skill
-negative in all 12 industries), so paper results measure the StockNN layer rather than an
-unvalidated allocator. **Remove the flag from the paper crontab line once MT1/MT2 are confirmed.**
+demonstrated out-of-sample skill, so paper results measure the StockNN layer rather than an
+unvalidated allocator. The pre-rebuild MT1 measured 52–53% direction OOS against 81–84% in-sample,
+with negative per-channel skill in all 12 industries; the v0.8.0.0 rebuild has **no measurement
+yet**, and the flag stays until it has one. **Remove the flag from the paper crontab line once MT1/MT2 are confirmed.**
 Prod does not pass it and keeps the MT1/MT2 path.
 
 It is a deliberate override, not a fallback — the "equal allocation" fallback in
@@ -357,7 +358,7 @@ Runs all five steps: updates `universe_acct0.py` and regenerates `universe.json`
 | Module | Contents |
 |--------|----------|
 | `version.py` | `VERSION` string — single source of truth for the project version (mirrored as `TRAINER_VERSION` in `training_v4.cpp`) |
-| `models.py` | `StockNN`, `MasterNN`, `MT1NN`, `MT2NN` — single source of truth for all model classes |
+| `models.py` | `StockNN`, `MasterNN`, `MT1Net`, `MT2NN` — single source of truth for all model classes |
 | `universe_acct0.py` | `INDUSTRIES` dict, `ALL_SYMBOLS`, `INDUSTRY_NAMES` for acct0 (144 symbols) |
 | `universe.py` | Aggregator: discovers all `universe_acct*.py`, exposes union for download/cleanup scripts |
 | `universe.json` | Auto-generated from `universe_acct0.py` by `swap_symbols.py`; read by the C++ trainer |
@@ -372,8 +373,8 @@ Runs all five steps: updates `universe_acct0.py` and regenerates `universe.json`
 
 ## Tests
 
-176 pytest tests across seven files in `tests/`:
-- `test_models.py` — output shapes, output constraints (ReLU/sigmoid/softmax), serialization roundtrip, inject-layer growth dimensions; MT1NN/MT2NN shape + activation + forward tests; `stock_close_pos` value/identity/scale-free/degenerate-bar tests and `TestTodayLayout` section-offset tests (both must mirror the C++ twins)
+pytest tests across the files in `tests/`:
+- `test_models.py` — output shapes, output constraints (ReLU/sigmoid/softmax), serialization roundtrip, inject-layer growth dimensions; MT2NN shape/dims/forward tests (MT1Net has its own files); `stock_close_pos` value/identity/scale-free/degenerate-bar tests and `TestTodayLayout` section-offset tests (both must mirror the C++ twins)
 - `test_universe.py` — industry count, symbols per industry, no duplicates, formatting
 - `test_fees.py` — fee constant values, `_sell_net` calculations, FINRA cap boundary
 - `test_imports.py` — every module must import. Added after `production_v2.py` sat unimportable for
@@ -442,194 +443,140 @@ All model classes are defined in `models.py` (single source of truth) and import
   `TODAY_WIDTH`), pinned by `TestTodayLayout`. A mismatch between the two sides misaligns every
   feature past the first symbol block while staying in bounds — plausible wrong numbers, no crash.
 - **`MasterNN`** — legacy single cross-sector allocator (444→48). Kept for backward compatibility; superseded by MT1+MT2 in production once MT2 models are available.
-- **`MT1NN`** (74→4, **9,208 params** composed) — per-industry preprocessor. Composed = one shared `MT1DualHead` (1,996 = two 37→28 trunks) + four `MT1Tail` (1,803 each). There is deliberately no single `MT1NN_PARAMS` constant: the C++ allocates and saves heads and tails separately (`HEADNN_PARAMS`, `TAILNN_PARAMS`), and a stale composed constant is exactly the kind of thing `load_bin` turns into a silent random-init. Pinned by `tests/test_models.py::TestMT1NN::test_param_count` and by `static_assert` in `training_v4.cpp`. **Five independent 200-slot pools per industry** (composite, direction, accuracy, range, confidence); see "MT1 pools" under MT1 scoring formulas. Input: one industry's 74-feature slice `[37 market ‖ 37 portfolio]` of the 888-feature master vector. Outputs (raw logits, activations applied at score time): `sigmoid(out[0])` = direction confidence P(positive return), `tanh(out[1])×$10K` = dollar P&L prediction, `softplus(out[2])` = range as fraction of effective delta, `sigmoid(out[3])` = calibrated confidence. Activates at `actual_day >= 25`; scored over a 10-day linear-weighted window. Files: `mt1_{industry}_model_{n}.pt` / `mt1_{industry}_best.pt`.
-- **`MT2NN`** (FC+LSTM→48, ~34,572 params per slot) — cross-industry allocator. Replaces `MasterNN`. Input: 48 raw MT1 slot0 activations (4 per industry × 12 industries, no normalization — dollar magnitude IS the allocation signal). Parallel FC branch (48→36→36) + 2-layer LSTM (input=4, hidden=36) → concat 72 → taper (72→66→60→54→48). Activates at `actual_day >= 30`. Files: `mt2_model_{n}.pt` / `mt2_best.pt`.
+- **`MT1Net`** (74→1, **3,501 params**) — per-industry predictor. One instance per industry, one
+  200-slot pool each. Input: that industry's 74-feature slice `[37 market ‖ 37 portfolio]` of the
+  888-feature master vector. Output: a single raw logit; `tanh(out) × MT1_PRED_SCALE ($10,000)` is
+  the predicted **next-session StockNN P&L in dollars**, signed. Shape: two 37→28 trunks (market ‖
+  portfolio) → concat 56 → 22 → 10 → 1. The d2 layer takes **23** inputs — 22 from d1 plus one
+  RESERVED slot fed 0.0, held open for `(H−L)/A`; inert by construction, so filling it later
+  changes no dimension, offset, file format or `MT1NET_PARAMS`. Layer order is pinned by
+  `MT1NET_LAYER_DEFS` in `models.py`, mirrored by the `NT_*` offsets in `mt1_pool.h`, and the two
+  are held to the same arithmetic by `tests/test_mt1net_parity.py`, which compiles the C++ forward
+  pass standalone and compares it against the torch module. Files: `mt1_{ind}_slot_{n}.bin` /
+  `mt1_{ind}_model_{n}.pt`, deployed model `mt1_{ind}_best.pt`, sidecar `mt1_{ind}_meta.bin`.
+  Activates at `actual_day >= MT1_START_DAY (25)`.
+- **`MT2NN`** (FC+LSTM→48, **32,844 params** per slot) — cross-industry allocator. Replaces
+  `MasterNN`. Input: **12** — one MT1 prediction per industry, signed, unnormalized (the dollar
+  magnitude IS the allocation signal and the sign is the direction call). Parallel FC branch
+  (12→36→36) + 2-layer LSTM (input=1, hidden=36, walking the 12 industries one scalar per step) →
+  concat 72 → taper (72→66→60→54→48). Activates at `actual_day >= 30`. Files: `mt2_model_{n}.pt` /
+  `mt2_best.pt`. **BREAKING:** the input was 48 (4 channels × 12) and `MT2NN_PARAMS` was 34,572, so
+  every pre-v0.8.0.0 MT2 model is unloadable.
 
-### MT1 scoring formulas
+### MT1 target and scoring
 
-Per-day raw outputs and target:
-```
-conf = sigmoid(out[0]);  delta_d = tanh(out[1]) × $10k
-range_pct = softplus(out[2]);  conf4 = sigmoid(out[3])
+**BREAKING in v0.8.0.0.** MT1 was one shared dual head plus four specialized tails (9,208 params),
+five 200-slot pools per industry, four graded channels, a 10-day recency-weighted replay window,
+and a 10-day-forward market target. It is now **one `MT1Net` (3,501 params), one output, one pool
+of 200 persistent individuals per industry**, scored daily against the next session.
 
-# Market-based FORWARD target (v0.2.5+): cumulative relative return over the next MT1_FWD_DAYS=10 sessions.
-# fwd_ret[i] = close[t+10]/close[t] − 1 (equal-weight per industry); daily magnitude is noise, but a
-# 10-day-forward magnitude is predictable enough for MT2 to rank industries.
-actual_d = (fwd_ret[i] − median_fwd_ret) × $10k     # forward relative return vs cross-sectional median
-# Trainer skips the last 10 days (no forward data); single-day mkt_ret is kept ONLY for the
-# backward-looking feature index (mkt_val_hist) + CSV. Production upkeep buffers predictions 10
-# sessions (mt_fwd_buffer.json) and trains each when its forward window completes.
-```
+Every MT1 `.bin`/`.pt`, every pool file, every `mt_training_log.bin` and every MT2 model from
+before this change is unloadable. `load_bin` validates by element count and falls back to random
+init **silently**, so start from a clean output directory.
 
-**Adaptive per-industry floors** (computed each day from 10-day rolling buffers, BEFORE scoring):
-```
-acc_floor     = mean(|actual_d| over last 10d) / 2            # cold-start $125 = MT1_FLOOR_COLD/2
-range_ceiling = 4 × mean(|actual_d − comp0_δd| over last 10d)  # backward-looking clamp on r; none until buffer has data
-eff_delta floor = acc_floor                                    # band anchored to the TARGET's scale
-```
-(The legacy flat `$250` floor is only the cold-start seed; after ~day 35 every floor is per-industry adaptive and sits *below* the typical signal.)
-
-**Per-day component scores** (`compute_mt1_scores`):
-```
-err = |actual_d − delta_d|
-
-# Direction (single-day, continuous):
-sc_dir = conf if actual_d ≥ 0 else (1 − conf)
-
-# Range (reward a tight band that still covers the error):
-eff_delta = max(|delta_d|, acc_floor);  r = min(range_pct × eff_delta, range_ceiling)
-m = err / r;  sc_rng = min(m, 1/m)                    # continuous, peaks at 1.0 when r == err
-# Single-peaked with a gradient on BOTH sides. The pre-v0.4.1.0 form (m if m<1 else 0) rose as r
-# shrank toward err and then fell off a cliff to 0, so the pool optimized itself over the edge into
-# a flat all-zero landscape it could not mutate back out of — the range pool died in every run.
-
-# Accuracy (scale-relative, smooth, always in (0,1]):
-denom = max(|actual_d|, acc_floor)                    # accuracy POOL uses acc_floor/(err+acc_floor) directly
-sc_acc = denom / (err + denom)
-
-# Confidence (grade conf4 against range geometry ideal):
-dor = err / r;  ideal = 1 / (1 + dor²)
-sc_cfd = 1 − (conf4 − ideal)²                        # no outside-range compression (retired v0.4.1.0:
-# with err > r always, it made conf4 = 0 the trivial optimum and collapsed the whole pool onto it)
-
-# Composite (per day): equal-weight mean of the four components' SECONDARY [0,1] normalizations.
-# Each secondary maps its component's naive baseline B → 0 and ideal → 1, so all four contribute
-# equally (raw confidence ≈1 / range ≈0.85 would otherwise dominate; acc/dir sit near 0.5):
-#   sec = clamp((raw − B)/(1 − B), 0, 1)
-#   B_dir = 0.5;  B_acc = denom/(|actual_d|+denom);  B_rng = (err/acc_floor capped <1);
-#   B_cfd = sc_cfd evaluated at conf4 = 0.5
-composite = 0.25×(sec_dir + sec_acc + sec_rng + sec_cfd)
-```
-
-**Direction pool — forward accumulation (v0.5.0.0, BREAKING).** Direction left the replay regime
-entirely. The v0.4.3.0 out-of-sample instrument measured it at **49.54% OOS against 61.09%
-in-sample**, with a negative skill score in all 12 industries: the apparent skill was the pool
-fitting its own scoring window. Two causes, both structural — a 10-day window over a 10-day-forward
-target overlaps 9-of-10 (≈1.6 independent observations), and `step_mt1_pool` regenerates 183 of 200
-slots daily, so nothing accumulates a record.
-
-Direction now keeps **200 persistent individuals**, each carrying its own rolling 16-prediction
-register (`DirSlotMeta` in `mt1_scoring.h`):
-```
-n = min(n_pred, 16)                       # bit 0 = most recent call
-primary   = popcount(record, n) / n
-secondary = Σ wᵢ·bitᵢ / Σ wᵢ              # w = 1.0,0.8,0.6,0.4 in blocks of 4 (full record Σw = 11.2)
-tertiary  = 0.4·primary + 0.6·secondary
-sort key  = (primary, secondary, tertiary) descending
-```
-Partial records normalize by the weight actually occupied, so an 8-prediction model is judged on its
-8. The tertiary key is inert by construction — being a function of the other two it is equal whenever
-both are equal — and is kept only because the blend distribution is worth logging.
-
-Lifecycle: `MT1_DIR_MIN_AGE = 8` predictions before a model may be culled *or* breed;
-`MT1_DIR_CULL_PCT = 0.083` of **mature** models culled per day. Steady state
-`mature/N = 1/(1 + MIN_AGE×CULL_PCT)` → ~60% mature (120 of 200), ~10 births/day, ~20-prediction
-lifespan. Parents = top `MT1_DIR_ELITE_PCT` (10%) of mature plus three **ephemeral** wavg blends of
-top-5/10/15 — breeding templates, not pool residents, since a synthetic average has no record and
-could never mature. Backfill is **flat round-robin**, not the `kChildren` table (which hands slot 0
-sixteen of 180 children and drives the monoculture).
-
-Lineage: every slot carries an inherited id; children take the parent's, blends and fresh inits get
-a new one. A lineage above `MT1_DIR_LINEAGE_CAP` (25%) of the pool is barred from breeding until its
-share falls back; both transitions log. This is the direct read on monoculture that previously had to
-be inferred from pool spread.
-
-Persistence: all 200 direction weights are saved (`mt1_{ind}_tail_dir_elite_{0..199}.bin`, was 20)
-plus a metadata sidecar `mt1_{ind}_tail_dir_meta.bin`. The sidecar is separate because
-`save_bin`/`load_bin` are raw headerless float arrays validated by exact element count — appending to
-a weight file makes the loader reject it and silently fall back to random init. Direction has **no
-weight-history ring**: persistent identity supersedes it, since a model worth recalling from history
-is a model that was never culled.
-
-`--dir-reps` (default 20) replays each block N times for the direction pool only. Each rep re-walks
-the block from the start so inputs reset naturally, while models, records, ages and lineages carry
-across. Reps restore the evolutionary throughput lost to the gentle cull — at the cost of N epochs
-over the same 25 days, which is a real overfitting risk, hence a flag that can be swept and read off
-the OOS instrument rather than assumed.
-
-**Volatility channel (v0.5.0.0).** Channel 2 was a band width `r = range_pct × max(|delta|, acc_floor)`
-graded by `min(m, 1/m)` against `err` — the delta head's own residual, i.e. the part of the target it
-had just failed to predict. That is noise by construction, so the pool correctly converged to a
-constant (range_pct 0.62, spread 2.2%). It now predicts **forward `MT1_VOL_DAYS = 20` realized
-volatility of the industry's deployed portfolio**:
+**The target.** MT1 predicts, for one industry, the P&L that industry's StockNN will realise over
+the **next session**, in dollars:
 
 ```
-vol_pred = softplus(out[2]) × MT1_VOL_SCALE          # $500, NOT the $10,000 delta scale
-sc_vol   = den / (|vol_pred − vol_actual| + den),  den = max(vol_actual, vol_floor, 1e-6)
-vol_floor = mean(last 10 vol targets) / 2            # 2×floor = the naive predictor sec_vol grades against
+actual = slot0_score − baseline        # the deployed portfolio's value now vs at the previous close
+pred   = tanh(out) × MT1_PRED_SCALE    # MT1_PRED_SCALE = $10,000
 ```
 
-`MT1_VOL_SCALE` is separate deliberately. The measured target averages **$242** (p90 $336), so at the
-$10,000 delta scale a model must hold softplus in 0.005–0.06 — its flat tail, where Gaussian mutations
-stop moving the output. That is the same squashing that pinned the magnitude head near zero. At $500
-the useful range is softplus 0.1–1.2 and a fresh tail starts within ~1.5× of the target. Measured
-effect on a 74-day smoke: vol slot-0 score **1.70 → 13.31** of a 15 max.
+This is the question production actually asks. The old 10-day-forward relative return was a proxy
+for it, and a poor one: a 10-day window over a 10-day-forward target overlaps 9-of-10, so a
+"10-day scoring window" held roughly **1.6 independent observations**.
 
-The benchmark it must beat out-of-sample is **r ≈ 0.41–0.46** (trailing vol → forward *portfolio* vol).
-Sector vol is more predictable (0.55) but portfolio vol is what MT2 sizes on.
+**The score.**
 
-**conf4 (channel 3) is present but UNGRADED.** It graded itself against the band geometry that just
-went away, and with `err > r` always its optimum was the degenerate `conf4 = 0` (89% of values below
-0.01, pool spread 0.05%). The tail stays in the model so `MT1NN` and every `.bin`/`.pt` layout are
-unchanged, but it is scored 0, dropped from the composite (now the mean of **three** secondaries), and
-forwarded to MT2 as the constant `MT1_UNGRADED_FEED` — a frozen arbitrary function would be structured
-noise MT2 could fit.
-
-**Replay scoring window (acc/vol only, `MT1_DIR_DAYS = 10`):** each model is scored over the trailing 10 days,
-summing its per-day score with a linear recency weight (oldest day in window = 1.0 → today = 2.0):
 ```
-model_score = Σ_{d in window} weight(age_d) × per_day_score(d)
-weight(age) = 2.0 − age/(MT1_DIR_DAYS−1)     # age 0 = today → 2.0;  age 9 → 1.0   (mt1_win_weight)
+err  = |actual − pred|
+base = |actual − baseline|                    # baseline = trailing mean over MT1_BASELINE_DAYS = 20
+d    = max(base, floor, 1e-6)
+score = d / (err + d)                          # in (0, 1]; 0.5 = tied the trailing mean
+floor = mean(|actual| over MT1_FLOOR_DAYS=10) × MT1_FLOOR_FRAC=0.5, and never below $1
 ```
-A longer, recency-weighted window reduces score-estimate variance → sharper selection, fewer lucky-model
-promotions. Each pool sums its own per-day score (dir→sc_dir, acc→sc_acc, rng→sc_rng, cfd→sc_cfd,
-composite→composite). The direction pool additionally tracks an integer correct-count (`dir_correct_dbl`,
-today still counted ×2) as a secondary qualify/sort key separate from the continuous sum.
 
-**Per-pool culls: NONE as of v0.4.1.0.** Both were removed:
-- Range & confidence: the ceiling cull (`range_pct × eff_delta > range_ceiling`) is redundant now that
-  `sc_rng` is self-limiting on the wide side, and its threshold was derived from *today's* target.
-  `range_ceiling` survives as a plain clamp on `r`.
-- Direction: the flip cull (sign-crossings `< market_flips/2`) culled precisely the constant predictor
-  that the class-balanced day weights are DESIGNED to score at the no-skill baseline (dir_W/2 = 7.50).
-  Removing the floor let the pool sit below it, and it did — ~35% balanced accuracy, systematically
-  inverted, across all 5 passes of v0.4.0.0. Class balancing alone handles constant predictors.
-  The **backfill gate** remains: freezes the pool when no live model gets ≥3 days' direction correct.
+Bounded, symmetric in the sign of the error, and anchored to a predictor that must actually be
+beaten. The floor exists because `base` goes to zero on any day the trailing mean happens to land
+on the outcome, which would otherwise make the score hypersensitive — p10 of |actual| is ~$86.
 
-**Bounded activations (v0.4.1.0, `mt1_scoring.h`):** `conf`/`conf4` decode as
-`sigmoid(MT1_LOGIT_CAP × tanh(raw / MT1_LOGIT_CAP))` → (0.018, 0.982), and `range_pct` softplus input is
-clamped to ±20. A saturated sigmoid has zero derivative, so weight mutations stop changing the output
-and the pool freezes genetically: by pass 5 of v0.4.0.0, 96.7% of `conf` values were *exactly* 0 or 1
-and the 200-slot direction pool had a best−min spread of 0.35%. Decode-side only — model files unchanged.
+`1/(1+err)` was rejected: with err in dollars it saturates near 0 everywhere, and it weights quiet
+days **19× more** than loud ones (p10 $86 vs p90 $1650), so a windowed mean would be dominated by
+the days that matter least.
 
-**MT1 pools — one shared head + 4 tails, 200 slots each.** Two regimes as of v0.5.0.0:
-- **Replay pools (acc/rng/cfd) and the head** — slot layout **0–16** direct elites · **17–19** wavg
-  blends · **20–199** mutations (180). No injection slots; the shared head propagates cross-component
-  learning. Mutations use a **weighted children table** (`kChildren`): slot 0 = 16 children, slots
-  1–4 = 13/13/12/12, slots 5–16 = 8, wavg 17–19 = 6. Slot identity is positional — the pool ranks
-  candidates and overwrites the buffer, so a slot means "whoever placed k-th today" and 183 of 200
-  models are one day old. 5-day history ring (10/day) supplies extra candidates.
-- **Direction pool** — 200 persistent individuals on forward accumulation; see the section above.
-  Cull ~10/day, ~20-prediction lifespan, no history ring, lineage-tracked.
-- Production model = composed head0 + tail0[4]; its 4 activations feed MT2. The direction tail0 is
-  the best *mature* individual, copied into slot 0 by convention rather than by reordering the pool.
+**The causality contract.** A prediction made on day *t* is scored at *t+1* against the realised
+*t→t+1* P&L, using a baseline and floor computed from days ≤ *t*.
+`mt1_windows_are_causal(scored_day, baseline_last_day, floor_last_day)` asserts it in both the C++
+and the Python paths, and `tests/test_mt1_pool.cpp` pins it. One day of delay is the minimum
+possible; the old design needed 10, and 20 for the volatility channel.
+
+**Out-of-sample by construction.** Every individual's prediction is parked before the outcome
+exists, so there is no in-sample path to correct for. The V10 log's OOS snapshot twin, the
+`MT1_SKILL_DAYS=250` skill ring and the block-start freeze all existed to work around selection on
+a window that contained the day being scored; all three are gone. What the instrument they
+replaced measured is worth keeping in mind: **49.54% OOS against 61.09% in-sample**, negative skill
+in all 12 industries.
+
+**Read the MEAN, not the max.** `mt1_score_best` is max-of-200 and rises with pool size under a
+pure null. `read_mt_log.py` prints the pool mean heavy and the max thin for that reason, plus
+`corr` — the correlation between the prediction on day *t* and the P&L realised on *t+1*, over the
+whole window. `corr` is the one column selection on noise cannot manufacture: a pool can hold a
+score near 0.5 with corr 0.
+
+**Why one output and not two.** The target is nearly pure noise — measured mean $24.9 against sd
+$1121 (mean/sd = 0.022), 49.2% of sessions negative. A correct estimator therefore shrinks hard
+toward the mean, which means **|prediction| already encodes conviction**: a model that is sure
+predicts far from the baseline, and one that is not predicts near it. A separate confidence output
+would be a computed function of the first, and MT2 can compute it. The old four channels made this
+concrete: one (conf4) was ungraded and forwarded a constant, one was the magnitude with its sign
+deliberately discarded, and one graded itself against another's residual.
+
+**The pool.** 200 persistent individuals per industry, each carrying a rolling
+`MT1_SCORE_HIST = 16` score register (`MT1SlotMeta` in `mt1_pool.h`):
+
+```
+primary   = mean score over the register
+secondary = Σ wᵢ·scoreᵢ / Σ wᵢ      # MT1_RECENCY_W = 1.0,0.8,0.6,0.4 in blocks of 4, newest first
+sort key  = (primary, secondary) descending; immature models sort last unconditionally
+```
+
+Partial registers normalise by the weight actually occupied, so an 8-prediction model is judged on
+its 8. Lifecycle: `MT1_POOL_MIN_AGE = 8` predictions before a model may be culled **or** breed;
+`MT1_POOL_CULL_PCT = 0.083` of **mature** models culled per day → ~60% mature, ~20-prediction
+lifespan. Parents = the top `MT1_POOL_ELITE_PCT` (10%) of mature models whose lineage is not
+barred. Backfill is **flat round-robin**, not the `kChildren` weighted table that handed slot 0
+sixteen of 180 children.
+
+Lineage: every slot carries an inherited id; children take the parent's. A lineage above
+`MT1_POOL_LINEAGE_CAP` (12.5% = 25 of 200) is barred from breeding until it falls back under
+`MT1_POOL_LINEAGE_RESUME` (10%). Logged per day as `lineage_max` / `lineage_n` — the direct read on
+monoculture that previously had to be inferred from pool spread.
+
+**No blocks.** `MT1_BLOCK_DAYS = 25` and the T1/H/T2 phase alternation are gone: there is one
+network, so there is nothing to alternate between, and with a next-session target there is nothing
+to buffer. `MT1_DAYS = 1` survives only as the extent of the per-day staging arrays the CSV and
+binary-log writers index.
+
+**Persistence.** All 200 individuals as `mt1_{ind}_slot_{n}.bin`, plus a metadata sidecar
+`mt1_{ind}_meta.bin` holding each slot's register, age and lineage, the deployed slot, and the
+trailing target window. The sidecar is a **separate file** because `save_bin`/`load_bin` are raw
+headerless float arrays validated by exact element count — appending metadata to a weight file
+makes the loader reject it and fall back to random init silently. A missing sidecar is handled: the
+weights load and the registers start empty, costing `MT1_POOL_MIN_AGE` days of maturity.
 
 ### Production inference chain (when MT2 models available)
 
 ```
-build_master_features() → today444
-  → MT1 slot0 ×12 (slices today444[i*37:(i+1)*37]) → 4 raw activations each
-  → build in48: [conf, delta_t, range_pct, conf4] × 12 (no normalization). Source = direction-pool
-    slot0 when MT2_FEED_DIRECTION=true (v0.2.5+, the strongest daily signal), else composite slot0;
-    toggle back to composite once MT2 shows a learning curve. Allocation path needs convert_weights.py
-    to emit mt1_{ind}_dir_best.pt (else degrades to composite cleanly).
+build_master_features() → today888
+  → MT1 best ×12 (slices today888[i*74:(i+1)*74]) → one raw logit each
+  → in12[i] = tanh(logit) × $10,000     # predicted next-session P&L for industry i, signed
   → MT2 slot0 forward pass → (12,4) logits → argmax per industry → tier map
-  → allocation/liquidation (unchanged from MasterNN path)
+  → allocation/liquidation (unchanged)
 ```
 
-`run_master_allocation()` in `production_v2.py` tries MT2 first (`mt2_best.pt` exists), falls back to MasterNN, then equal allocation. MT2 input: 48 raw MT1 activations (no normalization; `mt2_norm_stats.json` no longer used).
-
-**v0.2.6.0 additions:** (1) MT2 mutation sigma lowered 0.002→0.001 (`master_sigma/6`; tighter pool). (2) **Raw slot0 logging** — each industry's slot0 activations `[conf, delta_t, range_pct, conf4]` are written per day to `mt_training_log.bin` (record V7, 1244 bytes, `MT_LOG_VERSION=6`) so any run can be re-graded offline under any target. (3) **Pool-consensus allocation diagnostic** — a wisdom-of-crowds ensemble: rank industries by the pool's mean tier vote, re-tier by the pool's *observed* mean tier-0 count (NOT `opt_tier` — that would leak the realized outcome), grade with the normal pts formula. Two variants — flat (all slots) and look-behind-weighted (elites weighted by reliability over the last `MT2_LB_DAYS=5` days, leak-free because read-only). Logged to the binary log + CSV (`mt2_consensus_flat_pts`, `mt2_consensus_wtd_pts`); plotted as thick purple lines (solid=weighted, dashed=flat) on `mt2_performance.svg`. The MT2 injection already preserves the top-half elites (slots 0–7), so the limit-cycle is regime-driven, not injection-driven; the consensus is the regime-robustness mechanism.
+`run_master_allocation()` in `production_v2.py` tries MT2 first (`mt2_best.pt` exists), falls back
+to MasterNN, then equal allocation. The deployed MT1 for each industry is whichever individual its
+pool ranked first, published to `mt1_{ind}_best.pt` on every upkeep run — not a fixed slot 0.
 
 ### Daily upkeep (production_v2.py + upkeep.py)
 
@@ -659,7 +606,7 @@ History files per industry:
 
 **Swap file (droplet):** `/swapfile` (2 GB, btrfs-compatible via `chattr +C` + `dd`) is active on the DigitalOcean droplet alongside `/dev/zram0` (1.9 GB), giving ~3.9 GB total swap. To recreate after a rebuild: `truncate -s 0 /swapfile && chattr +C /swapfile && dd if=/dev/zero of=/swapfile bs=1M count=2048 && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /etc/fstab`.
 
-`training_v4_cpp` (C++ binary) is the canonical trainer — handles industry, MT1, and MT2 training with ~6× speedup over Python. Writes `mt_training_log.bin` and `training_log.csv` to `logs/acct0/training/`; read with `read_mt_log.py`. MT2 tier-classification uses 444→12×37 per-industry feature slices fed through MT1, then normalized outputs fed to MT2 (FC + LSTM forward). MT1 activates at `actual_day >= 25`; MT2 at `actual_day >= 30`.
+`training_v4_cpp` (C++ binary) is the canonical trainer — handles industry, MT1, and MT2 training with ~6× speedup over Python. Writes `mt_training_log.bin` and `training_log.csv` to `logs/acct0/training/`; read with `read_mt_log.py`. MT2 tier-classification takes the 12 MT1 predictions directly (FC + LSTM forward, no normalization). MT1 activates at `actual_day >= 25`; MT2 at `actual_day >= 30`.
 
 `training_v3.py` (parallel) differs from `training_v2.py` in: 7 worker threads, in-RAM model cache (`_model_cache`), no slippage on limit fills, and slot-level portfolio JSON persisted alongside weights. History candidates in v3 cause the model cache to be invalidated before `selection_and_mutation` (so virtual slot files load from disk); the cache is repopulated on the next day's `load_all_models` call.
 
@@ -673,7 +620,7 @@ When an elite holds ≥50% cash (industry) or ≥80% cash (master), an `UNDER_IN
 
 ### Production cycle
 
-`production_v2.py` runs once per trading day: fetch data from yfinance → run MT1×12 + MT2 (or MasterNN fallback) to rebalance capital → run StockNN per active industry → submit limit/stop orders to Alpaca → perform one upkeep evolution step on yesterday's data (via `upkeep.py`). Alpaca credentials are read from `keyring` or environment variables (`ALPACA_API_KEY` / `ALPACA_SECRET_KEY`). All per-account state files (`state.json`, `owners.json`, `master_state.json`, `mt1_rolling_state.json`) live under `--model-dir`, enabling multiple accounts to run independently with different `--model-dir` paths and credentials.
+`production_v2.py` runs once per trading day: fetch data from yfinance → run MT1×12 + MT2 (or MasterNN fallback) to rebalance capital → run StockNN per active industry → submit limit/stop orders to Alpaca → perform one upkeep evolution step on yesterday's data (via `upkeep.py`). Alpaca credentials are read from `keyring` or environment variables (`ALPACA_API_KEY` / `ALPACA_SECRET_KEY`). All per-account state files (`state.json`, `owners.json`, `master_state.json`, `mt1_rolling_state.json`, `mt_prev_session.json`) live under `--model-dir`, enabling multiple accounts to run independently with different `--model-dir` paths and credentials.
 
 `--paper` routes all API calls to Alpaca's paper trading endpoint — orders are submitted and portfolio state is read from the paper account, giving real paper trading history without risking real money. Omit `--paper` for live trading.
 
@@ -688,26 +635,20 @@ A `PostToolUse` hook in `.claude/settings.json` auto-updates `CHANGELOG.md` and 
 | `N_SLOTS` | 200 | Total model slots per pool |
 | `ELITE_COUNT` | 17 | Direct elite slots (industry + MT2) |
 | `ELITE_POOL` | 20 | Elites + weighted-average slots (industry + MT2) |
-| `MT1_COMP_SLOTS` | 200 | Slots per MT1 pool (5 pools: composite, dir, acc, rng, cfd) |
-| `HT_PARENTS` | 20 | Replay-pool parents (17 elites + 3 wavg); no injection slots |
-| `HT_MUTS` | 180 | Replay-pool mutations, assigned by the `kChildren` weighted table |
-| `MT1_SCALE_DOLLARS` | $10,000 | tanh(out[1]) × scale = dollar P&L prediction |
-| `MT1_DIR_DAYS` | 10 | Replay scoring window (acc/rng/cfd + head): linear-weighted, oldest=1.0 → today=2.0 |
-| `MT1_FLOOR_COLD` | $250 | Cold-start seed only; `acc_floor` cold = MT1_FLOOR_COLD/2 = $125, then per-industry adaptive |
-| `MT1_ROLLING_DAYS` | 10 | Days in per-industry |actual_d| / residual rolling buffers (floor + ceiling) |
-| `MT1_VOL_DAYS` | 20 | Forward horizon for the volatility target (channel 2) |
-| `MT1_VOL_SCALE` | $500 | softplus(out[2]) × scale = predicted vol; separate from the $10,000 delta scale |
-| `MT1_UNGRADED_FEED` | 0.5 | Constant the ungraded conf4 channel forwards to MT2 |
-| `MT1_SKILL_DAYS` | 250 | Trailing window for the read-only out-of-sample per-channel skill scores (V10 log) |
-| `MT1_DIR_HIST_BITS` | 16 | Direction pool: rolling per-model prediction record (2 bytes), bit 0 = newest |
-| `MT1_DIR_MIN_AGE` | 8 | Predictions before a direction model may be culled OR breed |
-| `MT1_DIR_CULL_PCT` | 0.083 | Fraction of MATURE direction models culled per day (→ ~60% mature, ~20-prediction life) |
-| `MT1_DIR_ELITE_PCT` | 0.10 | Top fraction of mature direction models used as mutation parents |
-| `MT1_DIR_LINEAGE_CAP` | 0.25 | Lineage above this share of the pool is barred from breeding |
-| `--dir-reps` | 20 | Times the direction pool replays each block (CLI flag, not a constant) |
-| `MT1_RANGE_CEIL_MULT` | 4 | range_ceiling = 4 × mean |actual_d − comp0_δd| (backward-looking) |
-| `MT1_LOGIT_CAP` | 4 | Pre-sigmoid squash for conf/conf4 → (0.018, 0.982); prevents saturation lock-in |
-| `MT1_SOFTPLUS_CLAMP` | 20 | Clamp on the softplus input for range_pct (guards → inf) |
+| `MT1_POOL_SLOTS` | 200 | Persistent individuals per industry (one pool, was five) |
+| `MT1_PRED_SCALE` | $10,000 | `tanh(out) × scale` = predicted next-session P&L, in dollars |
+| `MT1_BASELINE_DAYS` | 20 | Trailing mean of realised P&L — the predictor MT1 must beat |
+| `MT1_FLOOR_DAYS` | 10 | Rolling window behind the score floor |
+| `MT1_FLOOR_FRAC` | 0.5 | `floor = mean(\|actual\|) × frac`, per industry, never below $1 |
+| `MT1_SCORE_HIST` | 16 | Rolling per-model score register (`MT1SlotMeta`) |
+| `MT1_POOL_MIN_AGE` | 8 | Predictions before a model may be culled OR breed |
+| `MT1_POOL_CULL_PCT` | 0.083 | Fraction of MATURE models culled per day (→ ~60% mature) |
+| `MT1_POOL_ELITE_PCT` | 0.10 | Top fraction of mature models used as parents |
+| `MT1_POOL_LINEAGE_CAP` | 0.125 | Lineage above this share of the pool stops breeding (25 of 200) |
+| `MT1_POOL_LINEAGE_RESUME` | 0.10 | ...and resumes only below this (hysteresis) |
+| `MT1_RECENCY_W` | 1.0/0.8/0.6/0.4 | Register weights, newest-first, in blocks of 4 |
+| `MT1_DAYS` | 1 | MT1 steps once per session; vestigial staging-array extent |
+| `--mt1-sigma` | master_sigma | One MT1 mutation sigma (was four per-channel sigmas) |
 | `IND_STARTING_CASH` | $25,000 | Per-industry starting capital |
 | `MST_STARTING_CASH` | $300,000 | Master starting capital |
 | `MAX_SINGLE_STOCK_PCT` | 0.60 | Max fraction of industry cash in one stock |
@@ -726,7 +667,7 @@ Version string is defined in `version.py` (`VERSION`) and mirrored as `TRAINER_V
 - `FEATURE` — increment for any new capability or significant improvement; resets `BUILD` to 0.
 - `BUILD` — increment for bug fixes and minor changes within a `FEATURE`.
 
-Current version: **0.6.9.0**
+Current version: **0.8.0.0**
 
 To bump the version, edit `VERSION` in `version.py` and `TRAINER_VERSION` in `training_v4.cpp`, then rebuild the C++ binary.
 
