@@ -2223,9 +2223,14 @@ static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in7
             const int par = parents[c % n_par];
             const uint64_t seed = (uint64_t)actual_day * 0x9E3779B97F4A7C15ULL
                                 ^ ((uint64_t)ind_i << 32) ^ ((uint64_t)victim * 2654435761ULL);
+            // Read the age BEFORE mt1_slot_init zeroes it — otherwise every retirement is
+            // recorded as age 0 and both the mean and the histogram stay empty for the whole run.
+            const uint32_t age = sc.meta[victim].n_pred;
             mt1_mutate(sc.slot(par), sc.slot(victim), sigma, seed);
             mt1_slot_init(sc.meta[victim], sc.meta[par].lineage);
-            sc.retire_n++; sc.retire_age_sum += sc.meta[victim].n_pred;
+            sc.retire_n++;
+            sc.retire_age_sum += age;
+            sc.retire_hist[mt1_life_bucket(age)]++;
             r.culled++; r.births++;
         }
         sc.best_slot = order[0];

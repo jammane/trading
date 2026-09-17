@@ -261,6 +261,22 @@ static inline float mt1_slot_mean(const MT1SlotMeta& m) {
 
 // Sort key: recency-weighted first, plain mean as tie-break. Immature models rank last regardless
 // of score — a model with two lucky predictions must not displace one with a record.
+// Retirement-age histogram bucket: 8-15 / 16-31 / 32-63 / 64-127 / 128+.
+//
+// Ages below MT1_POOL_MIN_AGE cannot occur through culling (an immature model is never a victim),
+// but injection or a reset could produce one, so those clamp into bucket 0 rather than indexing
+// out of the array. Cumulative rather than per-day because ~150k models retire over a pass — the
+// trajectory is what matters, and it comes free from logging the running counts.
+static constexpr int MT1_LIFE_BUCKETS = 5;
+
+static inline int mt1_life_bucket(uint32_t age) {
+    if (age <  16u) return 0;
+    if (age <  32u) return 1;
+    if (age <  64u) return 2;
+    if (age < 128u) return 3;
+    return 4;
+}
+
 static inline bool mt1_slot_better(const MT1SlotMeta& a, const MT1SlotMeta& b) {
     const bool ma = mt1_slot_mature(a), mb = mt1_slot_mature(b);
     if (ma != mb) return ma;
