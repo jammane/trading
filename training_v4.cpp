@@ -3,7 +3,7 @@
 // Run:   ./build/training_v4_cpp --output models [--load-dir DIR] [--start-day N] [--stop-day N]
 //        [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F] [--workers N]
 
-#define TRAINER_VERSION "0.6.7.2"
+#define TRAINER_VERSION "0.6.9.0"
 
 #include <algorithm>
 #include <atomic>
@@ -230,6 +230,20 @@ static constexpr int MT2_OUT_W = 31932;  static constexpr int MT2_OUT_B = 34524;
 //
 // The point of the flag was never "do not write" — it was "do not leave a 3 GB run directory
 // behind". So it now writes to <output>.nosave and removes it on exit.
+// --control-untrained (v0.6.9.0): a deliberate NO-LEARNING control. StockNN elites are
+// re-randomised every day instead of loaded, so the pool never accumulates anything, while the
+// market data, selection, scoring and logging stay identical. It answers a question this codebase
+// cannot currently answer: how much of the observed performance comes from TRAINING versus from
+// the selection mechanism operating on arbitrary models.
+//
+// The question is live because an accidental version of this ran for months as the --no-save
+// defect, and it scored comparably to trained runs (+151.4% against ~+127-142%). If a control
+// matches a trained run, the problem is not the passes — it is that the scoring cannot tell
+// models apart at all.
+//
+// Deliberately LOUD: a banner at startup, a marker in the CSV header, and a per-pass reminder.
+// The whole hazard of this mode is that its output looks exactly like a real run.
+static bool g_control_untrained = false;
 static bool g_no_save = false;
 
 // ── Trading lock (v0.6.5.0) ───────────────────────────────────────────────────
@@ -1186,7 +1200,7 @@ struct MasterResult {
 
 // ── Forward declarations (needed because step_industry calls load/save defined later) ──
 static void load_or_init_industry(const std::string& dir, const std::string& load_dir,
-                                   int ind_i, float* elite_buf);
+                                   int ind_i, float* elite_buf, int actual_day);
 static void save_industry_elites(const std::string& dir, int ind_i, const float* elite_buf);
 static void load_ind_history(const std::string& dir, int ind_i, WorkerScratch& scratch);
 static void save_ind_history(const std::string& dir, int ind_i, const WorkerScratch& scratch);
@@ -1202,7 +1216,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                                int day_num, int num_days,
                                float sigma, bool freeze, const bool* seq_flags) {
     // Load this industry's elites from disk (or random init on first day)
-    load_or_init_industry(models_dir, load_dir, ind_i, scratch.elite_buf);
+    load_or_init_industry(models_dir, load_dir, ind_i, scratch.elite_buf, actual_day);
     // Load per-industry elite history (or reset at pass start)
     if (day_num == 0) {
         scratch.hist_head  = 0;
@@ -1900,11 +1914,15 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         top_hold += slot0_own.holdings[j] * price;
     }
 
-    // Save updated elites and history back to disk. ALWAYS — these are reloaded at the top of
-    // the next day, so skipping the write is what broke --no-save. Under --no-save models_dir is
-    // already redirected to the scratch directory.
-    save_industry_elites(models_dir, ind_i, scratch.elite_buf);
-    save_ind_history(models_dir, ind_i, scratch);
+    // Save updated elites and history back to disk. These are reloaded at the top of the next
+    // day, so skipping the write is what broke --no-save; under --no-save models_dir is already
+    // redirected to a scratch directory instead. The one case that genuinely skips the write is
+    // --control-untrained, where tomorrow re-randomises rather than loads, so saving would only
+    // burn 3 GB of I/O and leave a directory of weights that look trained.
+    if (!g_control_untrained) {
+        save_industry_elites(models_dir, ind_i, scratch.elite_buf);
+        save_ind_history(models_dir, ind_i, scratch);
+    }
 
     IndResult res;
     res.baseline      = baseline;
@@ -3204,8 +3222,20 @@ static void save_master_elites(const std::string& dir, const float* elite_buf) {
 }
 
 static void load_or_init_industry(const std::string& dir, const std::string& load_dir,
-                                   int ind_i, float* elite_buf) {
+                                   int ind_i, float* elite_buf, int actual_day) {
     PCG32 rng; rng.seed(mix_seed((uint64_t)ind_i * 987654321ULL + 123456789ULL));
+
+    // Control mode: fresh random weights every day, never loaded. Seeded by DAY as well as
+    // industry so the parents genuinely differ day to day — the accidental --no-save version
+    // re-drew the same models each day, which left a fixed pool that selection could still
+    // exploit. This is the cleaner null.
+    if (g_control_untrained) {
+        PCG32 crng;
+        crng.seed(mix_seed((uint64_t)actual_day * 7919ULL + (uint64_t)ind_i * 104729ULL + 31ULL));
+        for (int slot = 0; slot < ELITE_POOL; slot++)
+            init_stock_weights(elite_buf + (size_t)slot * STOCKNN_PARAMS, crng);
+        return;
+    }
     for (int slot = 0; slot < ELITE_POOL; slot++) {
         float* e = elite_buf + (size_t)slot * STOCKNN_PARAMS;
         // WORKING STORE FIRST, seed second. The order used to be reversed, and because this runs
@@ -3878,6 +3908,7 @@ static void print_usage(const char* prog) {
         "          [--workers N] [--master-only] [--preserve-stock-data] [--no-save]\n"
         "          [--seed N]   (default: clock, RE-SEEDED EVERY PASS; N derives passes from N)\n"
         "          [--trade-lock PATH | --no-trade-lock]  pause while production holds the lock\n"
+        "          [--control-untrained]  NO-LEARNING CONTROL: re-randomise StockNN daily\n"
         "       %s --output DIR [--load-dir DIR] ...  (diagnostic/override)\n"
         "       %s --drift-study --load-dir SEED --drift-scratch DIR  (phase-3 calibration)\n",
         prog, prog, prog);
@@ -4322,6 +4353,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--master-only") master_only = true;
         else if (arg == "--preserve-stock-data") preserve_stock = true;
         else if (arg == "--no-save") g_no_save = true;
+        else if (arg == "--control-untrained") g_control_untrained = true;
         else if (arg == "--seed"     && a+1<argc) { g_seed_arg = strtoull(argv[++a], nullptr, 10); }
         else if (arg == "--trade-lock" && a+1<argc) { g_trade_lock = argv[++a]; }
         else if (arg == "--no-trade-lock") { g_trade_lock.clear(); }
@@ -4353,6 +4385,18 @@ int main(int argc, char* argv[]) {
             "  account=" + (account.empty() ? "(diagnostic)" : account));
     log_msg(g_seed_arg ? "RNG: --seed " + std::to_string(g_seed_arg) + " (per-pass, derived)"
                        : std::string("RNG: clock-seeded per pass — runs will not repeat"));
+
+    if (g_control_untrained) {
+        log_msg("");
+        log_msg("################################################################");
+        log_msg("#  --control-untrained : THIS IS NOT A TRAINING RUN            #");
+        log_msg("#  StockNN elites are re-randomised every day and never saved. #");
+        log_msg("#  Any performance below is selection-on-noise, not learning.  #");
+        log_msg("#  CSV goes to training_log_CONTROL.csv; do not compare it to  #");
+        log_msg("#  a real run without saying which is which.                   #");
+        log_msg("################################################################");
+        log_msg("");
+    }
 
     if (!load_universe_json("universe.json")) return 1;
 
@@ -4410,7 +4454,11 @@ int main(int argc, char* argv[]) {
     auto mt2_scratch  = std::make_unique<MT2Scratch>();            // ~5.5 MB
 
     // Open CSV log (goes to log_dir, not output_dir)
-    std::string csv_path = log_dir + "/training_log.csv";
+    // Deliberately NOT training_log.csv. Every plotting and analysis script in the repo reads
+    // that exact name, and a control run's numbers look entirely ordinary — the only thing that
+    // makes them safe is that nothing can load them by accident.
+    std::string csv_path = log_dir +
+        (g_control_untrained ? "/training_log_CONTROL.csv" : "/training_log.csv");
     FILE* csv = fopen(csv_path.c_str(), "w");
     if (csv) {
         fprintf(csv, "pass,day");
@@ -4425,6 +4473,19 @@ int main(int argc, char* argv[]) {
             fprintf(csv, ",%s_mkt_ret,%s_mkt_val",
                     g_ind_names[i].c_str(), g_ind_names[i].c_str());
         fprintf(csv, "\n");
+    }
+
+    if (g_control_untrained) {
+        FILE* mk = fopen((output_dir + "/CONTROL_UNTRAINED").c_str(), "w");
+        if (mk) {
+            fprintf(mk, "This directory is the output of a --control-untrained run (v%s).\n"
+                        "StockNN weights here are NOT trained: the elites were re-randomised\n"
+                        "every day. Do not seed a run from this directory and do not run\n"
+                        "convert_weights.py against it. MT1/MT2 here were trained, but on top\n"
+                        "of a random StockNN portfolio, so they are not usable either.\n",
+                    TRAINER_VERSION);
+            fclose(mk);
+        }
     }
 
     // Open binary MT log (goes to log_dir, not output_dir)
@@ -5005,7 +5066,9 @@ int main(int argc, char* argv[]) {
             // Judge this pass against the standing champion and seed the next one. Skipped in
             // --master-only (StockNN is frozen, so the metric is meaningless) and for passes
             // shorter than the judging window.
-            if (!master_only && (day_end - day_start) > PASS_JUDGE_DAYS)
+            // Never in control mode: crowning a champion from random weights would write those
+            // weights into champion/, where the NEXT real run would seed from them.
+            if (!master_only && !g_control_untrained && (day_end - day_start) > PASS_JUDGE_DAYS)
                 pass_boundary(output_dir, pass + 1, day_start, day_end,
                               judge_start, judge_end, /*seed_next=*/pass + 1 < passes);
         }
