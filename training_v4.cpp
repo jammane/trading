@@ -274,6 +274,7 @@ static constexpr int MT2_OUT_W = 31932;  static constexpr int MT2_OUT_B = 34524;
 static bool g_control_random = false;
 static int  g_cur_pass = 0;      // set once per pass before workers start; read-only in workers
 static FILE* g_ctl_csv = nullptr;  // control_log.csv, long format, opened only with --control-random
+static FILE* g_hold_csv = nullptr; // holdings_log.csv: slot-0's composition, one row per industry-day
 
 static bool g_control_untrained = false;
 static bool g_no_save = false;
@@ -1242,6 +1243,13 @@ struct IndResult {
     // against THIS day's reference portfolio. ctl_n == 0 means the control did not run.
     float ctl_best, ctl_mean;
     int   ctl_n;
+    // Slot-0's book at the end of the day: the per-symbol share counts and cash of the model
+    // that is actually deployed. We already log the portfolio's VALUE (prod=$) but never its
+    // COMPOSITION, and without composition the only market-side regressor available is the
+    // equal-weight industry index — while the book may hold 60% in one name. That mismatch is
+    // why the P&L decomposition came back at R^2 ~ 0.0001: a broken regressor, not a finding.
+    float hold[IND_SYMS];
+    float hold_cash;
 };
 
 struct MasterResult {
@@ -2034,6 +2042,8 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     res.elite_mean_val= elite_mean_val;
     res.ctl_best      = ctl_best;
     res.ctl_mean      = ctl_mean;
+    for (int j = 0; j < IND_SYMS; j++) res.hold[j] = slot0_own.holdings[j];
+    res.hold_cash     = slot0_own.cash;
     res.ctl_n         = ctl_n;
     state.streak      = new_streak;
     return res;
@@ -3945,6 +3955,15 @@ static void write_csv_row(FILE* csv, int pass_num, int actual_day,
         fprintf(csv, ",%+10.2f,%+10.2f,%+10.2f,%.4f",
                 res[i].elite_max_val, res[i].elite_min_val, res[i].elite_mean_val,
                 res[i].mut_success);
+    if (g_hold_csv) {
+        for (int i = 0; i < N_IND; i++) {
+            fprintf(g_hold_csv, "%d,%d,%s,%.2f", pass_num + 1, actual_day + 1,
+                    g_ind_names[i].c_str(), res[i].hold_cash);
+            for (int j = 0; j < IND_SYMS; j++) fprintf(g_hold_csv, ",%.0f", res[i].hold[j]);
+            fprintf(g_hold_csv, "\n");
+        }
+        fflush(g_hold_csv);   // the other CSVs sit at 0 bytes for the whole run; this one must not
+    }
     if (g_ctl_csv)
         for (int i = 0; i < N_IND; i++)
             if (res[i].ctl_n > 0)
@@ -4597,6 +4616,19 @@ int main(int argc, char* argv[]) {
                         "of a random StockNN portfolio, so they are not usable either.\n",
                     TRAINER_VERSION);
             fclose(mk);
+        }
+    }
+
+    {
+        std::string hp = log_dir + "/holdings_log.csv";
+        g_hold_csv = fopen(hp.c_str(), "w");
+        if (g_hold_csv) {
+            fprintf(g_hold_csv, "pass,day,industry,cash");
+            for (int j = 0; j < IND_SYMS; j++) fprintf(g_hold_csv, ",q%d", j);
+            fprintf(g_hold_csv, "\n");
+            log_msg("slot-0 holdings log -> " + hp);
+        } else {
+            log_msg("WARNING: could not open " + hp);
         }
     }
 
