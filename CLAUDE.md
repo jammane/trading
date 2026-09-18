@@ -389,6 +389,18 @@ pytest tests across the files in `tests/`:
 - `test_flat_allocation.py` — `--flat-allocation`: even split, positive tiers, `zero_counts`
   cleared (pre-seeded above the liquidation threshold), MasterNN never called, and the two
   contrast cases proving flat cannot be expressed as the no-models fallback or via `tiers_to_alloc`.
+- `test_upkeep_mt1.py` — upkeep.py's MT1 path, the one production runs daily. `training_v4.cpp`
+  and `upkeep.py` evolve the **same** pool files, so the parity tests compile `mt1_pool.h`'s own
+  functions and compare numerically (the technique `test_mt1net_parity.py` uses for the forward
+  pass) rather than comparing the two by reading them: every pool constant, `mt1_score`,
+  `mt1_pred`, both register means, and the full pool ordering checked pairwise against
+  `mt1_slot_better`. Plus the lifecycle (bootstrap, park-then-score-next-run, maturity gate, cull
+  and lineage inheritance, deployed model published) and rolling-state persistence.
+  Two real defects came out of writing it: the sort key had its two components in the opposite
+  order from the C++ (recency-weighted mean is the PRIMARY key, plain mean only the tie-break —
+  the swapped version ranks identically on most pairs, so it reads as correct), and
+  `production_v2` never persisted the rolling state, which would have left every prediction parked
+  and none ever scored. Both are pinned.
 - `test_zip_strict.py` — parallel-array guards for the `zip(..., strict=True)` conversion (ruff
   B905). Bare `zip` truncates silently, so a length mismatch yielded a plausible wrong number
   instead of an error; these assert `ValueError` on mismatch and pin the cross-module industry-list
