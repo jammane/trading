@@ -1,3 +1,17 @@
+> # STILL LIVE, but the destination changed (v0.8.0.0)
+>
+> This was staged as an input to MT1's **volatility channel**. That channel no longer exists — the
+> four-tail MT1 was deleted and replaced by a single-output `MT1Net`.
+>
+> The feature itself is still wanted, and a slot is already held open for it: `MT1Net`'s `d2` layer
+> takes **23** inputs — 22 from `d1` plus one RESERVED slot fed `0.0`, reserved for exactly this.
+> It is inert by construction (`0 × w = 0`), so filling it changes no dimension, no offset, no file
+> format and not `MT1NET_PARAMS` — the same trick that let `close_vs_wap` land in v0.6.1.0 without
+> breaking binary compatibility. See `MT1NET_D2_RESERVED` in `mt1_pool.h` and
+> `MT1Net.RESERVED_D2_INPUT` in `models.py`.
+>
+> The blocker recorded below — that no portfolio-vol validation had been run — is unchanged.
+
 # Staged: add `(H−L)/A` as an MT1 input
 
 **Status: STAGED — do not implement yet.**

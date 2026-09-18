@@ -1,3 +1,27 @@
+> **UPDATE (v0.8.1.0) — the 13-vs-13.0 result now has a mechanism.**
+>
+> The gate judges on slot-0's percent book change over the last `PASS_JUDGE_DAYS = 15` days.
+> Daily book volatility is ~1.5-2%, so a 15-day return has sd ~7%, while a plausible skill
+> difference between two model sets is ~1.5% over that window. **SNR ≈ 0.2** — the metric is
+> nearly all noise, which is exactly why dethronings landed on the 1/k null.
+>
+> Two explanations that were proposed and are wrong: the window is at the *end* of a pass (the
+> most-trained point), not inside the learning curve; and beta largely cancels because every pass
+> is judged on the same calendar days.
+>
+> One real contamination: a hard-floor reset inside the window jumps `baseline` ~$22,400 → $25,000,
+> a spurious **+11.6%**, hitting ~6% of judgements at the measured reset rate.
+>
+> So the design is not refuted — it was never given a metric that could resolve it. Rebuild the
+> judge on the **sum of daily book P&L** (exactly $0 on reset days, now logged per day in
+> `mt1_dataset.bin`) over a substantially longer window, then re-measure. This matters beyond
+> seeding: the champion store decides what is promoted to paper.
+>
+> Separately, a controlled read on carryover — pass 1 vs pass 2 on identical calendar days — came
+> out −5.19 vs −4.68 $/day, i.e. no detectable transfer. That comparison covered days 25-361,
+> which is the window where BOTH passes are rebuilding a portfolio from all cash, so it is
+> confounded by capital deployment and should not be treated as settled.
+
 # Staged: per-industry proportional pass-boundary seeding (StockNN)
 
 **Status: IMPLEMENTED in v0.6.3.0.**
