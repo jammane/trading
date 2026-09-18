@@ -238,26 +238,36 @@ def mt1_windows_are_causal(scored_day, baseline_last_day, floor_last_day):
 
 
 def _mt1_slot_rank_key(meta):
-    """(primary, secondary) descending — the rolling register, same as the C++ mt1_slot_better.
+    """(recency-weighted mean, plain mean) descending — mirrors the C++ mt1_slot_better.
 
-    primary   = mean score over the register
-    secondary = recency-weighted mean, MT1_RECENCY_W in blocks of 4, newest first
+    ORDER MATTERS, and it is not the intuitive one. The primary key is the RECENCY-WEIGHTED mean
+    (`mt1_slot_score` in mt1_pool.h), with the plain mean (`mt1_slot_mean`) only as a tie-break.
+    Having the two the other way round still ranks identically whenever the plain means differ by
+    less than nothing — which is most pairs — so it reads as correct and passes almost every
+    spot check. It diverges on exactly the pairs that matter: a model improving over its last
+    eight predictions loses to a flat mediocre one. Since training_v4.cpp and this path evolve the
+    SAME pool, that means a different deployed model and different cull victims depending on which
+    half of the pool's life is running, with no error anywhere.
+
     A partial register normalises by the weight actually occupied, so an 8-prediction model is
     judged on its 8 rather than penalised for the 8 it has not made yet.
+
+    `scores` is oldest-first here; the C++ `score[0]` is the MOST RECENT. Reverse before weighting.
     """
     scores = meta.get('scores', [])
     n = min(len(scores), MT1_SCORE_HIST)
     if n == 0:
         return (0.0, 0.0)
-    recent = scores[-n:][::-1]                      # newest first
-    primary = sum(recent) / n
+    recent = scores[-n:][::-1]                      # newest first, matching the C++ layout
+    plain = sum(recent) / n
     wsum = 0.0
     tot = 0.0
     for i, v in enumerate(recent):
         w = MT1_RECENCY_W[min(i // 4, len(MT1_RECENCY_W) - 1)]
         wsum += w * v
         tot += w
-    return (primary, wsum / tot if tot > 0 else 0.0)
+    weighted = wsum / tot if tot > 0 else 0.0
+    return (weighted, plain)
 
 
 def _mt1_slot_mature(meta):
