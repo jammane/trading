@@ -1,7 +1,7 @@
 """
 models.py — Shared neural network definitions.
 
-Single source of truth for StockNN, MasterNN, MT1NN, and MT2NN.
+Single source of truth for StockNN, MasterNN, MT1Net, and MT2NN.
 All training scripts, production_v2.py, and inspect_trades.py import from here.
 """
 
@@ -162,99 +162,115 @@ class MasterNN(nn.Module):
         return self.fc_out(x)   # (1, 48) raw logits
 
 
-class MT1Head(nn.Module):
+class MT1Net(nn.Module):
+    """Single-output MT1 — the rebuild. ONE network per industry, ONE number out.
+
+    Predicts that industry's NEXT-DAY StockNN P&L in dollars. Replaces the deleted dual head +
+    four specialized tails (9,208 params across five 200-slot pools) with 3,501 in one pool.
+
+    Why the head/tail split went: it existed so four components could share a trunk. conf4 was
+    ungraded and fed MT2 a constant; direction scored 52.25% OOS against 83.66% in-sample with
+    negative skill in all 12 industries; delta aimed at the same 10-day forward relative-return
+    target that nothing predicted — including the control MT1 already receives as features
+    [10..16]. With one output a shared trunk has one consumer, so it is indirection, not sharing.
+
+    Why the BLOCK STRUCTURE stayed: it is a real inductive bias, not decoration. The 37 features
+    are three contiguous kinds — daily returns [0:10], decade momentum [10:17], vol+poly [17:37] —
+    and keeping them apart for two layers stops layer one mixing 20 volatility features with 10
+    daily returns. It is also CHEAPER than dense: 998 params per trunk versus 2,100 for a plain
+    74->28. Two trunks (market, portfolio) preserve the same separation across the 74-feature
+    input, which is [37 market || 37 portfolio].
+
+      per trunk:  daily 10->6->4 | decade 7->5->4 | vol+poly 20->20->20  -> concat 28
+      two trunks: 56
+      tail:       56 -> 22 -> 10 -> 1        (was 4 layers; 3 because search is evolutionary,
+                                              not gradient — depth costs more here)
+
+    d2 takes 23 inputs, not 22. The 23rd is RESERVED, fed 0.0, held for (H-L)/A — range as a
+    fraction of price, which measured +0.0338 incremental R2 against forward vol and is outside
+    the span of these features by construction (all 37 derive from one cumulative close series,
+    with no high or low anywhere). Injected at d2 rather than d1 so a single mutation can reach
+    the output: under gradient-free search a feature buried behind three ReLUs is unlikely to be
+    found. Reserving the slot now means filling it later changes no dimension, no offset and no
+    file format — the same trick that let StockNN's slot 16 be filled in v0.6.1.0 with binary
+    compatibility intact.
+
+    3,501 params. Layer names/order MUST match MT1NET_LAYER_DEFS and the C++ offsets.
     """
-    Shared MT1 feature-extraction trunk — ONE per industry, shared across all four component
-    tails. Input (batch, 37) Phase-1c layout → (batch, 28) concat feature vector.
-    Sliced contiguously: B daily [0:10], C decade [10:17], A vol+poly [17:37].
-      A: 20 → 20 → 20   B: 10 → 6 → 4   C: 7 → 5 → 4   → concat(A20,B4,C4)=28
-    998 params. Layer names/order MUST match HEAD_LAYER_DEFS + the C++ head offsets.
-    """
+
+    RESERVED_D2_INPUT = 22          # index of the held-open (H-L)/A slot
 
     def __init__(self):
         super().__init__()
-        self.a1 = nn.Linear(20, 20); self.a2 = nn.Linear(20, 20)   # vol + poly
-        self.b1 = nn.Linear(10, 6);  self.b2 = nn.Linear(6, 4)     # daily momentum
-        self.c1 = nn.Linear(7, 5);   self.c2 = nn.Linear(5, 4)     # decade momentum
+        # market trunk
+        self.m_a1 = nn.Linear(20, 20); self.m_a2 = nn.Linear(20, 20)
+        self.m_b1 = nn.Linear(10, 6);  self.m_b2 = nn.Linear(6, 4)
+        self.m_c1 = nn.Linear(7, 5);   self.m_c2 = nn.Linear(5, 4)
+        # portfolio trunk
+        self.p_a1 = nn.Linear(20, 20); self.p_a2 = nn.Linear(20, 20)
+        self.p_b1 = nn.Linear(10, 6);  self.p_b2 = nn.Linear(6, 4)
+        self.p_c1 = nn.Linear(7, 5);   self.p_c2 = nn.Linear(5, 4)
+        # tail
+        self.d1 = nn.Linear(56, 22)
+        self.d2 = nn.Linear(23, 10)   # 22 + 1 reserved
+        self.d3 = nn.Linear(10, 1)
 
-    def forward(self, x):
+    @staticmethod
+    def _trunk(x, a1, a2, b1, b2, c1, c2):
         xb, xc, xa = x[:, 0:10], x[:, 10:17], x[:, 17:37]
-        a = F.relu(self.a2(F.relu(self.a1(xa))))
-        b = F.relu(self.b2(F.relu(self.b1(xb))))
-        c = F.relu(self.c2(F.relu(self.c1(xc))))
-        return torch.cat([a, b, c], dim=1)   # (batch, 28)
+        a = F.relu(a2(F.relu(a1(xa))))
+        b = F.relu(b2(F.relu(b1(xb))))
+        c = F.relu(c2(F.relu(c1(xc))))
+        return torch.cat([a, b, c], dim=1)          # (batch, 28)
+
+    def forward(self, x, extra=None):
+        """x: (batch, 74) = [37 market || 37 portfolio]. Returns (batch, 1) RAW logit.
+
+        `extra` is the reserved d2 input; None feeds 0.0, which is exactly inert (0 x w = 0).
+        Decode with mt1_pred(): tanh(raw) * MT1_PRED_SCALE.
+        """
+        m = self._trunk(x[:, 0:37],  self.m_a1, self.m_a2, self.m_b1,
+                        self.m_b2, self.m_c1, self.m_c2)
+        p = self._trunk(x[:, 37:74], self.p_a1, self.p_a2, self.p_b1,
+                        self.p_b2, self.p_c1, self.p_c2)
+        h = F.relu(self.d1(torch.cat([m, p], dim=1)))           # (batch, 22)
+        if extra is None:
+            extra = torch.zeros(h.shape[0], 1, dtype=h.dtype, device=h.device)
+        h = F.relu(self.d2(torch.cat([h, extra], dim=1)))       # (batch, 10)
+        return self.d3(h)                                       # (batch, 1) raw
 
 
-class MT1DualHead(nn.Module):
-    """
-    Dual shared trunk (Part C): two parallel MT1Head trunks — one over the 37 market-index
-    features, one over the 37 normalized portfolio (slot-0 StockNN) features — concatenated.
-    Input (batch, 74) = [market37 ‖ portfolio37] → (batch, 56) concat feature vector.
-    1,996 params (2 × 998). Submodule order (mkt, pf) MUST match HEAD_LAYER_DEFS + the C++
-    head offsets (mkt sub-head at buffer base 0, pf sub-head at base HEADNN_SUB=998).
-    """
+# (prefix, out_size, in_size) — mirrors the C++ offsets, layers in order, each as weights then bias.
+MT1NET_LAYER_DEFS = [
+    ('m_a1', 20, 20), ('m_a2', 20, 20), ('m_b1', 6, 10),
+    ('m_b2', 4, 6),   ('m_c1', 5, 7),   ('m_c2', 4, 5),
+    ('p_a1', 20, 20), ('p_a2', 20, 20), ('p_b1', 6, 10),
+    ('p_b2', 4, 6),   ('p_c1', 5, 7),   ('p_c2', 4, 5),
+    ('d1', 22, 56), ('d2', 10, 23), ('d3', 1, 10),
+]
 
-    def __init__(self):
-        super().__init__()
-        self.mkt = MT1Head()   # market-index features  x[:, 0:37]
-        self.pf  = MT1Head()   # portfolio features     x[:, 37:74]
-
-    def forward(self, x):
-        return torch.cat([self.mkt(x[:, 0:37]), self.pf(x[:, 37:74])], dim=1)   # (batch, 56)
-
-
-class MT1Tail(nn.Module):
-    """
-    Specialized single-output MT1 tail — ONE per component (direction / accuracy / range /
-    confidence). Consumes the dual head's (batch, 56) → (batch, 1) raw logit.
-      D taper: 56 → 22 → 16 → 10 → 1
-    1,803 params. Layer names/order MUST match TAIL_LAYER_DEFS + the C++ tail offsets.
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.d1 = nn.Linear(56, 22); self.d2 = nn.Linear(22, 16)
-        self.d3 = nn.Linear(16, 10); self.d4 = nn.Linear(10, 1)
-
-    def forward(self, h):
-        h = F.relu(self.d1(h)); h = F.relu(self.d2(h)); h = F.relu(self.d3(h))
-        return self.d4(h)   # (batch, 1)
-
-
-class MT1NN(nn.Module):
-    """
-    Composed MT1 net: one shared MT1DualHead (74→56) + four specialized MT1Tails → (batch, 4)
-    raw logits. Input (batch, 74) = [37 market-index ‖ 37 portfolio] features per industry.
-    Tail order = [direction, accuracy, range, confidence] → outputs [0,1,2,3]:
-      out[0] → sigmoid → direction confidence   out[1] → tanh × $10K → dollar P&L
-      out[2] → softplus → range frac            out[3] → sigmoid → calibrated confidence
-    Components evolve head + their single tail; composite/production uses all four. 9,208 params.
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.head  = MT1DualHead()
-        self.tails = nn.ModuleList([MT1Tail() for _ in range(4)])
-
-    def forward(self, x):
-        h = self.head(x)
-        return torch.cat([t(h) for t in self.tails], dim=1)   # (batch, 4) raw logits
+MT1NET_PARAMS = sum(o * i + o for _, o, i in MT1NET_LAYER_DEFS)   # 3,501
 
 
 class MT2NN(nn.Module):
     """
     Cross-industry tier allocator — replaces MasterNN.
 
-    Input: (1, 48) — 4 MT1 slot0 raw activations × 12 industries, no normalization.
-           [conf0, delta_tanh, range_pct, conf4] per industry in INDUSTRY_NAMES order.
-           Reshaped to (1, 12, 4) for the LSTM branch (12 steps × 4 features).
+    Input: (1, 12) — one MT1 prediction per industry, in INDUSTRY_NAMES order: that industry's
+           predicted next-session StockNN P&L in dollars. No normalization — the dollar magnitude
+           IS the allocation signal, and its sign is the direction call.
 
-    FC branch (projects 48→36, then holds width):
-      FC1:  48 → 36  ReLU
+           This was 48 (4 channels × 12) until the MT1 rebuild. Of those four channels one was
+           ungraded and fed a constant, one was the magnitude with its sign deliberately discarded,
+           and one graded itself against another's residual. A single signed prediction carries
+           what all four were reaching for, and MT2 can no longer fit structure that isn't there.
+
+    FC branch (projects 12→36, then holds width):
+      FC1:  12 → 36  ReLU
       FC2:  36 → 36  ReLU          output: 36
 
-    LSTM branch (12 steps × 4 features):
-      LSTM layer 1: input=4,  hidden=36
+    LSTM branch (12 steps × 1 feature — one industry per step):
+      LSTM layer 1: input=1,  hidden=36
       LSTM layer 2: input=36, hidden=36   output: 36 (final hidden state)
 
     Concatenate: [FC_out ‖ LSTM_out] = 72
@@ -267,25 +283,25 @@ class MT2NN(nn.Module):
 
     Output (1, 48): raw logits, reshape to (12, 4) → argmax per industry → tier ∈ {0,1,2,3}
 
-    Total params: 34,572
+    Total params: 32,844
     """
 
     def __init__(self):
         super().__init__()
-        self.fc1    = nn.Linear(48, 36)
+        self.fc1    = nn.Linear(12, 36)
         self.fc2    = nn.Linear(36, 36)
-        self.lstm   = nn.LSTM(input_size=4, hidden_size=36, num_layers=2, batch_first=True)
+        self.lstm   = nn.LSTM(input_size=1, hidden_size=36, num_layers=2, batch_first=True)
         self.taper1 = nn.Linear(72, 66)
         self.taper2 = nn.Linear(66, 60)
         self.taper3 = nn.Linear(60, 54)
         self.fc_out = nn.Linear(54, 48)
 
     def forward(self, x):
-        # x: (batch, 48)
+        # x: (batch, 12)
         fc = F.relu(self.fc1(x))
         fc = F.relu(self.fc2(fc))                       # (batch, 36)
 
-        lstm_in = x.view(x.size(0), 12, 4)             # (batch, 12 steps, 4 features)
+        lstm_in = x.view(x.size(0), 12, 1)             # (batch, 12 steps, 1 feature)
         _, (h_n, _) = self.lstm(lstm_in)               # h_n: (2, batch, 36)
         lstm_out = h_n[-1]                              # last layer final hidden: (batch, 36)
 

@@ -31,7 +31,9 @@ from fees import BUY_FILL, SELL_FILL, _sell_net
 from models import MasterNN, StockNN, stock_close_pos, stock_close_vs_wap
 from universe import INDUSTRIES
 from upkeep import (
+    load_mt1_rolling_state,
     run_mt_inference,
+    save_mt1_rolling_state,
     upkeep_industry,
     upkeep_mt1_industry,
     upkeep_mt2,
@@ -242,76 +244,70 @@ def train_industry_one_day_prod(industry, symbols, yesterday_data, primed_portfo
 def train_mt_one_day_prod(industries, model_dir, mkt_val_history, pf_val_history,
                           slot0_deltas, mkt_ret, mt1_outputs_prev=None):
     """
-    Upkeep training for MT1 (12 dual-head pools) and MT2 (Part C — mirrors the C++ trainer).
+    Upkeep training for MT1 (12 single-output pools) and MT2 — mirrors the C++ trainer.
 
     mkt_val_history: {ind: [cumulative_market_index]}  — market feature source (compounding).
-    pf_val_history:  {ind: [cumulative_slot0_portfolio_index]} — portfolio feature source (compounding).
+    pf_val_history:  {ind: [cumulative_slot0_portfolio_index]} — portfolio feature source.
     slot0_deltas:    {ind: today's deployed slot-0 portfolio return} — the MT2 same-day objective.
 
-    MT1 input per industry = 74 = [37 market ‖ 37 portfolio] features. MT1 target = the PORTFOLIO
-    forward return over MT1_FWD_DAYS; MT2 trains on the deployed same-day slot-0 delta (Part A). Each
-    day's features + cumulative portfolio index + slot-0 delta are buffered (mt_fwd_buffer.json) and
-    trained MT1_FWD_DAYS sessions later, once the forward portfolio value is realized.
+    MT1 input per industry = 74 = [37 market ‖ 37 portfolio]. MT1 target = that industry's
+    realised P&L for THIS session, in dollars: the change in its cumulative portfolio index since
+    the previous run.
+
+    The 10-deep mt_fwd_buffer.json is gone with the 10-day-forward target it was waiting on. What
+    remains is one number per industry — the previous session's portfolio index — because a
+    next-session target is known one session later, not ten. The prediction each model parked on
+    the previous run is scored on this one, which is what makes every score out-of-sample without
+    any snapshot machinery.
     """
-    from training_lib import MT1_FWD_DAYS, build_master_features
-    from upkeep import MT1_SCALE_DOLLARS
+    from training_lib import build_master_features
     industry_list = list(industries.keys())
 
-    # Today's dual features + current cumulative portfolio index per industry (last history entry)
     today888 = build_master_features(mkt_val_history, pf_val_history, industry_list)
     cur_pf_index = {}
     for ind in industry_list:
         h = pf_val_history.get(ind, [])
         cur_pf_index[ind] = float(h[-1]) if h else 25000.0  # IND_STARTING_CASH cold-start
 
-    # Forward-target prediction buffer (persisted across daily runs)
-    buf_path = os.path.join(model_dir, 'mt_fwd_buffer.json')
-    buf = []
-    if os.path.exists(buf_path):
+    prev_path = os.path.join(model_dir, 'mt_prev_session.json')
+    prev_pf = {}
+    if os.path.exists(prev_path):
         try:
-            with open(buf_path) as _f:
-                buf = json.load(_f)
+            with open(prev_path) as _f:
+                prev_pf = json.load(_f).get('pf_index', {})
         except (OSError, json.JSONDecodeError) as e:
-            # An empty buffer costs MT1_FWD_DAYS of MT1 training before it refills.
-            print(f"Warning: MT1 forward buffer {buf_path} unreadable ({e}) — restarting empty")
-            buf = []
-    buf.append({'feat888':     today888.squeeze(0).tolist(),
-                'pf_index':    cur_pf_index,
-                'slot0_delta': {ind: float(slot0_deltas.get(ind, 0.0)) for ind in industry_list}})
+            # One missed session: MT1 skips scoring this run and resumes on the next.
+            print(f"Warning: {prev_path} unreadable ({e}) — MT1 scoring skipped this run")
+            prev_pf = {}
 
-    # Train once the oldest buffered prediction's MT1_FWD_DAYS forward window has completed
-    if len(buf) > MT1_FWD_DAYS:
-        old = buf.pop(0)
-        old_pf = old.get('pf_index', {})
-        pf_fwd = {}
-        for ind in industry_list:
-            oi = old_pf.get(ind, 0.0)
-            pf_fwd[ind] = (cur_pf_index[ind] / oi - 1.0) if oi else 0.0
-        # MT1 target = PORTFOLIO forward return; MT2 grades on the matured day's same-day slot-0 delta.
-        actual_d_by_ind = {ind: pf_fwd[ind] * MT1_SCALE_DOLLARS for ind in industry_list}
-        mt2_perf = {ind: float(old.get('slot0_delta', {}).get(ind, 0.0)) for ind in industry_list}
-        old_feat = torch.tensor(old['feat888'], dtype=torch.float32).unsqueeze(0)
+    # rolling_state carries the parked predictions, each slot's score register, lineages and the
+    # trailing target window ACROSS RUNS. Without persisting it every run would start with nothing
+    # parked, so no model would ever be scored and the pool would never evolve.
+    rolling_state = load_mt1_rolling_state(model_dir)
 
-        mt2_inputs: dict = {}
-        for i, ind in enumerate(industry_list):
-            in74_t = old_feat[:, i * 74:(i + 1) * 74]
-            try:
-                (_, _, conf, delta, range_pct, conf4,
-                 d0_conf, d0_delta, d0_range, d0_conf4) = upkeep_mt1_industry(
-                    ind, model_dir, in74_t, actual_d_by_ind[ind])
-                # Heads/tails design: one production model, so composite == direction feed.
-                mt2_inputs[ind] = (d0_conf, d0_delta, d0_range, d0_conf4)
-            except Exception as e:
-                print(f"Error in upkeep_mt1_industry {ind}: {e}")
-                mt2_inputs[ind] = (0.5, 0.0, 0.02, 0.5)
+    mt2_inputs: dict = {}
+    for i, ind in enumerate(industry_list):
+        in74_t = today888[:, i * 74:(i + 1) * 74]
+        oi = prev_pf.get(ind)
+        actual_d = (cur_pf_index[ind] - float(oi)) if oi else None
         try:
-            upkeep_mt2(model_dir, mt2_inputs, mt2_perf, industry_list)
-        except Exception as e:
-            print(f"Error in upkeep_mt2: {e}")
+            pred, _score0 = upkeep_mt1_industry(ind, model_dir, in74_t, actual_d,
+                                                rolling_state=rolling_state)
+            mt2_inputs[ind] = pred
+        except Exception as e:                                   # noqa: BLE001 - one industry
+            print(f"Error in upkeep_mt1_industry {ind}: {e}")
+            mt2_inputs[ind] = 0.0
 
-    buf = buf[-MT1_FWD_DAYS:]
-    with open(buf_path, 'w') as _f:
-        json.dump(buf, _f)
+    save_mt1_rolling_state(model_dir, rolling_state)
+
+    mt2_perf = {ind: float(slot0_deltas.get(ind, 0.0)) for ind in industry_list}
+    try:
+        upkeep_mt2(model_dir, mt2_inputs, mt2_perf, industry_list)
+    except Exception as e:                                       # noqa: BLE001
+        print(f"Error in upkeep_mt2: {e}")
+
+    with open(prev_path, 'w') as _f:
+        json.dump({'pf_index': cur_pf_index}, _f)
 
 
 def build_primed_portfolios(trading_client, industries, allocations, zero_counts=None):
@@ -540,7 +536,7 @@ def run_master_allocation(master_model, industries, mkt_val_history, pf_val_hist
     Returns (allocations, tier_map, mt1_outputs).
       allocations:  {ind: dollar_amount}
       tier_map:     {ind: 0-3}
-      mt1_outputs:  {ind: (conf, delta, range_hw)} or None for legacy path
+      mt1_outputs:  {ind: predicted_next_session_pnl_dollars} or None for legacy path
     """
     from training_lib import _build_ind_features37, decode_master_tiers, tiers_to_alloc
     industry_list = list(industries.keys())

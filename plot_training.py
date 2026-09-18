@@ -11,11 +11,7 @@ Usage:
 Outputs (git-ignored):
     plots/industry_performance.svg   — StockNN elite portfolio value per industry
                                        (○ = floor-reset event at $22.5K, ● = reset-to $25K)
-    plots/mt1_composite.svg          — MT1 composite score per industry
-    plots/mt1_direction.svg          — MT1 direction component
-    plots/mt1_range.svg              — MT1 range component
-    plots/mt1_accuracy.svg           — MT1 accuracy component
-    plots/mt1_confidence.svg         — MT1 confidence component
+    plots/mt1_score.svg              — MT1 score vs the trailing mean + pool lifecycle
     plots/mt2_performance.svg        — MT2 allocation score (elite pool stats)
 
 Lines: solid = mean, dashed = max & min  (slot0 excluded per design)
@@ -79,60 +75,27 @@ COLORS = [
 ]
 IND_COLOR = dict(zip(INDUSTRIES, COLORS, strict=True))
 
-_COMP_NAMES = ["composite", "direction", "range", "accuracy", "confidence"]
-_STAT_NAMES = ["best", "slot0", "mean", "min"]
-
-MT1_COMP_LABEL = {
-    "composite":  "Composite  (0.50×dir + 0.33×range + 0.17×acc)",
-    "direction":  "Direction  — 5-day sum  (conf if up, 1−conf if down)",
-    "range":      "Range  — calibration tightness",
-    "accuracy":   "Accuracy  — dollar error vs floor",
-    "confidence": "Confidence  — out[3] vs range-geometry ideal",
-}
 
 # ── Binary log constants ──────────────────────────────────────────────────────
 MT_LOG_MAGIC   = 0x4D543132  # 'MT12'
 HEADER_SIZE    = 16
-# v3/bin-version-3: 984 bytes — 5 comp stats × 4 stats × 12 ind + 3 MT2 floats + 1 byte
-RECORD_SIZE_V4 = 984
-_RECORD_STRUCT_V4 = struct.Struct("<II" + "f" * 243 + "Bxxx")
-assert _RECORD_STRUCT_V4.size == RECORD_SIZE_V4
-# v4/bin-version-4: 1032 bytes — adds mt1_dir_correct_dbl[12] before MT2 fields
-RECORD_SIZE_V5 = 1032
-_RECORD_STRUCT_V5 = struct.Struct("<II" + "f" * 255 + "Bxxx")
-assert _RECORD_STRUCT_V5.size == RECORD_SIZE_V5
-# v5/bin-version-5: 1044 bytes — adds mt1_dir_injected[12] collapse injection flags
-RECORD_SIZE_V6 = 1044
-_RECORD_STRUCT_V6 = struct.Struct("<II" + "f" * 255 + "Bxxx" + "12B")
-assert _RECORD_STRUCT_V6.size == RECORD_SIZE_V6
-# v6/bin-version-6 (V7 record): 1244 bytes — adds mt1_slot0_act[12][4] + mt2_consensus flat/wtd
-RECORD_SIZE_V7 = 1244
-_RECORD_STRUCT_V7 = struct.Struct("<II" + "f" * 255 + "Bxxx" + "12B" + "50f")
-assert _RECORD_STRUCT_V7.size == RECORD_SIZE_V7
-# bin-version-7 (V8 record): 1252 bytes — adds mt2_slot0_pts_pf + mt2_slot0_pts_mkt
-RECORD_SIZE_V8 = 1252
-_RECORD_STRUCT_V8 = struct.Struct("<II" + "f" * 255 + "Bxxx" + "12B" + "52f")
-assert _RECORD_STRUCT_V8.size == RECORD_SIZE_V8
-# bin-version-8 (V9 record): 1300 bytes — adds mt1_actual_d[12] (the MT1 target). V9 records are
-# also written PER BLOCK-DAY rather than once per 25-day block, so a pass has ~1238 records, not 50.
-RECORD_SIZE_V9 = 1300
-_RECORD_STRUCT_V9 = struct.Struct("<II" + "f" * 255 + "Bxxx" + "12B" + "52f" + "12f")
-assert _RECORD_STRUCT_V9.size == RECORD_SIZE_V9
-# bin-version-9 (V10 record): 1684 bytes — adds mt1_oos_act[12][4] then mt1_skill[12][4].
-# mt1_oos_act is the leak-free twin of mt1_slot0_act, produced by the head0/tail0 snapshot taken at
-# block start, so the model behind it never saw the day it is graded on. mt1_dir_injected also
-# carries real values from V10 (hardcoded 0 through V9).
-RECORD_SIZE_V10 = 1684
-_RECORD_STRUCT_V10 = struct.Struct("<II" + "f" * 255 + "Bxxx" + "12B" + "52f" + "12f" + "96f")
-assert _RECORD_STRUCT_V10.size == RECORD_SIZE_V10
-# bin-version-10 (V11 record): 2212 bytes — adds mt1_dir_stats[12][6] then mt1_dir_life[12][5],
-# the direction pool's forward-accumulation lifecycle (mature fraction, culls, lineage share and
-# count, mean secondary score, mean retirement age, cumulative retirement-age histogram).
-RECORD_SIZE_V11 = 2212
-_RECORD_STRUCT_V11 = struct.Struct("<II" + "f" * 255 + "Bxxx" + "12B" + "52f" + "12f" + "96f" + "132f")
-assert _RECORD_STRUCT_V11.size == RECORD_SIZE_V11
+# V12 record (log version 12) — the single-output MT1. Mirrors MTLogRecord in training_v4.cpp
+# and read_mt_log.RECORD_FMT; the three must stay in sync. Versions 3-10 decoded the five-pool
+# MT1's component stats, the OOS activation twin and the direction pool's lifecycle — every one of
+# those columns names something that no longer exists, and no such log survives, so they are gone
+# rather than kept as a parser that can only mislead.
+N_IND_LOG      = 12
+RECORD_FMT_V12 = ('<II' + 'f' * (8 * N_IND_LOG) + 'f' * (5 * N_IND_LOG) + 'f' * (5 * N_IND_LOG)
+                  + 'fff' + 'B3x' + '4f')
+RECORD_SIZE_V12   = struct.calcsize(RECORD_FMT_V12)
+_RECORD_STRUCT_V12 = struct.Struct(RECORD_FMT_V12)
+assert RECORD_SIZE_V12 == 904, f"V12 record must be 904 bytes, got {RECORD_SIZE_V12}"
 
-# ── Download ──────────────────────────────────────────────────────────────────
+# Field order inside the MT1 block, one list of 12 per name.
+MT1_FIELDS = ("pred", "actual", "baseline", "floor",
+              "score0", "score_mean", "score_best", "score_min")
+
+
 def download_logs(host: str, account: str) -> None:
     remote = f"{host}:{REMOTE_LOG.format(account=account)}"
     LOCAL_LOG_DIR.mkdir(exist_ok=True)
@@ -161,146 +124,40 @@ def load_binary_log(path: Path) -> list[dict]:
     magic, version, n_ind, _ = struct.unpack_from("<IIII", data, 0)
     if magic != MT_LOG_MAGIC:
         sys.exit(f"{path}: bad magic {magic:#010x} (expected {MT_LOG_MAGIC:#010x})")
-    if version not in (3, 4, 5, 6, 7, 8, 9, 10):
-        sys.exit(f"{path}: unsupported log version {version} (expected 3-10)")
-
-    # Pick record format by binary version number
-    if version == 10:
-        rec_size   = RECORD_SIZE_V11
-        rec_struct = _RECORD_STRUCT_V11
-    elif version == 9:
-        rec_size   = RECORD_SIZE_V10
-        rec_struct = _RECORD_STRUCT_V10
-    elif version == 8:
-        rec_size   = RECORD_SIZE_V9
-        rec_struct = _RECORD_STRUCT_V9
-    elif version == 7:
-        rec_size   = RECORD_SIZE_V8
-        rec_struct = _RECORD_STRUCT_V8
-    elif version == 6:
-        rec_size   = RECORD_SIZE_V7
-        rec_struct = _RECORD_STRUCT_V7
-    elif version == 5:
-        rec_size   = RECORD_SIZE_V6
-        rec_struct = _RECORD_STRUCT_V6
-    elif version == 4:
-        rec_size   = RECORD_SIZE_V5
-        rec_struct = _RECORD_STRUCT_V5
-    else:
-        rec_size   = RECORD_SIZE_V4
-        rec_struct = _RECORD_STRUCT_V4
+    if version != 12:
+        sys.exit(f"{path}: log version {version}; this reader handles 12 only.\n"
+                 "Versions 3-11 described the five-pool MT1 and are no longer decodable.")
+    if n_ind != N_IND_LOG:
+        sys.exit(f"{path}: {n_ind} industries, expected {N_IND_LOG}")
 
     records = []
     offset = HEADER_SIZE
-    while offset + rec_size <= len(data):
-        raw = rec_struct.unpack_from(data, offset)
-        pass_num   = raw[0] + 1   # C++ writes 0-indexed; normalise to match CSV's 1-indexed
-        actual_day = raw[1]
-
-        f = raw[2:242]  # 240 MT1 floats (unchanged across versions)
-        mt1 = {}
-        for ci, comp in enumerate(_COMP_NAMES):
-            mt1[comp] = {}
-            for si, stat in enumerate(_STAT_NAMES):
-                base = ci * 48 + si * 12
-                mt1[comp][stat] = list(f[base : base + 12])
-
-        if version in (8, 9, 10):
-            # V9 layout: V8 + mt1_actual_d[12] (raw[322:334]) — the MT1 target per industry.
-            # V10 appends mt1_oos_act[12][4] (raw[334:382]) + mt1_skill[12][4] (raw[382:430]);
-            # everything up to 334 is byte-identical, so the two share this branch.
-            mt1_dir_cdb      = list(raw[242:254])
-            mt2_best         = raw[254]
-            mt2_slot0        = raw[255]
-            mt2_ideal        = raw[256]
-            mt2_inj          = raw[257]
-            mt1_dir_injected = list(raw[258:270])
-            mt2_cons_flat    = raw[318]
-            mt2_cons_wtd     = raw[319]
-            mt2_slot0_pf     = raw[320]
-            mt2_slot0_mkt    = raw[321]
-        elif version == 7:
-            # V8 layout: V7 + mt2_slot0_pts_pf (raw[320]) + mt2_slot0_pts_mkt (raw[321])
-            mt1_dir_cdb      = list(raw[242:254])
-            mt2_best         = raw[254]
-            mt2_slot0        = raw[255]
-            mt2_ideal        = raw[256]
-            mt2_inj          = raw[257]
-            mt1_dir_injected = list(raw[258:270])
-            mt2_cons_flat    = raw[318]
-            mt2_cons_wtd     = raw[319]
-            mt2_slot0_pf     = raw[320]
-            mt2_slot0_mkt    = raw[321]
-        elif version == 6:
-            # V7 layout: V6 + mt1_slot0_act[12][4] (raw[270:318]) + consensus flat/wtd (318,319)
-            mt1_dir_cdb      = list(raw[242:254])
-            mt2_best         = raw[254]
-            mt2_slot0        = raw[255]
-            mt2_ideal        = raw[256]
-            mt2_inj          = raw[257]
-            mt1_dir_injected = list(raw[258:270])
-            mt2_cons_flat    = raw[318]
-            mt2_cons_wtd     = raw[319]
-            mt2_slot0_pf     = None
-            mt2_slot0_mkt    = None
-        elif version == 5:
-            # V6 layout: same as V5 + mt1_dir_injected[12] at raw[258:270]
-            mt1_dir_cdb      = list(raw[242:254])
-            mt2_best         = raw[254]
-            mt2_slot0        = raw[255]
-            mt2_ideal        = raw[256]
-            mt2_inj          = raw[257]
-            mt1_dir_injected = list(raw[258:270])
-            mt2_cons_flat    = None
-            mt2_cons_wtd     = None
-            mt2_slot0_pf     = None
-            mt2_slot0_mkt    = None
-        elif version == 4:
-            # V5 layout: mt1_dir_correct_dbl[12] at raw[242:254], MT2 at 254+
-            mt1_dir_cdb      = list(raw[242:254])
-            mt2_best         = raw[254]
-            mt2_slot0        = raw[255]
-            mt2_ideal        = raw[256]
-            mt2_inj          = raw[257]
-            mt1_dir_injected = [0] * 12
-            mt2_cons_flat    = None
-            mt2_cons_wtd     = None
-            mt2_slot0_pf     = None
-            mt2_slot0_mkt    = None
-        else:
-            mt1_dir_cdb      = [0.0] * 12
-            mt2_best         = raw[242]
-            mt2_slot0        = raw[243]
-            mt2_ideal        = raw[244]
-            mt2_inj          = raw[245]
-            mt1_dir_injected = [0] * 12
-            mt2_cons_flat    = None
-            mt2_cons_wtd     = None
-            mt2_slot0_pf     = None
-            mt2_slot0_mkt    = None
-
-        records.append({
-            "pass":                pass_num,
-            "day":                 actual_day,
-            "mt1":                 mt1,
-            # V9+: the MT1 target per industry (None on older logs, which never recorded it).
-            "mt1_actual_d":        list(raw[322:334]) if version >= 8 else None,
-            "mt1_dir_correct_dbl": mt1_dir_cdb,
-            "mt1_dir_injected":    mt1_dir_injected,
-            "mt2_best":            mt2_best,
-            "mt2_slot0":           mt2_slot0,
-            "mt2_ideal":           mt2_ideal,
-            "mt2_inj":             mt2_inj,
-            "mt2_consensus_flat":  mt2_cons_flat,
-            "mt2_consensus_wtd":   mt2_cons_wtd,
-            "mt2_slot0_pts_pf":    mt2_slot0_pf,
-            "mt2_slot0_pts_mkt":   mt2_slot0_mkt,
-        })
-        offset += rec_size
+    while offset + RECORD_SIZE_V12 <= len(data):
+        raw = _RECORD_STRUCT_V12.unpack_from(data, offset)
+        rec = {"pass": raw[0] + 1,        # C++ writes 0-indexed; CSV is 1-indexed
+               "day":  raw[1]}
+        i = 2
+        for name in MT1_FIELDS:
+            rec[f"mt1_{name}"] = list(raw[i:i + N_IND_LOG])
+            i += N_IND_LOG
+        rec["mt1_pool_stats"] = [list(raw[i + k * 5:i + k * 5 + 5]) for k in range(N_IND_LOG)]
+        i += 5 * N_IND_LOG
+        rec["mt1_life"] = [list(raw[i + k * 5:i + k * 5 + 5]) for k in range(N_IND_LOG)]
+        i += 5 * N_IND_LOG
+        rec.update({"mt2_best":            raw[i],
+                    "mt2_slot0":           raw[i + 1],
+                    "mt2_ideal":           raw[i + 2],
+                    "mt2_inj":             raw[i + 3],
+                    "mt2_consensus_flat":  raw[i + 4],
+                    "mt2_consensus_wtd":   raw[i + 5],
+                    "mt2_slot0_pts_pf":    raw[i + 6],
+                    "mt2_slot0_pts_mkt":   raw[i + 7]})
+        records.append(rec)
+        offset += RECORD_SIZE_V12
 
     return records
 
-# ── Downsampling ──────────────────────────────────────────────────────────────
+
 def _smooth_seg(xs: list, ys: list, target: int) -> tuple[list, list]:
     """Average (xs, ys) into `target` evenly-spaced bins when len > target."""
     n = len(xs)
@@ -531,141 +388,72 @@ def plot_industry(rows: list[dict], pass_num: int, out_path: Path) -> None:
     _save(fig, out_path)
 
 # ── MT1 single-component SVG ──────────────────────────────────────────────────
-def plot_mt1_component(records: list[dict], comp: str, pass_num: int, out_path: Path,
-                       csv_rows: list[dict] | None = None) -> None:
-    fig, ax = plt.subplots(figsize=(FIG_W, 9))
-    fig.subplots_adjust(bottom=0.23)
+def plot_mt1(records: list[dict], pass_num: int, out_path: Path,
+             csv_rows: list[dict] | None = None) -> None:
+    """One MT1 panel: the deployed model's score per industry, against the only line that matters.
+
+    0.5 is the trailing mean — the predictor MT1 must beat to be worth running at all. The pool
+    MEAN is drawn heavy and the pool MAX thin, because max-of-200 rises with pool size under a
+    pure null and reading it as skill is the mistake that made the old direction channel look like
+    it was at 81%.
+    """
+    fig, (ax, ax_lo) = plt.subplots(2, 1, figsize=(FIG_W, 11),
+                                    gridspec_kw={"height_ratios": [3, 2]})
+    fig.subplots_adjust(bottom=0.20, hspace=0.32)
 
     xs_raw = [r["day"] for r in records]
     n_ind = len(INDUSTRIES)
 
-    # Injection days per industry (direction component only)
-    inj_days_by_ind: list[list[int]] = [[] for _ in INDUSTRIES]
-    if comp == "direction":
-        for r in records:
-            for i in range(len(INDUSTRIES)):
-                if r.get("mt1_dir_injected", [0] * len(INDUSTRIES))[i]:
-                    inj_days_by_ind[i].append(r["day"])
-
-    star_added = False
     for i, ind in enumerate(INDUSTRIES):
-        means_raw = [r["mt1"][comp]["mean"][i] for r in records]
-        bests_raw = [r["mt1"][comp]["best"][i] for r in records]
-        mins_raw  = [r["mt1"][comp]["min"][i]  for r in records]
+        ys = [r["mt1_score0"][i] for r in records]
+        xs_s, ys_s = _smooth(xs_raw, ys)
+        ax.plot(xs_s, ys_s, color=IND_COLOR[ind], linewidth=1.2, alpha=0.75, label=ind)
 
-        xs_m, means = _smooth(xs_raw, means_raw)
-        xs_b, bests = _smooth(xs_raw, bests_raw)
-        xs_n, mins_s = _smooth(xs_raw, mins_raw)
+    for key, style, width, label in (
+        ("mt1_score_mean", (0, (4, 2)), 2.5, "All-ind pool mean"),
+        ("mt1_score_best", (0, (2, 2)), 1.4, "All-ind pool max (max-of-200 — not skill)"),
+        ("mt1_score_min",  (0, (1, 2)), 1.4, "All-ind pool min"),
+    ):
+        agg = [sum(r[key]) / n_ind for r in records]
+        xs_s, ys_s = _smooth(xs_raw, agg)
+        ax.plot(xs_s, ys_s, color="black", linewidth=width, linestyle=style, zorder=5,
+                label=label)
 
-        _plot_band(ax, xs_m, means, bests, mins_s, IND_COLOR[ind])
+    ax.axhline(0.5, color="gray", linewidth=1.0, linestyle="--",
+               label="Trailing mean (0.50) — the bar")
+    ax.set_ylim(0.0, 1.0)
+    _style_ax(ax, f"MT1 — score vs the trailing mean — Pass {pass_num}",
+              f"Day (Pass {pass_num})", "score  d / (err + d)   0.5 = tied")
 
-        if comp == "direction":
-            for day in inj_days_by_ind[i]:
-                y_val = _nearest_y(xs_m, means, day)
-                if y_val is not None:
-                    ax.plot([day], [y_val], marker="*", color=IND_COLOR[ind],
-                            markersize=12, zorder=7, linestyle="none")
-                    star_added = True
+    # Lower panel: pool lifecycle. A pool that has stopped turning over, or one lineage eating it,
+    # invalidates the score above without changing it — so the two are read together.
+    mature = [sum(r["mt1_pool_stats"][i][0] for i in range(n_ind)) / n_ind for r in records]
+    linmax = [sum(r["mt1_pool_stats"][i][2] for i in range(n_ind)) / n_ind for r in records]
+    lin_n = [sum(r["mt1_pool_stats"][i][3] for i in range(n_ind)) / n_ind for r in records]
+    for ys, color, label in ((mature, "#2060c0", "Mature individuals (of 200)"),
+                             (linmax, "#c02020", "Largest lineage"),
+                             (lin_n,  "#20a060", "Distinct lineages")):
+        xs_s, ys_s = _smooth(xs_raw, ys)
+        ax_lo.plot(xs_s, ys_s, color=color, linewidth=1.8, label=label)
+    ax_lo.axhline(25, color="#c02020", linewidth=0.8, linestyle=":",
+                  label="Lineage breeding cap (25)")
+    _style_ax(ax_lo, "MT1 — pool lifecycle (mean across industries)",
+              f"Day (Pass {pass_num})", "individuals")
 
-    # All-industry mean/max/min: average across industries of each per-day stat
-    all_means_raw = [sum(r["mt1"][comp]["mean"]) / n_ind for r in records]
-    all_bests_raw = [sum(r["mt1"][comp]["best"]) / n_ind for r in records]
-    all_mins_raw  = [sum(r["mt1"][comp]["min"])  / n_ind for r in records]
-    xs_am, all_means = _smooth(xs_raw, all_means_raw)
-    xs_ab, all_bests = _smooth(xs_raw, all_bests_raw)
-    xs_an, all_mins  = _smooth(xs_raw, all_mins_raw)
-    ax.plot(xs_am, all_means, color="black", linewidth=2.5, linestyle=(0, (4, 2)),
-            zorder=5, label="All-ind mean (mean)")
-    ax.plot(xs_ab, all_bests, color="black", linewidth=1.8, linestyle=(0, (2, 2)),
-            zorder=5, label="All-ind mean (max)")
-    ax.plot(xs_an, all_mins,  color="black", linewidth=1.8, linestyle=(0, (1, 2)),
-            zorder=5, label="All-ind mean (min)")
-
-    # 10-day linear-weighted scoring window: weights ramp oldest=1.0 → today=2.0,
-    # summing to MT1_DIR_DAYS(10) × avg(1.5) = 15. Per-day component scores are in [0,1],
-    # so the windowed best/mean/min span [0, 15].
-    ax.set_ylim(0, 15.3)
-    ylabel = "10-day weighted-sum score (0 – 15)"
-    if comp == "direction":
-        # Random model (conf≈0.5 every day) scores 0.5 × 15 = 7.5.
-        ax.axhline(7.5, color="gray", linewidth=0.8, linestyle="--",
-                   label="Random baseline (7.5)")
-
-        # Mean n_correct_dbl across all industries (integer correct-count, today×2).
-        # 10-day window: 9 older days × correct + today × 2 = max 11; 50% correct ≈ 5.5.
-        cdb_raw = [
-            sum(r["mt1_dir_correct_dbl"]) / n_ind
-            for r in records
-        ]
-        xs_cdb, cdb_vals = _smooth(xs_raw, cdb_raw)
-        # Choose markevery so ~12-15 triangles appear regardless of series length
-        markevery = max(1, len(xs_cdb) // 14)
-        ax.plot(xs_cdb, cdb_vals, color="#e06000", linewidth=2.2,
-                marker="^", markersize=6, markevery=markevery,
-                zorder=6, label="Mean correct direction calls (0–11, today×2)")
-
-        # % industries with positive market return (right y-axis).
-        # Uses mkt_ret CSV columns if available; falls back to StockNN portfolio direction.
-        if csv_rows:
-            csv_by_day = {int(r["day"]): r for r in csv_rows}
-            has_mkt = any(f"{INDUSTRIES[0]}_mkt_ret" in r for r in csv_rows)
-            net_pos_raw = []
-            for r in records:
-                day = r["day"]
-                row = csv_by_day.get(day)
-                if row and has_mkt:
-                    pct = 100.0 * sum(
-                        1 for ind in INDUSTRIES
-                        if float(row.get(f"{ind}_mkt_ret", 0)) > 0.0
-                    ) / n_ind
-                elif row:
-                    prev_row = csv_by_day.get(day - 1)
-                    pct = 100.0 * sum(
-                        1 for ind in INDUSTRIES
-                        if prev_row and float(row.get(f"{ind}_elite_mean", 0)) > float(prev_row.get(f"{ind}_elite_mean", 0))
-                    ) / n_ind if prev_row else 0.0
-                else:
-                    pct = 0.0
-                net_pos_raw.append(pct)
-        else:
-            net_pos_raw = [0.0] * len(records)
-        xs_np, net_pos = _smooth(xs_raw, net_pos_raw)
-        ax2 = ax.twinx()
-        ax2.plot(xs_np, net_pos, color="#808080", linewidth=2.5, zorder=4,
-                 label="% industries up today")
-        ax2.axhline(50.0, color="#cccccc", linewidth=0.6, linestyle=":", zorder=1)
-        ax2.set_ylim(0, 100)
-        ax2.set_ylabel("% industries mkt_ret > 0", fontsize=10, color="#606060")
-        ax2.tick_params(labelsize=8, colors="#606060")
-        ax2.spines["right"].set_color("#808080")
-    else:
-        ax2 = None
-
-    _style_ax(ax,
-              f"MT1 — {MT1_COMP_LABEL[comp]} — Pass {pass_num}",
-              f"Day (Pass {pass_num})", ylabel)
-    extra = [
-        mlines.Line2D([], [], color="black", linewidth=2.5, linestyle=(0, (4, 2)), label="All-ind mean (mean)"),
-        mlines.Line2D([], [], color="black", linewidth=1.8, linestyle=(0, (2, 2)), label="All-ind mean (max)"),
-        mlines.Line2D([], [], color="black", linewidth=1.8, linestyle=(0, (1, 2)), label="All-ind mean (min)"),
-    ]
-    if comp == "direction":
-        extra.append(mlines.Line2D([], [], color="#e06000", linewidth=2.2,
-                                   marker="^", markersize=6,
-                                   label="Mean correct direction calls (0–6, today×2)"))
-        if star_added:
-            extra.append(mlines.Line2D([], [], color="#555555", linewidth=0,
-                                       marker="*", markersize=10,
-                                       label="★ collapse injection"))
-    if ax2 is not None:
-        extra.append(mlines.Line2D([], [], color="#808080", linewidth=2.5,
-                                   label="% industries mkt_ret > 0 (right axis)"))
-    _industry_legend(ax, extra_handles=extra)
-    _save(fig, out_path)
-
-# ── MT2 SVG ───────────────────────────────────────────────────────────────────
-_MT2_INJ_THRESHOLD = -7.0   # injection fires when ≥75% of pool scores below this
-_MT2_BASELINE_WINDOW = 30   # days to look back when computing the random baseline
+    _industry_legend(ax, extra_handles=[
+        mlines.Line2D([], [], color="black", linewidth=2.5, linestyle=(0, (4, 2)),
+                      label="All-ind pool mean"),
+        mlines.Line2D([], [], color="black", linewidth=1.4, linestyle=(0, (2, 2)),
+                      label="All-ind pool max (max-of-200 — not skill)"),
+        mlines.Line2D([], [], color="black", linewidth=1.4, linestyle=(0, (1, 2)),
+                      label="All-ind pool min"),
+        mlines.Line2D([], [], color="gray", linewidth=1.0, linestyle="--",
+                      label="Trailing mean (0.50) — the bar"),
+    ])
+    ax_lo.legend(loc="upper right", fontsize=8, frameon=False, ncol=2)
+    fig.savefig(out_path, format="svg", bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote {out_path}")
 
 
 def _ideal_to_tier_counts(ideal_pts: float) -> tuple[int, int, int, int]:
@@ -962,9 +750,7 @@ def _generate_all(rows: list[dict], records: list[dict], pass_num: int, out_dir:
     out_dir.mkdir(exist_ok=True)
     plot_industry(rows, pass_num, out_dir / "industry_performance.svg")
     if records:
-        for comp in _COMP_NAMES:
-            plot_mt1_component(records, comp, pass_num, out_dir / f"mt1_{comp}.svg",
-                               csv_rows=rows)
+        plot_mt1(records, pass_num, out_dir / "mt1_score.svg", csv_rows=rows)
     else:
         print(f"  (no MT1 records for pass {pass_num} — MT1 activates at day 25)")
     plot_mt2(rows, pass_num, out_dir / "mt2_performance.svg")

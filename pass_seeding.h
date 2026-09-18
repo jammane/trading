@@ -1,6 +1,6 @@
 // pass_seeding.h — pure logic for the pass-boundary seeding decision (v0.6.3.0).
 //
-// Lives in a header, like mt1_scoring.h, so tests/test_pass_seeding.cpp grades the same arithmetic
+// Lives in a header, like mt1_pool.h, so tests/test_pass_seeding.cpp grades the same arithmetic
 // production runs. A replica drifted from production once already and the tests stayed green while
 // testing a function that no longer existed; nothing here is duplicated anywhere.
 //
