@@ -33,27 +33,43 @@ The 48-element output is reshaped to a 12×4 matrix — one row per stock in the
 
 Each industry portfolio is initialised at $25,000 ($300,000 total across 12 sectors).
 
-### Master allocator stack (MT1NN + MT2NN, with legacy MasterNN fallback)
+### Master allocator stack (MT1Net + MT2NN, with legacy MasterNN fallback)
 
 Capital allocation uses a two-stage stack trained concurrently with the industry models:
 
-**MT1NN** (per-industry preprocessor, one pool per sector, 3,399 params):
-- Input: `(1, 37)` — one industry's slice of a 444-feature master vector (18 delta lookbacks + poly-2 coefs + 4× poly-3 coefs)
-- FC: 37→37→29→20→12→3 (ReLU activations, raw logits out)
-- Output interpretation: `sigmoid(out[0])` = P(positive return), `tanh(out[1]) × 0.05` = expected delta, `softplus(out[2])` = error half-width
+**MT1Net** (per-industry predictor, one 200-slot pool per sector, 3,501 params):
+- Input: `(1, 74)` — one industry's slice of the 888-feature master vector,
+  `[37 market-index ‖ 37 portfolio]`, both built by the same 37-feature builder from a
+  cumulative-value curve
+- Shape: two 37→28 trunks (market ‖ portfolio) → concat 56 → 22 → 10 → 1
+- Output: a single raw logit; `tanh(out) × MT1_PRED_SCALE ($10,000)` is the predicted
+  **next-session book P&L for that industry, in dollars**, signed
+- The d2 layer takes 23 inputs — 22 from d1 plus one RESERVED slot fed 0.0, held open for
+  `(H−L)/A`. Inert by construction, so filling it later changes no dimension or file format.
 - Activates at `actual_day ≥ 25`
 
-**MT2NN** (cross-industry tier allocator, replaces MasterNN, 33,996 params):
-- Input: `(1, 36)` — 3 MT1 outputs × 12 industries (delta/range normalized via Welford running stats)
-- Parallel FC branch (36→36→36) + 2-layer LSTM (12 steps × 3 features, hidden=36) → concat 72 → taper 72→66→60→54→48
+**MT2NN** (cross-industry tier allocator, replaces MasterNN, 32,844 params):
+- Input: `(1, 12)` — one MT1 prediction per industry, signed and unnormalized. The dollar
+  magnitude is the allocation signal and the sign is the direction call.
+- Parallel FC branch (12→36→36) + 2-layer LSTM (input=1, hidden=36, walking the 12 industries one
+  scalar per step) → concat 72 → taper 72→66→60→54→48
 - Output: `(1, 48)` raw logits → reshape `(12, 4)` → per-industry softmax → argmax → tier ∈ {0,1,2,3}
-- Tier 0 = expected net loss (no allocation). Tiers 1/2/3 = positive-return terciles (low→high). Activates at `actual_day ≥ 30`
+- Tier 0 = expected net loss (no allocation). Tiers 1/2/3 = positive-return terciles (low→high).
+  Activates at `actual_day ≥ 30`
 
 **MasterNN** (legacy fallback, 599,028 params):
 - Flat 5-layer FC: 444→444→444→312→180→48 (ReLU activations, raw tier logits out)
-- Same `(12, 4)` → tier decoding as MT2NN. Used when `mt2_best.pt` is absent or norm stats unavailable.
+- Same `(12, 4)` → tier decoding as MT2NN. Used when `mt2_best.pt` is absent.
 
-Capital allocation from tiers: positive-tier industries are divided into terciles weighted 1:1.5:2.25 (tier 1:2:3). Tier-0 industries receive $0. Industries with 3+ consecutive tier-0 predictions are fully liquidated.
+Capital allocation from tiers: positive-tier industries are divided into terciles weighted
+1:1.5:2.25 (tier 1:2:3). Tier-0 industries receive $0. Industries with 3+ consecutive tier-0
+predictions are fully liquidated.
+
+> **Status.** Neither MT1 nor MT2 has demonstrated out-of-sample skill, and paper trading runs
+> `--flat-allocation` (even 1/12) until one does. Whether the per-industry (MT1) or the
+> cross-industry (MT2) formulation is the one worth learning — and whether the other can simply be
+> arithmetic — is an open question being measured from `mt1_dataset.bin`. See
+> **MT1 target and scoring** in CLAUDE.md.
 
 ### Evolutionary training
 
@@ -241,7 +257,7 @@ The canonical trainer — handles industry, MT1, and MT2 evolution with ~6× spe
 
 | File | Purpose |
 |------|---------|
-| `models.py` | `StockNN`, `MasterNN`, `MT1NN`, `MT2NN` class definitions — single source of truth |
+| `models.py` | `StockNN`, `MasterNN`, `MT1Net`, `MT2NN` class definitions — single source of truth |
 | `universe_acct0.py` | 144-symbol universe for acct0 (`INDUSTRIES`, `ALL_SYMBOLS`, `INDUSTRY_NAMES`) |
 | `universe.py` | Aggregator: auto-discovers all `universe_acct*.py` and exposes their union |
 | `fees.py` | Broker fee constants and `_sell_net()` helper |

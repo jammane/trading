@@ -155,6 +155,25 @@ MT1 and MT2 are saved to the run root. So the deliverable is:
 python convert_weights.py --account acct0 --industry-dir models/acct0/training/champion
 ```
 
+**The champion judging metric is known to be too short (open, v0.8.1.0).** Champions are crowned on
+slot-0's percent book change over the last `PASS_JUDGE_DAYS = 15` days of a pass. `PASS_SEEDING.md`
+records that gate producing **13 dethronings against a null expectation of exactly 13.0** — i.e.
+indistinguishable from choosing at random. The mechanism is now understood: daily book volatility
+is ~1.5-2%, so a 15-day return has sd ~7% while a real skill difference between two model sets
+might be 1.5% over that window — SNR ≈ 0.2, nearly all noise.
+
+Two things that are NOT the problem, recorded because both were asserted and both were wrong: the
+window sits at the *end* of a pass, which is the most-trained point, not inside the learning curve;
+and market beta largely cancels because every pass is judged on the same calendar days.
+
+One genuine contamination: a hard-floor reset inside the judging window jumps `baseline` from
+~$22,400 to $25,000, a spurious **+11.6%** on a metric whose real spread is a few percent. At 83
+resets per ~20,000 industry-days that hits roughly 6% of judgements.
+
+The fix is to judge on the **sum of daily book P&L** over the window — exactly $0 on reset days
+rather than jumping — and to lengthen the window. This matters beyond seeding: the champion store
+is what decides which models get promoted to paper.
+
 Pointing `--source-dir` at `champion/` instead would convert the industries and silently skip
 master/MT1/MT2. The script errors out if the industry directory has no elite files at all, and
 warns loudly if it holds fewer than 12 industries.
@@ -401,6 +420,16 @@ pytest tests across the files in `tests/`:
   the swapped version ranks identically on most pairs, so it reads as correct), and
   `production_v2` never persisted the rolling state, which would have left every prediction parked
   and none ever scored. Both are pinned.
+- `test_mt1_dataset.py` — `mt1_dataset.bin`: layout pinned against the C++ writer (magic, version,
+  feature width, component order, record size derived from the `static_assert`), round-trip of
+  every field, the decomposition identity plus a case that breaks it, and forward-window alignment
+  — including a direct check that day *t* is never inside row *t*'s window. An off-by-one there
+  would leak the present into the prediction and make every horizon look predictable.
+- `test_mt1_analysis.py` — the A/B/C harness: no-look-ahead (spying on `ridge_fit`), power (a
+  planted signal must be recovered, and a stronger one must read stronger), no-leak (shuffled
+  targets give IC ≈ 0, and shuffling must kill a planted signal), and the block bootstrap tested
+  against a series with a **known** dependence length — block=1 must recover the iid SE, and a
+  block spanning the dependence must give an SE more than 2× larger.
 - `test_zip_strict.py` — parallel-array guards for the `zip(..., strict=True)` conversion (ruff
   B905). Bare `zip` truncates silently, so a length mismatch yielded a plausible wrong number
   instead of an error; these assert `ValueError` on mismatch and pin the cross-module industry-list
@@ -486,17 +515,49 @@ Every MT1 `.bin`/`.pt`, every pool file, every `mt_training_log.bin` and every M
 before this change is unloadable. `load_bin` validates by element count and falls back to random
 init **silently**, so start from a clean output directory.
 
-**The target.** MT1 predicts, for one industry, the P&L that industry's StockNN will realise over
-the **next session**, in dollars:
+**The target (corrected in v0.8.1.0 — read this before trusting any older MT1 number).** MT1
+predicts, for one industry, the **book P&L** that industry's StockNN will realise over the next
+session, in dollars. Three marks on slot 0 decompose the day:
 
 ```
-actual = slot0_score − baseline        # the deployed portfolio's value now vs at the previous close
-pred   = tanh(out) × MT1_PRED_SCALE    # MT1_PRED_SCALE = $10,000
+book_prev   = reference book (yesterday's holdings, NO trades today) at TODAY's close
+baseline    = the same holdings at the NEXT day's close
+slot0_score = the book AFTER today's trades, at the NEXT day's close
+
+market move = baseline    − book_prev      prices moved, holdings fixed
+trade delta = slot0_score − baseline       holdings moved, prices fixed
+actual      = slot0_score − book_prev      = market + trade          <- the target
+pred        = tanh(out) × MT1_PRED_SCALE   MT1_PRED_SCALE = $10,000
 ```
 
-This is the question production actually asks. The old 10-day-forward relative return was a proxy
-for it, and a poor one: a 10-day window over a 10-day-forward target overlaps 9-of-10, so a
-"10-day scoring window" held roughly **1.6 independent observations**.
+**The target used to be `slot0_score − baseline`, and that was wrong.** Both sides are marked at
+the *same* next-day prices, so the market move on the held book **cancels exactly**, leaving only
+the value added by the day's trades. Measured over a full pass that component is **−8% of the
+book's gain**, zero-mean and 2.9× heavy-tailed, and directionally unpredictable (same-sign next day
+51.9%). It is also not what "how profitable will this industry be" means. Any MT1 result from
+before v0.8.1.0 was measured against it.
+
+The same error ran through the **inputs**: `today_pf_val` compounded the trading ratio
+(`slot0_score/baseline − 1`), so the portfolio-half features described a curve that ended a pass
+near −7% while the book it was supposed to describe ended +80%. MT1 could see neither the book's
+level nor the market move on it. It now compounds the book's return, on the same scale as the
+market index.
+
+Before that, the target was a 10-day-forward relative return — a proxy, and a poor one: a 10-day
+window over a 10-day-forward target overlaps 9-of-10, so a "10-day scoring window" held roughly
+**1.6 independent observations**.
+
+**Hard-floor resets.** `step_industry` recapitalises all 200 portfolios to `IND_STARTING_CASH`
+whenever the book falls below `IND_STARTING_CASH × 0.9` ($22,500). It fires often — 83 times in
+1,666 day-steps of the v0.8.0.0 run. The reset path sets `book_prev == slot0_score`, so such a day
+contributes a book P&L of **exactly $0** rather than a spurious +$2,600 jump to the reset level.
+That is load-bearing: without it the target acquires a large fake positive tail, and any
+reconstruction of the book from `holdings_log.csv` that ignores resets shows ~−0.4 daily
+autocorrelation and 6% daily volatility, both impossible for a 12-stock book.
+
+**The horizon is not yet decided.** The trainer's live target is the single-day atom (h=1).
+Forward-h P&L is a sum over consecutive days, computed offline from `mt1_dataset.bin`, so the
+horizon is a measurement rather than an assumption. See **Deciding the horizon** below.
 
 **The score.**
 
@@ -575,6 +636,61 @@ trailing target window. The sidecar is a **separate file** because `save_bin`/`l
 headerless float arrays validated by exact element count — appending metadata to a weight file
 makes the loader reject it and fall back to random init silently. A missing sidecar is handled: the
 weights load and the registers start empty, costing `MT1_POOL_MIN_AGE` days of maturity.
+
+### Deciding the horizon, and which layer needs a network
+
+Two open questions are being settled by measurement rather than argument, from one artefact.
+
+**`mt1_dataset.bin`** (v0.8.1.0, 3,752 B/day, ~4.6 MB/pass) is written every run alongside
+`mt_training_log.bin`. Per day it carries, per industry, the exact 74 features handed to
+`mt1_step_day` plus all four outcome marks (`book_prev`, `book_now`, `mkt_move`, `trade_delta`).
+Forward-h P&L for **any** h is a sum over consecutive records, so the horizon is an offline sweep
+instead of one ~10 h training run per candidate.
+
+The components are logged separately on purpose: the market move carries the level (+$89/day
+measured) and the trade delta is small and negative (−$4.57/day), so logging only the total would
+average them and hide it. `read_mt1_dataset.verify_identity` asserts
+`book_now − book_prev == mkt_move + trade_delta` on every row — a failure means the three marks in
+`step_industry` have drifted apart, which nothing else would catch.
+
+```bash
+python read_mt1_dataset.py logs/acct0/training/mt1_dataset.bin
+```
+
+**`mt1_analysis.py`** answers three questions from that file:
+
+- **A** — which formulation predicts at all: **per-industry** (12 models, 74→1, 3,501 params each,
+  1,238 samples each), **pooled** (one model shared across all 12, 12× the data, no
+  specialization), or **cross-sectional** (888→12, MT2's job done directly with no MT1 in between)
+- **B** — the horizon h
+- **C** — which of MT1/MT2 must be a network. Exactly one needs to be: if MT1 produces good
+  per-industry estimates then ranking is `sorted()` and allocation is `tiers_to_alloc`, so MT2 is
+  arithmetic; if MT2 maps 888 features to 12 tiers directly then MT1 is redundant. The prior
+  favours MT1 on sample efficiency (0.35 samples/param vs 0.038), and MT1's calibration problem —
+  twelve independently-miscalibrated estimates rank badly — is fixable programmatically by
+  z-scoring each output against its own trailing distribution.
+
+```bash
+python mt1_analysis.py logs/acct0/training/mt1_dataset.bin --horizons 1,2,3,5,10,20
+```
+
+Three properties it is built around, **each because the opposite has already produced a wrong
+answer in this project**:
+
+- **No look-ahead.** A model predicting `[t+1, t+h]` may only be fitted on windows that *closed*
+  before `t`, not started before it. A test spies on `ridge_fit` to assert the largest fit still
+  stops `h` rows short of the test day at every horizon.
+- **Overlap-correct error bars.** Consecutive daily h-day predictions share h−1 days and the 12
+  industries move together, so treating T × 12 rows as independent overstates t by roughly
+  `sqrt(12h)`. That produced a **t of −7.20 on a signal indistinguishable from zero**. All SEs come
+  from a moving-block bootstrap over *time*, block = `max(2h, 20)`, resampling whole blocks with
+  every industry attached.
+- **Controls on every run.** A shuffled target must give IC ≈ 0 (else the protocol leaks) and a
+  planted signal must be recovered (else the harness has no power and its nulls are
+  uninformative). An IC of 0.02 means nothing without both.
+
+**Do not read an IC without its block-bootstrap t.** This is the single most repeated mistake in
+this project's history.
 
 ### Production inference chain (when MT2 models available)
 
@@ -660,6 +776,8 @@ A `PostToolUse` hook in `.claude/settings.json` auto-updates `CHANGELOG.md` and 
 | `MT1_POOL_LINEAGE_RESUME` | 0.10 | ...and resumes only below this (hysteresis) |
 | `MT1_RECENCY_W` | 1.0/0.8/0.6/0.4 | Register weights, newest-first, in blocks of 4 |
 | `MT1_DAYS` | 1 | MT1 steps once per session; vestigial staging-array extent |
+| `DS_FEAT` | 74 | Features per industry in `mt1_dataset.bin`; must equal MT1Net's input width |
+| `PASS_JUDGE_DAYS` | 15 | Champion judging window. **Known too short** — see the champion note under `convert_weights.py` |
 | `--mt1-sigma` | master_sigma | One MT1 mutation sigma (was four per-channel sigmas) |
 | `IND_STARTING_CASH` | $25,000 | Per-industry starting capital |
 | `MST_STARTING_CASH` | $300,000 | Master starting capital |
@@ -679,7 +797,7 @@ Version string is defined in `version.py` (`VERSION`) and mirrored as `TRAINER_V
 - `FEATURE` — increment for any new capability or significant improvement; resets `BUILD` to 0.
 - `BUILD` — increment for bug fixes and minor changes within a `FEATURE`.
 
-Current version: **0.8.0.0**
+Current version: **0.8.1.1**
 
 To bump the version, edit `VERSION` in `version.py` and `TRAINER_VERSION` in `training_v4.cpp`, then rebuild the C++ binary.
 

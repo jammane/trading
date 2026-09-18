@@ -1,3 +1,19 @@
+> # SUPERSEDED — the architecture this plan describes was deleted in v0.8.0.0
+>
+> MT1 is no longer a shared dual head plus four specialized tails, and there is no block-alternating
+> T1/H/T2 schedule, no five 200-slot pools per industry, and no four graded channels. It is one
+> `MT1Net` (74→1, 3,501 params), one output, one pool of 200 persistent individuals per industry,
+> scored daily. See **MT1 target and scoring** in CLAUDE.md.
+>
+> Kept because it records *why* the heads/tails design was built and what it was trying to solve —
+> the reasoning is still worth reading even though the answer was wrong. What it could not do was
+> be measured: a 10-day scoring window over a 10-day-forward target overlaps 9-of-10, leaving ~1.6
+> independent observations, and every model was selected on a window containing the day it was
+> graded on. The out-of-sample instrument built to work around that reported **49.54% OOS against
+> 61.09% in-sample**, with negative skill in all 12 industries.
+>
+> **Do not implement anything from this document.**
+
 # MT1 heads/tails: shared trunk + specialized tails, block-alternating training
 
 > Recovered from plan-mode transcript (session d620c1ab). Kept in-repo so it survives `/clear`.
