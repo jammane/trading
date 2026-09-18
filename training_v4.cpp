@@ -3,7 +3,7 @@
 // Run:   ./build/training_v4_cpp --output models [--load-dir DIR] [--start-day N] [--stop-day N]
 //        [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F] [--workers N]
 
-#define TRAINER_VERSION "0.8.0.1"
+#define TRAINER_VERSION "0.8.1.0"
 
 #include <algorithm>
 #include <atomic>
@@ -1098,6 +1098,17 @@ static void wavg_mst_portfolio(const MasterPortfolio* ports[], const float* weig
 }
 
 struct IndResult {
+    // The three marks that decompose a day. All on slot 0 (the deployed model):
+    //   book_prev   = reference book (yesterday's holdings, no trades) at TODAY's close
+    //   baseline    = the same holdings at the NEXT day's close  -> price move, no trading
+    //   slot0_score = the book AFTER today's trades at the NEXT day's close
+    // so that
+    //   market move = baseline    - book_prev     (prices moved, holdings fixed)
+    //   trade delta = slot0_score - baseline      (holdings moved, prices fixed)
+    //   book P&L    = slot0_score - book_prev     = market + trade, exactly
+    // Only the trade delta was available before, and it is the component that cancels beta --
+    // which is why the target built on it was zero-mean, fat-tailed and unpredictable.
+    float book_prev;
     float baseline, slot0_score, best_delta;
     float top_hold, top_cash;
     int   new_streak;
@@ -1182,6 +1193,16 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         float price = fill_sym[j].valid ? fill_sym[j].close :
                       day_sym[j].valid  ? day_sym[j].close  : 0.f;
         baseline += ref_hold[j] * price;
+    }
+    // Same holdings, same cash, marked at TODAY's close instead of the fill close. The difference
+    // between the two is the overnight price move on what is already held -- the component the
+    // trade delta cancels. Falls back the other way (day -> fill) so a missing bar degrades to the
+    // same price on both sides and contributes 0 to the move rather than the position's whole value.
+    float book_prev = state.portfolios[0].cash;
+    for (int j = 0; j < IND_SYMS; j++) {
+        float price = day_sym[j].valid  ? day_sym[j].close :
+                      fill_sym[j].valid ? fill_sym[j].close : 0.f;
+        book_prev += ref_hold[j] * price;
     }
 
     // Reset all 200 portfolios to slot 0's state
@@ -1637,8 +1658,19 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                 state.portfolios[s].stop_prices[j] = 0.f;
             }
         }
-        return {baseline, baseline, 0.f, 0.f, 0.f, 0,
-                IND_STARTING_CASH, IND_STARTING_CASH, IND_STARTING_CASH};
+        // Designated, not positional: this aggregate silently reassigns every field if a member
+        // is added ahead of it, and only got caught here because the shift happened to narrow a
+        // float into an int. book_prev == slot0_score on a reset day, so the day contributes a
+        // book P&L of exactly 0 rather than a spurious jump to the reset level.
+        IndResult r{};
+        r.book_prev      = baseline;
+        r.baseline       = baseline;
+        r.slot0_score    = baseline;
+        r.new_streak     = 0;
+        r.elite_max_val  = IND_STARTING_CASH;
+        r.elite_min_val  = IND_STARTING_CASH;
+        r.elite_mean_val = IND_STARTING_CASH;
+        return r;
     }
 
     // Zero-trade inaction filter
@@ -1900,6 +1932,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     }
 
     IndResult res;
+    res.book_prev     = book_prev;
     res.baseline      = baseline;
     res.slot0_score   = slot_scores[0];
     res.best_delta    = best_delta;
@@ -3122,6 +3155,44 @@ struct MTLogRecord {
 static_assert(sizeof(MTLogRecord) == 904,
               "MTLogRecord must be 904 bytes — read_mt_log.py and plot_training.py parse by size");
 
+// ── MT1 dataset log ──────────────────────────────────────────────────────────────
+//
+// Everything an offline fit needs, and nothing that depends on a choice we have not made yet:
+// the 74 features MT1 sees per industry, and the day's outcome DECOMPOSED. Forward-h book P&L
+// for ANY h is a sum over consecutive records, so the horizon becomes an offline sweep rather
+// than one training run per candidate.
+//
+// The components are logged separately on purpose. book P&L = market move + trade delta, and the
+// two behave nothing alike -- the trade delta is ~8% of the book's gain, zero-mean and heavy
+// tailed, while the market move carries the level. Logging only the total would average them and
+// we would rediscover that months later, which is the same mistake as averaging over the learning
+// curve. The identity is also a free self-check: book_now - book_prev must equal mkt_move +
+// trade_delta to floating-point tolerance on every row.
+static constexpr uint32_t DS_LOG_MAGIC   = 0x4D543144u;   // "MT1D"
+static constexpr uint32_t DS_LOG_VERSION = 1u;
+static constexpr int      DS_FEAT        = 74;            // per industry, = MT1Net's input width
+
+struct DSLogRecord {
+    uint32_t pass_num, actual_day;
+    float    feat[N_IND][DS_FEAT];     // exactly the slice handed to mt1_step_day
+    float    book_prev[N_IND];         // book at TODAY's close, before the day's trades
+    float    book_now[N_IND];          // book at the NEXT close, after them
+    float    mkt_move[N_IND];          // baseline - book_prev : prices moved, holdings fixed
+    float    trade_delta[N_IND];       // slot0_score - baseline : holdings moved, prices fixed
+};
+static_assert(sizeof(DSLogRecord) == 8 + 4 * (DS_FEAT * N_IND + 4 * N_IND),
+              "DSLogRecord packing drifted — the offline reader parses this by size");
+
+static bool write_ds_log_header(FILE* f) {
+    uint32_t h[4] = {DS_LOG_MAGIC, DS_LOG_VERSION, (uint32_t)N_IND, (uint32_t)DS_FEAT};
+    return fwrite(h, sizeof(uint32_t), 4, f) == 4;
+}
+
+static void write_ds_log_record(FILE* f, const DSLogRecord& r) {
+    fwrite(&r, sizeof(DSLogRecord), 1, f);
+    fflush(f);
+}
+
 static void write_mt_log_record(FILE* f, const MTLogRecord& r) {
     fwrite(&r, sizeof(MTLogRecord), 1, f);
     fflush(f);
@@ -3805,6 +3876,17 @@ int main(int argc, char* argv[]) {
     std::string mt_log_path = log_dir + "/mt_training_log.bin";
     FILE* mt_log = fopen(mt_log_path.c_str(), "wb");
     if (mt_log) { write_mt_log_header(mt_log); fflush(mt_log); }
+    // ~3.7 KB/day -> ~4.6 MB per pass. Always on: it is the only artefact that lets the horizon
+    // and the "is there any signal in these 74 features" question be answered without a rerun.
+    std::string ds_log_path = log_dir + "/mt1_dataset.bin";
+    FILE* ds_log = fopen(ds_log_path.c_str(), "wb");
+    if (ds_log) {
+        write_ds_log_header(ds_log); fflush(ds_log);
+        log_msg("MT1 dataset -> " + ds_log_path + " (" +
+                std::to_string(sizeof(DSLogRecord)) + " B/day)");
+    } else {
+        log_msg("WARNING: could not open " + ds_log_path + " — offline horizon sweep unavailable");
+    }
 
     // Threading setup
     num_workers = std::max(1, std::min(num_workers, N_IND));
@@ -3923,11 +4005,15 @@ int main(int argc, char* argv[]) {
                 // against the other's residual. The prediction's own sign and size say all of it.
                 float in12[N_IND];
                 for (int i = 0; i < N_IND; i++) {
-                    // Realised P&L for THIS session: the deployed StockNN's portfolio value now
-                    // against its value at the previous close. This is the target, and it is the
-                    // outcome of the prediction parked yesterday.
+                    // Realised P&L for THIS session: the deployed book's value now against its
+                    // value at the previous close. Includes the market move on what is held --
+                    // this was `slot0_score - baseline`, which marks both sides at the SAME
+                    // next-day prices and so cancels beta exactly, leaving only the value added by
+                    // the day's trades. That component is ~8% of the book's gain, zero-mean and
+                    // 2.9x heavy-tailed, and it is not what "how profitable will this industry be"
+                    // means. See CHANGELOG / mt1_target notes.
                     const IndResult& ir = blk_results[d][i];
-                    const float actual = ir.slot0_score - ir.baseline;
+                    const float actual = ir.slot0_score - ir.book_prev;
                     MT1DayResult dr = mt1_step_day(i, mt1_scratches[i],
                                                    &blk_888[d][i * 74], actual,
                                                    blk_actual_day[d] >= MT1_START_DAY,
@@ -3960,6 +4046,26 @@ int main(int argc, char* argv[]) {
                 for (int d = 0; d < blk_len; d++)
                     write_csv_row(csv, pass, blk_actual_day[d], blk_results[d],
                                   blk_master_res[d], blk_mkt_ret_c[d], blk_mkt_val_c[d]);
+            // 3b. MT1 dataset: the features and the decomposed outcome, per day per industry.
+            //     Written before the MT log so a run killed mid-write loses at most one row of
+            //     the artefact the horizon decision depends on.
+            if (ds_log) {
+                for (int d = 0; d < blk_len; d++) {
+                    DSLogRecord ds{};
+                    ds.pass_num   = (uint32_t)pass;
+                    ds.actual_day = (uint32_t)blk_actual_day[d];
+                    for (int i = 0; i < N_IND; i++) {
+                        memcpy(ds.feat[i], &blk_888[d][i * DS_FEAT], DS_FEAT * sizeof(float));
+                        const IndResult& ir = blk_results[d][i];
+                        ds.book_prev[i]   = ir.book_prev;
+                        ds.book_now[i]    = ir.slot0_score;
+                        ds.mkt_move[i]    = ir.baseline    - ir.book_prev;
+                        ds.trade_delta[i] = ir.slot0_score - ir.baseline;
+                    }
+                    write_ds_log_record(ds_log, ds);
+                }
+            }
+
             // 4. One MT log record per BLOCK-DAY (V9). Was one per 25-day block, which gave 50
             //    points per pass and made per-day pool dynamics invisible.
             if (mt_log) {
@@ -4117,9 +4223,16 @@ int main(int argc, char* argv[]) {
                     if (actual_day == day_end - PASS_JUDGE_DAYS - 1) judge_start[i] = results[i].baseline;
                     if (actual_day == day_end - 1)                   judge_end[i]   = results[i].baseline;
                 }
-                float slot0_ret = (results[i].baseline > 1e-6f)
-                    ? (results[i].slot0_score / results[i].baseline - 1.f) : 0.f;
-                today_pf_val[i] = prev_pf * (1.f + slot0_ret);
+                // The portfolio index now compounds the BOOK's return, not the trading ratio.
+                // It used to be slot0_score/baseline - 1, which is the trade delta over the
+                // reference book -- so the curve MT1 saw ended pass 1 near -7% while the book it
+                // was supposed to describe ended +80%. MT1's portfolio-half features were built
+                // on that curve, so it could see neither the book's level nor the market move on
+                // it. Same denominator as the market index (both compound a close-to-close
+                // return from IND_STARTING_CASH), so the two halves stay on one scale.
+                float book_ret = (results[i].book_prev > 1e-6f)
+                    ? (results[i].slot0_score / results[i].book_prev - 1.f) : 0.f;
+                today_pf_val[i] = prev_pf * (1.f + book_ret);
                 if (mst->ind_hist_count < IND_HIST_CAP) {
                     mst->mkt_val_hist[i][mst->ind_hist_count] = today_mkt_val[i];
                     mst->ind_val_hist[i][mst->ind_hist_count] = today_pf_val[i];
@@ -4171,6 +4284,7 @@ int main(int argc, char* argv[]) {
 
     if (csv)    fclose(csv);
     if (mt_log) fclose(mt_log);
+    if (ds_log) fclose(ds_log);
 
     if (!nosave_scratch.empty()) {
         std::error_code ec;
