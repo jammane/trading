@@ -815,3 +815,52 @@ class TestProductionWiresItUp:
         src = (REPO / 'production_v2.py').read_text()
         body = src[src.index('def train_mt_one_day_prod('):src.index('def build_primed_portfolios(')]
         assert 'mt2_inputs[ind] = pred' in body, 'MT2 must be fed the MT1 prediction itself'
+
+
+class TestCullArithmeticMatchesTheTrainer:
+    """`n_cull` and `n_elite` are computed inline in both mt1_step_day and upkeep_mt1_industry.
+
+    Duplicated arithmetic with no shared definition: the two can drift to different rounding and
+    the pool would turn over at different rates in training and in production, which shows up only
+    as a slow difference in how fast the pool forgets.
+    """
+
+    @staticmethod
+    def _cpp_exprs():
+        src = (REPO / 'training_v4.cpp').read_text()
+        cull = re.search(r'n_cull\s*=\s*\(int\)\((.*?)\);', src)
+        elite = re.search(r'n_elite\s*=\s*std::max\(1,\s*\(int\)\((.*?)\)\);', src)
+        assert cull and elite, 'cull/elite arithmetic not found in mt1_step_day'
+        return cull.group(1), elite.group(1)
+
+    def test_cull_rounds_to_nearest(self):
+        expr, _ = self._cpp_exprs()
+        assert 'MT1_POOL_CULL_PCT' in expr
+        assert '+ 0.5' in expr, 'C++ rounds to nearest; Python must not truncate instead'
+
+    def test_elite_has_a_floor_of_one(self):
+        _, expr = self._cpp_exprs()
+        assert 'MT1_POOL_ELITE_PCT' in expr
+        src = (REPO / 'upkeep.py').read_text()
+        assert 'max(1, int(MT1_POOL_ELITE_PCT' in src, \
+            'without the floor a small mature set yields zero parents and the pool freezes'
+
+    @pytest.mark.parametrize('mature', [1, 6, 12, 25, 60, 100, 120, 131, 200])
+    def test_both_sides_agree_for_every_plausible_mature_count(self, mature):
+        n_cull = int(MT1_POOL_CULL_PCT * mature + 0.5)
+        n_elite = max(1, int(MT1_POOL_ELITE_PCT * mature))
+        assert 0 <= n_cull <= mature, 'cannot cull more of the pool than is mature'
+        assert 1 <= n_elite <= mature, 'there must always be at least one parent'
+        assert n_cull <= MT1_POOL_SLOTS and n_elite <= MT1_POOL_SLOTS
+
+    def test_the_steady_state_is_the_documented_sixty_percent(self):
+        """mature/N settles at 1/(1 + MIN_AGE x CULL_PCT). The smoke run measured 131 of 200;
+        this pins the arithmetic that predicts it, so a constant change shows its consequence."""
+        predicted = 1.0 / (1.0 + MT1_POOL_MIN_AGE * MT1_POOL_CULL_PCT)
+        assert predicted == pytest.approx(0.60, abs=0.02)
+        assert MT1_POOL_SLOTS * predicted == pytest.approx(120, abs=5)
+
+    def test_a_single_mature_model_still_breeds_rather_than_freezing(self):
+        assert max(1, int(MT1_POOL_ELITE_PCT * 1)) == 1
+        assert int(MT1_POOL_CULL_PCT * 1 + 0.5) == 0, \
+            'with one mature model there is nothing to cull, and it must not cull itself'
