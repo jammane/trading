@@ -30,38 +30,14 @@ ELITE_POOL            = ELITE_COUNT + WAVG_COUNT   # 20 — all parent slots
 MUTATIONS_PER_PARENT  = 9           # each of the ELITE_POOL parents gets this many children
 # Layout: 0–16 direct elites | 17 w5 | 18 w10 | 19 w15 | 20–199 mutations (9 per parent)
 
-# MT1: 5 separate pools (4 component + 1 composite blend).
-# Component pools (dir/acc/rng/cfd): 23 elites (17 direct + 3 wavg + 3 re-injected) + 207 mutations = 230 slots.
-# Composite pool: 200 blends/day (no mutation); 5-day history (10/day).
-MT1_COMP_INJECT      = 5            # injection slots per pool (cascade sources)
-MT1_RANGE_INJECT     = 5            # range→confidence injection count
-MT1_COMP_PARENTS     = ELITE_COUNT + WAVG_COUNT + MT1_COMP_INJECT  # 25
-MT1_COMP_CHILDREN    = 7            # mutations per parent
-MT1_COMP_SLOTS       = MT1_COMP_PARENTS * (MT1_COMP_CHILDREN + 1)  # 200
-MT1_BLEND_SLOTS      = 200          # composite blend pool size per day
-# Band scale: r = range_pct × max(|delta_d|, acc_floor). The floor is acc_floor (the per-industry
-# adaptive |actual_d| scale), NOT a flat dollar amount — the retired MT1_RANGE_FLOOR = $1 let r
-# collapse to cents whenever the delta head predicted ~0, which is what killed the range pool.
-MT1_RANGE_CEIL_MULT  = 4.0          # ceiling = 4 × mean |actual−comp0_delta| (clamp on r; backward-looking)
-# Pre-activation cap for the sigmoid outputs (direction conf + conf4). Without it raw logits blow up,
-# sigmoid saturates to exactly 0/1, and weight mutations stop changing the output — the pool freezes
-# genetically (96.7% of conf values were exactly 0 or 1 by pass 5 of the v0.4.0.0 run).
-MT1_LOGIT_CAP        = 4.0          # conf ∈ (0.018, 0.982), always mobile under mutation
-MT1_SOFTPLUS_CLAMP   = 20.0         # guards softplus(raw) → inf
-MT1_DIR_BACKFILL     = 0.65         # (legacy) skip direction pool update when best score < this
-MT1_DIR_DAYS         = 10           # scoring window (all pools): linear-weighted last N days (oldest=1.0 → today=2.0)
-MT1_DIR_SKILL_FLOOR  = 0.52         # (legacy — superseded by MT1_DIR_MIN_CORRECT)
-MT1_DIR_MIN_CORRECT  = 3            # direction collapse floor: freeze/inject only when best model got < N of the window's days' direction right (genuine collapse; random ~5/10, rarely trips). Skill is optimized by the two-half selection.
-MT1_FWD_DAYS         = 10           # prediction horizon: target = cumulative relative return over next N sessions
-MT2_FEED_DIRECTION   = True         # MT2 input from direction-pool slot0 (True) vs composite slot0 (False)
-MT1_POOL_NAMES       = ('dir', 'acc', 'rng', 'cfd')
-# Direction constant-collapse injection (v0.4.2.0): re-diversify the direction tail when the deployed
-# model has gone constant (all-up or all-down over its MT1_DIR_DAYS window) for N consecutive daily
-# checks AND ≥1 of those window days is wrong. MT1 tail pools were the only pools with no
-# re-diversification trigger, which is why 9/12 direction pools froze in the v0.4.1.0 run.
-MT1_DIR_CONST_TRIP   = 3            # consecutive constant+imperfect checks → inject
-MT1_DIR_INJ_COOLDOWN = MT1_DIR_DAYS  # checks to wait before another injection
-MT1_DIR_INJ_BLEND    = 0.5          # injected dir tail = BLEND*best + (1-BLEND)*random
+# MT1: one pool of persistent individuals per industry, one output per model — that industry's
+# predicted next-session StockNN P&L in dollars. The pool constants live in mt1_pool.h and are
+# mirrored in upkeep.py (the C++ trainer and the production upkeep path evolve the SAME files).
+#
+# What stood here configured five pools scoring four channels over a 10-day replay window against
+# a 10-day-forward target: the injection cascade, the per-component slot arithmetic, the band
+# ceiling and range floor, the sigmoid/softplus caps, the direction pool's collapse detector and
+# the MT2 feed toggle. All of it went with the architecture.
 
 IND_STARTING_CASH     = 25_000.0    # per-industry portfolio starting capital
 MST_STARTING_CASH     = 300_000.0   # master starting capital (12 × IND_STARTING_CASH)
