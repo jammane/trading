@@ -388,7 +388,7 @@ class TestCompetitorInput:
         compared against anything."""
         body = CPP[CPP.index('MT1DayResult cr = mt1_step_day'):]
         body = body[:body.index('mt1c_day_res[i][d] = cr;') + 40]
-        assert 'in12' not in body, 'the competitor is feeding MT2'
+        assert 'in12' not in re.sub(r'//[^\n]*', '', body), 'the competitor is feeding MT2'
 
     def test_both_pools_share_one_step_function(self):
         """Same selection, lifecycle and scoring — only the network and inputs differ, or the
@@ -471,3 +471,34 @@ class TestCompetitorInput:
         assert 'mean_close' in pre and 'day_sym[j].close' in pre, \
             'the industry level must be built from today\'s bars before the field loop'
         assert 'hist' not in re.sub(r'//[^\n]*', '', pre).lower(), 'no history may enter the level'
+
+
+    def test_all_three_pools_are_logged_paired(self, tmp_path):
+        """MT1Net, MT1CNet and MT2INet on one row. The three-way comparison must not need a join."""
+        blob, want = _synth()
+        p = tmp_path / 'ds.bin'
+        p.write_bytes(blob)
+        ds = D.parse(p)
+        assert len(D.PAIRED) == 6
+        for k in D.PAIRED:
+            assert np.allclose(ds[k], want[k]), f'{k} did not round-trip'
+
+    def test_the_independent_allocator_sees_the_whole_master_vector(self):
+        """MT1Net gets its own 74, MT1CNet its own 146. MT2INet gets all 888 — that is the
+        difference being tested, so it must not be handed a slice."""
+        body = CPP[CPP.index('Independent allocator'):]
+        body = body[:body.index('mt2i_day_res[i][d] = ir2;')]
+        assert 'blk_888[d],' in body, 'must receive the whole vector, not blk_888[d][i * 74]'
+        assert 'i * 74' not in body
+
+    def test_no_competitor_feeds_mt2(self):
+        """Neither extra pool may reach in12, or MT2's input differs from an MT1-only run and
+        none of the three can be compared against anything."""
+        seg = CPP[CPP.index('MT1DayResult cr = mt1_step_day'):]
+        seg = seg[:seg.index('mt2i_day_res[i][d] = ir2;') + 40]
+        # strip comments: they necessarily mention in12 to explain why it is excluded
+        assert 'in12' not in re.sub(r'//[^\n]*', '', seg)
+
+    def test_all_three_share_one_step_function(self):
+        for tag in ('mt1_scratches[i]', 'mt1c_scratches[i]', 'mt2i_scratches[i]'):
+            assert CPP.count(f'mt1_step_day(i, {tag}') == 1, f'{tag} not stepped exactly once'
