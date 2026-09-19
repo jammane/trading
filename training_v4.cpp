@@ -3289,14 +3289,36 @@ static inline float cn_clamp(float v, float lo, float hi) {
 }
 
 static void build_mt1c_input(const OHLCV* day_sym, const IndResult& ir, float* out /*MT1C_IN*/) {
+    // Everything here is SCALE-FREE, and that is not cosmetic. MT1Net's own 74 inputs are already
+    // normalised (returns lifted by RETURN_SCALE = 100, every polynomial level-normalised), so raw
+    // dollars here would make the comparison measure normalisation rather than feature set.
+    //
+    // It also has to survive gradient-free search. The first layer computes w.x, so one mutation
+    // of sigma moves the pre-activation by sigma * x: a $304 price and a +-0.4 close_pos differ by
+    // ~750x in how hard the same mutation hits them, and selection would see only the price
+    // columns. StockNN can feed raw dollars because it has 928,825 parameters and a dedicated
+    // 422->300 layer to learn the rescaling; this has 11,177 in total.
+    //
+    // The OUTPUT is unaffected — both nets emit tanh(out) * MT1_PRED_SCALE and are scored against
+    // dollar P&L. Input scale and output scale are independent.
+    float mean_close = 0.f;
+    int   n_close = 0;
+    for (int j = 0; j < MT1C_SYMS; j++) {
+        if (day_sym[j].valid && day_sym[j].close > 1e-6f) { mean_close += day_sym[j].close; n_close++; }
+    }
+    mean_close = n_close ? mean_close / (float)n_close : 1.f;
+    const float book = (ir.book_prev > 1.f) ? ir.book_prev : 1.f;
+
     for (int j = 0; j < MT1C_SYMS; j++) {
         float* f = out + j * MT1C_PER_SYM;
         const OHLCV& b = day_sym[j];
-        const bool ok = b.valid && b.high > b.low;
-        f[CN_OPEN]  = ok ? b.open  : 0.f;
-        f[CN_HIGH]  = ok ? b.high  : 0.f;
-        f[CN_LOW]   = ok ? b.low   : 0.f;
-        f[CN_CLOSE] = ok ? b.close : 0.f;
+        const bool ok = b.valid && b.high > b.low && b.close > 1e-6f;
+        // Bar shape as ratios to today's close, and the close itself relative to the industry's
+        // own level today — cross-sectional, so still present-day only.
+        f[CN_OPEN]  = ok ? b.open / b.close : 1.f;
+        f[CN_HIGH]  = ok ? b.high / b.close : 1.f;
+        f[CN_LOW]   = ok ? b.low  / b.close : 1.f;
+        f[CN_CLOSE] = ok ? b.close / mean_close : 1.f;
         f[CN_CPOS]  = ok ? stock_close_pos(b.open, b.high, b.low, b.close) : 0.f;
         f[CN_CWAP]  = ok ? stock_close_vs_wap(b.open, b.high, b.low, b.close) : 0.f;
         // (H-L)/A — the range as a fraction of the weighted average price. close_pos and
@@ -3304,20 +3326,15 @@ static void build_mt1c_input(const OHLCV* day_sym, const IndResult& ir, float* o
         // exactly this; it is supplied directly rather than left for the net to divide.
         const float A = ok ? (2.f * b.open + 3.f * b.close + b.high + b.low) / 7.f : 0.f;
         f[CN_RANGE_A] = (ok && A > 1e-6f) ? (b.high - b.low) / A : 0.f;
-        f[CN_HOLD]  = cn_ok(ir.ref_hold[j]);
-        // Quantities as the FRACTION OF WHAT IS AVAILABLE — which is exactly how the fill path
-        // reads them: a buy is min(buy_qty, cash/price) and a sell is min(sell_qty, holdings).
-        // The raw head is ReLU and unbounded (~121x the book at the median, 3e7x at the extreme)
-        // precisely because the clamp does the bounding, so the raw magnitude carries nothing.
-        // What carries information is how much of the available funds / of the position it wants
-        // to use, which lands naturally in [0, 1]. Zero when there is nothing to spend or sell.
+        // Position WEIGHT, not a share count: holdings x close is the exposure that actually
+        // determines the P&L being predicted, and 875 shares means nothing without the price.
+        f[CN_HOLD]  = ok ? cn_clamp(cn_ok(ir.ref_hold[j]) * b.close / book, 0.f, 1.f) : 0.f;
         // whole_shares() on both, because that is what would actually execute — Alpaca stop
         // orders forbid fractional quantities, so the fill path floors every amount and a
         // fractional intent would describe a trade that cannot be placed. It matters most where
         // the floor bites: a small cash balance against a high price rounds to zero shares, which
         // is real information about whether the model can act at all.
-        const float affordable = (ok && b.close > 1e-6f)
-                               ? whole_shares(cn_ok(ir.ref_cash_v) / b.close) : 0.f;
+        const float affordable = ok ? whole_shares(cn_ok(ir.ref_cash_v) / b.close) : 0.f;
         f[CN_BQTY]  = (affordable > 1e-9f)
                       ? cn_clamp(whole_shares(fminf(cn_ok(ir.si_bqty[j]), affordable)) / affordable,
                                  0.f, 1.f)
@@ -3331,7 +3348,7 @@ static void build_mt1c_input(const OHLCV* day_sym, const IndResult& ir, float* o
         f[CN_BFRAC] = cn_clamp(cn_ok(ir.si_bfrac[j], 0.5f), 0.f, 1.f);
         f[CN_SFRAC] = cn_clamp(cn_ok(ir.si_sfrac[j], 0.5f), 0.f, 1.f);
     }
-    out[CN_CASH] = cn_ok(ir.ref_cash_v) / ((ir.book_prev > 1.f) ? ir.book_prev : 1.f);
+    out[CN_CASH] = cn_clamp(cn_ok(ir.ref_cash_v) / book, 0.f, 1.f);
     out[CN_BOOK] = cn_ok(ir.book_prev) / (float)IND_STARTING_CASH;
 }
 

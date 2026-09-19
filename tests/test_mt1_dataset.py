@@ -439,3 +439,35 @@ class TestCompetitorInput:
         body = CPP[CPP.index('static void build_mt1c_input'):
                    CPP.index('// ── MT1 dataset log ─')]
         assert '(affordable > 1e-9f)' in body and '(pos > 1e-9f)' in body
+
+
+    def test_every_input_is_scale_free(self):
+        """MT1Net's 74 inputs are already normalised (RETURN_SCALE, level-normalised polys), so raw
+        dollars here would make the comparison measure normalisation rather than feature set. It
+        also has to survive one global mutation sigma: w.x means a $304 input and a +-0.4 input
+        differ ~750x in how hard the same mutation hits them."""
+        body = CPP[CPP.index('static void build_mt1c_input'):
+                   CPP.index('// ── MT1 dataset log ─')]
+        body = re.sub(r'//[^\n]*', '', body)
+        # no bare price reaches the vector
+        for raw in ('f[CN_OPEN]  = ok ? b.open;', 'b.close;'):
+            assert raw not in body
+        assert 'b.open / b.close' in body and 'b.high / b.close' in body
+        assert 'b.low  / b.close' in body
+        assert 'b.close / mean_close' in body, 'close must be relative to the industry level'
+
+    def test_holdings_are_a_position_weight_not_a_share_count(self):
+        body = CPP[CPP.index('static void build_mt1c_input'):
+                   CPP.index('// ── MT1 dataset log ─')]
+        assert 'ir.ref_hold[j]) * b.close / book' in body, \
+            'holdings x close is the exposure that determines P&L; a share count alone does not'
+
+    def test_the_industry_level_uses_only_todays_bars(self):
+        """close is normalised by the mean across the 12 symbols TODAY — cross-sectional, so the
+        no-history constraint holds. A trailing mean would quietly reintroduce history."""
+        body = CPP[CPP.index('static void build_mt1c_input'):
+                   CPP.index('// ── MT1 dataset log ─')]
+        pre = body[:body.index('float* f = out + j * MT1C_PER_SYM;')]
+        assert 'mean_close' in pre and 'day_sym[j].close' in pre, \
+            'the industry level must be built from today\'s bars before the field loop'
+        assert 'hist' not in re.sub(r'//[^\n]*', '', pre).lower(), 'no history may enter the level'

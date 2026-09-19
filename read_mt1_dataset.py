@@ -58,8 +58,10 @@ RECORD_SIZE = struct.calcsize(RECORD_FMT)
 assert RECORD_SIZE == 11288, f'dataset record must be 11288 bytes, got {RECORD_SIZE}'
 
 # Field offsets inside each symbol's 12-wide block of cfeat — mirrors the CN_* constants.
-CN_FIELDS = ('open', 'high', 'low', 'close', 'close_pos', 'close_vs_wap', 'range_over_a',
-             'holdings', 'buy_qty', 'buy_price_frac', 'sell_all_price_frac', 'sell_qty')
+# All scale-free. See build_mt1c_input in training_v4.cpp for why.
+CN_FIELDS = ('open_over_c', 'high_over_c', 'low_over_c', 'close_rel', 'close_pos',
+             'close_vs_wap', 'range_over_a', 'pos_weight',
+             'buy_frac_avail', 'buy_price_frac', 'sell_all_price_frac', 'sell_frac_held')
 CN_SYMS, CN_PER_SYM = 12, 12
 CN_CASH, CN_BOOK = CN_SYMS * CN_PER_SYM, CN_SYMS * CN_PER_SYM + 1
 
