@@ -1,4 +1,4 @@
-"""MT1CNet: the C++ twin must produce the same number as the torch module.
+"""MT1CNet and MT2INet: each C++ twin must match its torch module.
 
 Same reasoning as test_mt1net_parity — `load_bin` validates a weight file by ELEMENT COUNT only,
 so a layout drift leaving the total unchanged loads silently and produces plausible wrong numbers.
@@ -11,7 +11,8 @@ import subprocess
 import pytest
 import torch
 
-from models import MT1CNET_LAYER_DEFS, MT1CNET_PARAMS, MT1CNet
+from models import (MT1CNET_LAYER_DEFS, MT1CNET_PARAMS, MT1CNet,
+                    MT2INET_LAYER_DEFS, MT2INET_PARAMS, MT2INet)
 
 CPP = r'''
 #include <cstdio>
@@ -118,3 +119,103 @@ class TestParity:
         blk = hdr[hdr.index('static constexpr int CN_OPEN'):hdr.index('static inline float mt1cnet_forward')]
         assert 'VOL' not in blk.upper()
         assert MT1CNet.PER_SYM == 12, 'per-symbol width implies volume crept back in'
+
+
+# ── MT2INet: the independent allocator ───────────────────────────────────────────
+
+CPP_MI = r'''
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+#include "mt1_pool.h"
+int main(int argc, char** argv) {
+    std::vector<float> W(MT2INET_PARAMS), in(MT2I_IN);
+    FILE* f = fopen(argv[1], "rb");
+    if (!f || fread(W.data(), sizeof(float), MT2INET_PARAMS, f) != (size_t)MT2INET_PARAMS) return 2;
+    fclose(f);
+    f = fopen(argv[2], "rb");
+    if (!f || fread(in.data(), sizeof(float), MT2I_IN, f) != (size_t)MT2I_IN) return 3;
+    fclose(f);
+    printf("%.7e\n", mt2inet_forward(W.data(), in.data(), 0.f));
+    return 0;
+}
+'''
+
+
+def flatten_mi(net):
+    sd = net.state_dict()
+    parts = []
+    for name, _, _ in MT2INET_LAYER_DEFS:
+        parts.append(sd[f'{name}.weight'].flatten())
+        parts.append(sd[f'{name}.bias'].flatten())
+    return torch.cat(parts)
+
+
+@pytest.fixture(scope='module')
+def mi_exe(tmp_path_factory):
+    d = tmp_path_factory.mktemp('mt2inet')
+    src = d / 'fwd.cpp'
+    src.write_text(CPP_MI)
+    exe = d / 'fwd'
+    r = subprocess.run(['g++', '-std=c++20', '-O2', '-I', '.', '-o', str(exe), str(src), '-lm'],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        pytest.skip(f'g++ unavailable: {r.stderr[:300]}')
+    return exe
+
+
+class TestMT2INetParity:
+    def test_flat_vector_length(self):
+        assert flatten_mi(MT2INet()).numel() == MT2INET_PARAMS == 28929
+
+    def test_input_is_the_whole_master_vector(self):
+        """888 = 12 industries x 74. This is the one competitor that sees the cross-section."""
+        assert MT2INet.N_IN == 888 == 12 * 74
+
+    @pytest.mark.parametrize('seed', [0, 3, 42, 999])
+    def test_same_output_as_torch(self, mi_exe, tmp_path, seed):
+        torch.manual_seed(seed)
+        net = MT2INet().eval()
+        x = torch.randn(1, MT2INet.N_IN)
+        with torch.no_grad():
+            want = float(net(x)[0, 0])
+        got = run_cpp(mi_exe, tmp_path, flatten_mi(net), x[0])
+        assert abs(got - want) < 1e-4 * max(1.0, abs(want)), f'C++ {got} vs torch {want}'
+
+    def test_zero_weights_give_zero(self, mi_exe, tmp_path):
+        net = MT2INet().eval()
+        with torch.no_grad():
+            for p in net.parameters():
+                p.zero_()
+        x = torch.randn(1, MT2INet.N_IN)
+        assert abs(run_cpp(mi_exe, tmp_path, flatten_mi(net), x[0])) < 1e-6
+
+    def test_every_industry_block_reaches_the_output(self, mi_exe, tmp_path):
+        """888 laid out as 12 blocks of 74. An off-by-one would shift whole industries and still
+        return a number."""
+        torch.manual_seed(11)
+        net = MT2INet().eval()
+        w = flatten_mi(net)
+        base_x = torch.zeros(MT2INet.N_IN)
+        base = run_cpp(mi_exe, tmp_path, w, base_x)
+        moved = 0
+        for blk in range(12):
+            x = base_x.clone()
+            x[blk * 74:(blk + 1) * 74] = 3.0
+            if abs(run_cpp(mi_exe, tmp_path, w, x) - base) > 1e-7:
+                moved += 1
+        assert moved >= 10, f'only {moved}/12 industry blocks reach the output'
+
+    def test_taper_is_four_layers_and_decreasing(self):
+        widths = [MT2INet.N_IN] + [o for _, o, _ in MT2INET_LAYER_DEFS]
+        assert len(MT2INET_LAYER_DEFS) == 4
+        assert widths == sorted(widths, reverse=True) and widths[-1] == 1
+
+    def test_all_three_competitors_emit_one_value(self):
+        """Same output shape, so all three drop into the same pool, score and target — the
+        comparison isolates the feature set rather than the machinery."""
+        from models import MT1Net
+        x74, x146, x888 = torch.randn(1, 74), torch.randn(1, 146), torch.randn(1, 888)
+        assert MT1Net()(x74).shape == (1, 1)
+        assert MT1CNet()(x146).shape == (1, 1)
+        assert MT2INet()(x888).shape == (1, 1)

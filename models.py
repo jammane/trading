@@ -1,7 +1,7 @@
 """
 models.py — Shared neural network definitions.
 
-Single source of truth for StockNN, MasterNN, MT1Net, MT1CNet, and MT2NN.
+Single source of truth for StockNN, MasterNN, MT1Net, MT1CNet, MT2INet, and MT2NN.
 All training scripts, production_v2.py, and inspect_trades.py import from here.
 """
 
@@ -302,6 +302,46 @@ MT1CNET_LAYER_DEFS = [
     ('l1', 64, MT1CNet.N_IN), ('l2', 24, 64), ('l3', 8, 24), ('l4', 1, 8),
 ]
 MT1CNET_PARAMS = sum(o * i + o for _, o, i in MT1CNET_LAYER_DEFS)   # 11,177
+
+
+class MT2INet(nn.Module):
+    """The INDEPENDENT allocator: all 12 industries in, one industry's P&L out. No MT1, no MT1C.
+
+    Input is the whole 888-feature master vector — every industry's 74 — so it can see the
+    cross-section that MT1Net and MT1CNet cannot. Output is a single value for the industry being
+    asked about, exactly like them, so it drops into the same pool, scoring and target and the
+    three-way comparison isolates the FEATURE SET.
+
+    Why a per-industry output rather than the joint (12,4) tier map MT2NN emits: training signal.
+    A joint ranking makes each DAY one example (1,238 of them); a per-industry value makes each
+    INDUSTRY-DAY one (14,856). That 12x is structural and no architecture recovers it. Ranking is
+    then arithmetic — sort the 12 outputs and hand them to tiers_to_alloc — which is the half of
+    the job that never needed a network.
+
+    Sized so samples/param (0.51) is comparable to the MT1 stack's 0.354, so a loss cannot be
+    blamed on being starved of capacity relative to data.
+    """
+
+    N_IN = 888
+
+    def __init__(self):
+        super().__init__()
+        self.l1 = nn.Linear(self.N_IN, 32)
+        self.l2 = nn.Linear(32, 12)
+        self.l3 = nn.Linear(12, 6)
+        self.l4 = nn.Linear(6, 1)
+
+    def forward(self, x):
+        x = F.relu(self.l1(x))
+        x = F.relu(self.l2(x))
+        x = F.relu(self.l3(x))
+        return self.l4(x)                 # raw logit; tanh x MT1_PRED_SCALE at decode
+
+
+MT2INET_LAYER_DEFS = [
+    ('l1', 32, MT2INet.N_IN), ('l2', 12, 32), ('l3', 6, 12), ('l4', 1, 6),
+]
+MT2INET_PARAMS = sum(o * i + o for _, o, i in MT2INET_LAYER_DEFS)   # 28,929
 
 
 class MT2NN(nn.Module):

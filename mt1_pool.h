@@ -164,6 +164,40 @@ static inline float mt1net_forward(const float* W, const float* in74, float extr
 //
 // Both must be computed from days <= t, BEFORE the day's scoring — the same ordering the old
 // acc_floor used. mt1_windows_are_causal() below is the assertion to call at the point of use.
+// ── MT2INet: the independent allocator — all 12 industries in, one value out ─────
+// Mirrors models.py MT2INet / MT2INET_LAYOUT. Same flat convention as the others.
+//
+//   888 -> 32 -> 12 -> 6 -> 1
+//
+// Input is the whole 888-feature master vector, so unlike MT1Net (its own industry's 74) and
+// MT1CNet (its own industry today) this one sees the cross-section. Output is still a single
+// value for the industry being asked about, so it runs in the same pool against the same target
+// and the three-way comparison isolates the feature set.
+//
+// Per-industry output rather than a joint tier map is a training-signal decision: a joint ranking
+// makes each DAY one example (1,238); a per-industry value makes each INDUSTRY-DAY one (14,856).
+// Ranking is then arithmetic — sort and hand to tiers_to_alloc.
+static constexpr int MT2I_IN = 888;
+
+static constexpr int MI_L1_W = 0,     MI_L1_B = 28416;   // 32x888
+static constexpr int MI_L2_W = 28448, MI_L2_B = 28832;   // 12x32
+static constexpr int MI_L3_W = 28844, MI_L3_B = 28916;   // 6x12
+static constexpr int MI_L4_W = 28922, MI_L4_B = 28928;   // 1x6
+
+static constexpr int MT2INET_PARAMS = 28929;
+static_assert(MI_L4_B + 1 == MT2INET_PARAMS,
+              "MT2INet layout drifted from MT2INET_PARAMS — check models.py MT2INET_LAYER_DEFS");
+
+static inline float mt2inet_forward(const float* W, const float* in, float /*extra*/) {
+    float a[32], b[12], c[6];
+    mt1net_matvec_relu(W + MI_L1_W, W + MI_L1_B, in, a, 32, MT2I_IN);
+    mt1net_matvec_relu(W + MI_L2_W, W + MI_L2_B, a,  b, 12, 32);
+    mt1net_matvec_relu(W + MI_L3_W, W + MI_L3_B, b,  c,  6, 12);
+    float out = W[MI_L4_B];
+    for (int i = 0; i < 6; i++) out += W[MI_L4_W + i] * c[i];
+    return out;
+}
+
 // ── MT1CNet: the competitor — today only, no history ─────────────────────────────
 // Mirrors models.py MT1CNet / MT1CNET_LAYER_DEFS. Same flat layout convention as MT1Net: layers
 // in defs order, each [weights (out x in)] then [bias (out)]. KEEP IN SYNC — load_bin validates

@@ -36,7 +36,7 @@ import numpy as np
 
 HEADER_SIZE  = 16
 DS_MAGIC     = 0x4D543144        # "MT1D" — must match DS_LOG_MAGIC in training_v4.cpp
-DS_VERSION   = 3
+DS_VERSION   = 4
 N_IND        = 12
 DS_FEAT      = 74
 CFEAT        = 146       # MT1CNet's input width; mirrors MT1C_IN in mt1_pool.h
@@ -50,12 +50,16 @@ COMPONENTS = ('book_prev', 'book_now', 'mkt_move', 'trade_delta',
               'oi_buy_disp', 'oi_buy_val', 'oi_sell_val')
 
 # Both pools' deployed prediction and its score, paired on the same row.
-PAIRED = ('m_pred', 'm_score', 'c_pred', 'c_score')
+# All three competitors' DEPLOYED call and its score, paired on one row.
+#   m = MT1Net  (74  own industry, trailing)
+#   c = MT1CNet (146 own industry, today + intent)
+#   i = MT2INet (888 all industries — the independent allocator, no MT1 in the loop)
+PAIRED = ('m_pred', 'm_score', 'c_pred', 'c_score', 'i_pred', 'i_score')
 
 RECORD_FMT  = ('<II' + 'f' * (DS_FEAT * N_IND) + 'f' * (len(COMPONENTS) * N_IND)
                + 'f' * (CFEAT * N_IND) + 'f' * (len(PAIRED) * N_IND))
 RECORD_SIZE = struct.calcsize(RECORD_FMT)
-assert RECORD_SIZE == 11288, f'dataset record must be 11288 bytes, got {RECORD_SIZE}'
+assert RECORD_SIZE == 11384, f'dataset record must be 11384 bytes, got {RECORD_SIZE}'
 
 # Field offsets inside each symbol's 12-wide block of cfeat — mirrors the CN_* constants.
 # All scale-free. See build_mt1c_input in training_v4.cpp for why.
@@ -181,7 +185,8 @@ def main():
     sc = [ds[k] for k in ('m_score', 'c_score')]
     if np.any(sc[0] > 0):
         print(f'\n{"evolved pools":<18} {"mean score":>11} {"mean |pred|":>12}')
-        for lbl, k in (('MT1Net  (74)', 'm'), ('MT1CNet (146)', 'c')):
+        for lbl, k in (('MT1Net  (74)', 'm'), ('MT1CNet (146)', 'c'),
+                       ('MT2INet (888)', 'i')):
             m = ds[f'{k}_score'] > 0
             print(f'{lbl:<18} {ds[f"{k}_score"][m].mean():>11.4f} '
                   f'{np.abs(ds[f"{k}_pred"][m]).mean():>12.1f}')

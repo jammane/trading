@@ -2246,6 +2246,15 @@ static void mt1c_init_weights(float* W, uint64_t seed) {
     kaiming_init(W + CN_L4_W,  1,  8, rng);
 }
 
+// Kaiming-init one MT2INet.
+static void mt2i_init_weights(float* W, uint64_t seed) {
+    PCG32 rng; rng.seed(mix_seed(seed));
+    kaiming_init(W + MI_L1_W, 32, MT2I_IN, rng);
+    kaiming_init(W + MI_L2_W, 12, 32, rng);
+    kaiming_init(W + MI_L3_W,  6, 12, rng);
+    kaiming_init(W + MI_L4_W,  1,  6, rng);
+}
+
 // Rank every slot by its rolling register. Immature models sort last regardless of score: with
 // MT1_POOL_MIN_AGE = 8 calls behind it, a fresh model's single lucky prediction would otherwise
 // top the pool, which is the max-of-N artifact this design exists to remove.
@@ -3366,7 +3375,7 @@ static void build_mt1c_input(const OHLCV* day_sym, const IndResult& ir, float* o
 // curve. The identity is also a free self-check: book_now - book_prev must equal mkt_move +
 // trade_delta to floating-point tolerance on every row.
 static constexpr uint32_t DS_LOG_MAGIC   = 0x4D543144u;   // "MT1D"
-static constexpr uint32_t DS_LOG_VERSION = 3u;   // v3: + MT1CNet 146-wide input
+static constexpr uint32_t DS_LOG_VERSION = 4u;   // v4: + MT2INet, three pools paired
 static constexpr int      DS_FEAT        = 74;            // per industry, = MT1Net's input width
 
 struct DSLogRecord {
@@ -3391,11 +3400,12 @@ struct DSLogRecord {
     float    cfeat[N_IND][MT1C_IN];
     // Both pools' deployed call and its score, on the same day against the same target, so the
     // comparison is PAIRED in one place rather than joined across two files.
-    float    m_pred[N_IND],  m_score[N_IND];    // MT1Net   (74 trailing features)
-    float    c_pred[N_IND],  c_score[N_IND];    // MT1CNet  (146 present-day + intent)
+    float    m_pred[N_IND],  m_score[N_IND];    // MT1Net   (74  own industry, trailing)
+    float    c_pred[N_IND],  c_score[N_IND];    // MT1CNet  (146 own industry, today + intent)
+    float    i_pred[N_IND],  i_score[N_IND];    // MT2INet  (888 all industries, trailing)
 };
 static_assert(sizeof(DSLogRecord) == 8 + 4 * (DS_FEAT * N_IND + 11 * N_IND + MT1C_IN * N_IND
-                                              + 4 * N_IND),
+                                              + 6 * N_IND),
               "DSLogRecord packing drifted — the offline reader parses this by size");
 
 static bool write_ds_log_header(FILE* f) {
@@ -4029,6 +4039,11 @@ int main(int argc, char* argv[]) {
     // its inputs differ, so a difference in outcome is a difference in FEATURE SET.
     auto mt1c_scratches = std::make_unique<MT1PoolScratch[]>(N_IND);
     for (int i = 0; i < N_IND; i++) mt1c_scratches[i].alloc(MT1CNET_PARAMS);
+    // The independent allocator: all 888 features, so it sees the cross-section the other two
+    // cannot. ~278 MB of pool across 12 industries — the largest of the three by far, because
+    // 888 inputs cannot be read by a small first layer.
+    auto mt2i_scratches = std::make_unique<MT1PoolScratch[]>(N_IND);
+    for (int i = 0; i < N_IND; i++) mt2i_scratches[i].alloc(MT2INET_PARAMS);
     auto mt2_scratch  = std::make_unique<MT2Scratch>();            // ~5.5 MB
 
     // Open CSV log (goes to log_dir, not output_dir)
@@ -4161,6 +4176,8 @@ int main(int argc, char* argv[]) {
             load_or_init_mt1_pool(output_dir, load_dir, i, mt1_scratches[i]);
             load_or_init_mt1_pool(output_dir, load_dir, i, mt1c_scratches[i],
                                   "mt1c", mt1c_init_weights);
+            load_or_init_mt1_pool(output_dir, load_dir, i, mt2i_scratches[i],
+                                  "mt2i", mt2i_init_weights);
         }
         load_or_init_mt2(output_dir, load_dir, *mt2_scratch);
         // Init MT2 portfolio state
@@ -4216,8 +4233,10 @@ int main(int argc, char* argv[]) {
             MT1DayResult blk_mt1_res[N_IND];
             static MT1DayResult mt1_day_res[N_IND][MT1_DAYS];
             static MT1DayResult mt1c_day_res[N_IND][MT1_DAYS];
+            static MT1DayResult mt2i_day_res[N_IND][MT1_DAYS];
             memset(mt1_day_res, 0, sizeof(mt1_day_res));
             memset(mt1c_day_res, 0, sizeof(mt1c_day_res));
+            memset(mt2i_day_res, 0, sizeof(mt2i_day_res));
             // 2. MT2 M phase: replay block days with the post-block composed MT1 (head0+tail0).
             //    MT2 is now GRADED/TRAINED on the deployed slot-0 StockNN portfolio delta
             //    (perf_pf = slot0_score/baseline − 1) — the quantity that actually earns — instead
@@ -4262,6 +4281,13 @@ int main(int argc, char* argv[]) {
                                                        mt1cnet_forward);
                         mt1c_day_res[i][d] = cr;
                     }
+                    // Independent allocator: the WHOLE 888 vector, not this industry's slice.
+                    // Also scored and logged only — it never reaches in12 either.
+                    MT1DayResult ir2 = mt1_step_day(i, mt2i_scratches[i], blk_888[d], actual,
+                                                    blk_actual_day[d] >= MT1_START_DAY,
+                                                    blk_actual_day[d], cur_mt1_sigma,
+                                                    mt2inet_forward);
+                    mt2i_day_res[i][d] = ir2;
                 }
                 if (blk_actual_day[d] >= MASTER_START_DAY) {
                     // Deployed slot-0 portfolio return (training target) + market return (diagnostic).
@@ -4315,6 +4341,8 @@ int main(int argc, char* argv[]) {
                         ds.m_score[i] = mt1_day_res[i][d].score0;
                         ds.c_pred[i]  = mt1c_day_res[i][d].pred0;
                         ds.c_score[i] = mt1c_day_res[i][d].score0;
+                        ds.i_pred[i]  = mt2i_day_res[i][d].pred0;
+                        ds.i_score[i] = mt2i_day_res[i][d].score0;
                     }
                     write_ds_log_record(ds_log, ds);
                 }
@@ -4364,6 +4392,7 @@ int main(int argc, char* argv[]) {
             for (int i = 0; i < N_IND; i++) {
                 save_mt1_pool(output_dir, i, mt1_scratches[i]);
                 save_mt1_pool(output_dir, i, mt1c_scratches[i], "mt1c");
+                save_mt1_pool(output_dir, i, mt2i_scratches[i], "mt2i");
             }
             save_mt2_elites(output_dir, *mt2_scratch);
         };
@@ -4522,6 +4551,7 @@ int main(int argc, char* argv[]) {
             for (int i = 0; i < N_IND; i++) {
                 save_mt1_pool(output_dir, i, mt1_scratches[i]);
                 save_mt1_pool(output_dir, i, mt1c_scratches[i], "mt1c");
+                save_mt1_pool(output_dir, i, mt2i_scratches[i], "mt2i");
             }
             save_mt2_elites(output_dir, *mt2_scratch);
 
