@@ -101,6 +101,23 @@ class TestPower:
                                                min_train=250, refit_every=25), 1, n_boot=150)
         assert strong['ic'] > weak['ic']
 
+    @pytest.mark.parametrize('h', [1, 3, 5, 10])
+    def test_the_planted_control_has_power_at_every_horizon(self, h):
+        """The control must fill the whole forward window. A one-day plant tested at h=5 read
+        IC +0.020 (t +1.0) while the same plant at h=1 read +0.164 (t +10.4) — so the h=5 null it
+        was validating meant nothing. A control that only works at h=1 is worse than none."""
+        # Strength scales with sqrt(h) so signal-to-noise is held CONSTANT across horizons.
+        # This tests the plant MECHANISM (does it fill the window), not absolute power — power
+        # genuinely falls with h for a signal of fixed per-day size, because the target's noise
+        # grows as sqrt(h) while independent training observations fall as h. Measured on the real
+        # collection data at a fixed strength: planted IC t = +11.8 (h=1), +2.0 (h=5), +0.8 (h=10).
+        ds = synth(T=1000, signal=0.0, seed=20 + h)
+        r = M.planted_control(ds, h, 'per-industry', strength=0.40 * h ** 0.5,
+                              min_train=250, refit_every=25)
+        assert r is not None
+        assert r['ic'] > 0.05, f'h={h}: planted signal not recovered, IC {r["ic"]:.4f}'
+        assert r['ic_t'] > 2, f'h={h}: planted signal not significant, t {r["ic_t"]:.2f}'
+
     def test_the_pooled_formulation_also_finds_it(self):
         """Pooling shares one model across 12 industries. If the plumbing misaligns industries the
         signal vanishes, and it would look like a real negative result about pooling."""

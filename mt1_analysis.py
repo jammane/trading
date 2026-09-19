@@ -264,15 +264,26 @@ def shuffle_control(ds, h, formulation, seed=0, **kw):
 def planted_control(ds, h, formulation, strength=0.30, seed=0, **kw):
     """Same pipeline, with a known signal added to the target from feature 0.
 
-    If the harness cannot recover a planted signal it has no power, and any null it reports is
-    uninformative rather than evidence of absence.
+    The plant must fill the WHOLE forward window, not one day of it. A one-day kick tested at h=5
+    is diluted by sqrt(5) and by the four days it does not touch, so the control fails and the
+    null it is supposed to validate becomes uninterpretable. That happened: at h=5 a one-day plant
+    read IC +0.020 (t +1.0) while the same plant at h=1 read +0.164 (t +10.4).
+
+    So day t's feature drives days t+1..t+h, each by strength/h of the daily sd. The forward-h sum
+    from t then contains the full `strength * sd * f0[t]` exactly once, at every h.
+
+    If this control is not clearly positive, the harness has no power at that horizon and any null
+    it reports there is uninformative rather than evidence of absence.
     """
     ds2 = dict(ds)
     f0 = ds['feat'][:, :, 0].astype(float)
     f0 = (f0 - np.nanmean(f0)) / (np.nanstd(f0) + 1e-9)
     base = (ds['book_now'] - ds['book_prev']).astype(float)
-    kick = strength * np.nanstd(base) * f0
-    ds2['book_now'] = (ds['book_now'] + kick).astype(np.float32)
+    per_day = strength * np.nanstd(base) * f0 / h
+    add = np.zeros_like(per_day)
+    for k in range(1, h + 1):
+        add[k:] += per_day[:-k]
+    ds2['book_now'] = (ds['book_now'] + add).astype(np.float32)
     return evaluate(*run_formulation(ds2, h, formulation, **kw), h, n_boot=200, seed=seed)
 
 
