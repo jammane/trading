@@ -167,7 +167,7 @@ static inline float mt1net_forward(const float* W, const float* in74, float extr
 // ── MT2INet: the independent allocator — all 12 industries in, one value out ─────
 // Mirrors models.py MT2INet / MT2INET_LAYOUT. Same flat convention as the others.
 //
-//   888 -> 32 -> 12 -> 6 -> 1
+//   888 -> 16 -> 8 -> 4 -> 1
 //
 // Input is the whole 888-feature master vector, so unlike MT1Net (its own industry's 74) and
 // MT1CNet (its own industry today) this one sees the cross-section. Output is still a single
@@ -179,22 +179,25 @@ static inline float mt1net_forward(const float* W, const float* in74, float extr
 // Ranking is then arithmetic — sort and hand to tiers_to_alloc.
 static constexpr int MT2I_IN = 888;
 
-static constexpr int MI_L1_W = 0,     MI_L1_B = 28416;   // 32x888
-static constexpr int MI_L2_W = 28448, MI_L2_B = 28832;   // 12x32
-static constexpr int MI_L3_W = 28844, MI_L3_B = 28916;   // 6x12
-static constexpr int MI_L4_W = 28922, MI_L4_B = 28928;   // 1x6
+static constexpr int MI_L1_W = 0,     MI_L1_B = 14208;   // 16x888
+static constexpr int MI_L2_W = 14224, MI_L2_B = 14352;   // 8x16
+static constexpr int MI_L3_W = 14360, MI_L3_B = 14392;   // 4x8
+static constexpr int MI_L4_W = 14396, MI_L4_B = 14400;   // 1x4
 
-static constexpr int MT2INET_PARAMS = 28929;
+// 16 wide, not 32: at 32 the pool wanted 278 MB across 12 industries and pushed the box into
+// swap — 936 MB paged out and the trainer's wall time went 32 -> 80 s/day, all thrashing, since
+// the forward pass itself costs ~0.14 s/day. At 16 it is 138 MB and fits.
+static constexpr int MT2INET_PARAMS = 14401;
 static_assert(MI_L4_B + 1 == MT2INET_PARAMS,
               "MT2INet layout drifted from MT2INET_PARAMS — check models.py MT2INET_LAYER_DEFS");
 
 static inline float mt2inet_forward(const float* W, const float* in, float /*extra*/) {
-    float a[32], b[12], c[6];
-    mt1net_matvec_relu(W + MI_L1_W, W + MI_L1_B, in, a, 32, MT2I_IN);
-    mt1net_matvec_relu(W + MI_L2_W, W + MI_L2_B, a,  b, 12, 32);
-    mt1net_matvec_relu(W + MI_L3_W, W + MI_L3_B, b,  c,  6, 12);
+    float a[16], b[8], c[4];
+    mt1net_matvec_relu(W + MI_L1_W, W + MI_L1_B, in, a, 16, MT2I_IN);
+    mt1net_matvec_relu(W + MI_L2_W, W + MI_L2_B, a,  b,  8, 16);
+    mt1net_matvec_relu(W + MI_L3_W, W + MI_L3_B, b,  c,  4,  8);
     float out = W[MI_L4_B];
-    for (int i = 0; i < 6; i++) out += W[MI_L4_W + i] * c[i];
+    for (int i = 0; i < 4; i++) out += W[MI_L4_W + i] * c[i];
     return out;
 }
 

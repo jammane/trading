@@ -2249,10 +2249,10 @@ static void mt1c_init_weights(float* W, uint64_t seed) {
 // Kaiming-init one MT2INet.
 static void mt2i_init_weights(float* W, uint64_t seed) {
     PCG32 rng; rng.seed(mix_seed(seed));
-    kaiming_init(W + MI_L1_W, 32, MT2I_IN, rng);
-    kaiming_init(W + MI_L2_W, 12, 32, rng);
-    kaiming_init(W + MI_L3_W,  6, 12, rng);
-    kaiming_init(W + MI_L4_W,  1,  6, rng);
+    kaiming_init(W + MI_L1_W, 16, MT2I_IN, rng);
+    kaiming_init(W + MI_L2_W,  8, 16, rng);
+    kaiming_init(W + MI_L3_W,  4,  8, rng);
+    kaiming_init(W + MI_L4_W,  1,  4, rng);
 }
 
 // Rank every slot by its rolling register. Immature models sort last regardless of score: with

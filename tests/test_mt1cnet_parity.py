@@ -166,7 +166,7 @@ def mi_exe(tmp_path_factory):
 
 class TestMT2INetParity:
     def test_flat_vector_length(self):
-        assert flatten_mi(MT2INet()).numel() == MT2INET_PARAMS == 28929
+        assert flatten_mi(MT2INet()).numel() == MT2INET_PARAMS == 14401
 
     def test_input_is_the_whole_master_vector(self):
         """888 = 12 industries x 74. This is the one competitor that sees the cross-section."""
