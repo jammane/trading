@@ -1,7 +1,7 @@
 """
 models.py — Shared neural network definitions.
 
-Single source of truth for StockNN, MasterNN, MT1Net, and MT2NN.
+Single source of truth for StockNN, MasterNN, MT1Net, MT1CNet, and MT2NN.
 All training scripts, production_v2.py, and inspect_trades.py import from here.
 """
 
@@ -250,6 +250,58 @@ MT1NET_LAYER_DEFS = [
 ]
 
 MT1NET_PARAMS = sum(o * i + o for _, o, i in MT1NET_LAYER_DEFS)   # 3,501
+
+
+class MT1CNet(nn.Module):
+    """MT1 competitor: TODAY only, no history of any kind.
+
+    MT1Net sees 74 features, every one of them derived from a trailing value curve — 10 daily
+    returns, 7 ten-day buckets, a 20-day vol, and polynomial fits over 5/10/30/60/90 days. It sees
+    no individual symbol and nothing about what StockNN intends to do.
+
+    This sees the opposite: everything available at today's close and nothing before it.
+
+        per symbol (x12)   O H L C                                              4
+                           close_pos, close_vs_wap, (H-L)/A                     3
+                           holdings                                             1
+                           buy_qty, buy_price_frac, sell_all_price_frac, sell_qty  4
+        per industry       cash, book value                                     2
+                                                                        total = 146
+
+    Volume is deliberately excluded: without history there is no norm to read it against, so 1M
+    shares carries no information about whether that is high or low for the symbol.
+
+    Same target as MT1Net — that industry's next-session book P&L — and the same pool, scoring and
+    lifecycle, so the comparison isolates the FEATURE SET rather than the machinery.
+
+    The intents are causal: limit prices are `low_t + frac * span_t`, anchored to today's bar, and
+    the quantities come straight off StockNN's forward pass on today's data. Executed volume would
+    not be, since a fill is decided by the next day's bar.
+    """
+
+    N_SYMS = 12
+    PER_SYM = 12
+    N_IN = N_SYMS * PER_SYM + 2          # 146
+
+    def __init__(self):
+        super().__init__()
+        self.l1 = nn.Linear(self.N_IN, 64)
+        self.l2 = nn.Linear(64, 24)
+        self.l3 = nn.Linear(24, 8)
+        self.l4 = nn.Linear(8, 1)
+
+    def forward(self, x):
+        x = F.relu(self.l1(x))
+        x = F.relu(self.l2(x))
+        x = F.relu(self.l3(x))
+        return self.l4(x)                 # raw logit; tanh x MT1_PRED_SCALE at decode
+
+
+# (prefix, out_size, in_size) — mirrors the C++ CN_* offsets, same convention as MT1NET_LAYER_DEFS.
+MT1CNET_LAYER_DEFS = [
+    ('l1', 64, MT1CNet.N_IN), ('l2', 24, 64), ('l3', 8, 24), ('l4', 1, 8),
+]
+MT1CNET_PARAMS = sum(o * i + o for _, o, i in MT1CNET_LAYER_DEFS)   # 11,177
 
 
 class MT2NN(nn.Module):

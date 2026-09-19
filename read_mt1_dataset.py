@@ -36,9 +36,10 @@ import numpy as np
 
 HEADER_SIZE  = 16
 DS_MAGIC     = 0x4D543144        # "MT1D" — must match DS_LOG_MAGIC in training_v4.cpp
-DS_VERSION   = 2
+DS_VERSION   = 3
 N_IND        = 12
 DS_FEAT      = 74
+CFEAT        = 146       # MT1CNet's input width; mirrors MT1C_IN in mt1_pool.h
 
 COMPONENTS = ('book_prev', 'book_now', 'mkt_move', 'trade_delta',
               # v2: slot-0 order INTENT. Causal — limit prices are anchored to TODAY's bar and
@@ -48,9 +49,19 @@ COMPONENTS = ('book_prev', 'book_now', 'mkt_move', 'trade_delta',
               'oi_n_buy', 'oi_n_sell', 'oi_buy_aggr', 'oi_sell_aggr',
               'oi_buy_disp', 'oi_buy_val', 'oi_sell_val')
 
-RECORD_FMT  = '<II' + 'f' * (DS_FEAT * N_IND) + 'f' * (len(COMPONENTS) * N_IND)
+# Both pools' deployed prediction and its score, paired on the same row.
+PAIRED = ('m_pred', 'm_score', 'c_pred', 'c_score')
+
+RECORD_FMT  = ('<II' + 'f' * (DS_FEAT * N_IND) + 'f' * (len(COMPONENTS) * N_IND)
+               + 'f' * (CFEAT * N_IND) + 'f' * (len(PAIRED) * N_IND))
 RECORD_SIZE = struct.calcsize(RECORD_FMT)
-assert RECORD_SIZE == 4088, f'dataset record must be 4088 bytes, got {RECORD_SIZE}'
+assert RECORD_SIZE == 11288, f'dataset record must be 11288 bytes, got {RECORD_SIZE}'
+
+# Field offsets inside each symbol's 12-wide block of cfeat — mirrors the CN_* constants.
+CN_FIELDS = ('open', 'high', 'low', 'close', 'close_pos', 'close_vs_wap', 'range_over_a',
+             'holdings', 'buy_qty', 'buy_price_frac', 'sell_all_price_frac', 'sell_qty')
+CN_SYMS, CN_PER_SYM = 12, 12
+CN_CASH, CN_BOOK = CN_SYMS * CN_PER_SYM, CN_SYMS * CN_PER_SYM + 1
 
 
 def parse(path):
@@ -75,6 +86,8 @@ def parse(path):
     if n == 0:
         return {'pass': np.zeros(0, np.int64), 'day': np.zeros(0, np.int64),
                 'feat': np.zeros((0, N_IND, DS_FEAT), np.float32),
+                'cfeat': np.zeros((0, N_IND, CFEAT), np.float32),
+                **{k: np.zeros((0, N_IND), np.float32) for k in PAIRED},
                 **{k: np.zeros((0, N_IND), np.float32) for k in COMPONENTS}}
 
     raw = np.frombuffer(body[:n * RECORD_SIZE], dtype=np.uint8).reshape(n, RECORD_SIZE)
@@ -84,6 +97,11 @@ def parse(path):
            'feat': rest[:, :DS_FEAT * N_IND].reshape(n, N_IND, DS_FEAT)}
     off = DS_FEAT * N_IND
     for k in COMPONENTS:
+        out[k] = rest[:, off:off + N_IND]
+        off += N_IND
+    out['cfeat'] = rest[:, off:off + CFEAT * N_IND].reshape(n, N_IND, CFEAT)
+    off += CFEAT * N_IND
+    for k in PAIRED:
         out[k] = rest[:, off:off + N_IND]
         off += N_IND
     return out
@@ -158,7 +176,16 @@ def main():
     print(f'\n{"order intent":<14} {"mean":>11} {"sd":>9}')
     for k in COMPONENTS[4:]:
         print(f'{k:<14} {ds[k].mean():>+11.3f} {ds[k].std():>9.3f}')
-    print(f'\nfeatures: {ds["feat"].shape}  '
+    sc = [ds[k] for k in ('m_score', 'c_score')]
+    if np.any(sc[0] > 0):
+        print(f'\n{"evolved pools":<18} {"mean score":>11} {"mean |pred|":>12}')
+        for lbl, k in (('MT1Net  (74)', 'm'), ('MT1CNet (146)', 'c')):
+            m = ds[f'{k}_score'] > 0
+            print(f'{lbl:<18} {ds[f"{k}_score"][m].mean():>11.4f} '
+                  f'{np.abs(ds[f"{k}_pred"][m]).mean():>12.1f}')
+    print(f'\ncompetitor input: {ds["cfeat"].shape}  '
+          f'finite {np.isfinite(ds["cfeat"]).mean():.2%}')
+    print(f'features: {ds["feat"].shape}  '
           f'finite {np.isfinite(ds["feat"]).mean():.2%}  '
           f'|x| p99 {np.percentile(np.abs(ds["feat"]), 99):.3g}')
 
