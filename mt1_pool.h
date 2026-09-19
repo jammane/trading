@@ -164,6 +164,47 @@ static inline float mt1net_forward(const float* W, const float* in74, float extr
 //
 // Both must be computed from days <= t, BEFORE the day's scoring — the same ordering the old
 // acc_floor used. mt1_windows_are_causal() below is the assertion to call at the point of use.
+// ── MT1CNet: the competitor — today only, no history ─────────────────────────────
+// Mirrors models.py MT1CNet / MT1CNET_LAYER_DEFS. Same flat layout convention as MT1Net: layers
+// in defs order, each [weights (out x in)] then [bias (out)]. KEEP IN SYNC — load_bin validates
+// by element count alone, so a drift with an unchanged total loads silently.
+//
+//   146 -> 64 -> 24 -> 8 -> 1
+//
+// Input, per industry, all from TODAY's close and nothing earlier:
+//   per symbol (x12): O H L C | close_pos, close_vs_wap, (H-L)/A | holdings
+//                     | buy_qty, buy_price_frac, sell_all_price_frac, sell_qty   = 12
+//   per industry:     cash, book value                                           =  2
+static constexpr int MT1C_SYMS    = 12;
+static constexpr int MT1C_PER_SYM = 12;
+static constexpr int MT1C_IN      = MT1C_SYMS * MT1C_PER_SYM + 2;   // 146
+
+static constexpr int CN_L1_W = 0,     CN_L1_B = 9344;    // 64x146
+static constexpr int CN_L2_W = 9408,  CN_L2_B = 10944;   // 24x64
+static constexpr int CN_L3_W = 10968, CN_L3_B = 11160;   // 8x24
+static constexpr int CN_L4_W = 11168, CN_L4_B = 11176;   // 1x8
+
+static constexpr int MT1CNET_PARAMS = 11177;
+static_assert(CN_L4_B + 1 == MT1CNET_PARAMS,
+              "MT1CNet layout drifted from MT1CNET_PARAMS — check models.py MT1CNET_LAYER_DEFS");
+
+// Offsets of each per-symbol field inside the 146-vector, so the builder and any reader agree.
+static constexpr int CN_OPEN = 0, CN_HIGH = 1, CN_LOW = 2, CN_CLOSE = 3;
+static constexpr int CN_CPOS = 4, CN_CWAP = 5, CN_RANGE_A = 6, CN_HOLD = 7;
+static constexpr int CN_BQTY = 8, CN_BFRAC = 9, CN_SFRAC = 10, CN_SQTY = 11;
+static constexpr int CN_CASH = MT1C_SYMS * MT1C_PER_SYM;        // 144
+static constexpr int CN_BOOK = CN_CASH + 1;                     // 145
+
+static inline float mt1cnet_forward(const float* W, const float* in, float /*extra*/) {
+    float a[64], b[24], c[8];
+    mt1net_matvec_relu(W + CN_L1_W, W + CN_L1_B, in, a, 64, MT1C_IN);
+    mt1net_matvec_relu(W + CN_L2_W, W + CN_L2_B, a,  b, 24, 64);
+    mt1net_matvec_relu(W + CN_L3_W, W + CN_L3_B, b,  c,  8, 24);
+    float out = W[CN_L4_B];
+    for (int i = 0; i < 8; i++) out += W[CN_L4_W + i] * c[i];
+    return out;
+}
+
 static constexpr int MT1_BASELINE_DAYS = 20;   // trailing mean = the predictor MT1 must beat
 static constexpr int MT1_FLOOR_DAYS    = 10;   // rolling window behind the score floor
 static constexpr float MT1_FLOOR_FRAC  = 0.5f; // floor = mean(|actual|) * frac, per industry

@@ -672,7 +672,13 @@ struct MasterScratch {
 // one-day delay, the minimum possible; the old design needed 10 (and 20 for vol), which is what
 // left a 10-day scoring window holding ~1.6 independent observations.
 struct MT1PoolScratch {
-    float*      pool{nullptr};              // [MT1_POOL_SLOTS x MT1NET_PARAMS], persistent
+    // Parameterised on the model width so MT1Net (3,501) and its competitor MT1CNet (11,177) share
+    // one pool implementation. They must: the comparison is only meaningful if the two run under
+    // identical selection, lifecycle and scoring, so the ONLY difference is the network and its
+    // inputs. Allocation is deferred to alloc() because make_unique<T[]> cannot pass constructor
+    // arguments.
+    int         n_params{MT1NET_PARAMS};
+    float*      pool{nullptr};              // [MT1_POOL_SLOTS x n_params], persistent
     float*      mut_buf{nullptr};           // one model, breeding scratch
     MT1SlotMeta meta[MT1_POOL_SLOTS]{};
     int         best_slot{0};               // deployed model; ranked in place, never shuffled
@@ -697,16 +703,19 @@ struct MT1PoolScratch {
     uint32_t    retire_n{0};
     int         culled_today{0}, births_today{0};
 
-    MT1PoolScratch() {
-        pool    = new float[(size_t)MT1_POOL_SLOTS * MT1NET_PARAMS]();
-        mut_buf = new float[MT1NET_PARAMS]();
+    MT1PoolScratch() { alloc(MT1NET_PARAMS); }
+    void alloc(int np) {
+        delete[] pool; delete[] mut_buf;
+        n_params = np;
+        pool    = new float[(size_t)MT1_POOL_SLOTS * np]();
+        mut_buf = new float[np]();
     }
     ~MT1PoolScratch() { delete[] pool; delete[] mut_buf; }
     MT1PoolScratch(const MT1PoolScratch&) = delete;
     MT1PoolScratch& operator=(const MT1PoolScratch&) = delete;
 
-    float* slot(int i) { return pool + (size_t)i * MT1NET_PARAMS; }
-    const float* slot(int i) const { return pool + (size_t)i * MT1NET_PARAMS; }
+    float* slot(int i) { return pool + (size_t)i * n_params; }
+    const float* slot(int i) const { return pool + (size_t)i * n_params; }
 
     // Trailing mean of realised P&L — the naive predictor. Score 0.5 means tying this.
     float baseline() const {
@@ -1132,6 +1141,11 @@ struct IndResult {
                                       // > 0 = limit above today's close (wants to fill now)
     float oi_buy_disp;                // sd of buy_price_frac across ordering symbols
     float oi_buy_val, oi_sell_val;    // intended buy / sell in dollars at today's close
+    // Per-symbol slot-0 state and intent, for the MT1CNet competitor's 146-wide input. Holdings
+    // and cash are the PRE-trade reference book — what is actually held at today's close, since
+    // today's orders do not fill until tomorrow.
+    float ref_hold[IND_SYMS], ref_cash_v;
+    float si_bqty[IND_SYMS], si_bfrac[IND_SYMS], si_sfrac[IND_SYMS], si_sqty[IND_SYMS];
     float baseline, slot0_score, best_delta;
     float top_hold, top_cash;
     int   new_streak;
@@ -1369,6 +1383,8 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     }
 
     // slot-0 order intent, accumulated on the slot == 0 iteration only
+    float si_bq[IND_SYMS] = {}, si_bf[IND_SYMS] = {};
+    float si_sf[IND_SYMS] = {}, si_sq[IND_SYMS] = {};
     int   oi_nb = 0, oi_ns = 0;
     double oi_ba = 0.0, oi_sa = 0.0, oi_bv = 0.0, oi_sv = 0.0;
     double oi_bf = 0.0, oi_bf2 = 0.0;
@@ -1413,14 +1429,19 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             // nd_open/nd_low/nd_high by accident.
             if (slot == 0) {
                 const float close_t = day_sym[j].close;
-                if (buy_qty > 1e-6f && buy_price > 0.f) {
+                si_bq[j] = buy_qty;  si_bf[j] = buy_price_frac;
+                si_sf[j] = sell_all_price_frac; si_sq[j] = sell_qty;
+                // The aggregates below are features too, so a non-finite raw output must not
+                // propagate into them. NaN fails `> 1e-6f`, so those orders are simply not
+                // counted — the same way the fill path treats them.
+                if (buy_qty > 1e-6f && buy_price > 0.f && std::isfinite(buy_price)) {
                     oi_nb++;
                     oi_ba  += (double)(buy_price - close_t) / span_t;
                     oi_bv  += (double)buy_qty * close_t;
                     oi_bf  += buy_price_frac;
                     oi_bf2 += (double)buy_price_frac * buy_price_frac;
                 }
-                if (sell_qty > 1e-6f) {
+                if (sell_qty > 1e-6f && std::isfinite(sell_all_price)) {
                     oi_ns++;
                     oi_sa += (double)(sell_all_price - close_t) / span_t;
                     oi_sv += (double)sell_qty * close_t;
@@ -1979,6 +2000,14 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     }
 
     IndResult res;
+    res.ref_cash_v = ref_cash;
+    for (int j = 0; j < IND_SYMS; j++) {
+        res.ref_hold[j] = ref_hold[j];
+        res.si_bqty[j]  = si_bq[j];
+        res.si_bfrac[j] = si_bf[j];
+        res.si_sfrac[j] = si_sf[j];
+        res.si_sqty[j]  = si_sq[j];
+    }
     res.oi_n_buy    = (float)oi_nb;
     res.oi_n_sell   = (float)oi_ns;
     res.oi_buy_aggr = oi_nb ? (float)(oi_ba / oi_nb) : 0.f;
@@ -2171,9 +2200,9 @@ static void build_master_features(const float mkt_val_hist[][IND_HIST_CAP],
 
 
 // Gaussian mutation of one MT1Net.
-static void mt1_mutate(const float* parent, float* dst, float sigma, uint64_t seed) {
-    memcpy(dst, parent, sizeof(float) * MT1NET_PARAMS);
-    apply_gaussian(dst, MT1NET_PARAMS, sigma, mix_seed(seed));
+static void mt1_mutate(const float* parent, float* dst, int n_params, float sigma, uint64_t seed) {
+    memcpy(dst, parent, sizeof(float) * n_params);
+    apply_gaussian(dst, n_params, sigma, mix_seed(seed));
 }
 
 // ── MT1: one pool per industry, one step per day ─────────────────────────────────
@@ -2206,6 +2235,15 @@ static void mt1_init_weights(float* W, uint64_t seed) {
     kaiming_init(W + NT_D1_W, 22, 56, rng);
     kaiming_init(W + NT_D2_W, 10, 23, rng);
     kaiming_init(W + NT_D3_W,  1, 10, rng);
+}
+
+// Kaiming-init one MT1CNet. Plain taper, so the layer list is short.
+static void mt1c_init_weights(float* W, uint64_t seed) {
+    PCG32 rng; rng.seed(mix_seed(seed));
+    kaiming_init(W + CN_L1_W, 64, MT1C_IN, rng);
+    kaiming_init(W + CN_L2_W, 24, 64, rng);
+    kaiming_init(W + CN_L3_W,  8, 24, rng);
+    kaiming_init(W + CN_L4_W,  1,  8, rng);
 }
 
 // Rank every slot by its rolling register. Immature models sort last regardless of score: with
@@ -2255,8 +2293,11 @@ static bool mt1_is_barred(const MT1PoolScratch& sc, uint32_t lineage) {
 // One MT1 day for one industry. `actual` is the P&L this industry's StockNN realised from the
 // previous session's close to this one — the thing yesterday's prediction was a prediction OF.
 // `have_actual` is false only on the first day of a pass, before any outcome exists.
-static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in74,
-                                 float actual, bool have_actual, int actual_day, float sigma) {
+using MT1Forward = float (*)(const float*, const float*, float);
+
+static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in,
+                                 float actual, bool have_actual, int actual_day, float sigma,
+                                 MT1Forward fwd = mt1net_forward) {
     MT1DayResult r{};
     r.actual = actual;
 
@@ -2272,7 +2313,7 @@ static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in7
     // MT1 was solving a strictly harder problem than the one production asks. Out-of-sample is a
     // property of what the model can see, not of the order the loop happens to run in.
     for (int s = 0; s < MT1_POOL_SLOTS; s++)
-        sc.pending[s] = mt1_pred(mt1net_forward(sc.slot(s), in74, 0.f));
+        sc.pending[s] = mt1_pred(fwd(sc.slot(s), in, 0.f));
     sc.has_pending = true;
     sc.pending_day = actual_day;
     // The deployed model's call, captured BEFORE selection can reorder the pool — this is the
@@ -2328,7 +2369,7 @@ static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in7
             const uint64_t seed = (uint64_t)actual_day * 0x9E3779B97F4A7C15ULL
                                 ^ ((uint64_t)ind_i << 32) ^ ((uint64_t)victim * 2654435761ULL);
             const uint32_t age = sc.meta[victim].n_pred;
-            mt1_mutate(sc.slot(par), sc.slot(victim), sigma, seed);
+            mt1_mutate(sc.slot(par), sc.slot(victim), sc.n_params, sigma, seed);
             mt1_slot_init(sc.meta[victim], sc.meta[par].lineage);
             sc.retire_n++;
             sc.retire_age_sum += age;
@@ -3045,17 +3086,19 @@ static void load_or_init_master(const std::string& dir, const std::string& load_
 static constexpr uint32_t MT1_META_MAGIC   = 0x4D543150u;   // "MT1P"
 static constexpr uint32_t MT1_META_VERSION = 1u;
 
-static std::string mt1_pool_path(const std::string& dir, int ind_i, int slot) {
-    return dir + "/mt1_" + g_ind_names[ind_i] + "_slot_" + std::to_string(slot) + ".bin";
+static std::string mt1_pool_path(const std::string& dir, int ind_i, int slot,
+                                 const char* tag = "mt1") {
+    return dir + "/" + tag + "_" + g_ind_names[ind_i] + "_slot_" + std::to_string(slot) + ".bin";
 }
-static std::string mt1_meta_path(const std::string& dir, int ind_i) {
-    return dir + "/mt1_" + g_ind_names[ind_i] + "_meta.bin";
+static std::string mt1_meta_path(const std::string& dir, int ind_i, const char* tag = "mt1") {
+    return dir + "/" + tag + "_" + g_ind_names[ind_i] + "_meta.bin";
 }
 
-static void save_mt1_pool(const std::string& dir, int ind_i, const MT1PoolScratch& sc) {
+static void save_mt1_pool(const std::string& dir, int ind_i, const MT1PoolScratch& sc,
+                          const char* tag = "mt1") {
     for (int s = 0; s < MT1_POOL_SLOTS; s++)
-        save_bin(mt1_pool_path(dir, ind_i, s), sc.slot(s), MT1NET_PARAMS);
-    FILE* f = fopen(mt1_meta_path(dir, ind_i).c_str(), "wb");
+        save_bin(mt1_pool_path(dir, ind_i, s, tag), sc.slot(s), sc.n_params);
+    FILE* f = fopen(mt1_meta_path(dir, ind_i, tag).c_str(), "wb");
     if (!f) return;
     uint32_t hdr[4] = {MT1_META_MAGIC, MT1_META_VERSION, (uint32_t)MT1_POOL_SLOTS,
                        (uint32_t)MT1_SCORE_HIST};
@@ -3071,27 +3114,32 @@ static void save_mt1_pool(const std::string& dir, int ind_i, const MT1PoolScratc
 // `load_dir` is a SEED, consulted only when `dir` has nothing — the same contract as
 // load_or_init_industry. Checking it every day is what made --load-dir runs stand still before
 // v0.6.6.0.
+using MT1Init = void (*)(float*, uint64_t);
+
 static void load_or_init_mt1_pool(const std::string& dir, const std::string& load_dir,
-                                  int ind_i, MT1PoolScratch& sc) {
+                                  int ind_i, MT1PoolScratch& sc,
+                                  const char* tag = "mt1", MT1Init init = mt1_init_weights) {
     int loaded = 0;
     for (int s = 0; s < MT1_POOL_SLOTS; s++) {
-        if (load_bin(mt1_pool_path(dir, ind_i, s), sc.slot(s), MT1NET_PARAMS) ||
+        if (load_bin(mt1_pool_path(dir, ind_i, s, tag), sc.slot(s), sc.n_params) ||
             (!load_dir.empty() &&
-             load_bin(mt1_pool_path(load_dir, ind_i, s), sc.slot(s), MT1NET_PARAMS))) {
+             load_bin(mt1_pool_path(load_dir, ind_i, s, tag), sc.slot(s), sc.n_params))) {
             loaded++;
         } else {
-            mt1_init_weights(sc.slot(s), 0xB1A5E0000000ULL ^ ((uint64_t)ind_i << 20) ^ (uint64_t)s);
+            init(sc.slot(s), 0xB1A5E0000000ULL ^ ((uint64_t)ind_i << 20) ^ (uint64_t)s
+                            ^ ((uint64_t)tag[0] << 40));
             mt1_slot_init(sc.meta[s], sc.next_lineage++);
         }
     }
     if (loaded == 0) {
-        log_msg("MT1 " + g_ind_names[ind_i] + ": random init (200 slots)");
+        log_msg(std::string(tag) + " " + g_ind_names[ind_i] + ": random init (200 slots, "
+                + std::to_string(sc.n_params) + " params)");
         return;
     }
     // Metadata is optional: weights without it are usable, they just start the registers empty,
     // which costs MT1_POOL_MIN_AGE days of maturity and nothing else.
-    FILE* f = fopen(mt1_meta_path(dir, ind_i).c_str(), "rb");
-    if (!f && !load_dir.empty()) f = fopen(mt1_meta_path(load_dir, ind_i).c_str(), "rb");
+    FILE* f = fopen(mt1_meta_path(dir, ind_i, tag).c_str(), "rb");
+    if (!f && !load_dir.empty()) f = fopen(mt1_meta_path(load_dir, ind_i, tag).c_str(), "rb");
     if (!f) { for (int s = 0; s < MT1_POOL_SLOTS; s++) mt1_slot_init(sc.meta[s], sc.next_lineage++); return; }
     uint32_t hdr[4] = {0,0,0,0};
     bool ok = fread(hdr, sizeof(uint32_t), 4, f) == 4
@@ -3106,7 +3154,7 @@ static void load_or_init_mt1_pool(const std::string& dir, const std::string& loa
         }
         fread(sc.actual_buf, sizeof(float), MT1_BASELINE_DAYS, f);
     } else {
-        log_msg("MT1 " + g_ind_names[ind_i] + ": metadata sidecar rejected, registers reset");
+        log_msg(std::string(tag) + " " + g_ind_names[ind_i] + ": metadata sidecar rejected, registers reset");
         for (int s = 0; s < MT1_POOL_SLOTS; s++) mt1_slot_init(sc.meta[s], sc.next_lineage++);
     }
     fclose(f);
@@ -3219,6 +3267,74 @@ struct MTLogRecord {
 static_assert(sizeof(MTLogRecord) == 904,
               "MTLogRecord must be 904 bytes — read_mt_log.py and plot_training.py parse by size");
 
+// Build MT1CNet's 146-wide input for one industry: everything available at TODAY's close and
+// nothing before it. Mirrors the CN_* field offsets in mt1_pool.h — a drift here shifts every
+// symbol's block and still produces a number, so the offsets are named, not literal.
+//
+// Volume is deliberately absent: with no history there is no norm to read a raw share count
+// against. Holdings and cash are the PRE-trade reference book, because today's orders do not fill
+// until tomorrow — what is held at today's close is what we had this morning.
+// Sanitise and bound. StockNN's raw head is ReLU on the quantities and saturating on the price
+// fractions, so out48 carries values up to ~1e10 and is NON-FINITE for a large share of
+// symbol-days. The fill path hides both: min(buy_qty, affordable) clamps the size, and
+// `buy_qty > 1e-6f && buy_price > 0.f` silently drops NaN because every comparison against it is
+// false. As a FEATURE neither is acceptable — one non-finite input poisons the whole forward pass,
+// and a 1e10 input swamps every other column.
+static inline float cn_ok(float v, float fallback = 0.f) {
+    return std::isfinite(v) ? v : fallback;
+}
+static inline float cn_clamp(float v, float lo, float hi) {
+    v = cn_ok(v);
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static void build_mt1c_input(const OHLCV* day_sym, const IndResult& ir, float* out /*MT1C_IN*/) {
+    for (int j = 0; j < MT1C_SYMS; j++) {
+        float* f = out + j * MT1C_PER_SYM;
+        const OHLCV& b = day_sym[j];
+        const bool ok = b.valid && b.high > b.low;
+        f[CN_OPEN]  = ok ? b.open  : 0.f;
+        f[CN_HIGH]  = ok ? b.high  : 0.f;
+        f[CN_LOW]   = ok ? b.low   : 0.f;
+        f[CN_CLOSE] = ok ? b.close : 0.f;
+        f[CN_CPOS]  = ok ? stock_close_pos(b.open, b.high, b.low, b.close) : 0.f;
+        f[CN_CWAP]  = ok ? stock_close_vs_wap(b.open, b.high, b.low, b.close) : 0.f;
+        // (H-L)/A — the range as a fraction of the weighted average price. close_pos and
+        // close_vs_wap share a numerator and differ only in denominator, so their RATIO is
+        // exactly this; it is supplied directly rather than left for the net to divide.
+        const float A = ok ? (2.f * b.open + 3.f * b.close + b.high + b.low) / 7.f : 0.f;
+        f[CN_RANGE_A] = (ok && A > 1e-6f) ? (b.high - b.low) / A : 0.f;
+        f[CN_HOLD]  = cn_ok(ir.ref_hold[j]);
+        // Quantities as the FRACTION OF WHAT IS AVAILABLE — which is exactly how the fill path
+        // reads them: a buy is min(buy_qty, cash/price) and a sell is min(sell_qty, holdings).
+        // The raw head is ReLU and unbounded (~121x the book at the median, 3e7x at the extreme)
+        // precisely because the clamp does the bounding, so the raw magnitude carries nothing.
+        // What carries information is how much of the available funds / of the position it wants
+        // to use, which lands naturally in [0, 1]. Zero when there is nothing to spend or sell.
+        // whole_shares() on both, because that is what would actually execute — Alpaca stop
+        // orders forbid fractional quantities, so the fill path floors every amount and a
+        // fractional intent would describe a trade that cannot be placed. It matters most where
+        // the floor bites: a small cash balance against a high price rounds to zero shares, which
+        // is real information about whether the model can act at all.
+        const float affordable = (ok && b.close > 1e-6f)
+                               ? whole_shares(cn_ok(ir.ref_cash_v) / b.close) : 0.f;
+        f[CN_BQTY]  = (affordable > 1e-9f)
+                      ? cn_clamp(whole_shares(fminf(cn_ok(ir.si_bqty[j]), affordable)) / affordable,
+                                 0.f, 1.f)
+                      : 0.f;
+        const float pos = whole_shares(cn_ok(ir.ref_hold[j]));
+        f[CN_SQTY]  = (pos > 1e-9f)
+                      ? cn_clamp(whole_shares(fminf(cn_ok(ir.si_sqty[j]), pos)) / pos, 0.f, 1.f)
+                      : 0.f;
+        // Price fractions are meant to index into today's range; clamp to it. 0.5 is the neutral
+        // fallback (mid-range) so a non-finite output reads as "no opinion" rather than "at the low".
+        f[CN_BFRAC] = cn_clamp(cn_ok(ir.si_bfrac[j], 0.5f), 0.f, 1.f);
+        f[CN_SFRAC] = cn_clamp(cn_ok(ir.si_sfrac[j], 0.5f), 0.f, 1.f);
+    }
+    out[CN_CASH] = cn_ok(ir.ref_cash_v) / ((ir.book_prev > 1.f) ? ir.book_prev : 1.f);
+    out[CN_BOOK] = cn_ok(ir.book_prev) / (float)IND_STARTING_CASH;
+}
+
 // ── MT1 dataset log ──────────────────────────────────────────────────────────────
 //
 // Everything an offline fit needs, and nothing that depends on a choice we have not made yet:
@@ -3233,7 +3349,7 @@ static_assert(sizeof(MTLogRecord) == 904,
 // curve. The identity is also a free self-check: book_now - book_prev must equal mkt_move +
 // trade_delta to floating-point tolerance on every row.
 static constexpr uint32_t DS_LOG_MAGIC   = 0x4D543144u;   // "MT1D"
-static constexpr uint32_t DS_LOG_VERSION = 2u;   // v2: + slot-0 order intent
+static constexpr uint32_t DS_LOG_VERSION = 3u;   // v3: + MT1CNet 146-wide input
 static constexpr int      DS_FEAT        = 74;            // per industry, = MT1Net's input width
 
 struct DSLogRecord {
@@ -3253,8 +3369,16 @@ struct DSLogRecord {
     float    oi_buy_disp[N_IND];       // sd of buy_price_frac across ordering symbols
     float    oi_buy_val[N_IND];        // intended buy, dollars at today's close
     float    oi_sell_val[N_IND];
+    // ── v3: the competitor's whole input, so the two FEATURE SETS can be compared offline under
+    //    one walk-forward protocol with the same controls, without another run.
+    float    cfeat[N_IND][MT1C_IN];
+    // Both pools' deployed call and its score, on the same day against the same target, so the
+    // comparison is PAIRED in one place rather than joined across two files.
+    float    m_pred[N_IND],  m_score[N_IND];    // MT1Net   (74 trailing features)
+    float    c_pred[N_IND],  c_score[N_IND];    // MT1CNet  (146 present-day + intent)
 };
-static_assert(sizeof(DSLogRecord) == 8 + 4 * (DS_FEAT * N_IND + 11 * N_IND),
+static_assert(sizeof(DSLogRecord) == 8 + 4 * (DS_FEAT * N_IND + 11 * N_IND + MT1C_IN * N_IND
+                                              + 4 * N_IND),
               "DSLogRecord packing drifted — the offline reader parses this by size");
 
 static bool write_ds_log_header(FILE* f) {
@@ -3883,7 +4007,11 @@ int main(int argc, char* argv[]) {
     // Allocate state on heap
     auto ind_states   = std::make_unique<IndustryState[]>(N_IND);
     auto mst          = std::make_unique<MasterState>();   // portfolio state reused by MT2
-    auto mt1_scratches = std::make_unique<MT1PoolScratch[]>(N_IND);   // 12 × ~272 KB ≈ 3.3 MB
+    auto mt1_scratches = std::make_unique<MT1PoolScratch[]>(N_IND);   // 12 × ~2.8 MB
+    // The competitor: same pool, same lifecycle, same score, same target — only the network and
+    // its inputs differ, so a difference in outcome is a difference in FEATURE SET.
+    auto mt1c_scratches = std::make_unique<MT1PoolScratch[]>(N_IND);
+    for (int i = 0; i < N_IND; i++) mt1c_scratches[i].alloc(MT1CNET_PARAMS);
     auto mt2_scratch  = std::make_unique<MT2Scratch>();            // ~5.5 MB
 
     // Open CSV log (goes to log_dir, not output_dir)
@@ -4012,8 +4140,11 @@ int main(int argc, char* argv[]) {
             for (int s = 1; s < N_SLOTS; s++) ind_states[i].portfolios[s] = ind_states[i].portfolios[0];
         }
         // Load MT1 head+tail pools (heads/tails redesign) and MT2 once at pass start
-        for (int i = 0; i < N_IND; i++)
+        for (int i = 0; i < N_IND; i++) {
             load_or_init_mt1_pool(output_dir, load_dir, i, mt1_scratches[i]);
+            load_or_init_mt1_pool(output_dir, load_dir, i, mt1c_scratches[i],
+                                  "mt1c", mt1c_init_weights);
+        }
         load_or_init_mt2(output_dir, load_dir, *mt2_scratch);
         // Init MT2 portfolio state
         mst->portfolios[0].cash = MST_STARTING_CASH;
@@ -4052,6 +4183,10 @@ int main(int argc, char* argv[]) {
         static float blk_mkt_ret_c[MT1_DAYS][N_IND];
         static float blk_mkt_val_c[MT1_DAYS][N_IND];
         static IndResult blk_results[MT1_DAYS][N_IND];
+        // Today's bars, for MT1CNet's input. Cached rather than rebuilt because process_block
+        // runs after the day loop has moved on, and the competitor's whole premise is that it
+        // sees TODAY and nothing else.
+        const DayData* blk_day[MT1_DAYS] = {};
         int blk_actual_day[MT1_DAYS];
 
         auto process_block = [&](int blk_len) {
@@ -4063,7 +4198,9 @@ int main(int argc, char* argv[]) {
             //    gone with the design that needed them.
             MT1DayResult blk_mt1_res[N_IND];
             static MT1DayResult mt1_day_res[N_IND][MT1_DAYS];
+            static MT1DayResult mt1c_day_res[N_IND][MT1_DAYS];
             memset(mt1_day_res, 0, sizeof(mt1_day_res));
+            memset(mt1c_day_res, 0, sizeof(mt1c_day_res));
             // 2. MT2 M phase: replay block days with the post-block composed MT1 (head0+tail0).
             //    MT2 is now GRADED/TRAINED on the deployed slot-0 StockNN portfolio delta
             //    (perf_pf = slot0_score/baseline − 1) — the quantity that actually earns — instead
@@ -4095,6 +4232,19 @@ int main(int argc, char* argv[]) {
                     mt1_day_res[i][d] = dr;
                     blk_mt1_res[i]    = dr;
                     in12[i]           = dr.pred0;
+
+                    // Competitor, on the same day against the same target. Its prediction does
+                    // NOT feed MT2 — it is scored and logged only, so the two pools cannot
+                    // interfere and MT2's input is unchanged from the MT1-only run.
+                    if (blk_day[d]) {
+                        float cin[MT1C_IN];
+                        build_mt1c_input(blk_day[d]->sym[i], ir, cin);
+                        MT1DayResult cr = mt1_step_day(i, mt1c_scratches[i], cin, actual,
+                                                       blk_actual_day[d] >= MT1_START_DAY,
+                                                       blk_actual_day[d], cur_mt1_sigma,
+                                                       mt1cnet_forward);
+                        mt1c_day_res[i][d] = cr;
+                    }
                 }
                 if (blk_actual_day[d] >= MASTER_START_DAY) {
                     // Deployed slot-0 portfolio return (training target) + market return (diagnostic).
@@ -4142,6 +4292,12 @@ int main(int argc, char* argv[]) {
                         ds.oi_buy_disp[i]  = ir.oi_buy_disp;
                         ds.oi_buy_val[i]   = ir.oi_buy_val;
                         ds.oi_sell_val[i]  = ir.oi_sell_val;
+                        if (blk_day[d])
+                            build_mt1c_input(blk_day[d]->sym[i], ir, ds.cfeat[i]);
+                        ds.m_pred[i]  = mt1_day_res[i][d].pred0;
+                        ds.m_score[i] = mt1_day_res[i][d].score0;
+                        ds.c_pred[i]  = mt1c_day_res[i][d].pred0;
+                        ds.c_score[i] = mt1c_day_res[i][d].score0;
                     }
                     write_ds_log_record(ds_log, ds);
                 }
@@ -4188,7 +4344,10 @@ int main(int argc, char* argv[]) {
                 }
             }
             // 5. Save (per block ≈ 25 days). Always — under --no-save output_dir is the scratch.
-            for (int i = 0; i < N_IND; i++) save_mt1_pool(output_dir, i, mt1_scratches[i]);
+            for (int i = 0; i < N_IND; i++) {
+                save_mt1_pool(output_dir, i, mt1_scratches[i]);
+                save_mt1_pool(output_dir, i, mt1c_scratches[i], "mt1c");
+            }
             save_mt2_elites(output_dir, *mt2_scratch);
         };
 
@@ -4335,6 +4494,7 @@ int main(int argc, char* argv[]) {
             memcpy(blk_mkt_ret_c[0], mkt_ret,       sizeof(mkt_ret));
             memcpy(blk_mkt_val_c[0], today_mkt_val, sizeof(today_mkt_val));
             memcpy(blk_perf[0],      fwd_ret,       sizeof(fwd_ret));   // MT2 market diagnostic only
+            blk_day[0]        = day_ptr;
             blk_actual_day[0] = actual_day;
             process_block(1);
         }
@@ -4342,8 +4502,10 @@ int main(int argc, char* argv[]) {
         // Save MT1/MT2 after each pass (industry elites already saved by step_industry)
         {
             log_msg("Pass " + std::to_string(pass+1) + " complete — saving MT1/MT2 elites");
-            for (int i = 0; i < N_IND; i++)
+            for (int i = 0; i < N_IND; i++) {
                 save_mt1_pool(output_dir, i, mt1_scratches[i]);
+                save_mt1_pool(output_dir, i, mt1c_scratches[i], "mt1c");
+            }
             save_mt2_elites(output_dir, *mt2_scratch);
 
             // Judge this pass against the standing champion and seed the next one. Skipped in

@@ -37,11 +37,14 @@ class TestLayoutMatchesTheWriter:
         assert _cpp_const('DS_FEAT') == D.DS_FEAT
 
     def test_record_size_matches_the_static_assert(self):
-        m = re.search(r'sizeof\(DSLogRecord\) == 8 \+ 4 \* \(DS_FEAT \* N_IND \+ (\d+) \* N_IND\)', CPP)
+        m = re.search(r'sizeof\(DSLogRecord\) == 8 \+ 4 \* \(DS_FEAT \* N_IND '
+                      r'\+ (\d+) \* N_IND \+ MT1C_IN \* N_IND\s*\+ (\d+) \* N_IND\)', CPP)
         assert m, 'DSLogRecord static_assert not found — did the struct move?'
         n_comp = int(m.group(1))
         assert n_comp == len(D.COMPONENTS), 'C++ writes a different number of component arrays'
-        assert D.RECORD_SIZE == 8 + 4 * (D.DS_FEAT * D.N_IND + n_comp * D.N_IND)
+        assert int(m.group(2)) == len(D.PAIRED), 'paired prediction/score count differs'
+        assert D.RECORD_SIZE == 8 + 4 * (D.DS_FEAT * D.N_IND + n_comp * D.N_IND
+                                         + D.CFEAT * D.N_IND + len(D.PAIRED) * D.N_IND)
 
     def test_feature_width_is_mt1nets_input(self):
         """74 is not a free number: it is the slice mt1_step_day is handed. If MT1Net's input
@@ -70,6 +73,8 @@ def _synth(n_days=40, seed=0):
     book_now = (book_prev + mkt + trade).astype(np.float32)
     oi = {k: rng.normal(size=(n_days, D.N_IND)).astype(np.float32)
           for k in D.COMPONENTS[4:]}
+    cfeat = rng.normal(size=(n_days, D.N_IND, D.CFEAT)).astype(np.float32)
+    paired = {k: rng.normal(size=(n_days, D.N_IND)).astype(np.float32) for k in D.PAIRED}
     blob = struct.pack('<4I', D.DS_MAGIC, D.DS_VERSION, D.N_IND, D.DS_FEAT)
     for t in range(n_days):
         blob += struct.pack('<II', 0, 25 + t)
@@ -77,8 +82,13 @@ def _synth(n_days=40, seed=0):
         blob += mkt[t].tobytes() + trade[t].tobytes()
         for k in D.COMPONENTS[4:]:
             blob += oi[k][t].tobytes()
-    want = dict(feat=feat, book_prev=book_prev, book_now=book_now, mkt=mkt, trade=trade)
+        blob += cfeat[t].tobytes()
+        for k in D.PAIRED:
+            blob += paired[k][t].tobytes()
+    want = dict(feat=feat, book_prev=book_prev, book_now=book_now, mkt=mkt, trade=trade,
+                cfeat=cfeat)
     want.update(oi)
+    want.update(paired)
     return blob, want
 
 
@@ -295,3 +305,137 @@ class TestOrderIntentIsCausal:
         p.write_bytes(struct.pack('<4I', D.DS_MAGIC, 1, D.N_IND, D.DS_FEAT) + b'\x00' * 3752)
         with pytest.raises(SystemExit):
             D.parse(p)
+
+
+
+class TestCompetitorInput:
+    """cfeat is MT1CNet's whole input: today only, no history, 12 symbols x 12 fields + 2.
+
+    The layout is positional on both sides. An off-by-one in the builder shifts every symbol's
+    block and still yields a number — which, since this model exists to be COMPARED against
+    MT1Net, would read as a result rather than a bug.
+    """
+
+    def test_width_matches_the_model(self):
+        from models import MT1CNet
+        assert D.CFEAT == MT1CNet.N_IN == 146
+        assert D.CN_SYMS * D.CN_PER_SYM + 2 == D.CFEAT
+
+    def test_field_names_match_the_cpp_offsets(self):
+        hdr = (REPO / 'mt1_pool.h').read_text()
+        blk = hdr[hdr.index('static constexpr int CN_OPEN'):hdr.index('static inline float mt1cnet_forward')]
+        order = re.findall(r'CN_(\w+)\s*=\s*(\d+)', blk)
+        per_sym = [(n, int(v)) for n, v in order if int(v) < D.CN_PER_SYM
+                   and n not in ('SYMS', 'PER_SYM', 'IN')]
+        per_sym.sort(key=lambda kv: kv[1])
+        assert len(per_sym) == D.CN_PER_SYM, f'expected 12 per-symbol fields, got {per_sym}'
+        assert [v for _, v in per_sym] == list(range(D.CN_PER_SYM)), 'per-symbol offsets have a gap'
+
+    def test_cash_and_book_sit_after_every_symbol(self):
+        assert D.CN_CASH == 144 and D.CN_BOOK == 145
+
+    def test_it_round_trips(self, tmp_path):
+        blob, want = _synth()
+        p = tmp_path / 'ds.bin'
+        p.write_bytes(blob)
+        ds = D.parse(p)
+        assert ds['cfeat'].shape == (40, D.N_IND, D.CFEAT)
+        assert np.allclose(ds['cfeat'], want['cfeat'])
+
+    def test_industry_grouping_survives(self, tmp_path):
+        blob, want = _synth()
+        p = tmp_path / 'ds.bin'
+        p.write_bytes(blob)
+        ds = D.parse(p)
+        for i in range(D.N_IND):
+            assert np.allclose(ds['cfeat'][:, i, :], want['cfeat'][:, i, :])
+
+    def test_builder_reads_only_todays_bar(self):
+        """The competitor's premise. `day_sym` is today; `fill_sym` is tomorrow."""
+        body = CPP[CPP.index('static void build_mt1c_input'):
+                   CPP.index('// ── MT1 dataset log ─')]
+        body = re.sub(r'//[^\n]*', '', body)
+        for forbidden in ('fill_sym', 'nd_open', 'nd_low', 'nd_high', 'fill_price'):
+            assert forbidden not in body, f'competitor input reads {forbidden} — look-ahead'
+
+    def test_builder_excludes_volume(self):
+        body = re.sub(r'//[^\n]*', '',
+                      CPP[CPP.index('static void build_mt1c_input'):
+                          CPP.index('// ── MT1 dataset log ─')])
+        assert '.volume' not in body and 'CN_VOL' not in body
+
+    def test_holdings_are_pre_trade(self):
+        """At today's close we hold what we held this morning — today's orders fill tomorrow."""
+        body = CPP[CPP.index('static void build_mt1c_input'):
+                   CPP.index('// ── MT1 dataset log ─')]
+        assert 'ir.ref_hold[j]' in body, 'must use the PRE-trade reference holdings'
+        assert 'ir.hold[j]' not in body, 'ir.hold is POST-trade — those orders have not filled yet'
+
+
+    def test_both_pools_are_logged_paired(self, tmp_path):
+        """MT1Net's and MT1CNet's deployed call and score land on the same row. Joining them
+        across two files would invite an off-by-one that makes one pool look better."""
+        blob, want = _synth()
+        p = tmp_path / 'ds.bin'
+        p.write_bytes(blob)
+        ds = D.parse(p)
+        for k in D.PAIRED:
+            assert np.allclose(ds[k], want[k]), f'{k} did not round-trip'
+
+    def test_the_competitor_does_not_feed_mt2(self):
+        """Its prediction is scored and logged only. If it reached in12 the two pools would
+        interfere and MT2's input would differ from the MT1-only run, so neither could be
+        compared against anything."""
+        body = CPP[CPP.index('MT1DayResult cr = mt1_step_day'):]
+        body = body[:body.index('mt1c_day_res[i][d] = cr;') + 40]
+        assert 'in12' not in body, 'the competitor is feeding MT2'
+
+    def test_both_pools_share_one_step_function(self):
+        """Same selection, lifecycle and scoring — only the network and inputs differ, or the
+        comparison measures the machinery instead of the feature set."""
+        assert CPP.count('mt1_step_day(i, mt1_scratches[i]') == 1
+        assert CPP.count('mt1_step_day(i, mt1c_scratches[i]') == 1
+
+
+    def test_builder_sanitises_non_finite_raw_outputs(self):
+        """StockNN's raw head is non-finite for a large share of symbol-days — the fill path hides
+        it because every comparison against NaN is false. One NaN input poisons an entire forward
+        pass, so the builder must not pass any through."""
+        body = CPP[CPP.index('static void build_mt1c_input'):
+                   CPP.index('// ── MT1 dataset log ─')]
+        assert 'cn_ok(' in body and 'cn_clamp(' in body
+        for raw in ('ir.si_bqty[j];', 'ir.si_sqty[j];', 'ir.si_bfrac[j];', 'ir.si_sfrac[j];'):
+            assert raw not in body, f'{raw} reaches the input unsanitised'
+
+    def test_quantities_are_bounded_intent_not_raw_share_counts(self):
+        """Raw buy_qty runs to ~1e10 and would swamp every other column."""
+        body = CPP[CPP.index('static void build_mt1c_input'):
+                   CPP.index('// ── MT1 dataset log ─')]
+        # The fraction of what is AVAILABLE, matching how the fill path clamps them: a buy is
+        # min(buy_qty, cash/price), a sell is min(sell_qty, holdings). The raw head is unbounded
+        # because the clamp does the bounding, so raw magnitude carries nothing.
+        assert 'affordable' in body and 'fminf(cn_ok(ir.si_bqty[j]), affordable)' in body
+        assert 'fminf(cn_ok(ir.si_sqty[j]), pos)' in body
+        # whole shares, as the fill path does: Alpaca stop orders forbid fractional
+        # quantities, so a fractional intent describes a trade that cannot be placed.
+        assert body.count('whole_shares(') >= 4, 'intent must be floored to whole shares'
+
+    def test_aggregates_reject_non_finite_limits(self):
+        blk = CPP[CPP.index("Record the deployed model's INTENT"):]
+        blk = blk[:blk.index('slot_scores[slot]')]
+        assert 'std::isfinite(buy_price)' in blk
+        assert 'std::isfinite(sell_all_price)' in blk
+
+
+    def test_intent_quantities_land_in_zero_one(self):
+        """Fractions of available funds / of the position. Anything outside [0,1] means the
+        denominator is not what the fill path uses."""
+        body = CPP[CPP.index('static void build_mt1c_input'):
+                   CPP.index('// ── MT1 dataset log ─')]
+        assert 'whole_shares(fminf(cn_ok(ir.si_bqty[j]), affordable)) / affordable' in body
+        assert 'whole_shares(fminf(cn_ok(ir.si_sqty[j]), pos)) / pos' in body
+
+    def test_intent_is_zero_when_there_is_nothing_to_spend_or_sell(self):
+        body = CPP[CPP.index('static void build_mt1c_input'):
+                   CPP.index('// ── MT1 dataset log ─')]
+        assert '(affordable > 1e-9f)' in body and '(pos > 1e-9f)' in body
