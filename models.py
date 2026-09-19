@@ -318,18 +318,22 @@ class MT2INet(nn.Module):
     then arithmetic — sort the 12 outputs and hand them to tiers_to_alloc — which is the half of
     the job that never needed a network.
 
-    Sized so samples/param (0.51) is comparable to the MT1 stack's 0.354, so a loss cannot be
-    blamed on being starved of capacity relative to data.
+    Sized by MEMORY, not by preference. 888 inputs make the first layer dominate, and at 32 wide
+    the pool wanted 278 MB across 12 industries — which pushed a 1.9 GB box into swap and more
+    than doubled the trainer's wall time (32 -> 80 s/day) with 936 MB paged out. At 16 wide it is
+    138 MB and fits. samples/param is 1.03 against the MT1 stack's 0.354, so a loss still cannot
+    be blamed on capacity relative to data; the honest caveat is the 16-wide bottleneck on 888
+    inputs, which is a real constraint on how much of the cross-section it can carry.
     """
 
     N_IN = 888
 
     def __init__(self):
         super().__init__()
-        self.l1 = nn.Linear(self.N_IN, 32)
-        self.l2 = nn.Linear(32, 12)
-        self.l3 = nn.Linear(12, 6)
-        self.l4 = nn.Linear(6, 1)
+        self.l1 = nn.Linear(self.N_IN, 16)
+        self.l2 = nn.Linear(16, 8)
+        self.l3 = nn.Linear(8, 4)
+        self.l4 = nn.Linear(4, 1)
 
     def forward(self, x):
         x = F.relu(self.l1(x))
@@ -339,9 +343,9 @@ class MT2INet(nn.Module):
 
 
 MT2INET_LAYER_DEFS = [
-    ('l1', 32, MT2INet.N_IN), ('l2', 12, 32), ('l3', 6, 12), ('l4', 1, 6),
+    ('l1', 16, MT2INet.N_IN), ('l2', 8, 16), ('l3', 4, 8), ('l4', 1, 4),
 ]
-MT2INET_PARAMS = sum(o * i + o for _, o, i in MT2INET_LAYER_DEFS)   # 28,929
+MT2INET_PARAMS = sum(o * i + o for _, o, i in MT2INET_LAYER_DEFS)   # 14,401
 
 
 class MT2NN(nn.Module):
