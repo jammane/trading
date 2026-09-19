@@ -10,6 +10,14 @@ Each record is one training day and carries, per industry:
     mkt_move      baseline − book_prev    prices moved, holdings fixed
     trade_delta   slot0_score − baseline  holdings moved, prices fixed
 
+  and, from v2, the deployed model's ORDER INTENT — what it decided to do before anything filled:
+
+    oi_n_buy      symbols carrying a buy order (0..12);  oi_n_sell likewise
+    oi_buy_aggr   mean (buy limit − close_t)/span_t; > 0 = limit above today's close
+    oi_sell_aggr  same for the sell_all limit
+    oi_buy_disp   sd of buy_price_frac across ordering symbols
+    oi_buy_val    intended buy in dollars at today's close;  oi_sell_val likewise
+
 book P&L = book_now − book_prev = mkt_move + trade_delta, exactly. `verify_identity` checks that
 on every row; a failure means the three marks in step_industry have drifted apart.
 
@@ -28,15 +36,21 @@ import numpy as np
 
 HEADER_SIZE  = 16
 DS_MAGIC     = 0x4D543144        # "MT1D" — must match DS_LOG_MAGIC in training_v4.cpp
-DS_VERSION   = 1
+DS_VERSION   = 2
 N_IND        = 12
 DS_FEAT      = 74
 
-RECORD_FMT  = '<II' + 'f' * (DS_FEAT * N_IND) + 'f' * (4 * N_IND)
-RECORD_SIZE = struct.calcsize(RECORD_FMT)
-assert RECORD_SIZE == 3752, f'dataset record must be 3752 bytes, got {RECORD_SIZE}'
+COMPONENTS = ('book_prev', 'book_now', 'mkt_move', 'trade_delta',
+              # v2: slot-0 order INTENT. Causal — limit prices are anchored to TODAY's bar and
+              # the quantities come off StockNN's forward pass on today's data. Contrast
+              # buy_exec/sell_exec, which count what FILLED and are decided by the NEXT day's
+              # bar; those are look-ahead and do not exist yet at production decision time.
+              'oi_n_buy', 'oi_n_sell', 'oi_buy_aggr', 'oi_sell_aggr',
+              'oi_buy_disp', 'oi_buy_val', 'oi_sell_val')
 
-COMPONENTS = ('book_prev', 'book_now', 'mkt_move', 'trade_delta')
+RECORD_FMT  = '<II' + 'f' * (DS_FEAT * N_IND) + 'f' * (len(COMPONENTS) * N_IND)
+RECORD_SIZE = struct.calcsize(RECORD_FMT)
+assert RECORD_SIZE == 4088, f'dataset record must be 4088 bytes, got {RECORD_SIZE}'
 
 
 def parse(path):
@@ -141,6 +155,9 @@ def main():
                      ('trade delta', ds['trade_delta'])):
         print(f'{label:<14} {v.mean():>+11.2f} {v.std():>9.0f} '
               f'{np.mean(np.abs(v)) / denom:>15.0%}')
+    print(f'\n{"order intent":<14} {"mean":>11} {"sd":>9}')
+    for k in COMPONENTS[4:]:
+        print(f'{k:<14} {ds[k].mean():>+11.3f} {ds[k].std():>9.3f}')
     print(f'\nfeatures: {ds["feat"].shape}  '
           f'finite {np.isfinite(ds["feat"]).mean():.2%}  '
           f'|x| p99 {np.percentile(np.abs(ds["feat"]), 99):.3g}')

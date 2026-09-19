@@ -68,12 +68,18 @@ def _synth(n_days=40, seed=0):
     mkt = rng.normal(0, 300, (n_days, D.N_IND)).astype(np.float32)
     trade = rng.normal(0, 80, (n_days, D.N_IND)).astype(np.float32)
     book_now = (book_prev + mkt + trade).astype(np.float32)
+    oi = {k: rng.normal(size=(n_days, D.N_IND)).astype(np.float32)
+          for k in D.COMPONENTS[4:]}
     blob = struct.pack('<4I', D.DS_MAGIC, D.DS_VERSION, D.N_IND, D.DS_FEAT)
     for t in range(n_days):
         blob += struct.pack('<II', 0, 25 + t)
         blob += feat[t].tobytes() + book_prev[t].tobytes() + book_now[t].tobytes()
         blob += mkt[t].tobytes() + trade[t].tobytes()
-    return blob, dict(feat=feat, book_prev=book_prev, book_now=book_now, mkt=mkt, trade=trade)
+        for k in D.COMPONENTS[4:]:
+            blob += oi[k][t].tobytes()
+    want = dict(feat=feat, book_prev=book_prev, book_now=book_now, mkt=mkt, trade=trade)
+    want.update(oi)
+    return blob, want
 
 
 class TestRoundTrip:
@@ -204,3 +210,88 @@ class TestForwardWindow:
 
     def test_a_horizon_longer_than_the_sample_is_all_nan(self, ds):
         assert np.all(np.isnan(D.forward_pnl(ds, 500)))
+
+
+
+class TestOrderIntentIsCausal:
+    """The reason order intent is logged and executed volume is not.
+
+    buy_exec/sell_exec count what actually FILLED, and a fill is decided by nd_open/nd_low/nd_high
+    — the NEXT day's bar. Using them as a feature is look-ahead, and in production they do not
+    exist yet: orders are placed after the allocation decision. Intent is anchored to today's bar
+    alone. These tests pin that distinction in the source, because it is invisible at the call site
+    and a future edit could silently move the accumulator below the fill logic.
+    """
+
+    @staticmethod
+    def _strip_comments(src):
+        """Comments describe the leak we are avoiding, so they mention the very tokens these
+        tests forbid. Check the CODE."""
+        return re.sub(r'//[^\n]*', '', src)
+
+    @staticmethod
+    def _intent_block():
+        """Exactly the `if (slot == 0) { ... }` body, by brace matching — a fixed-size slice
+        overruns into the fill logic and then trivially 'finds' nd_open there."""
+        i = CPP.index('if (slot == 0) {')
+        j = CPP.index('{', i)
+        depth = 0
+        for k in range(j, len(CPP)):
+            if CPP[k] == '{':
+                depth += 1
+            elif CPP[k] == '}':
+                depth -= 1
+                if depth == 0:
+                    return CPP[i:k + 1]
+        raise AssertionError('unbalanced braces in the intent block')
+
+    def test_intent_is_recorded_before_any_next_day_price_is_read(self):
+        fn = CPP[CPP.index('float out48[48];'):CPP.index('slot_scores[slot] = compute_value_ind')]
+        intent_at = fn.index("Record the deployed model's INTENT")
+        nd_at = fn.index('float nd_open')
+        assert intent_at < nd_at, \
+            'the intent accumulator sits BELOW the next-day price reads — it can now leak'
+
+    def test_intent_uses_no_next_day_quantity(self):
+        blk = self._strip_comments(self._intent_block())
+        for forbidden in ('nd_open', 'nd_low', 'nd_high', 'fill_sym', 'fill_price'):
+            assert forbidden not in blk, f'order intent reads {forbidden} — that is look-ahead'
+
+    def test_intent_is_slot_zero_only(self):
+        """Slot 0 is the deployed model and the only one production runs. Pooling 200 slots blurs
+        its conviction into the pool average, which is what made the executed-volume test
+        uninformative."""
+        assert 'if (slot == 0) {' in self._intent_block()
+
+    def test_limit_prices_are_anchored_to_todays_bar(self):
+        assert 'float buy_price      = low_t + buy_price_frac * span_t;' in CPP
+        assert 'float low_t  = day_sym[j].low;' in CPP, 'low_t must come from TODAY (day_sym)'
+
+    def test_executed_volume_is_not_in_the_record(self):
+        body = self._strip_comments(
+            CPP[CPP.index('struct DSLogRecord'):CPP.index('static bool write_ds_log_header')])
+        for forbidden in ('buy_exec', 'sell_exec'):
+            assert forbidden not in body, \
+                f'{forbidden} is executed volume — decided by the next day bar, never a feature'
+
+    def test_every_intent_field_reaches_the_record(self, tmp_path):
+        blob, want = _synth()
+        p = tmp_path / 'ds.bin'
+        p.write_bytes(blob)
+        ds = D.parse(p)
+        for k in D.COMPONENTS[4:]:
+            assert np.allclose(ds[k], want[k]), f'{k} did not round-trip'
+
+    def test_intent_does_not_disturb_the_decomposition(self, tmp_path):
+        blob, _ = _synth()
+        p = tmp_path / 'ds.bin'
+        p.write_bytes(blob)
+        assert D.verify_identity(D.parse(p))[0]
+
+    def test_a_v1_file_is_refused(self, tmp_path):
+        """v1 records are 3752 bytes against v2's 4088. Size-sniffing a v1 file as v2 would read
+        each row straddling the next, which produces plausible numbers and no error."""
+        p = tmp_path / 'old.bin'
+        p.write_bytes(struct.pack('<4I', D.DS_MAGIC, 1, D.N_IND, D.DS_FEAT) + b'\x00' * 3752)
+        with pytest.raises(SystemExit):
+            D.parse(p)

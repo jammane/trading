@@ -1109,6 +1109,29 @@ struct IndResult {
     // Only the trade delta was available before, and it is the component that cancels beta --
     // which is why the target built on it was zero-mean, fat-tailed and unpredictable.
     float book_prev;
+    // ── slot-0 ORDER INTENT ──────────────────────────────────────────────────
+    // What the DEPLOYED model decided to do, before any of it filled.
+    //
+    // CAUSAL, and the distinction matters: buy_exec/sell_exec count what actually FILLED, and a
+    // fill is decided by `nd_open/nd_low/nd_high` — the NEXT day's bar. Using executed volume as a
+    // feature is look-ahead, and in production it does not exist yet because orders are placed
+    // after the allocation decision. Intent is different: the limit prices are
+    // `low_t + frac * span_t`, anchored to TODAY's bar alone, and the quantities come straight off
+    // StockNN's forward pass on today's data.
+    //
+    // This is also the only thing available to MT1 that carries per-symbol information. The 74
+    // features are built from two scalar value curves; StockNN is a 928,825-parameter model that
+    // has already read all 12 symbols, so its order intent is a learned compression of exactly the
+    // data MT1 cannot see.
+    //
+    // The price fracs are additionally CAPITAL-INDEPENDENT — `buy_price_frac` is a raw network
+    // output scaled by today's range — so a production run can obtain them from a forward pass at
+    // any capital, before allocation, at no extra cost.
+    float oi_n_buy, oi_n_sell;        // symbols (of IND_SYMS) carrying a buy / sell order
+    float oi_buy_aggr, oi_sell_aggr;  // mean (limit − close_t)/span_t over ordering symbols;
+                                      // > 0 = limit above today's close (wants to fill now)
+    float oi_buy_disp;                // sd of buy_price_frac across ordering symbols
+    float oi_buy_val, oi_sell_val;    // intended buy / sell in dollars at today's close
     float baseline, slot0_score, best_delta;
     float top_hold, top_cash;
     int   new_streak;
@@ -1345,6 +1368,11 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             mut_seeds[i] = ((uint64_t)seed_rng.next() << 32) | seed_rng.next();
     }
 
+    // slot-0 order intent, accumulated on the slot == 0 iteration only
+    int   oi_nb = 0, oi_ns = 0;
+    double oi_ba = 0.0, oi_sa = 0.0, oi_bv = 0.0, oi_sv = 0.0;
+    double oi_bf = 0.0, oi_bf2 = 0.0;
+
     float out48[48];
     for (int slot = 0; slot < N_SLOTS; slot++) {
         Portfolio& port = state.portfolios[slot];
@@ -1379,6 +1407,25 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             float sell_all_price = low_t + sell_all_price_frac * span_t;
             float buy_price      = low_t + buy_price_frac * span_t;
             float stop_loss      = buy_price * 0.9f;
+
+            // Record the deployed model's INTENT before anything is matched against next-day
+            // prices. Deliberately placed here, above the fill logic, so it cannot pick up
+            // nd_open/nd_low/nd_high by accident.
+            if (slot == 0) {
+                const float close_t = day_sym[j].close;
+                if (buy_qty > 1e-6f && buy_price > 0.f) {
+                    oi_nb++;
+                    oi_ba  += (double)(buy_price - close_t) / span_t;
+                    oi_bv  += (double)buy_qty * close_t;
+                    oi_bf  += buy_price_frac;
+                    oi_bf2 += (double)buy_price_frac * buy_price_frac;
+                }
+                if (sell_qty > 1e-6f) {
+                    oi_ns++;
+                    oi_sa += (double)(sell_all_price - close_t) / span_t;
+                    oi_sv += (double)sell_qty * close_t;
+                }
+            }
 
             // Fill day data (next-day)
             float nd_open = fill_sym[j].valid ? fill_sym[j].open  : day_sym[j].close;
@@ -1662,7 +1709,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         // is added ahead of it, and only got caught here because the shift happened to narrow a
         // float into an int. book_prev == slot0_score on a reset day, so the day contributes a
         // book P&L of exactly 0 rather than a spurious jump to the reset level.
-        IndResult r{};
+        IndResult r{};          // value-initialised: order intent is all zero on a reset day
         r.book_prev      = baseline;
         r.baseline       = baseline;
         r.slot0_score    = baseline;
@@ -1932,6 +1979,15 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     }
 
     IndResult res;
+    res.oi_n_buy    = (float)oi_nb;
+    res.oi_n_sell   = (float)oi_ns;
+    res.oi_buy_aggr = oi_nb ? (float)(oi_ba / oi_nb) : 0.f;
+    res.oi_sell_aggr= oi_ns ? (float)(oi_sa / oi_ns) : 0.f;
+    // population sd of buy_price_frac; 0 with fewer than two orders, which is the honest value
+    res.oi_buy_disp = (oi_nb > 1)
+        ? (float)sqrt(std::max(0.0, oi_bf2 / oi_nb - (oi_bf / oi_nb) * (oi_bf / oi_nb))) : 0.f;
+    res.oi_buy_val  = (float)oi_bv;
+    res.oi_sell_val = (float)oi_sv;
     res.book_prev     = book_prev;
     res.baseline      = baseline;
     res.slot0_score   = slot_scores[0];
@@ -2204,12 +2260,31 @@ static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in7
     MT1DayResult r{};
     r.actual = actual;
 
-    // ── 1. SCORE ─────────────────────────────────────────────────────────────────
-    if (sc.has_pending && have_actual) {
+    // ── 1. PREDICT ───────────────────────────────────────────────────────────────
+    // in74 is built from the value curves BEFORE today's append, so it contains nothing after
+    // close(t). `actual` is the move from close(t) to close(t+1). Predicting one from the other is
+    // a genuine one-step-ahead forecast and leaks nothing.
+    //
+    // This used to score the PREVIOUS day's parked predictions first, on the reasoning that "a
+    // model should only be graded on a call it made before the outcome existed". That confused
+    // program order with INFORMATION order. The parked prediction knew only close(t-1) while
+    // `actual` spans close(t)..close(t+1) — two days out, with a full day's hole in between — so
+    // MT1 was solving a strictly harder problem than the one production asks. Out-of-sample is a
+    // property of what the model can see, not of the order the loop happens to run in.
+    for (int s = 0; s < MT1_POOL_SLOTS; s++)
+        sc.pending[s] = mt1_pred(mt1net_forward(sc.slot(s), in74, 0.f));
+    sc.has_pending = true;
+    sc.pending_day = actual_day;
+    // The deployed model's call, captured BEFORE selection can reorder the pool — this is the
+    // number that would actually have been handed to MT2 for today's allocation.
+    r.pred0 = sc.pending[sc.best_slot];
+
+    // ── 2. SCORE ─────────────────────────────────────────────────────────────────
+    if (have_actual) {
         const float base = sc.baseline();
         const float fl   = sc.floor_v();
-        // Both windows were filled from sessions strictly before the one being scored. This is
-        // the contract that the 10-day-forward target could not hold.
+        // Baseline and floor are built from sessions strictly before the one being scored:
+        // `actual` is pushed below, not above.
         assert(mt1_windows_are_causal(actual_day, sc.last_pushed_day, sc.last_pushed_day));
         r.baseline = base; r.floor_v = fl; r.scored = true;
         double sum = 0.0; float best = -1.f, worst = 2.f;
@@ -2225,10 +2300,10 @@ static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in7
         r.score_best = best;
         r.score_min  = worst;
         sc.has_pending = false;
+        sc.push_actual(actual, actual_day);
     }
-    if (have_actual) sc.push_actual(actual, actual_day);
 
-    // ── 2. EVOLVE ────────────────────────────────────────────────────────────────
+    // ── 3. EVOLVE ────────────────────────────────────────────────────────────────
     int order[MT1_POOL_SLOTS];
     mt1_rank(sc, order);
     int n_mature = 0;
@@ -2241,23 +2316,17 @@ static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in7
         const int n_cull  = (int)(MT1_POOL_CULL_PCT  * n_mature + 0.5f);
         const int n_elite = std::max(1, (int)(MT1_POOL_ELITE_PCT * n_mature));
 
-        // Parents: the top mature models whose lineage is not barred.
         int parents[MT1_POOL_SLOTS]; int n_par = 0;
         for (int k = 0; k < n_mature && n_par < n_elite; k++)
             if (!mt1_is_barred(sc, sc.meta[order[k]].lineage)) parents[n_par++] = order[k];
-        if (n_par == 0) parents[n_par++] = order[0];     // every lineage barred: breed anyway
+        if (n_par == 0) parents[n_par++] = order[0];
 
-        // Cull the worst mature models and refill flat round-robin from the parents. Flat, not
-        // the kChildren weighted table, which handed slot 0 sixteen of 180 children and drove the
-        // monoculture the lineage cap now also guards against.
         for (int c = 0; c < n_cull; c++) {
             const int victim = order[n_mature - 1 - c];
             if (victim == sc.best_slot) continue;
             const int par = parents[c % n_par];
             const uint64_t seed = (uint64_t)actual_day * 0x9E3779B97F4A7C15ULL
                                 ^ ((uint64_t)ind_i << 32) ^ ((uint64_t)victim * 2654435761ULL);
-            // Read the age BEFORE mt1_slot_init zeroes it — otherwise every retirement is
-            // recorded as age 0 and both the mean and the histogram stay empty for the whole run.
             const uint32_t age = sc.meta[victim].n_pred;
             mt1_mutate(sc.slot(par), sc.slot(victim), sigma, seed);
             mt1_slot_init(sc.meta[victim], sc.meta[par].lineage);
@@ -2270,15 +2339,10 @@ static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in7
     }
     sc.culled_today = r.culled;
     sc.births_today = r.births;
-
-    // ── 3. PREDICT ───────────────────────────────────────────────────────────────
-    for (int s = 0; s < MT1_POOL_SLOTS; s++)
-        sc.pending[s] = mt1_pred(mt1net_forward(sc.slot(s), in74, 0.f));
-    sc.has_pending = true;
-    sc.pending_day = actual_day;
-    r.pred0 = sc.pending[sc.best_slot];
     return r;
 }
+
+
 
 
 // ── MT1 composite blend-pool step ────────────────────────────────────────────────
@@ -3169,7 +3233,7 @@ static_assert(sizeof(MTLogRecord) == 904,
 // curve. The identity is also a free self-check: book_now - book_prev must equal mkt_move +
 // trade_delta to floating-point tolerance on every row.
 static constexpr uint32_t DS_LOG_MAGIC   = 0x4D543144u;   // "MT1D"
-static constexpr uint32_t DS_LOG_VERSION = 1u;
+static constexpr uint32_t DS_LOG_VERSION = 2u;   // v2: + slot-0 order intent
 static constexpr int      DS_FEAT        = 74;            // per industry, = MT1Net's input width
 
 struct DSLogRecord {
@@ -3179,8 +3243,18 @@ struct DSLogRecord {
     float    book_now[N_IND];          // book at the NEXT close, after them
     float    mkt_move[N_IND];          // baseline - book_prev : prices moved, holdings fixed
     float    trade_delta[N_IND];       // slot0_score - baseline : holdings moved, prices fixed
+    // ── v2: slot-0 order INTENT — see the IndResult comment for why this is causal and
+    //    buy_exec/sell_exec are not. These carry per-symbol information that the 74 features,
+    //    being built from two scalar value curves, provably cannot.
+    float    oi_n_buy[N_IND];          // symbols carrying a buy order (0..IND_SYMS)
+    float    oi_n_sell[N_IND];
+    float    oi_buy_aggr[N_IND];       // mean (buy limit - close_t)/span_t; >0 = wants to fill now
+    float    oi_sell_aggr[N_IND];
+    float    oi_buy_disp[N_IND];       // sd of buy_price_frac across ordering symbols
+    float    oi_buy_val[N_IND];        // intended buy, dollars at today's close
+    float    oi_sell_val[N_IND];
 };
-static_assert(sizeof(DSLogRecord) == 8 + 4 * (DS_FEAT * N_IND + 4 * N_IND),
+static_assert(sizeof(DSLogRecord) == 8 + 4 * (DS_FEAT * N_IND + 11 * N_IND),
               "DSLogRecord packing drifted — the offline reader parses this by size");
 
 static bool write_ds_log_header(FILE* f) {
@@ -4061,6 +4135,13 @@ int main(int argc, char* argv[]) {
                         ds.book_now[i]    = ir.slot0_score;
                         ds.mkt_move[i]    = ir.baseline    - ir.book_prev;
                         ds.trade_delta[i] = ir.slot0_score - ir.baseline;
+                        ds.oi_n_buy[i]     = ir.oi_n_buy;
+                        ds.oi_n_sell[i]    = ir.oi_n_sell;
+                        ds.oi_buy_aggr[i]  = ir.oi_buy_aggr;
+                        ds.oi_sell_aggr[i] = ir.oi_sell_aggr;
+                        ds.oi_buy_disp[i]  = ir.oi_buy_disp;
+                        ds.oi_buy_val[i]   = ir.oi_buy_val;
+                        ds.oi_sell_val[i]  = ir.oi_sell_val;
                     }
                     write_ds_log_record(ds_log, ds);
                 }
