@@ -36,6 +36,7 @@
 
 #include "mt1_pool.h"   // MT1Net layout/forward + pool scoring (shared with tests/test_mt1_pool.cpp)
 #include "pass_seeding.h"   // pass-boundary share + interleave (shared with tests/test_pass_seeding.cpp)
+#include "sort_util.h"      // small fixed-buffer index sort (shared with tests/test_sort_util.cpp)
 
 // Force OpenBLAS single-threaded: multi-threaded BLAS with N worker threads causes
 // 2×N threads competing for N CPUs, multiplying overhead 2-3× per forward pass.
@@ -470,14 +471,7 @@ static void stock_forward(const float* W, const float* hist15x60,
 
 // MasterNN forward — weights[] is MASTERNN_PARAMS floats, today444 is (1,444) flat vector.
 // Output out48: raw logits [12][4]; caller decodes tier via argmax over each group of 4.
-static void master_forward(const float* W, const float* today444, float* out48) {
-    float h1[444], h2[444], h3[312], h4[180];
-    sgemv_relu(W + MAST_FC1_W, W + MAST_FC1_B, today444, h1, 444, 444);
-    sgemv_relu(W + MAST_FC2_W, W + MAST_FC2_B, h1,       h2, 444, 444);
-    sgemv_relu(W + MAST_FC3_W, W + MAST_FC3_B, h2,       h3, 312, 444);
-    sgemv_relu(W + MAST_FC4_W, W + MAST_FC4_B, h3,       h4, 180, 312);
-    sgemv_only(W + MAST_OUT_W, W + MAST_OUT_B, h4,    out48,  48, 180);
-}
+// master_forward() removed in v0.8.1.10: dead since the 888-wide feature vector landed (-Wunused-function). MasterNN inference lives in production_v2.py, not the trainer.
 
 // Single LSTM time step (one layer). gates[4*hidden] is caller-provided scratch.
 static inline void lstm_step(const float* W_ih, const float* W_hh,
@@ -876,13 +870,7 @@ static void init_stock_weights(float* W, PCG32& rng) {
     kaiming_init(W + STOCK_OUT_W,    48, 111, rng);
 }
 
-static void init_master_weights(float* W, PCG32& rng) {
-    kaiming_init(W + MAST_FC1_W, 444, 444, rng);
-    kaiming_init(W + MAST_FC2_W, 444, 444, rng);
-    kaiming_init(W + MAST_FC3_W, 312, 444, rng);
-    kaiming_init(W + MAST_FC4_W, 180, 312, rng);
-    kaiming_init(W + MAST_OUT_W,  48, 180, rng);
-}
+// init_master_weights() removed in v0.8.1.10: its only caller was load_or_init_master(), also removed (-Wunused-function).
 
 static void init_mt2_weights(float* W, PCG32& rng) {
     kaiming_init(W + MT2_FC1_W, 36, 12, rng);
@@ -992,6 +980,8 @@ static long g_bad_bars = 0;
 // (int)NaN is UB and lands on INT32_MIN here. Belt-and-braces for anything that formats a
 // float as an int; the real fix is rejecting the bar above.
 static inline int safe_int(float v) { return std::isfinite(v) ? (int)v : 0; }
+
+// sort_index_prefix() lives in sort_util.h -- see there for why it is not std::sort.
 
 static float parse_float_after(const char* buf, const char* key, float def = 0.f) {
     const char* p = strstr(buf, key);
@@ -2449,8 +2439,8 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
         int pos_idx[N_IND]; int n_pos = 0;
         for (int i = 0; i < N_IND; i++)
             if (actual_perf[i] >= 0.f) pos_idx[n_pos++] = i;
-        std::sort(pos_idx, pos_idx + n_pos,
-                  [&actual_perf](int a, int b){ return actual_perf[a] < actual_perf[b]; });
+        sort_index_prefix(pos_idx, n_pos,
+                          [&actual_perf](int a, int b){ return actual_perf[a] < actual_perf[b]; });
         if (n_pos == 1) { opt_tier[pos_idx[0]] = 3; }
         else if (n_pos == 2) { opt_tier[pos_idx[0]] = 2; opt_tier[pos_idx[1]] = 3; }
         else {
@@ -2505,8 +2495,8 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
         for (int i = 0; i < N_IND; i++) if (tier[i] > 0) positives[n_pos++] = i;
         float alloc[N_IND] = {};
         if (n_pos > 0) {
-            std::sort(positives, positives + n_pos,
-                      [&tier](int a, int b){ return tier[a] < tier[b]; });
+            sort_index_prefix(positives, n_pos,
+                              [&tier](int a, int b){ return tier[a] < tier[b]; });
             float pool = port.cash;
             for (int i = 0; i < N_IND; i++) pool += port.holdings[i] * IND_UNIT_PRICE;
             if (n_pos == 1) {
@@ -2575,7 +2565,7 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
             for (int i = 0; i < N_IND; i++) out_tier[i] = 0;
             int pos_idx[N_IND]; int n_pos = 0;
             for (int i = 0; i < N_IND; i++) if (perf[i] >= 0.f) pos_idx[n_pos++] = i;
-            std::sort(pos_idx, pos_idx + n_pos, [&perf](int a, int b){ return perf[a] < perf[b]; });
+            sort_index_prefix(pos_idx, n_pos, [&perf](int a, int b){ return perf[a] < perf[b]; });
             if (n_pos == 1) { out_tier[pos_idx[0]] = 3; }
             else if (n_pos == 2) { out_tier[pos_idx[0]] = 2; out_tier[pos_idx[1]] = 3; }
             else if (n_pos > 0) {
@@ -2599,7 +2589,7 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
         auto build_ct = [&](const float* ord, int* ct) {
             for (int i = 0; i < N_IND; i++) ct[i] = 0;
             int idx[N_IND]; for (int i = 0; i < N_IND; i++) idx[i] = i;
-            std::sort(idx, idx + N_IND, [&ord](int a, int b){ return ord[a] > ord[b]; });
+            sort_index_prefix(idx, N_IND, [&ord](int a, int b){ return ord[a] > ord[b]; });
             int n0 = (int)lroundf(mean_t0); if (n0 < 0) n0 = 0; if (n0 > N_IND) n0 = N_IND;
             int n_pos = N_IND - n0;
             if (n_pos > 0) { int base = n_pos/3, rem = n_pos%3, n1 = base+(rem>=1?1:0), n2 = base+(rem>=2?1:0), n3 = n_pos-n1-n2;
@@ -3053,13 +3043,7 @@ static void pass_boundary(const std::string& out_dir, int pass_num,
     fs::remove_all(stage_dir, ec);
 }
 
-static void save_master_elites(const std::string& dir, const float* elite_buf) {
-    for (int slot = 0; slot < ELITE_POOL; slot++) {
-        std::string path = elite_path(dir, "master", slot);
-        if (!save_bin(path, elite_buf + (size_t)slot * MASTERNN_PARAMS, MASTERNN_PARAMS))
-            log_msg("WARNING: could not save " + path);
-    }
-}
+// save_master_elites() removed in v0.8.1.10: unreferenced (-Wunused-function).
 
 static void load_or_init_industry(const std::string& dir, const std::string& load_dir,
                                    int ind_i, float* elite_buf, int actual_day) {
@@ -3099,26 +3083,7 @@ static void load_or_init_industry(const std::string& dir, const std::string& loa
     }
 }
 
-static void load_or_init_master(const std::string& dir, const std::string& load_dir,
-                                 float* elite_buf) {
-    PCG32 rng; rng.seed(mix_seed(0xDEADBEEFCAFEBABEULL));
-    for (int slot = 0; slot < ELITE_POOL; slot++) {
-        float* e = elite_buf + (size_t)slot * MASTERNN_PARAMS;
-        bool loaded = false;
-        if (!load_dir.empty()) {
-            std::string p = elite_path(load_dir, "master", slot);
-            loaded = load_bin(p, e, MASTERNN_PARAMS);
-        }
-        if (!loaded) {
-            std::string p = elite_path(dir, "master", slot);
-            loaded = load_bin(p, e, MASTERNN_PARAMS);
-        }
-        if (!loaded) {
-            log_msg("[master  ]   Slot " + std::to_string(slot) + ": random init");
-            init_master_weights(e, rng);
-        }
-    }
-}
+// load_or_init_master() removed in v0.8.1.10: unreferenced (-Wunused-function).
 
 // ── MT1/MT2 persistence ──────────────────────────────────────────────────────────
 
@@ -3661,7 +3626,7 @@ static float drift_score_mt2_pts(const float* W, const float in12[N_IND], const 
     {
         int pos_idx[N_IND]; int n_pos = 0;
         for (int i = 0; i < N_IND; i++) if (actual_perf[i] >= 0.f) pos_idx[n_pos++] = i;
-        std::sort(pos_idx, pos_idx + n_pos, [&](int a, int b){ return actual_perf[a] < actual_perf[b]; });
+        sort_index_prefix(pos_idx, n_pos, [&](int a, int b){ return actual_perf[a] < actual_perf[b]; });
         if (n_pos == 1) { opt_tier[pos_idx[0]] = 3; }
         else if (n_pos == 2) { opt_tier[pos_idx[0]] = 2; opt_tier[pos_idx[1]] = 3; }
         else if (n_pos > 0) {

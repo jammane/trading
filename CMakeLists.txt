@@ -40,6 +40,14 @@ target_compile_options(test_pass_seeding_cpp PRIVATE -O2 -Wall -Wextra)
 target_link_libraries(test_pass_seeding_cpp m)
 add_test(NAME test_pass_seeding COMMAND test_pass_seeding_cpp)
 
+# sort_index_prefix() replaced std::sort at five sites to kill an -O3 -Warray-bounds false
+# positive. A hand-written sort now decides MT2 tier assignment, so it is checked against
+# std::sort over randomized inputs -- including the heavy-tie case that is MT2's normal input.
+add_executable(test_sort_util_cpp tests/test_sort_util.cpp)
+target_include_directories(test_sort_util_cpp PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_options(test_sort_util_cpp PRIVATE -Wall -Wextra)
+add_test(NAME test_sort_util COMMAND test_sort_util_cpp)
+
 # Floating-point guards must survive the optimiser. Built with the DIRECTORY's flags on
 # purpose -- no -O override that could mask a fast-math regression -- so dropping
 # -fno-finite-math-only breaks the build instead of silently voiding every isfinite() check.
