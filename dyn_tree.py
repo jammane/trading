@@ -171,11 +171,24 @@ class DynTree:
             self._decay(c, g)
 
 
-def run(pnl, half_life, window, judge, max_depth=5, min_obs=40):
+def run(pnl, half_life, window, judge, max_depth=5, min_obs=40, freeze=False):
+    """Populate the tree from the FULL history under the kernel; judge only the last `judge` days.
+
+    Every day from the start of the sample is fed in, subject to the memory kernel -- the 1y/2y
+    windows and the decays are what decide how much of that history still counts by the time
+    judging begins. Scoring starts only at T - judge, and each prediction for day t is made before
+    day t is observed, so nothing is judged in-sample.
+
+    `freeze` stops the tree updating once judging starts, which answers the other reading of
+    "populate from the full window, then judge": with it the last 50 days are scored against a
+    table that never saw any of them.
+    """
     T, N = pnl.shape
     tree = DynTree(max_depth, min_obs, half_life, window)
     hits, lls, depths, base = [], [], [], []
     start = T - judge
+    train_days = 0
+    root_at_start = None
     for t in range(1, T):
         obs = []
         for i in range(N):
@@ -185,6 +198,8 @@ def run(pnl, half_life, window, judge, max_depth=5, min_obs=40):
                 continue
             same = float(np.sign(y) == np.sign(ytd))
             if t >= start:
+                if root_at_start is None:
+                    root_at_start = tree.root.n
                 p, d = tree.predict(path)
                 call = np.sign(ytd) if p > 0.5 else -np.sign(ytd)
                 hits.append(float(call == np.sign(y)))
@@ -192,8 +207,12 @@ def run(pnl, half_life, window, judge, max_depth=5, min_obs=40):
                 depths.append(d)
                 base.append(float(y > 0))
             obs.append((path, same))
-        tree.observe(obs)
-    return (np.array(hits), np.array(lls), np.array(depths), np.array(base))
+        if t < start or not freeze:
+            tree.observe(obs)
+            if t < start:
+                train_days += 1
+    return (np.array(hits), np.array(lls), np.array(depths), np.array(base),
+            train_days, root_at_start or 0.0)
 
 
 def main():
@@ -202,6 +221,8 @@ def main():
     ap.add_argument('--burn-in', type=int, default=400)
     ap.add_argument('--judge', type=int, default=50, help='judge on the last N days only')
     ap.add_argument('--min-obs', type=int, default=40)
+    ap.add_argument('--freeze', action='store_true',
+                    help='stop updating the tree once judging begins')
     a = ap.parse_args()
 
     ds = D.read(a.dataset) if hasattr(D, 'read') else D.parse(a.dataset)
@@ -219,16 +240,19 @@ def main():
                ('never forget', 1e9, 0)]
     coin = -math.log(2)
     print(f'  {"kernel":<13} {"n":>6} {"hit rate":>10} {"vs always-up":>14} '
-          f'{"logL/obs":>10} {"vs coin":>10} {"mean depth":>11} {"max":>4}')
+          f'{"logL/obs":>10} {"vs coin":>10} {"mean depth":>11} {"max":>4} '
+          f'{"trained":>7} {"root n":>10}')
     rows = []
     for name, hl, win in kernels:
-        h, ll, dep, bs = run(P, hl, win, a.judge, min_obs=a.min_obs)
+        h, ll, dep, bs, td, rn = run(P, hl, win, a.judge, min_obs=a.min_obs,
+                                     freeze=a.freeze)
         if len(h) == 0:
             continue
-        rows.append((name, h, ll, dep, bs))
+        rows.append((name, h, ll, dep, bs, td, rn))
         print(f'  {name:<13} {len(h):>6} {100*h.mean():>9.2f}% '
               f'{100*(h.mean()-bs.mean()):>+13.2f}pp {ll.mean():>10.5f} '
-              f'{1000*(ll.mean()-coin):>+9.2f} {dep.mean():>11.2f} {int(dep.max()):>4}')
+              f'{1000*(ll.mean()-coin):>+9.2f} {dep.mean():>11.2f} {int(dep.max()):>4} '
+              f'{td:>7} {rn:>10.0f}')
 
     bs = rows[0][4]
     se = np.sqrt(0.25 / len(bs))
@@ -238,6 +262,9 @@ def main():
     print('  and the 12 industries move together (mean pairwise corr +0.26) so the effective')
     print(f'  sample is nearer {a.judge} than {len(bs)} -- SE ~{100*np.sqrt(0.25/a.judge):.1f}pp.')
     print(f'  Differences below roughly {2*100*np.sqrt(0.25/a.judge):.0f}pp are not resolvable here.')
+    print('\n  "trained" = days fed into the tree BEFORE the first judged prediction; "root n" =')
+    print('  effective observations surviving the memory kernel at that moment. Judging is on the')
+    print(f'  last {a.judge} days only, and every prediction is made before its own day is observed.')
 
 
 if __name__ == '__main__':

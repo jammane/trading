@@ -84,14 +84,14 @@ class TestAdaptiveDepth:
                     keep = rng.random() < 0.5
                 mag = 1.0 + rng.random()
                 v = mag * (1 if (x[t, i] > 0) == keep else -1)
-        h, ll, dep, base = DT.run(x, 1e9, 0, judge=1000, min_obs=40)
+        h, ll, dep, base, _td, _rn = DT.run(x, 1e9, 0, judge=1000, min_obs=40)
         assert dep.max() >= 2, 'tree never reached depth 2 on planted depth-2 structure'
         assert dep.mean() > 1.2, f'mean depth {dep.mean():.2f} -- barely using the structure'
 
     def test_it_stays_shallow_on_noise(self):
         rng = np.random.default_rng(1)
         x = rng.normal(0, 700, (3000, 8))
-        h, ll, dep, base = DT.run(x, 1e9, 0, judge=800, min_obs=40)
+        h, ll, dep, base, _td, _rn = DT.run(x, 1e9, 0, judge=800, min_obs=40)
         assert dep.mean() < 1.2, f'tree split on pure noise to mean depth {dep.mean():.2f}'
 
 
