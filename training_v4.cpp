@@ -37,6 +37,7 @@
 #include "mt1_pool.h"   // MT1Net layout/forward + pool scoring (shared with tests/test_mt1_pool.cpp)
 #include "pass_seeding.h"   // pass-boundary share + interleave (shared with tests/test_pass_seeding.cpp)
 #include "sort_util.h"      // small fixed-buffer index sort (shared with tests/test_sort_util.cpp)
+#include "bayes_online.h"   // online conditional models trained during the pass
 
 // Force OpenBLAS single-threaded: multi-threaded BLAS with N worker threads causes
 // 2×N threads competing for N CPUs, multiplying overhead 2-3× per forward pass.
@@ -245,6 +246,13 @@ static FILE* g_ctl_csv = nullptr;  // control_log.csv, long format, opened only 
 static FILE* g_hold_csv = nullptr; // holdings_log.csv: slot-0's composition, one row per industry-day
 
 static bool g_control_untrained = false;
+// Skip EVERY neural allocator for this run: MT1Net, MT1CNet, MT2INet and MT2 itself. Frees
+// ~369 MB of pools and scratch, and their forward and evolve passes, leaving StockNN plus the
+// online conditional models. MT2 goes with them because it consumes MT1's predictions as in12 --
+// running it against a dead MT1 would train it on twelve zeros and quietly corrupt its pool.
+// StockNN is untouched, so the P&L series the conditional models learn from is the same one a
+// normal run produces.
+static bool g_no_nn_race = false;
 static bool g_no_save = false;
 
 // ── Trading lock (v0.6.5.0) ───────────────────────────────────────────────────
@@ -1131,6 +1139,10 @@ struct IndResult {
                                       // > 0 = limit above today's close (wants to fill now)
     float oi_buy_disp;                // sd of buy_price_frac across ordering symbols
     float oi_buy_val, oi_sell_val;    // intended buy / sell in dollars at today's close
+    // Every scored elite's post-trade value at the next close, so the online conditional
+    // models can consume all of them rather than only the deployed slot. They all start
+    // from slot 0's portfolio, so they share the market move and differ only in trades.
+    float elite_score[ELITE_POOL];
     // Per-symbol slot-0 state and intent, for the MT1CNet competitor's 146-wide input. Holdings
     // and cash are the PRE-trade reference book — what is actually held at today's close, since
     // today's orders do not fill until tomorrow.
@@ -2024,6 +2036,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         ? (float)sqrt(std::max(0.0, oi_bf2 / oi_nb - (oi_bf / oi_nb) * (oi_bf / oi_nb))) : 0.f;
     res.oi_buy_val  = (float)oi_bv;
     res.oi_sell_val = (float)oi_sv;
+    for (int s = 0; s < ELITE_POOL; s++) res.elite_score[s] = slot_scores[s];
     res.book_prev     = book_prev;
     res.baseline      = baseline;
     res.slot0_score   = slot_scores[0];
@@ -3565,7 +3578,7 @@ static void print_usage(const char* prog) {
         "Usage: %s --account ACCT [--start-day N] [--stop-day N]\n"
         "          [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F]\n"
         "          [--dir-sigma F] [--rng-sigma F] [--acc-sigma F] [--cfd-sigma F] [--mt2-sigma F]\n"
-        "          [--workers N] [--master-only] [--no-save]\n"
+        "          [--workers N] [--master-only] [--no-save] [--no-nn-race]\n"
         "          [--seed N]   (default: clock, RE-SEEDED EVERY PASS; N derives passes from N)\n"
         "          [--trade-lock PATH | --no-trade-lock]  pause while production holds the lock\n"
         "          [--control-untrained]  NO-LEARNING CONTROL: re-randomise StockNN daily\n"
@@ -3941,6 +3954,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--mt2-sigma" && a+1<argc) { mt2_sigma_arg= atof(argv[++a]); }
         else if (arg == "--workers"  && a+1<argc) { num_workers=atoi(argv[++a]);}
         else if (arg == "--master-only") master_only = true;
+        else if (arg == "--no-nn-race") g_no_nn_race = true;
         else if (arg == "--no-save") g_no_save = true;
         else if (arg == "--control-untrained") g_control_untrained = true;
         else if (arg == "--control-random") g_control_random = true;
@@ -4037,15 +4051,32 @@ int main(int argc, char* argv[]) {
     // Allocate state on heap
     auto ind_states   = std::make_unique<IndustryState[]>(N_IND);
     auto mst          = std::make_unique<MasterState>();   // portfolio state reused by MT2
+    // Online conditional models: 5 memory kernels x depths {1,2}, pooled across industries,
+    // trained during the pass from the scores already in hand. Kilobytes, not megabytes.
+    auto bo_family = bo_make_family();
+    // Yesterday's conditioning comes from ALL of yesterday's scored elites, not only the
+    // deployed slot. The chain is coherent because every slot resets to slot 0's portfolio each
+    // morning: slot0(t-2) -> elite_e(t-1) -> slot0(t) is a genuine two-step trajectory for elite
+    // e, even though slot INDICES do not persist across days (selection reorders them).
+    float bo_prev2[N_IND] = {};                            // slot-0 P&L at t-2
+    float bo_prev1_el[N_IND][ELITE_POOL] = {};             // every elite's P&L at t-1
+    bool  bo_ok2[N_IND] = {}, bo_ok1[N_IND] = {};
+    float bo_pnl_today[N_IND] = {};
+    float bo_el_today[N_IND][ELITE_POOL] = {};
+    bool  bo_have[N_IND] = {};
+    FILE* bo_csv = nullptr;
+
     auto mt1_scratches = std::make_unique<MT1PoolScratch[]>(N_IND);   // 12 × ~2.8 MB
     // The competitor: same pool, same lifecycle, same score, same target — only the network and
     // its inputs differ, so a difference in outcome is a difference in FEATURE SET.
     auto mt1c_scratches = std::make_unique<MT1PoolScratch[]>(N_IND);
+    if (!g_no_nn_race)
     for (int i = 0; i < N_IND; i++) mt1c_scratches[i].alloc(MT1CNET_PARAMS);
     // The independent allocator: all 888 features, so it sees the cross-section the other two
     // cannot. ~278 MB of pool across 12 industries — the largest of the three by far, because
     // 888 inputs cannot be read by a small first layer.
     auto mt2i_scratches = std::make_unique<MT1PoolScratch[]>(N_IND);
+    if (!g_no_nn_race)
     for (int i = 0; i < N_IND; i++) mt2i_scratches[i].alloc(MT2INET_PARAMS);
     auto mt2_scratch  = std::make_unique<MT2Scratch>();            // ~5.5 MB
 
@@ -4176,11 +4207,13 @@ int main(int argc, char* argv[]) {
         }
         // Load MT1 head+tail pools (heads/tails redesign) and MT2 once at pass start
         for (int i = 0; i < N_IND; i++) {
-            load_or_init_mt1_pool(output_dir, load_dir, i, mt1_scratches[i]);
-            load_or_init_mt1_pool(output_dir, load_dir, i, mt1c_scratches[i],
-                                  "mt1c", mt1c_init_weights);
-            load_or_init_mt1_pool(output_dir, load_dir, i, mt2i_scratches[i],
-                                  "mt2i", mt2i_init_weights);
+            if (!g_no_nn_race) {
+                load_or_init_mt1_pool(output_dir, load_dir, i, mt1_scratches[i]);
+                load_or_init_mt1_pool(output_dir, load_dir, i, mt1c_scratches[i],
+                                      "mt1c", mt1c_init_weights);
+                load_or_init_mt1_pool(output_dir, load_dir, i, mt2i_scratches[i],
+                                      "mt2i", mt2i_init_weights);
+            }
         }
         load_or_init_mt2(output_dir, load_dir, *mt2_scratch);
         // Init MT2 portfolio state
@@ -4264,18 +4297,22 @@ int main(int argc, char* argv[]) {
                     // means. See CHANGELOG / mt1_target notes.
                     const IndResult& ir = blk_results[d][i];
                     const float actual = ir.slot0_score - ir.book_prev;
-                    MT1DayResult dr = mt1_step_day(i, mt1_scratches[i],
-                                                   &blk_888[d][i * 74], actual,
-                                                   blk_actual_day[d] >= MT1_START_DAY,
-                                                   blk_actual_day[d], cur_mt1_sigma);
-                    mt1_day_res[i][d] = dr;
-                    blk_mt1_res[i]    = dr;
-                    in12[i]           = dr.pred0;
+                    if (!g_no_nn_race) {
+                        MT1DayResult dr = mt1_step_day(i, mt1_scratches[i],
+                                                       &blk_888[d][i * 74], actual,
+                                                       blk_actual_day[d] >= MT1_START_DAY,
+                                                       blk_actual_day[d], cur_mt1_sigma);
+                        mt1_day_res[i][d] = dr;
+                        blk_mt1_res[i]    = dr;
+                        in12[i]           = dr.pred0;
+                    } else {
+                        in12[i] = 0.f;
+                    }
 
                     // Competitor, on the same day against the same target. Its prediction does
                     // NOT feed MT2 — it is scored and logged only, so the two pools cannot
                     // interfere and MT2's input is unchanged from the MT1-only run.
-                    if (blk_day[d]) {
+                    if (blk_day[d] && !g_no_nn_race) {
                         float cin[MT1C_IN];
                         build_mt1c_input(blk_day[d]->sym[i], ir, cin);
                         MT1DayResult cr = mt1_step_day(i, mt1c_scratches[i], cin, actual,
@@ -4286,13 +4323,101 @@ int main(int argc, char* argv[]) {
                     }
                     // Independent allocator: the WHOLE 888 vector, not this industry's slice.
                     // Also scored and logged only — it never reaches in12 either.
-                    MT1DayResult ir2 = mt1_step_day(i, mt2i_scratches[i], blk_888[d], actual,
-                                                    blk_actual_day[d] >= MT1_START_DAY,
-                                                    blk_actual_day[d], cur_mt1_sigma,
-                                                    mt2inet_forward);
-                    mt2i_day_res[i][d] = ir2;
+                    if (!g_no_nn_race) {
+                        MT1DayResult ir2 = mt1_step_day(i, mt2i_scratches[i], blk_888[d], actual,
+                                                        blk_actual_day[d] >= MT1_START_DAY,
+                                                        blk_actual_day[d], cur_mt1_sigma,
+                                                        mt2inet_forward);
+                        mt2i_day_res[i][d] = ir2;
+                    }
+
+                    // ── online conditional models ───────────────────────────────────────
+                    // Trained here, during the pass, from the scores already in hand. Every
+                    // scored elite contributes an outcome, not just the deployed slot.
+                    bo_pnl_today[i] = actual;
+                    for (int e = 0; e < ELITE_POOL; e++)
+                        bo_el_today[i][e] = ir.elite_score[e] - ir.book_prev;
+                    bo_have[i] = true;
                 }
-                if (blk_actual_day[d] >= MASTER_START_DAY) {
+
+                // ── online conditional models: predict, score, then learn ────────────────
+                // Order matters: every model is asked for day d BEFORE day d is folded in, so
+                // nothing is ever scored on an outcome it has already seen.
+                {
+                    if (!bo_csv) {
+                        std::string bp = log_dir + "/bayes_online.csv";
+                        bo_csv = fopen(bp.c_str(), "w");
+                        if (bo_csv) fprintf(bo_csv, "pass,day,model,preds,hits,base_up,"
+                                                    "elite_obs,p_up_less,p_dn_less,n_up_less\n");
+                    }
+                    BODay contrib[10];
+                    int  hits[10] = {}, preds[10] = {};
+                    int  base_up = 0, n_base = 0, elite_obs = 0;
+                    for (int i = 0; i < N_IND; i++) {
+                        if (!bo_have[i] || !bo_ok1[i]) continue;
+                        const float cur = bo_pnl_today[i];
+                        if (cur == 0.f || !std::isfinite(cur)) continue;
+                        base_up += (cur > 0.f) ? 1 : 0;
+                        n_base++;
+                        for (size_t m = 0; m < bo_family.size(); m++) {
+                            // ONE call per industry-day, formed from the whole elite pool: each
+                            // elite's own state gives P(today keeps ITS sign), which converts to
+                            // P(today is up) and is averaged. Twenty separate predictions of the
+                            // same outcome would be twenty correlated votes, not twenty tests.
+                            double p_up = 0.0;
+                            int used = 0;
+                            for (int e = 0; e < ELITE_POOL; e++) {
+                                const float y1 = bo_prev1_el[i][e];
+                                if (y1 == 0.f || !std::isfinite(y1)) continue;
+                                const int st = (bo_family[m].k == 1)
+                                             ? bo_state1(y1) : (bo_ok2[i] ? bo_state2(bo_prev2[i], y1) : -1);
+                                if (st < 0) continue;
+                                const double pc = bo_family[m].p_continue(st);
+                                p_up += (y1 > 0.f) ? pc : (1.0 - pc);
+                                used++;
+                                contrib[m].n[st]    += 1.0;
+                                contrib[m].same[st] += (std::signbit(cur) == std::signbit(y1)) ? 1.0 : 0.0;
+                                contrib[m].sum[st]  += cur;
+                                if (m == 0) elite_obs++;
+                            }
+                            if (!used) continue;
+                            p_up /= used;
+                            preds[m]++;
+                            if ((p_up > 0.5) == (cur > 0.f)) hits[m]++;
+                        }
+                    }
+                    for (size_t m = 0; m < bo_family.size(); m++) {
+                        if (bo_csv && preds[m] > 0)
+                            fprintf(bo_csv, "%d,%d,%s,%d,%d,%d,%d,%.4f,%.4f,%.1f\n",
+                                    pass + 1, blk_actual_day[d], bo_family[m].name,
+                                    preds[m], hits[m], base_up, elite_obs,
+                                    bo_family[m].p_continue(BO_UP_LESS),
+                                    bo_family[m].p_continue(BO_DN_LESS),
+                                    bo_family[m].n[BO_UP_LESS]);
+                        bo_family[m].commit(contrib[m]);
+                    }
+                    // Flush every day. Buffered, the whole file is lost if a long run is
+                    // interrupted -- and this log only exists because it is cheaper than keeping
+                    // the raw data. One fflush per day against a ~55 s day is free.
+                    if (bo_csv) fflush(bo_csv);
+                    (void)n_base;
+                    for (int i = 0; i < N_IND; i++) {
+                        if (!bo_have[i]) continue;
+                        // Shift, and the ORDER here is the whole correctness of the state.
+                        // bo_prev2 must lag bo_prev1_el by exactly one day, so it takes
+                        // YESTERDAY's slot-0 figure -- which is bo_prev1_el[i][0], since elite 0
+                        // IS slot 0 -- and must be read before that array is overwritten. Taking
+                        // today's slot-0 instead paired it with today's elites, making the
+                        // "accelerated / decelerated" state a same-day cross-section between
+                        // slots rather than a two-day trajectory of one.
+                        if (bo_ok1[i]) { bo_prev2[i] = bo_prev1_el[i][0]; bo_ok2[i] = true; }
+                        for (int e = 0; e < ELITE_POOL; e++) bo_prev1_el[i][e] = bo_el_today[i][e];
+                        bo_ok1[i]   = true;
+                        bo_have[i]  = false;
+                    }
+                }
+
+                if (blk_actual_day[d] >= MASTER_START_DAY && !g_no_nn_race) {
                     // Deployed slot-0 portfolio return (training target) + market return (diagnostic).
                     float perf_pf[N_IND], perf_mkt[N_IND];
                     for (int i = 0; i < N_IND; i++) {
@@ -4393,9 +4518,11 @@ int main(int argc, char* argv[]) {
             }
             // 5. Save (per block ≈ 25 days). Always — under --no-save output_dir is the scratch.
             for (int i = 0; i < N_IND; i++) {
-                save_mt1_pool(output_dir, i, mt1_scratches[i]);
-                save_mt1_pool(output_dir, i, mt1c_scratches[i], "mt1c");
-                save_mt1_pool(output_dir, i, mt2i_scratches[i], "mt2i");
+                if (!g_no_nn_race) {
+                    save_mt1_pool(output_dir, i, mt1_scratches[i]);
+                    save_mt1_pool(output_dir, i, mt1c_scratches[i], "mt1c");
+                    save_mt1_pool(output_dir, i, mt2i_scratches[i], "mt2i");
+                }
             }
             save_mt2_elites(output_dir, *mt2_scratch);
         };
@@ -4585,6 +4712,8 @@ int main(int argc, char* argv[]) {
         log_msg(ec ? "WARNING: could not remove scratch " + nosave_scratch
                    : "--no-save: removed scratch " + nosave_scratch);
     }
+
+    if (bo_csv) { fclose(bo_csv); bo_csv = nullptr; }
 
     log_msg("Training complete.");
     return 0;
