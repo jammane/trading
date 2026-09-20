@@ -261,6 +261,44 @@ def shuffle_control(ds, h, formulation, seed=0, **kw):
     return evaluate(*run_formulation(ds2, h, formulation, **kw), h, n_boot=200, seed=seed)
 
 
+def _plant(ds, h, strength, component='book'):
+    """Return a copy of `ds` with a known signal added to the component being measured.
+
+    The signal must land in the field `forward_pnl()` actually READS for this component. It used
+    to always go into `book_now`, which meant that under `--component mkt` or `--component trade`
+    the plant never reached the target at all: the control silently measured nothing, reported no
+    power, and so the nulls those two runs produced were uninterpretable rather than evidence of
+    absence. A control that cannot fail is not a control.
+
+    Two invariants, both load-bearing:
+
+    * The plant is scaled to the sd of the component BEING MEASURED, not always the book's. The
+      trade delta's sd is several times smaller than the book's (measured: $419 vs $691), so a
+      book-scaled plant injected into the trade leg would be relatively enormous and the control
+      would pass trivially, which tells us nothing about detecting a trade-sized effect.
+    * The decomposition identity `book_now - book_prev == mkt_move + trade_delta` survives.
+      Adding to `book_now` AND to exactly one of the two legs keeps both sides equal, so the
+      planted copy stays a physically consistent dataset rather than one that only happens not to
+      be checked here.
+    """
+    f0 = ds['feat'][:, :, 0].astype(float)
+    f0 = (f0 - np.nanmean(f0)) / (np.nanstd(f0) + 1e-9)
+    base = {'book': ds['book_now'] - ds['book_prev'],
+            'mkt': ds['mkt_move'],
+            'trade': ds['trade_delta']}[component].astype(float)
+    per_day = strength * np.nanstd(base) * f0 / h
+    add = np.zeros_like(per_day)
+    for k in range(1, h + 1):
+        add[k:] += per_day[:-k]
+    ds2 = dict(ds)
+    ds2['book_now'] = (ds['book_now'] + add).astype(np.float32)
+    # 'book' is carried on the market leg by convention; either leg would do, but it must be
+    # exactly one of them or the identity breaks.
+    leg = 'trade_delta' if component == 'trade' else 'mkt_move'
+    ds2[leg] = (ds[leg] + add).astype(np.float32)
+    return ds2
+
+
 def planted_control(ds, h, formulation, strength=0.30, seed=0, **kw):
     """Same pipeline, with a known signal added to the target from feature 0.
 
@@ -274,16 +312,11 @@ def planted_control(ds, h, formulation, strength=0.30, seed=0, **kw):
 
     If this control is not clearly positive, the harness has no power at that horizon and any null
     it reports there is uninformative rather than evidence of absence.
+
+    The plant is placed by `_plant()`, which routes it to the field the chosen `component` is
+    actually read from. See that function for why.
     """
-    ds2 = dict(ds)
-    f0 = ds['feat'][:, :, 0].astype(float)
-    f0 = (f0 - np.nanmean(f0)) / (np.nanstd(f0) + 1e-9)
-    base = (ds['book_now'] - ds['book_prev']).astype(float)
-    per_day = strength * np.nanstd(base) * f0 / h
-    add = np.zeros_like(per_day)
-    for k in range(1, h + 1):
-        add[k:] += per_day[:-k]
-    ds2['book_now'] = (ds['book_now'] + add).astype(np.float32)
+    ds2 = _plant(ds, h, strength, kw.get('component', 'book'))
     return evaluate(*run_formulation(ds2, h, formulation, **kw), h, n_boot=200, seed=seed)
 
 
