@@ -24,6 +24,10 @@ find_path(CBLAS_INCLUDE_DIR cblas.h
         /usr/include /usr/local/include)
 
 add_executable(training_v4_cpp training_v4.cpp)
+# The binary that matters carried NO warning flags until v0.8.1.8 -- only the test targets did.
+# That is why two positional MasterResult aggregates sat here unflagged, the same shape as the
+# IndResult bug that shipped. Warnings on the trainer are the thing that makes the class visible.
+target_compile_options(training_v4_cpp PRIVATE -Wall -Wextra)
 target_include_directories(training_v4_cpp PRIVATE ${CBLAS_INCLUDE_DIR})
 target_link_libraries(training_v4_cpp ${BLAS_LIBRARIES} pthread)
 
