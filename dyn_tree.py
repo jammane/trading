@@ -235,7 +235,7 @@ def main():
     print(f'\n  ALWAYS-UP on this window: {100*bs.mean():.2f}%')
     print(f'  POWER: n = {len(bs)} predictions over {a.judge} days. Naive SE on a hit rate is '
           f'{100*se:.2f}pp,')
-    print(f'  and the 12 industries move together (mean pairwise corr +0.26) so the effective')
+    print('  and the 12 industries move together (mean pairwise corr +0.26) so the effective')
     print(f'  sample is nearer {a.judge} than {len(bs)} -- SE ~{100*np.sqrt(0.25/a.judge):.1f}pp.')
     print(f'  Differences below roughly {2*100*np.sqrt(0.25/a.judge):.0f}pp are not resolvable here.')
 
