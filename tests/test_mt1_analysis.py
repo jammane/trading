@@ -118,6 +118,56 @@ class TestPower:
         assert r['ic'] > 0.05, f'h={h}: planted signal not recovered, IC {r["ic"]:.4f}'
         assert r['ic_t'] > 2, f'h={h}: planted signal not significant, t {r["ic_t"]:.2f}'
 
+    @pytest.mark.parametrize('component', ['book', 'mkt', 'trade'])
+    def test_the_planted_control_reaches_every_component(self, component):
+        """The control must have power on the component actually being measured.
+
+        This is a regression test for a real defect: `planted_control` always injected into
+        `book_now`, so under `--component mkt` or `--component trade` the plant never touched the
+        field `forward_pnl()` reads. Both component runs therefore had NO working power check,
+        and the nulls they produced meant nothing. The bug was invisible because a control that
+        silently measures nothing looks exactly like a control reporting a true null.
+        """
+        ds = synth(T=900, seed=30)
+        r = M.planted_control(ds, 1, 'per-industry', component=component,
+                              min_train=250, refit_every=40)
+        assert r is not None, f'{component}: control produced no result'
+        assert r['ic'] > 0.05, f'{component}: planted signal not recovered, IC {r["ic"]:.4f}'
+        assert r['ic_t'] > 2, f'{component}: planted signal not significant, t {r["ic_t"]:.2f}'
+
+    @pytest.mark.parametrize('component,leg', [('book', 'mkt_move'),
+                                               ('mkt', 'mkt_move'),
+                                               ('trade', 'trade_delta')])
+    def test_the_plant_lands_in_the_field_the_target_reads(self, component, leg):
+        """Pins the mechanism, not just the outcome: the old bug left these fields untouched."""
+        ds = synth(T=300, seed=31)
+        ds2 = M._plant(ds, 1, 0.30, component)
+        assert not np.allclose(ds2[leg], ds[leg]), f'{component}: {leg} was not planted into'
+        other = 'trade_delta' if leg == 'mkt_move' else 'mkt_move'
+        assert np.allclose(ds2[other], ds[other]), f'{component}: {other} should be untouched'
+        assert not np.allclose(ds2['book_now'], ds['book_now']), 'book_now must move too'
+
+    @pytest.mark.parametrize('component', ['book', 'mkt', 'trade'])
+    def test_the_plant_preserves_the_decomposition_identity(self, component):
+        """A planted dataset must stay physically consistent, not merely unchecked here."""
+        ds = synth(T=300, seed=32)
+        ds2 = M._plant(ds, 3, 0.30, component)
+        lhs = ds2['book_now'].astype(float) - ds2['book_prev'].astype(float)
+        rhs = ds2['mkt_move'].astype(float) + ds2['trade_delta'].astype(float)
+        assert np.allclose(lhs, rhs, atol=0.5), f'{component}: identity broken by the plant'
+
+    def test_the_plant_is_scaled_to_the_component_it_measures(self):
+        """A book-scaled plant in the trade leg would pass trivially and prove nothing."""
+        ds = synth(T=300, seed=33)
+        d_trade = M._plant(ds, 1, 0.30, 'trade')['trade_delta'].astype(float) \
+            - ds['trade_delta'].astype(float)
+        d_mkt = M._plant(ds, 1, 0.30, 'mkt')['mkt_move'].astype(float) \
+            - ds['mkt_move'].astype(float)
+        # synth() builds mkt with sd 300 and trade with sd 80, so the trade plant must be the
+        # smaller of the two -- roughly in that ratio, not equal.
+        assert d_trade.std() < d_mkt.std(), 'plant is not component-scaled'
+        assert d_trade.std() < 0.6 * d_mkt.std(), 'plant scaling does not track component sd'
+
     def test_the_pooled_formulation_also_finds_it(self):
         """Pooling shares one model across 12 industries. If the plumbing misaligns industries the
         signal vanishes, and it would look like a real negative result about pooling."""
