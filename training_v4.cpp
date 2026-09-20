@@ -2429,7 +2429,12 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
                               float sigma, bool* injected_out) {
     if (actual_day < MASTER_START_DAY) {
         if (injected_out) *injected_out = false;
-        return {0.f, 0.f, 0.f, 0.f, 0.f};
+        // Designated, not positional: MasterResult has NINE members and this supplies five.
+        // A member inserted anywhere above shifts every later value silently, because they are
+        // all floats and neither narrowing nor -Wmissing-field-initializers would stop it. The
+        // IndResult twin of this bug shipped and was caught only because one float happened to
+        // land in an int field.
+        return MasterResult{};
     }
 
     {
@@ -2827,8 +2832,21 @@ static MasterResult step_mt2(MasterState& state, MT2Scratch& scratch,
     elite_mean_pts /= ELITE_COUNT;
 
     if (injected_out) *injected_out = injected;
-    return {best_pts_v, elite_max_pts, elite_min_pts, elite_mean_pts, ideal_pts,
-            consensus_flat_pts, consensus_wtd_pts};
+    // Every member named, including the two that are 0 here on purpose: slot0_pts_pf and
+    // slot0_pts_mkt are filled in by process_block. Writing the zeros out rather than leaning on
+    // the default keeps -Wextra silent for a real reason instead of a suppressed one, and states
+    // the intent where the next reader will look.
+    return MasterResult{
+        .best_pts           = best_pts_v,
+        .elite_max_pts      = elite_max_pts,
+        .elite_min_pts      = elite_min_pts,
+        .elite_mean_pts     = elite_mean_pts,
+        .ideal_pts          = ideal_pts,
+        .consensus_flat_pts = consensus_flat_pts,
+        .consensus_wtd_pts  = consensus_wtd_pts,
+        .slot0_pts_pf       = 0.f,          // set later in process_block
+        .slot0_pts_mkt      = 0.f,          // set later in process_block
+    };
 }
 
 // ── History update (main thread after workers finish) ────────────────────────────
@@ -3582,7 +3600,7 @@ static void print_usage(const char* prog) {
         "Usage: %s --account ACCT [--start-day N] [--stop-day N]\n"
         "          [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F]\n"
         "          [--dir-sigma F] [--rng-sigma F] [--acc-sigma F] [--cfd-sigma F] [--mt2-sigma F]\n"
-        "          [--workers N] [--master-only] [--preserve-stock-data] [--no-save]\n"
+        "          [--workers N] [--master-only] [--no-save]\n"
         "          [--seed N]   (default: clock, RE-SEEDED EVERY PASS; N derives passes from N)\n"
         "          [--trade-lock PATH | --no-trade-lock]  pause while production holds the lock\n"
         "          [--control-untrained]  NO-LEARNING CONTROL: re-randomise StockNN daily\n"
@@ -3654,8 +3672,12 @@ static float drift_score_mt2_pts(const float* W, const float in12[N_IND], const 
     }
     float out48[48]; mt2_forward(W, in12, out48);
     int tier[N_IND];
-    for (int i = 0; i < N_IND; i++) { const float* lg = out48 + i*4; int b = 0;
-        for (int k = 1; k < 4; k++) if (lg[k] > lg[b]) b = k; tier[i] = b; }
+    for (int i = 0; i < N_IND; i++) {
+        const float* lg = out48 + i*4;
+        int b = 0;
+        for (int k = 1; k < 4; k++) { if (lg[k] > lg[b]) b = k; }
+        tier[i] = b;                       // once per industry, AFTER the argmax loop
+    }
     float pts = 0.f;
     for (int i = 0; i < N_IND; i++) {
         int pred = tier[i], opt = opt_tier[i];
@@ -3936,7 +3958,7 @@ int main(int argc, char* argv[]) {
     int  start_day = -1, stop_day = -1, passes = 1, num_workers = 2;
     float sigma = 0.01f, master_sigma = -1.f, sigma_decay = 0.5f;
     float mt1_sigma = -1.f, mt2_sigma_arg = -1.f;
-    bool master_only = false, preserve_stock = false;
+    bool master_only = false;
     bool drift_study = false; std::string drift_scratch;
 
     for (int a = 1; a < argc; a++) {
@@ -3954,7 +3976,6 @@ int main(int argc, char* argv[]) {
         else if (arg == "--mt2-sigma" && a+1<argc) { mt2_sigma_arg= atof(argv[++a]); }
         else if (arg == "--workers"  && a+1<argc) { num_workers=atoi(argv[++a]);}
         else if (arg == "--master-only") master_only = true;
-        else if (arg == "--preserve-stock-data") preserve_stock = true;
         else if (arg == "--no-save") g_no_save = true;
         else if (arg == "--control-untrained") g_control_untrained = true;
         else if (arg == "--control-random") g_control_random = true;

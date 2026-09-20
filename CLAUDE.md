@@ -92,10 +92,15 @@ python prepare_models.py --account acct0
 # Short diagnostic (verifies history accumulates at day 5+, CSV has elite columns):
 mkdir -p /root/diag_logs
 ./build/training_v4_cpp --output /root/diag_logs --load-dir /root/diag_logs \
-  --start-day 16 --stop-day 37 --passes 1 --preserve-stock-data --no-save
+  --start-day 16 --stop-day 37 --passes 1 --no-save
 # After training, convert back to .pt before inspect_trades.py or production_v2.py:
 python convert_weights.py --account acct0
 ```
+**`--preserve-stock-data` was removed in v0.8.1.8.** It was parsed into a variable that
+nothing ever read — a documented flag that did nothing. It surfaced as the lone
+`-Wunused-but-set-variable` the moment `-Wall -Wextra` was turned on for the trainer target,
+which until then carried no warning flags at all.
+
 `--no-save` trains into `<output>.nosave` and **deletes it at exit** — the canonical model
 directory is untouched, and no 3 GB run directory is left behind.
 
