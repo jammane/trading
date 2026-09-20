@@ -35,6 +35,7 @@ from upkeep import (
     run_mt_inference,
     save_mt1_rolling_state,
     upkeep_industry,
+    upkeep_living_bn,
     upkeep_mt1_industry,
     upkeep_mt2,
 )
@@ -299,6 +300,22 @@ def train_mt_one_day_prod(industries, model_dir, mkt_val_history, pf_val_history
             mt2_inputs[ind] = 0.0
 
     save_mt1_rolling_state(model_dir, rolling_state)
+
+    # Living conditional model: re-evaluate the state percentages and N against recent StockNN
+    # performance. Read-only for now -- nothing allocates on it until it shows an edge, and the
+    # measured edge so far is not distinguishable from zero. It costs one JSON write per run.
+    try:
+        _living = upkeep_living_bn(
+            model_dir,
+            {ind: (cur_pf_index[ind] - float(prev_pf[ind])) if prev_pf.get(ind) else None
+             for ind in industry_list},
+            industry_list)
+        _dec = [r for r in _living if r['group'] == 'decel']
+        if _dec:
+            print("living_bn: " + "  ".join(
+                f"{r['state']} P(cont)={r['p_continue']:.3f} N={r['streak_N']:.2f}" for r in _dec))
+    except Exception as e:                                       # noqa: BLE001
+        print(f"Error in upkeep_living_bn: {e}")
 
     mt2_perf = {ind: float(slot0_deltas.get(ind, 0.0)) for ind in industry_list}
     try:

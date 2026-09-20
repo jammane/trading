@@ -507,6 +507,77 @@ def upkeep_mt1_industry(industry, model_dir, in74_t, actual_d,
 
 # ── MT2 upkeep ─────────────────────────────────────────────────────────────────
 
+# ── living conditional model ────────────────────────────────────────────────────
+# Re-evaluated every run against RECENT StockNN performance, which is what makes it "living":
+# the counts decay, so the percentages and the streak length N both move as behaviour changes,
+# and the memory length itself is re-selected from data rather than fixed.
+LIVING_BN_FILE = 'living_bn.json'
+LIVING_BN_HISTORY = 750       # days of per-industry P&L retained, for re-selecting the half-life
+LIVING_BN_REFIT_EVERY = 20    # runs between half-life re-selection (it is the expensive step)
+LIVING_BN_MIN_REFIT = 400     # days needed before a half-life estimate means anything
+
+
+def upkeep_living_bn(model_dir, actual_by_industry, industry_list):
+    """One daily step of the living conditional model. Returns its current report.
+
+    `actual_by_industry` is each industry's realised book change for the session -- StockNN's own
+    P&L on the portfolio it chose, not raw stock returns. A missing industry is recorded as NaN,
+    not 0.0: zero is the value a hard-floor reset writes, and `classify` treats it as "no state"
+    on purpose, so passing 0.0 for "unknown" would silently mix the two.
+    """
+    import numpy as _np
+
+    from living_bn import LivingBN, fit_half_life
+
+    path = os.path.join(model_dir, LIVING_BN_FILE)
+    blob = {}
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                blob = json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"living_bn: {path} unreadable ({e}) — starting fresh")
+            blob = {}
+
+    n_ind = len(industry_list)
+    model = (LivingBN.from_dict(blob['model']) if blob.get('model')
+             else LivingBN(n_ind=n_ind))
+    if model.n_ind != n_ind:                       # industry count changed; state is meaningless
+        print(f"living_bn: industry count {model.n_ind} -> {n_ind}, resetting")
+        model = LivingBN(n_ind=n_ind)
+        blob = {}
+
+    hist = blob.get('history', [])
+    row = [float(actual_by_industry.get(ind, _np.nan)) if actual_by_industry.get(ind) is not None
+           else float('nan') for ind in industry_list]
+    hist.append(row)
+    hist = hist[-LIVING_BN_HISTORY:]
+
+    if len(hist) >= 3:
+        model.observe(_np.array(hist[-3]), _np.array(hist[-2]), _np.array(hist[-1]))
+
+    runs = int(blob.get('runs_since_refit', 0)) + 1
+    if runs >= LIVING_BN_REFIT_EVERY and len(hist) >= LIVING_BN_MIN_REFIT:
+        arr = _np.array(hist, dtype=float)
+        try:
+            best, _ = fit_half_life(arr, warmup=min(250, len(hist) // 2))
+            if best != model.half_life:
+                print(f"living_bn: half-life {model.half_life} -> {best}")
+            # Rebuild from history: the decay is baked into every count, so changing it means
+            # re-accumulating rather than carrying forward counts weighted the old way.
+            model = LivingBN(n_ind=n_ind, half_life=best)
+            for t in range(2, len(arr)):
+                model.observe(arr[t - 2], arr[t - 1], arr[t])
+        except Exception as e:                                   # noqa: BLE001
+            print(f"living_bn: half-life refit failed ({e}); keeping {model.half_life}")
+        runs = 0
+
+    with open(path, 'w') as f:
+        json.dump({'model': model.to_dict(), 'history': hist,
+                   'runs_since_refit': runs}, f)
+    return model.report()
+
+
 def upkeep_mt2(model_dir, mt1_slot0_outputs, actual_perf, industry_list,
                sigma=UPKEEP_MT2_SIGMA):
     """

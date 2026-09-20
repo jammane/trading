@@ -32,6 +32,9 @@ import numpy as np
 
 import read_mt1_dataset as D
 
+IND_NAMES = ['hardware', 'software', 'financial', 'discret', 'services', 'health',
+             'industrl', 'staples', 'energy', 'utilitie', 'land', 'materials']
+
 
 def blocks(T, block, rng):
     n = max(1, int(np.ceil(T / block)))
@@ -220,6 +223,88 @@ def focused_edge(pnl, seed, n_perm, states, label, warmup=250):
     print(f'  observed {o:+.3f} $/day/industry   null {nl:+.3f}   z {z:+.1f}   p {pv:.3f}{star}')
 
 
+ACCEL = {0: 'accel', 1: 'decel', 2: 'flip', 3: 'accel', 4: 'decel', 5: 'flip'}
+
+
+def accel_summary(pnl, seed, n_perm):
+    """Group the six states by ACCELERATING / DECELERATING / FLIPPED.
+
+    The spec gives accelerating and decelerating the same outcome. Measured pooled, they do not
+    behave the same: both decelerating states select reversal and both accelerating states select
+    nothing. This tests that grouping directly, which is a 3-test family instead of 6 and so is
+    the better-powered form of the same question.
+    """
+    print('\nACCEL / DECEL GROUPING  P(tomorrow KEEPS today\'s sign)')
+    print(f'  {"group":<26} {"n":>6} {"P(same)":>9} {"vs null":>9} {"z":>6} {"p":>7}  verdict')
+    for tag in ('accel', 'decel', 'flip'):
+        ks = [k for k, v in ACCEL.items() if v == tag]
+
+        def stat(p, ks=ks):
+            st, nxt = statefn_panel(p, method2_states)
+            tod = np.concatenate([p[1:-1, i] for i in range(p.shape[1])])
+            m = np.isin(st, ks)
+            if m.sum() < 30:
+                return np.nan
+            return float((np.sign(nxt[m]) == np.sign(tod[m])).mean())
+
+        st_all, _ = statefn_panel(pnl, method2_states)
+        n = int(np.isin(st_all, ks).sum())
+        o, nl, z, pv = perm_test(stat, pnl, n_perm, seed)
+        if not np.isfinite(z):
+            continue
+        d = o - nl
+        v = ('A continuation' if d > 0 else 'B REVERSAL') if pv < 0.05 else 'neither'
+        names = {'accel': 'ACCELERATING (MORE up/down)', 'decel': 'DECELERATING (LESS up/down)',
+                 'flip': 'FLIPPED (sign changed)'}
+        print(f'  {names[tag]:<26} {n:>6} {100*o:>8.1f}% {100*d:>+8.2f}pp {z:>+5.1f} {pv:>7.3f}  {v}')
+
+
+def per_industry(pnl, seed, n_perm, names=None):
+    """The same test run inside each industry separately, with its POWER stated first.
+
+    Per-industry is what the living model would actually condition on, but it divides the sample
+    by 12. Before reading twelve nulls as twelve findings, the detectable effect size is computed
+    from the actual bucket sizes: with n observations in a state, the standard error on a
+    proportion is sqrt(0.25/n), so the smallest effect detectable at 95% with 80% power is about
+    2.8 * that. If the pooled effect (-3.4pp) is smaller than that number, a per-industry null is
+    a statement about the sample size, not about the industry.
+    """
+    T, N = pnl.shape
+    print(f'\nPER-INDUSTRY  (decelerating states only -- the pooled effect lives there)')
+    ks = [1, 4]
+    st_all, _ = statefn_panel(pnl, method2_states)
+    n_typ = int(np.isin(st_all, ks).sum()) // N
+    mde = 2.8 * np.sqrt(0.25 / max(n_typ, 1)) * 100
+    print(f'  typical n per industry in those states: {n_typ};  smallest detectable effect '
+          f'~{mde:.1f}pp at 80% power')
+    print(f'  (the pooled effect is -3.4pp, so per-industry is '
+          f'{"UNDERPOWERED -- expect nulls" if mde > 3.4 else "adequately powered"})')
+    print(f'  {"industry":<12} {"n":>5} {"P(same)":>9} {"vs null":>9} {"z":>6} {"p":>7}')
+    hits = 0
+    for i in range(N):
+        col = pnl[:, i:i + 1]
+
+        def stat(p):
+            st, nxt = statefn_panel(p, method2_states)
+            tod = p[1:-1, 0]
+            m = np.isin(st, ks)
+            if m.sum() < 30:
+                return np.nan
+            return float((np.sign(nxt[m]) == np.sign(tod[m])).mean())
+
+        sti, _ = statefn_panel(col, method2_states)
+        n = int(np.isin(sti, ks).sum())
+        o, nl, z, pv = perm_test(stat, col, n_perm, seed + i)
+        if not np.isfinite(z):
+            continue
+        nm = names[i] if names else f'ind{i}'
+        star = '*' if pv < 0.05 else ' '
+        hits += pv < 0.05
+        print(f'  {nm:<12} {n:>5} {100*o:>8.1f}% {100*(o-nl):>+8.2f}pp {z:>+5.1f} {pv:>7.3f}{star}')
+    print(f'  {hits}/{N} industries individually significant at 5% '
+          f'(chance alone gives {0.05*N:.1f})')
+
+
 def streak_table(pnl, seed):
     """P(the current run continues) by run length so far -- the 'streak of N' premise."""
     print('\nSTREAK CONTINUATION  (is a longer run more or less likely to continue?)')
@@ -327,6 +412,7 @@ def main():
     ap.add_argument('--burn-in', type=int, default=500)
     ap.add_argument('--perm', type=int, default=200, help='permutations for the null')
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--per-industry', action='store_true')
     a = ap.parse_args()
 
     ds = D.read(a.dataset) if hasattr(D, 'read') else D.parse(a.dataset)
@@ -353,6 +439,9 @@ def main():
         state_table(p, method2_states, M2_NAMES,
                     'METHOD 2 -- condition on (yesterday, today, grew/shrank)', a.seed, a.perm)
         outcome_table(p, a.seed, a.perm)
+        accel_summary(p, a.seed, a.perm)
+        if a.per_industry:
+            per_industry(p, a.seed, a.perm, IND_NAMES)
         streak_table(p, a.seed)
         reversal_edge(p, a.seed, a.perm)
         method2_edge(p, a.seed, a.perm)
