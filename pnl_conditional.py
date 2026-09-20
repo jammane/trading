@@ -287,7 +287,7 @@ def method2_edge(pnl, seed, n_perm, warmup=250):
 
     def edge(p):
         T, N = p.shape
-        if T < warmup + 50:
+        if warmup + 50 > T:
             return np.nan
         st = np.full((T, N), -1)
         for i in range(N):
@@ -341,7 +341,7 @@ def main():
                       (f'AFTER BURN-IN (day >= {a.burn_in})', day >= a.burn_in)):
         cols = [raw[keep, i][np.isfinite(raw[keep, i])] for i in range(raw.shape[1])]
         m = min(len(c) for c in cols)
-        if 200 > m:
+        if m < 200:
             continue
         p = np.column_stack([c[-m:] for c in cols])
         print(f'\n{"=" * 92}\n{lab}   ({p.shape[0]} days x {p.shape[1]} industries)\n{"=" * 92}')
