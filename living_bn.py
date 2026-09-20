@@ -38,6 +38,7 @@ WHAT "LIVING" MEANS
 """
 import json
 import math
+from collections import deque
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -68,6 +69,7 @@ class LivingBN:
 
     n_ind: int
     half_life: float = 250.0
+    window: int = 0               # >0 selects a RECTANGULAR window of this many days instead
     prior_strength: float = 2.0          # weak Beta(1,1)-ish prior, in pseudo-observations
     # weighted counts: [industry][state]
     w_n: np.ndarray = field(default=None, repr=False)      # total weight
@@ -94,7 +96,14 @@ class LivingBN:
 
         `prev2`,`prev1` are the two days that DEFINED the state; `today` is the outcome being
         predicted. Called with (t-2, t-1, t) so nothing ever sees its own outcome.
+
+        Two weightings of "recent history" are supported, and which is better is a measurement,
+        not a preference: exponential decay (every past day still counts, geometrically less), or
+        a rectangular `window` of the last N days (a day counts fully, then not at all).
         """
+        if self.window > 0:
+            self._observe_window(prev2, prev1, today)
+            return
         g = self.decay
         self.w_n *= g
         self.w_same *= g
@@ -109,6 +118,35 @@ class LivingBN:
                 self.w_same[i, s] += 1.0
             self.w_sum[i, s] += today[i]
             self.w_sq[i, s] += today[i] ** 2
+        self.days_seen += 1
+
+    def _observe_window(self, prev2, prev1, today):
+        """Rectangular window: add today's observations, drop those older than `window` days.
+
+        Kept exact rather than approximated by an equivalent half-life, because the two kernels
+        differ in the only place it matters -- a windowed estimate discards a regime completely on
+        a known date, while a decayed one never quite does.
+        """
+        if not hasattr(self, '_ring'):
+            self._ring = deque()
+        obs = []
+        for i in range(self.n_ind):
+            st = classify(prev2[i], prev1[i])
+            if st is None or today[i] == 0 or not np.isfinite(today[i]):
+                continue
+            same = float(np.sign(today[i]) == np.sign(prev1[i]))
+            obs.append((i, st, same, float(today[i])))
+            self.w_n[i, st] += 1.0
+            self.w_same[i, st] += same
+            self.w_sum[i, st] += today[i]
+            self.w_sq[i, st] += today[i] ** 2
+        self._ring.append(obs)
+        while len(self._ring) > self.window:
+            for i, st, same, dol in self._ring.popleft():
+                self.w_n[i, st] -= 1.0
+                self.w_same[i, st] -= same
+                self.w_sum[i, st] -= dol
+                self.w_sq[i, st] -= dol ** 2
         self.days_seen += 1
 
     # ── posteriors ──────────────────────────────────────────────────────────────
@@ -205,14 +243,14 @@ class LivingBN:
 
     # ── persistence ─────────────────────────────────────────────────────────────
     def to_dict(self):
-        return {'n_ind': self.n_ind, 'half_life': self.half_life,
+        return {'n_ind': self.n_ind, 'half_life': self.half_life, 'window': int(self.window or 0),
                 'prior_strength': self.prior_strength, 'days_seen': self.days_seen,
                 **{a: getattr(self, a).tolist()
                    for a in ('w_n', 'w_same', 'w_sum', 'w_sq', 'w_run', 'w_runn')}}
 
     @classmethod
     def from_dict(cls, d):
-        m = cls(n_ind=d['n_ind'], half_life=d['half_life'],
+        m = cls(n_ind=d['n_ind'], half_life=d['half_life'], window=int(d.get('window', 0) or 0),
                 prior_strength=d.get('prior_strength', 2.0))
         m.days_seen = d.get('days_seen', 0)
         for a in ('w_n', 'w_same', 'w_sum', 'w_sq', 'w_run', 'w_runn'):
@@ -230,15 +268,51 @@ class LivingBN:
             return cls.from_dict(json.load(f))
 
 
+def observed_streak_lengths(pnl):
+    """Mean REMAINING run length after each state, measured directly rather than derived.
+
+    The model reports N as 1/(1-p), which is the expected remaining length of a GEOMETRIC run.
+    That identity holds only if the per-day continuation probability is constant within a run. If
+    runs are not geometric -- if, say, continuation weakens the longer a run has gone on -- the
+    derived N and the observed N come apart, and the derived one is wrong.
+
+    N counts the run from TODAY INCLUSIVE, matching 1/(1-p): under a geometric run with
+    continuation probability p, the expected number of days from today that keep the sign is
+    1/(1-p), while the expected number of ADDITIONAL days is p/(1-p). Comparing one against the
+    other makes the two estimators look like they disagree by about a factor of two, which is what
+    the first version of this function did.
+
+    Returns (mean_observed, n) per state. Forward-looking by construction, so it is an estimator
+    to run over history, never a prediction input.
+    """
+    T, N = pnl.shape
+    tot = np.zeros(N_STATES)
+    cnt = np.zeros(N_STATES)
+    for i in range(N):
+        x = pnl[:, i]
+        for t in range(1, T - 1):
+            s = classify(x[t - 1], x[t])
+            if s is None:
+                continue
+            run = 0
+            k = t + 1
+            while k < T and x[k] != 0 and np.isfinite(x[k]) and np.sign(x[k]) == np.sign(x[t]):
+                run += 1
+                k += 1
+            tot[s] += run + 1          # include today: N counts the run from today inclusive
+            cnt[s] += 1
+    return np.where(cnt > 0, tot / np.maximum(cnt, 1), np.nan), cnt
+
+
 # ── data-driven half-life ───────────────────────────────────────────────────────
 
-def predictive_loglik(pnl, half_life, warmup=250):
+def predictive_loglik(pnl, half_life, warmup=250, window=0):
     """Walk-forward log-likelihood of the sign outcomes under a model with this half-life.
 
     Strictly causal: the model has only ever observed days before the one being scored.
     """
     T, N = pnl.shape
-    m = LivingBN(n_ind=N, half_life=half_life)
+    m = LivingBN(n_ind=N, half_life=half_life, window=window)
     ll, n = 0.0, 0
     for t in range(2, T - 1):
         if t > warmup:
@@ -266,3 +340,20 @@ def fit_half_life(pnl, grid=(30, 60, 125, 250, 500, 1000, 1e9), warmup=250):
         out.append((h, ll, n))
     best = max(out, key=lambda r: r[1])
     return best[0], out
+
+
+def compare_kernels(pnl, half_lives=(125, 250, 500, 1e9), windows=(63, 126, 252, 504),
+                    warmup=250):
+    """Exponential decay vs a rectangular window, on the same walk-forward criterion.
+
+    'The past year' is one specific candidate (252 trading days) among several, scored the same
+    way as every other, so the choice of memory is a measurement rather than a convention.
+    """
+    rows = []
+    for h in half_lives:
+        ll, n = predictive_loglik(pnl, h, warmup)
+        rows.append(('decay', 'never forget' if h > 1e8 else f'{int(h)} d half-life', ll, n))
+    for w in windows:
+        ll, n = predictive_loglik(pnl, 1e9, warmup, window=int(w))
+        rows.append(('window', f'last {int(w)} d', ll, n))
+    return rows

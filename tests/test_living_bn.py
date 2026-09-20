@@ -223,3 +223,94 @@ class TestDailyUpkeep:
         (tmp_path / upkeep.LIVING_BN_FILE).write_text('{not json')
         rep = upkeep.upkeep_living_bn(str(tmp_path), {'a': 1.0}, ['a'])
         assert isinstance(rep, list) and len(rep) == L.N_STATES
+
+
+class TestStreakEstimators:
+    """The derived N (1/(1-p)) and the observed N must measure the SAME quantity.
+
+    They did not at first: the observed version counted only the ADDITIONAL days a run lasted,
+    while the derived one counts from today inclusive. Under a geometric run those differ by
+    exactly 1 -- p/(1-p) versus 1/(1-p) -- which made the two estimators look like they disagreed
+    by a factor of two on real data and would have been read as "runs are not geometric".
+    """
+
+    @pytest.mark.parametrize('p', [0.3, 0.5, 0.7])
+    def test_the_two_agree_on_a_synthetic_geometric_run(self, p):
+        rng = np.random.default_rng(int(p * 100))
+        T = 60000
+        x = np.zeros((T, 1))
+        sign = 1.0
+        for t in range(T):
+            x[t, 0] = sign * (1.0 + rng.random())
+            if rng.random() >= p:
+                sign = -sign
+        obs, cnt = L.observed_streak_lengths(x)
+        want = 1.0 / (1.0 - p)
+        seen = float(np.nanmean(obs[np.isfinite(obs) & (cnt > 200)]))
+        assert abs(seen - want) < 0.25 * want, (
+            f'p={p}: observed N {seen:.2f} vs geometric {want:.2f}')
+
+    def test_a_coin_flip_gives_n_of_about_two(self):
+        rng = np.random.default_rng(9)
+        x = rng.normal(0, 1, (40000, 1))
+        obs, cnt = L.observed_streak_lengths(x)
+        seen = float(np.nanmean(obs[np.isfinite(obs) & (cnt > 200)]))
+        assert 1.8 < seen < 2.2, f'coin-flip observed N {seen:.2f}'
+
+
+class TestWindowKernel:
+    def test_a_window_forgets_completely_on_schedule(self):
+        """The property that distinguishes a window from decay: evidence older than the window
+        contributes exactly nothing, not merely little."""
+        m = L.LivingBN(n_ind=1, window=20)
+        old = np.tile([[3.0], [2.0], [1.0]], (40, 1))     # up_less, always continues down to 1
+        for t in range(2, len(old)):
+            m.observe(old[t - 2], old[t - 1], old[t])
+        assert m.w_n.sum() <= 20, 'window kept more observations than its length'
+
+    def test_window_and_decay_reach_similar_answers_on_stationary_data(self):
+        rng = np.random.default_rng(11)
+        s = rng.normal(0, 100, (800, 6))
+        win = L.LivingBN(n_ind=6, window=252)
+        dec = L.LivingBN(n_ind=6, half_life=250)
+        for t in range(2, len(s)):
+            win.observe(s[t - 2], s[t - 1], s[t])
+            dec.observe(s[t - 2], s[t - 1], s[t])
+        a = [r['p_continue'] for r in win.report()]
+        b = [r['p_continue'] for r in dec.report()]
+        assert max(abs(x - y) for x, y in zip(a, b, strict=True)) < 0.08
+
+    def test_the_window_survives_a_save_load_round_trip(self, tmp_path):
+        """The chosen memory kernel is part of the model. Losing it on reload would silently
+        revert to exponential decay and change every number the next day."""
+        m = L.LivingBN(n_ind=3, window=252)
+        s = np.random.default_rng(12).normal(0, 100, (300, 3))
+        for t in range(2, len(s)):
+            m.observe(s[t - 2], s[t - 1], s[t])
+        p = tmp_path / 'bn.json'
+        m.save(p)
+        back = L.LivingBN.load(p)
+        assert back.window == 252
+        for i in range(3):
+            for st in range(L.N_STATES):
+                assert abs(back.p_continue(i, st) - m.p_continue(i, st)) < 1e-12
+
+
+class TestKernelComparison:
+    def test_it_scores_both_families(self):
+        rng = np.random.default_rng(13)
+        pnl = rng.normal(0, 500, (700, 6))
+        rows = L.compare_kernels(pnl, half_lives=(250, 1e9), windows=(126, 252), warmup=200)
+        kinds = {r[0] for r in rows}
+        assert kinds == {'decay', 'window'}
+        assert all(np.isfinite(r[2]) for r in rows)
+
+    def test_a_very_short_window_is_scored_worse_on_stationary_data(self):
+        """Throwing away usable data must cost something measurable, or the selection criterion
+        cannot tell a good memory length from a bad one."""
+        rng = np.random.default_rng(14)
+        pnl = rng.normal(0, 500, (800, 8))
+        rows = L.compare_kernels(pnl, half_lives=(500,), windows=(30,), warmup=250)
+        decay = next(r[2] for r in rows if r[0] == 'decay')
+        short = next(r[2] for r in rows if r[0] == 'window')
+        assert decay > short

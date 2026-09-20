@@ -527,7 +527,7 @@ def upkeep_living_bn(model_dir, actual_by_industry, industry_list):
     """
     import numpy as _np
 
-    from living_bn import LivingBN, fit_half_life
+    from living_bn import LivingBN, compare_kernels
 
     path = os.path.join(model_dir, LIVING_BN_FILE)
     blob = {}
@@ -542,6 +542,8 @@ def upkeep_living_bn(model_dir, actual_by_industry, industry_list):
     n_ind = len(industry_list)
     model = (LivingBN.from_dict(blob['model']) if blob.get('model')
              else LivingBN(n_ind=n_ind))
+    if blob.get('kernel_window'):
+        model.window = int(blob['kernel_window'])
     if model.n_ind != n_ind:                       # industry count changed; state is meaningless
         print(f"living_bn: industry count {model.n_ind} -> {n_ind}, resetting")
         model = LivingBN(n_ind=n_ind)
@@ -560,21 +562,32 @@ def upkeep_living_bn(model_dir, actual_by_industry, industry_list):
     if runs >= LIVING_BN_REFIT_EVERY and len(hist) >= LIVING_BN_MIN_REFIT:
         arr = _np.array(hist, dtype=float)
         try:
-            best, _ = fit_half_life(arr, warmup=min(250, len(hist) // 2))
-            if best != model.half_life:
-                print(f"living_bn: half-life {model.half_life} -> {best}")
-            # Rebuild from history: the decay is baked into every count, so changing it means
-            # re-accumulating rather than carrying forward counts weighted the old way.
-            model = LivingBN(n_ind=n_ind, half_life=best)
+            # Both shapes of "recent history" compete on the same walk-forward criterion: an
+            # exponential decay, or a rectangular window such as the last trading year. Measured
+            # on the v0.8.1.7 collection run a 500-day half-life won (+1.83 millinats/obs over a
+            # coin flip) and a 252-day window came third (+1.22), because the conditionals are
+            # stationary and a window simply discards usable data. That can change, so the choice
+            # is re-made from data rather than fixed here.
+            rows = compare_kernels(arr, warmup=min(250, len(hist) // 2))
+            kind, name, ll, _n = max(rows, key=lambda r: r[2])
+            win = int(name.split()[1]) if kind == 'window' else 0
+            hl = 1e9 if kind == 'window' else float(name.split()[0])
+            if (win or 0) != (model.window or 0) or (not win and hl != model.half_life):
+                print(f"living_bn: memory {kind} {name} (logL/obs {ll:+.5f})")
+            # Rebuild from history: the weighting is baked into every count, so changing it means
+            # re-accumulating rather than carrying counts weighted the old way.
+            model = LivingBN(n_ind=n_ind, half_life=hl, window=win)
             for t in range(2, len(arr)):
                 model.observe(arr[t - 2], arr[t - 1], arr[t])
+            blob['kernel_window'] = win
         except Exception as e:                                   # noqa: BLE001
-            print(f"living_bn: half-life refit failed ({e}); keeping {model.half_life}")
+            print(f"living_bn: memory refit failed ({e}); keeping current")
         runs = 0
 
     with open(path, 'w') as f:
         json.dump({'model': model.to_dict(), 'history': hist,
-                   'runs_since_refit': runs}, f)
+                   'runs_since_refit': runs,
+                   'kernel_window': int(getattr(model, 'window', 0) or 0)}, f)
     return model.report()
 
 
