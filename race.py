@@ -81,12 +81,19 @@ NET_CANDIDATES = [('MT1Net',  'm', '74  own industry, trailing'),
                   ('MT1CNet', 'c', '146 own industry, today + intent'),
                   ('MT2INet', 'i', '888 all industries, trailing')]
 
-# (name, half_life, window, description). window = 0 selects exponential decay.
-COND_CANDIDATES = [('cond-1y-decay', 252.0, 0,   'state table, 252 d half-life'),
-                   ('cond-2y-decay', 504.0, 0,   'state table, 504 d half-life'),
-                   ('cond-1y-win',   1e9,   252, 'state table, last 252 d'),
-                   ('cond-2y-win',   1e9,   504, 'state table, last 504 d'),
-                   ('cond-forever',  1e9,   0,   'state table, never forgets')]
+# (label, half_life, window). window = 0 selects exponential decay.
+COND_KERNELS = [('1y-decay', 252.0, 0), ('2y-decay', 504.0, 0),
+                ('1y-win', 1e9, 252), ('2y-win', 1e9, 504),
+                ('forever', 1e9, 0)]
+# Depth: how many past days the state is built from. State = those days ORDERED BY
+# PROFITABILITY plus the profitability inversion point, so k! * (k+1) states -- k=1 gives 2
+# (sign of today) and k=2 gives the original six. Only 1 and 2 are raced: depth_sweep.py measured
+# k=3 at roughly break-even and k=4-5 at 8-50 millinats WORSE than a coin flip, because the state
+# space outruns the data (720 states over ~9,000 industry-days is 14 observations each).
+COND_DEPTHS = [1, 2]
+COND_CANDIDATES = [(f'cond-k{k}-{lab}', hl, win, k,
+                    f'ordered-set k={k}, {lab}')
+                   for k in COND_DEPTHS for lab, hl, win in COND_KERNELS]
 TIER_W = (1.0, 1.5, 2.25)
 
 ds = D.parse(sys.argv[1] if len(sys.argv) > 1 else 'mt1_dataset.bin')
@@ -170,24 +177,55 @@ def rank_ic(pred, mask, fwd, h, lo=0, hi=None):
     return np.array(out)
 
 
-def conditional_pred(book_arr, half_life, window, warmup=250):
-    """Walk-forward E[tomorrow's P&L | state], one column per industry.
+def conditional_pred(book_arr, half_life, window, k, warmup=250, prior=50.0):
+    """Walk-forward E[tomorrow's P&L | state], one column per industry, for any depth k.
 
     Alignment matches the logged candidates: pred[t] is the prediction FOR day t's outcome, so it
-    may only use information through t-1. The state is read from (t-2, t-1) and the model observes
-    day t only AFTER the prediction for day t has been made.
+    may only use information through t-1. The state is read from days t-k..t-1 and the estimator
+    sees day t only AFTER the prediction for day t has been made.
+
+    Pooled across industries, shrunk toward the global mean. The between-industry variance of this
+    effect measured SMALLER than sampling noise alone (tau^2 = 0), so per-industry tables would be
+    fitting noise.
     """
-    from living_bn import LivingBN, classify
+    from depth_sweep import n_states, state_k
     Tn, Nn = book_arr.shape
+    S = n_states(k)
+    w_n, w_sum = np.zeros(S), np.zeros(S)
+    g_n = g_sum = 0.0
+    ring = []
+    gamma = 0.5 ** (1.0 / half_life) if window <= 0 else 1.0
     out = np.full((Tn, Nn), np.nan)
-    mdl = LivingBN(n_ind=Nn, half_life=half_life, window=window)
-    for t in range(2, Tn):
-        if t > warmup:
-            for i in range(Nn):
-                st = classify(book_arr[t - 2, i], book_arr[t - 1, i])
-                if st is not None:
-                    out[t, i] = mdl.expected_dollars(i, st)
-        mdl.observe(book_arr[t - 2], book_arr[t - 1], book_arr[t])
+    for t in range(k + 1, Tn):
+        obs = []
+        for i in range(Nn):
+            st = state_k(book_arr[t - 1 - k:t - 1, i])
+            if st is None:
+                continue
+            if t > warmup and (w_n[st] + g_n) > 0:
+                gm = g_sum / g_n if g_n > 0 else 0.0
+                out[t, i] = (w_sum[st] + prior * gm) / (w_n[st] + prior)
+            y = book_arr[t - 1, i]
+            if np.isfinite(y) and y != 0:
+                obs.append((st, float(y)))
+        if window <= 0:
+            w_n *= gamma
+            w_sum *= gamma
+            g_n *= gamma
+            g_sum *= gamma
+        for st, y in obs:
+            w_n[st] += 1.0
+            w_sum[st] += y
+            g_n += 1.0
+            g_sum += y
+        if window > 0:
+            ring.append(obs)
+            while len(ring) > window:
+                for st, y in ring.pop(0):
+                    w_n[st] -= 1.0
+                    w_sum[st] -= y
+                    g_n -= 1.0
+                    g_sum -= y
     return out
 
 
@@ -197,14 +235,14 @@ for _n, _k, _d in NET_CANDIDATES:
     PRED[_n] = (ds[f'{_k}_pred'].astype(float), ds[f'{_k}_score'].astype(float) > 0,
                 ds[f'{_k}_score'].astype(float), _d)
 _book_clean = np.where(np.abs(book) < 1e-9, np.nan, book)
-for _n, _hl, _w, _d in COND_CANDIDATES:
-    _p = conditional_pred(_book_clean, _hl, _w)
+for _n, _hl, _w, _k, _d in COND_CANDIDATES:
+    _p = conditional_pred(_book_clean, _hl, _w, _k)
     PRED[_n] = (_p, np.isfinite(_p), None, _d)
 
 CANDIDATES = [(n, None, d) for n, _, d in NET_CANDIDATES] + \
-             [(n, None, d) for n, _, _, d in COND_CANDIDATES]
+             [(n, None, d) for n, _, _, _, d in COND_CANDIDATES]
 
-_cn = [n for n, _, _, _ in COND_CANDIDATES]
+_cn = [n for n, _, _, _, _ in COND_CANDIDATES]
 _flat = {n: PRED[n][0].ravel() for n in _cn}
 _msk = np.ones_like(next(iter(_flat.values())), bool)
 for v in _flat.values():
