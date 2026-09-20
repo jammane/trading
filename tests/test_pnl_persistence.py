@@ -10,15 +10,19 @@ So each measure here is fed a series whose answer is known in advance. A statist
 be shown to read a planted effect correctly cannot be trusted to report a null.
 """
 import importlib.util
-import sys
-import types
 
 import numpy as np
 import pytest
 
+# NOTE: do NOT stub read_mt1_dataset into sys.modules here. An earlier version of this file did
+# `sys.modules.setdefault('read_mt1_dataset', types.ModuleType(...))` to load the script under
+# test, which installs an EMPTY module that every later test importing the real one then receives.
+# test_mt1_dataset.py passed alone and failed in the full suite, and the poisoning only surfaced
+# when a file sorting alphabetically earlier acquired the same stub. The real module is importable
+# from the repo root, so the stub bought nothing.
+
 
 def _load():
-    sys.modules.setdefault('read_mt1_dataset', types.ModuleType('read_mt1_dataset'))
     spec = importlib.util.spec_from_file_location('pnl_persistence', 'pnl_persistence.py')
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
