@@ -1432,19 +1432,36 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                 si_bq[j] = buy_qty;  si_bf[j] = buy_price_frac;
                 si_sf[j] = sell_all_price_frac; si_sq[j] = sell_qty;
                 // The aggregates below are features too, so a non-finite raw output must not
-                // propagate into them. NaN fails `> 1e-6f`, so those orders are simply not
-                // counted — the same way the fill path treats them.
-                if (buy_qty > 1e-6f && buy_price > 0.f && std::isfinite(buy_price)) {
+                // propagate into them. TWO independent guards on purpose: the comparisons
+                // reject NaN on their own, and the explicit isfinite() catches the infinities
+                // that comparisons let through. The sell branch used to carry only the
+                // isfinite(), which -ffast-math folded to `true` -- measured, oi_sell_aggr came
+                // back NaN on 98.55% of industry-days while its buy twin, which also had a
+                // `> 0.f`, was clean. See the -fno-finite-math-only note in CMakeLists.txt.
+                const bool bar_ok = std::isfinite(close_t) && std::isfinite(span_t)
+                                    && span_t > 0.f && close_t > 0.f;
+                // Intent is bounded by what could actually EXECUTE -- a buy by available cash,
+                // a sell by the position held -- and floored to whole shares, because Alpaca
+                // forbids fractional quantities. Unbounded, these are raw network outputs:
+                // measured, they summed to $1.5e12 of "intended buys" against a $25k book.
+                // The COUNTS are deliberately not bounded: an order the model cannot afford was
+                // still an order it chose to place, and oi_n_buy/oi_n_sell is the buy/sell
+                // ratio channel. A bounded quantity of 0 against a nonzero count is the honest
+                // encoding of "wanted to, could not".
+                const float afford_q = bar_ok ? whole_shares(ref_cash / close_t) : 0.f;
+                const float held_q   = whole_shares(ref_hold[j]);
+                if (bar_ok && buy_qty > 1e-6f && buy_price > 0.f && std::isfinite(buy_price)) {
                     oi_nb++;
                     oi_ba  += (double)(buy_price - close_t) / span_t;
-                    oi_bv  += (double)buy_qty * close_t;
+                    oi_bv  += (double)whole_shares(fminf(buy_qty, afford_q)) * close_t;
                     oi_bf  += buy_price_frac;
                     oi_bf2 += (double)buy_price_frac * buy_price_frac;
                 }
-                if (sell_qty > 1e-6f && std::isfinite(sell_all_price)) {
+                if (bar_ok && sell_qty > 1e-6f && sell_all_price > 0.f
+                        && std::isfinite(sell_all_price)) {
                     oi_ns++;
                     oi_sa += (double)(sell_all_price - close_t) / span_t;
-                    oi_sv += (double)sell_qty * close_t;
+                    oi_sv += (double)whole_shares(fminf(sell_qty, held_q)) * close_t;
                 }
             }
 
