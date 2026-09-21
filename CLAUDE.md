@@ -751,11 +751,40 @@ seed is **a new model**: MT1 is re-initialised from `0xB901 ^ (pass+1)<<32 ^ ind
 rather than being carried over. The one exception is the first pass of a run seeded with
 `--load-dir`, where those elites *are* what this MT1 was raised against, so its paired weights load.
 
-**Open — the formulation is not the one that was measured.** The +0.0184 result came from
-`mt1_backprop.py`'s `walk()`, which reshapes to `(T×N, F)` and fits **one pooled model** across all
-12 industries. The trainer fits **12 separate per-industry nets**, which is a different estimator
-with 855 rows each instead of 10,260 — 0.17 samples/param against MT1Net's 0.35. Pooled-vs-per-industry
-has never been compared on the same days. Until it has, treat the per-industry result as unmeasured.
+**The variant race.** Five variants train in the SAME daily loop, on the SAME 200 order sets, in
+the same order (`BP_VARIANTS` in `training_v4.cpp`): `per-ind 32/8` (what ships), `pooled 32/8`,
+`per-ind 64/16`, `per-ind 16/4`, and `CONTROL slot0`. Racing in-loop rather than logging the rows
+and fitting offline avoids a ~400 MB artefact and a reader to keep in sync, and removes the risk
+that an offline reconstruction quietly differs from what the trainer does — the variants cannot
+disagree about the data because they are handed the same bytes. Cost is negligible: a few thousand
+parameters each against StockNN's 200 forward passes over 928,825.
+
+`pooled` is there because the **+0.0184 that motivated this work was a POOLED fit** —
+`mt1_backprop.py`'s `walk()` reshapes to `(T×N, F)` and fits one model across all 12 industries,
+while the trainer fits 12 per-industry nets with 855 rows each instead of 10,260 (0.17
+samples/param against MT1Net's 0.35). The race settles that on the same days.
+
+**`CONTROL slot0` is the row that matters most.** It hands every one of the 200 models slot 0's
+intent — exactly the defect fixed in v0.8.1.27 — so its rows are identical across the 200 and it
+*cannot* rank them. It must read 0.0000. If it does not, the measurement leaks and no other row
+means anything.
+
+**Targets deliberately do not vary across variants.** Within a day, total book P&L and trade delta
+differ by a constant, because the market move is common to all 200 — so they induce the SAME
+ranking. Target choice moves the loss and the across-day number, not the thing being raced.
+
+**What is reported, per pass.** Each variant's mean training loss, its mean **within-day rank**
+(Spearman across the 200 order sets, one value per industry-day), and the same split into 100-day
+buckets. The buckets exist because MT1 starts from random weights at `MT1_BP_START_DAY`: a single
+pass-average blends "has not learned yet" with "has", and could not tell a net that never learns
+from one that learns slowly. Also logged is `slot-0 corr` — the deployed model's prediction against
+its realised P&L across days — which still contains the common market move and so is the easier,
+allocator-facing number, not evidence about the trading.
+
+Both measures are out-of-sample by construction: the net predicts a day before training on it, and
+**within a day it predicts all 200 with the net frozen, then trains**. Training inside the
+prediction loop would score model *m+1* with a net that had already seen model *m*'s outcome —
+same day, same market move — which leaks hard and manufactures a ranking out of noise.
 
 ### Production inference chain (when MT2 models available)
 
