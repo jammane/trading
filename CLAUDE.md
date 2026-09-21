@@ -697,6 +697,66 @@ answer in this project**:
 **Do not read an IC without its block-bootstrap t.** This is the single most repeated mistake in
 this project's history.
 
+### Gradient-trained MT1 (`mt1_backprop.h`)
+
+A second MT1 trained by **backpropagation** rather than mutation-and-selection, running alongside
+the evolutionary pool inside the same training pass. The search method — not the architecture — is
+the thing being tested: everything MT1 has ever been is a gradient-free search over a ~3,500-param
+space using a target whose mean/sd is 0.022.
+
+`MT1Backprop` is a hand-coded MLP (tanh hidden, linear output, Adam with decoupled weight decay) so
+the trainer keeps no torch dependency. Gradients are pinned against central finite differences at
+four shapes in `tests/test_mt1_backprop.cpp`; worst relative error 1.1e-04.
+
+| constant | value | meaning |
+|---|---|---|
+| `MT1_BP_START_DAY` | 400 | first day that trains — the first 400 are ignored |
+| `MT1_BP_HIDDEN_A/B` | 32 / 8 | `MT1C_IN(146) → 32 → 8 → 1`, 4,977 params |
+
+**Shape is 32/8 because bigger measured worse**, not for speed: the wider net read +0.0077 rank IC
+against +0.0184 for this one.
+
+**Inputs are MT1CNet's `cfeat146`** — that industry's features, today only, post-close, **carrying
+that model's own order intent**. **One training row per scored model** (`MT1_BP_MODELS = N_SLOTS`),
+each row's target being its own realised `slot_score − book_prev`. The prediction published to
+`bp_pred` uses slot 0's intent, because slot 0 is what production places, and it predicts before it
+learns so nothing is scored on an outcome it has seen.
+
+**The target is RAW DOLLARS**, divided only by the constant `MT1_PRED_SCALE` to keep the optimiser
+well-conditioned (targets near O(1) rather than O(750)); `bp_pred` multiplies straight back. This is
+the whole point of MT1: it answers "what will *this order set* earn," in dollars, and MT2 ranks the
+12 dollar amounts to allocate. Dividing by the industry's own book — which an earlier revision did —
+is a per-industry rescaling, not a unit change, and destroys that: +$500 on a $45k book reads 0.0111
+against 0.0200 for the same $500 on a $25k book, so MT2 would fund the smaller book for identical
+dollars.
+
+**Per-model order intent is what makes the 200 rows real** (`training_v4.cpp`, `IndResult.slot_*`).
+Every slot resets to slot 0's portfolio each morning, so all 200 see an identical market move and
+differ only in what they chose to trade. Until v0.8.1.27 every order-intent feature was gated behind
+`if (slot == 0)`, so MT1 was handed slot 0's orders and asked for elite #7's P&L — for 19 of 20 rows
+the input described orders that model never placed. With a shared input the rows are near-duplicates:
+measured post-day-400 over 855 days × 12 industries, the across-model outcome sd is **$166** against a
+between-day sd of **$729**, so 20 elites were worth **1.05 independent samples** and 200 would have
+been worth no more. Varying the input where the outcome varies is what turns them into 200 rows, and
+that $166 spread is the part MT1 can now learn to rank.
+
+A one-time log line on the first day that trains reports how many of the 146 features differ between
+slot 0 and slot 199, printing `<-- BROKEN` at zero. Without it a broken intent capture is invisible —
+it just looks like a 200× learning rate.
+
+**Pairing and the pass boundary.** Each industry's MT1 is raised against *that industry's* elites, so
+it is meaningful only next to them. `copy_elites()` carries `mt1bp_<ind>.bin` into `champion/` with
+the elites it was trained beside (a missing file is not an error). At a pass boundary a new champion
+seed is **a new model**: MT1 is re-initialised from `0xB901 ^ (pass+1)<<32 ^ ind` and grows with it
+rather than being carried over. The one exception is the first pass of a run seeded with
+`--load-dir`, where those elites *are* what this MT1 was raised against, so its paired weights load.
+
+**Open — the formulation is not the one that was measured.** The +0.0184 result came from
+`mt1_backprop.py`'s `walk()`, which reshapes to `(T×N, F)` and fits **one pooled model** across all
+12 industries. The trainer fits **12 separate per-industry nets**, which is a different estimator
+with 855 rows each instead of 10,260 — 0.17 samples/param against MT1Net's 0.35. Pooled-vs-per-industry
+has never been compared on the same days. Until it has, treat the per-industry result as unmeasured.
+
 ### Production inference chain (when MT2 models available)
 
 ```

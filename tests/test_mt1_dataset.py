@@ -414,8 +414,8 @@ class TestCompetitorInput:
         # The fraction of what is AVAILABLE, matching how the fill path clamps them: a buy is
         # min(buy_qty, cash/price), a sell is min(sell_qty, holdings). The raw head is unbounded
         # because the clamp does the bounding, so raw magnitude carries nothing.
-        assert 'affordable' in body and 'fminf(cn_ok(ir.si_bqty[j]), affordable)' in body
-        assert 'fminf(cn_ok(ir.si_sqty[j]), pos)' in body
+        assert 'affordable' in body and 'fminf(cn_ok(si_bqty[j]), affordable)' in body
+        assert 'fminf(cn_ok(si_sqty[j]), pos)' in body
         # whole shares, as the fill path does: Alpaca stop orders forbid fractional
         # quantities, so a fractional intent describes a trade that cannot be placed.
         assert body.count('whole_shares(') >= 4, 'intent must be floored to whole shares'
@@ -432,8 +432,27 @@ class TestCompetitorInput:
         denominator is not what the fill path uses."""
         body = CPP[CPP.index('static void build_mt1c_input'):
                    CPP.index('// ── MT1 dataset log ─')]
-        assert 'whole_shares(fminf(cn_ok(ir.si_bqty[j]), affordable)) / affordable' in body
-        assert 'whole_shares(fminf(cn_ok(ir.si_sqty[j]), pos)) / pos' in body
+        assert 'whole_shares(fminf(cn_ok(si_bqty[j]), affordable)) / affordable' in body
+        assert 'whole_shares(fminf(cn_ok(si_sqty[j]), pos)) / pos' in body
+
+    def test_intent_source_is_selectable_and_defaults_to_slot_zero(self):
+        """build_mt1c_input_for picks WHOSE orders go into the vector; the old name is a slot-0
+        wrapper. Both halves matter. Per-model intent is what makes the gradient MT1's 200 rows
+        distinct rather than one row repeated -- every slot resets to slot 0's portfolio, so the
+        orders are the only thing that differs. And the default has to stay slot 0, because the
+        dataset log and the race competitors describe the DEPLOYED model; if the fallback changed,
+        every one of those would silently start describing something else."""
+        body = CPP[CPP.index('static void build_mt1c_input_for'):
+                   CPP.index('// ── MT1 dataset log ─')]
+        # the four intent channels are read through the selectable aliases, not off ir directly
+        for alias in ('si_bqty', 'si_bfrac', 'si_sfrac', 'si_sqty'):
+            assert f'in_{alias[3:]}  ? in_{alias[3:]}  : ir.{alias}' in body \
+                   or f'in_{alias[3:]} ? in_{alias[3:]} : ir.{alias}' in body, \
+                   f'{alias} must fall back to slot 0 when no model is named'
+            assert f'ir.{alias}[j]' not in body, \
+                   f'{alias} must be read through the alias so a named model is honoured'
+        # the old name survives as a slot-0 wrapper, so existing callers are unchanged
+        assert 'build_mt1c_input_for(day_sym, ir, nullptr, nullptr, nullptr, nullptr, out)' in body
 
     def test_intent_is_zero_when_there_is_nothing_to_spend_or_sell(self):
         body = CPP[CPP.index('static void build_mt1c_input'):

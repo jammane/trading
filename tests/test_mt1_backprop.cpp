@@ -89,6 +89,41 @@ int main() {
         check((int)net.W.size() == net.n_params(), "W is sized to n_params");
     }
 
+    // Weights must round-trip through the flat array convert_weights.py and save_bin read, or the
+    // paired MT1 that travels into champion/ comes back as something else.
+    {
+        MT1Backprop a, b;
+        a.init({146, 32, 8, 1}, 4242);
+        b.init({146, 32, 8, 1}, 777);
+        std::vector<float> in(146);
+        for (int i = 0; i < 146; i++) in[i] = 0.2f * std::cos(0.3f * i);
+        for (int i = 0; i < 300; i++) { a.forward(in.data()); a.train_step(0.31f); }
+        const float want = a.forward(in.data());
+        check(std::fabs(b.forward(in.data()) - want) > 1e-6f,
+              "a differently-seeded net really does differ before the copy");
+        b.W = a.W;                                  // the save/load path is a flat float copy
+        check(std::fabs(b.forward(in.data()) - want) < 1e-6f,
+              "copying the flat weight vector reproduces the output exactly");
+    }
+
+    // Two industries trained on different targets must not converge to the same network -- if they
+    // did, the per-industry pairing would be decoration.
+    {
+        MT1Backprop p, q;
+        p.init({6, 8, 1}, 11); q.init({6, 8, 1}, 11);   // SAME seed, so any divergence is training
+        uint64_t s2 = 5;
+        auto rnd = [&s2]() { s2 = s2 * 6364136223846793005ULL + 1442695040888963407ULL;
+                             return (float)((s2 >> 33) / 4294967296.0) * 2.f - 1.f; };
+        for (int it = 0; it < 2000; it++) {
+            float x[6]; for (int i = 0; i < 6; i++) x[i] = rnd();
+            p.forward(x); p.train_step(0.4f * x[0]);
+            q.forward(x); q.train_step(-0.4f * x[0]);
+        }
+        float x[6]; for (int i = 0; i < 6; i++) x[i] = 0.5f;
+        check(std::fabs(p.forward(x) - q.forward(x)) > 0.05f,
+              "nets trained on opposite targets diverge from an identical seed");
+    }
+
     printf(failures ? "\n%d FAILURE(S)\n" : "\nbackprop verified\n", failures);
     return failures ? 1 : 0;
 }
