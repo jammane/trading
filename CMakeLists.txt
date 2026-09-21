@@ -40,6 +40,15 @@ target_compile_options(test_pass_seeding_cpp PRIVATE -O2 -Wall -Wextra)
 target_link_libraries(test_pass_seeding_cpp m)
 add_test(NAME test_pass_seeding COMMAND test_pass_seeding_cpp)
 
+# The hand-coded backward pass is checked against finite differences. A wrong chain rule still
+# compiles, still shows a falling loss, and trains a quietly wrong model forever -- this is the
+# only test that can tell the difference.
+add_executable(test_mt1_backprop_cpp tests/test_mt1_backprop.cpp)
+target_include_directories(test_mt1_backprop_cpp PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_options(test_mt1_backprop_cpp PRIVATE -Wall -Wextra)
+target_link_libraries(test_mt1_backprop_cpp m)
+add_test(NAME test_mt1_backprop COMMAND test_mt1_backprop_cpp)
+
 # sort_index_prefix() replaced std::sort at five sites to kill an -O3 -Warray-bounds false
 # positive. A hand-written sort now decides MT2 tier assignment, so it is checked against
 # std::sort over randomized inputs -- including the heavy-tie case that is MT2's normal input.
