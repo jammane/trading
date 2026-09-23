@@ -176,6 +176,17 @@ static constexpr int   MT1_BP_START_DAY    = 400;
 // exactly the variety a critic needs to learn what separates a good order set from a bad one.
 // Cost is ~2.05M gradient steps on a 4,977-param net over a full pass, which is nothing.
 static constexpr int   MT1_BP_MODELS       = N_SLOTS;
+// Carried gradient entries begin TRAINING here instead of MT1_BP_START_DAY, to let Adam's moment
+// estimates mature before the measurement window opens. Adam's first steps are effectively a
+// warm-up: the second-moment estimate starts at zero and the bias correction is large, so early
+// updates are noisy in a way that has nothing to do with the architecture being raced.
+//
+// They are still only MEASURED from MT1_BP_START_DAY, like every other entry, so the extra days
+// buy warm-up and not a longer scoring window. The cost is that a carried entry sees ~35% more
+// training data per pass than a restarted one, which is a real confound for "does carryover help"
+// -- grad vs grdC now differs in two ways, not one. It is the right trade only because the
+// comparison that matters most, evo vs grdC, has both sides carrying and both warmed up.
+static constexpr int   MT1_BP_WARM_DAY     = 100;
 
 // ── the MT1 race: 3 architectures x 2 search methods ────────────────────────────
 //
@@ -221,6 +232,11 @@ struct RaceEntry {
     bool        carry;        // keep the model across a pass boundary, or start fresh
     const char* tag;          // pool file prefix; must be unique per evolutionary entry
 };
+
+// Day this entry starts TRAINING. Measurement always begins at MT1_BP_START_DAY.
+static inline int race_train_start(const RaceEntry& e) {
+    return (e.search == SRCH_GRAD && e.carry) ? MT1_BP_WARM_DAY : MT1_BP_START_DAY;
+}
 // CARRY is the third axis, and it is deliberate rather than incidental.
 //
 // The evolutionary pools have always carried: the champion store seeds the next pass, so a pool
@@ -4798,7 +4814,7 @@ int main(int argc, char* argv[]) {
                     // The PREDICTION still comes from slot 0's intent, because slot 0 is what
                     // production actually places. Predict before learning, so no row is ever scored
                     // on an outcome the net has already been shown.
-                    if (blk_day[d] && blk_actual_day[d] >= MT1_BP_START_DAY) {
+                    if (blk_day[d] && blk_actual_day[d] >= MT1_BP_WARM_DAY) {
                         float bin[MT1C_IN];
                         build_mt1c_input(blk_day[d]->sym[i], ir, bin);
                         bool finite_in = true;
@@ -4897,7 +4913,7 @@ int main(int argc, char* argv[]) {
                         }
 
                         // Distinct-row census, once per industry-day for the three input sets.
-                        if (nm >= 3) {
+                        if (nm >= 3 && blk_actual_day[d] >= MT1_BP_START_DAY) {
                             auto row_hash = [](const float* v, int n) {
                                 uint64_t h = 1469598103934665603ULL;
                                 for (int q = 0; q < n; q++) {
@@ -4941,13 +4957,20 @@ int main(int argc, char* argv[]) {
                                              ? r.pool[i].slot(r.pool[i].best_slot)
                                              : r.w[i].data();
 
+                            // Measurement window is the SAME for every entry, whatever its
+                            // training start: the warm-up days buy Adam maturity, not a longer
+                            // scoring window.
+                            const bool measure = blk_actual_day[d] >= MT1_BP_START_DAY;
+                            const bool train   = blk_actual_day[d] >= race_train_start(e);
+                            if (!measure && !train) continue;
+                            if (measure)
                             for (int m = 0; m < nm; m++) {
                                 const float* row = (e.arch == ARCH_MT1) ? ind_in : mrows[m];
                                 mpred[m] = (e.arch == ARCH_MT1)  ? mt1net_forward(W, row, 0.f)
                                          : (e.arch == ARCH_MT1C) ? mt1cnet_forward(W, row, 0.f)
                                                                  : mt1s_forward(W, row);
                             }
-                            if (nm >= 3) {
+                            if (measure && nm >= 3) {
                                 static thread_local float srt[MT1_BP_MODELS];
                                 memcpy(srt, mpred, (size_t)nm * sizeof(float));
                                 std::sort(srt, srt + nm);
@@ -4965,19 +4988,20 @@ int main(int argc, char* argv[]) {
                                     }
                                 }
                             }
-                            if (nm > 0) {          // across-day: slot 0 is what production places
+                            if (measure && nm > 0) {   // across-day: slot 0 is production's
                                 const double px = mpred[0], py = mreal[0];
                                 r.sx[i] += px; r.sy[i] += py;
                                 r.xy[i] += px * py; r.xx[i] += px * px; r.yy[i] += py * py;
                                 r.dn[i]++;
                             }
 
+                            if (!train) continue;
                             if (e.search == SRCH_EVO) {
                                 // One step per industry-day through the existing pool lifecycle.
                                 // Selection sees one scalar per model, so there is no per-row
                                 // notion here and nm plays no part.
                                 mt1_step_day(i, r.pool[i], ind_in, actual,
-                                             blk_actual_day[d] >= MT1_BP_START_DAY,
+                                             blk_actual_day[d] >= race_train_start(e),
                                              blk_actual_day[d], cur_mt1_sigma,
                                              race_forward(e.arch));
                             } else {
@@ -5436,6 +5460,14 @@ int main(int argc, char* argv[]) {
                         "them is noise.");
                 log_msg("   grdC = gradient CARRIED across the pass boundary; grad = restarted. "
                         "evo always carries.");
+                {
+                    char c[192];
+                    snprintf(c, sizeof(c),
+                             "   grdC also trains from day %d (Adam warm-up) but is SCORED from "
+                             "day %d, same as everything else.",
+                             MT1_BP_WARM_DAY, MT1_BP_START_DAY);
+                    log_msg(c);
+                }
                 {
                     char c[256];
                     auto line = [&](const char* lab, const RowCount& rc, int per_day) {
