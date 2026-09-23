@@ -4453,6 +4453,17 @@ int main(int argc, char* argv[]) {
         // may tie more than MT1C even where the inputs differ. The residual bias from mishandled
         // ties scales as (k/n)^2 in the tie width, so this is the number that bounds it.
         double distinct_sum = 0.0; long distinct_n = 0;
+        // ── allocation backtest ───────────────────────────────────────────────────────
+        // The metric that decides paper readiness, which neither rank nor corr answers. A model
+        // can correlate +0.05 with realised P&L and still allocate worse than 1/12, because
+        // allocation depends on getting the TOP industries right rather than the average rank.
+        //
+        // Each day the 12 deployed predictions are ranked and capital placed equally across the
+        // top k, against an equal 1/12 flat book. Long-only, because that is what production does.
+        // The long-short spread is carried too: it is the cleaner read on whether the ranking
+        // holds information, since it cancels the market move common to all 12.
+        double alloc_flat = 0.0, alloc_top4 = 0.0, alloc_top6 = 0.0, alloc_bot4 = 0.0;
+        long   alloc_n = 0;
         std::vector<double> bk_sum = std::vector<double>(16, 0.0);
         std::vector<long>   bk_n   = std::vector<long>(16, 0);
         // across-day: the deployed model's prediction against the realised industry P&L
@@ -4690,6 +4701,7 @@ int main(int argc, char* argv[]) {
             }
             r.loss_sum = 0.0; r.loss_n = 0; r.rank_sum = 0.0; r.rank_n = 0; r.adam_step = 0;
             r.distinct_sum = 0.0; r.distinct_n = 0;
+            r.alloc_flat = r.alloc_top4 = r.alloc_top6 = r.alloc_bot4 = 0.0; r.alloc_n = 0;
             std::fill(r.bk_sum.begin(), r.bk_sum.end(), 0.0);
             std::fill(r.bk_n.begin(),   r.bk_n.end(),   0);
             std::fill(r.xy.begin(), r.xy.end(), 0.0); std::fill(r.xx.begin(), r.xx.end(), 0.0);
@@ -4761,6 +4773,12 @@ int main(int argc, char* argv[]) {
 
         auto process_block = [&](int blk_len) {
             if (blk_len <= 0) return;
+            // Per-day staging for the allocation backtest: each entry's deployed prediction for
+            // every industry, plus that industry's realised return, gathered across the industry
+            // loop and resolved once all 12 are present.
+            static float race_day_pred[RACE_N][N_IND];
+            static float race_day_ret[N_IND];
+            static bool  race_day_ok[N_IND];
             // 1. MT1 now steps once per industry per DAY, inside the day loop below — there are
             //    no T1/H/T2 phases to run ahead of it and no block-start snapshot to take. The
             //    prediction each model parked yesterday IS its out-of-sample record, so the
@@ -4776,6 +4794,7 @@ int main(int argc, char* argv[]) {
             //    of the coincident market forward return (blk_perf, kept as a read-only diagnostic).
             MasterResult blk_master_res[MT1_DAYS];
             for (int d = 0; d < blk_len; d++) {
+                memset(race_day_ok, 0, sizeof(race_day_ok));
                 MasterResult mr{}; bool inj = false;
                 float s0_pf = 0.f, s0_mkt = 0.f;
                 // MT2's input is now ONE number per industry: MT1's dollar prediction of that
@@ -4994,6 +5013,12 @@ int main(int argc, char* argv[]) {
                                 }
                             }
                             if (measure && nm > 0) {   // across-day: slot 0 is production's
+                                // staged for the allocation backtest once all 12 are in
+                                race_day_pred[v][i] = mpred[0];
+                                race_day_ret[i]     = (ir.book_prev > 1.f)
+                                                      ? (ir.slot0_score - ir.book_prev) / ir.book_prev
+                                                      : 0.f;
+                                race_day_ok[i]      = true;
                                 const double px = mpred[0], py = mreal[0];
                                 r.sx[i] += px; r.sy[i] += py;
                                 r.xy[i] += px * py; r.xx[i] += px * px; r.yy[i] += py * py;
@@ -5067,6 +5092,45 @@ int main(int argc, char* argv[]) {
                     for (int e = 0; e < ELITE_POOL; e++)
                         bo_el_today[i][e] = ir.elite_score[e] - ir.book_prev;
                     bo_have[i] = true;
+                }
+
+                // ── allocation backtest: rank the 12, place capital, compare to flat ──
+                //
+                // Runs once per day with all twelve industries in hand. Equal weight across the
+                // top k by prediction, against an equal 1/12 book -- long-only, matching what
+                // production does. bot4 is kept so the long-short spread can be read: it cancels
+                // the market move common to all twelve, which the long-only numbers do not.
+                {
+                    int ok_n = 0;
+                    for (int i = 0; i < N_IND; i++) if (race_day_ok[i]) ok_n++;
+                    if (ok_n >= 8) {
+                        double flat = 0.0;
+                        for (int i = 0; i < N_IND; i++)
+                            if (race_day_ok[i]) flat += race_day_ret[i];
+                        flat /= ok_n;
+                        int idx[N_IND];
+                        for (int v = 0; v < RACE_N; v++) {
+                            RaceState& r = race[v];
+                            int n = 0;
+                            for (int i = 0; i < N_IND; i++) if (race_day_ok[i]) idx[n++] = i;
+                            // sort_index_prefix, not std::sort: at -O3 the latter emits an
+                            // -Warray-bounds false positive on a small int[] (same reason it was
+                            // replaced at five other sites -- see sort_util.h).
+                            sort_index_prefix(idx, n, [&](int a, int b) {
+                                return race_day_pred[v][a] > race_day_pred[v][b];
+                            });
+                            auto mean_of = [&](int from, int cnt) {
+                                double t = 0.0;
+                                for (int k = 0; k < cnt; k++) t += race_day_ret[idx[from + k]];
+                                return cnt ? t / cnt : 0.0;
+                            };
+                            r.alloc_flat += flat;
+                            r.alloc_top4 += mean_of(0, std::min(4, n));
+                            r.alloc_top6 += mean_of(0, std::min(6, n));
+                            r.alloc_bot4 += mean_of(std::max(0, n - 4), std::min(4, n));
+                            r.alloc_n++;
+                        }
+                    }
                 }
 
                 // ── online conditional models: predict, score, then learn ────────────────
@@ -5474,6 +5538,8 @@ int main(int argc, char* argv[]) {
                     log_msg(c);
                     log_msg("   In PASS 1 grdC has nothing to carry and the same start as grad, "
                             "so their gap there is the noise floor.");
+                log_msg("   alloc bp/day is the PAPER-READINESS read: top4 vs flat is what "
+                        "switching off --flat-allocation would have earned.");
                 }
                 {
                     char c[256];
@@ -5515,6 +5581,23 @@ int main(int argc, char* argv[]) {
                                  "        distinct preds %.1f/%d (%.1f%% tied, tie-bias bound ~%.1e)",
                                  dm, MT1_BP_MODELS, 100.0 * tie_frac,
                                  (kbar / MT1_BP_MODELS) * (kbar / MT1_BP_MODELS));
+                        log_msg(m);
+                    }
+                    if (r.alloc_n > 0) {
+                        // Basis points per day. The long-only line is the paper-readiness read:
+                        // production allocates long-only, so "top4 - flat" is literally what
+                        // switching off --flat-allocation would have earned. long-short cancels
+                        // the market move common to all twelve and is the cleaner read on whether
+                        // the ranking carries information at all.
+                        const double n = (double)r.alloc_n;
+                        const double fl = 1e4 * r.alloc_flat / n;
+                        const double t4 = 1e4 * r.alloc_top4 / n;
+                        const double t6 = 1e4 * r.alloc_top6 / n;
+                        const double b4 = 1e4 * r.alloc_bot4 / n;
+                        snprintf(m, sizeof(m),
+                                 "        alloc bp/day: flat %+.2f | top4 %+.2f (%+.2f vs flat) | "
+                                 "top6 %+.2f (%+.2f) | long-short %+.2f",
+                                 fl, t4, t4 - fl, t6, t6 - fl, t4 - b4);
                         log_msg(m);
                     }
                     std::string traj = "        by day:";
