@@ -113,7 +113,7 @@ int main() {
         p.init({6, 8, 1}, 11); q.init({6, 8, 1}, 11);   // SAME seed, so any divergence is training
         uint64_t s2 = 5;
         auto rnd = [&s2]() { s2 = s2 * 6364136223846793005ULL + 1442695040888963407ULL;
-                             return (float)((s2 >> 33) / 4294967296.0) * 2.f - 1.f; };
+                             return (float)((s2 >> 33) / 2147483648.0) * 2.f - 1.f; };
         for (int it = 0; it < 2000; it++) {
             float x[6]; for (int i = 0; i < 6; i++) x[i] = rnd();
             p.forward(x); p.train_step(0.4f * x[0]);

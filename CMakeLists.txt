@@ -49,6 +49,12 @@ target_compile_options(test_mt1_backprop_cpp PRIVATE -Wall -Wextra)
 target_link_libraries(test_mt1_backprop_cpp m)
 add_test(NAME test_mt1_backprop COMMAND test_mt1_backprop_cpp)
 
+add_executable(test_mt1_grad_cpp tests/test_mt1_grad.cpp)
+target_include_directories(test_mt1_grad_cpp PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_options(test_mt1_grad_cpp PRIVATE -Wall -Wextra)
+target_link_libraries(test_mt1_grad_cpp m)
+add_test(NAME test_mt1_grad COMMAND test_mt1_grad_cpp)
+
 # sort_index_prefix() replaced std::sort at five sites to kill an -O3 -Warray-bounds false
 # positive. A hand-written sort now decides MT2 tier assignment, so it is checked against
 # std::sort over randomized inputs -- including the heavy-tie case that is MT2's normal input.
