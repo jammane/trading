@@ -176,16 +176,20 @@ static constexpr int   MT1_BP_START_DAY    = 400;
 // exactly the variety a critic needs to learn what separates a good order set from a bad one.
 // Cost is ~2.05M gradient steps on a 4,977-param net over a full pass, which is nothing.
 static constexpr int   MT1_BP_MODELS       = N_SLOTS;
-// Carried gradient entries begin TRAINING here instead of MT1_BP_START_DAY, to let Adam's moment
-// estimates mature before the measurement window opens. Adam's first steps are effectively a
-// warm-up: the second-moment estimate starts at zero and the bias correction is large, so early
-// updates are noisy in a way that has nothing to do with the architecture being raced.
+// Carried gradient entries begin TRAINING here instead of MT1_BP_START_DAY -- but only from the
+// SECOND pass onward.
 //
-// They are still only MEASURED from MT1_BP_START_DAY, like every other entry, so the extra days
-// buy warm-up and not a longer scoring window. The cost is that a carried entry sees ~35% more
-// training data per pass than a restarted one, which is a real confound for "does carryover help"
-// -- grad vs grdC now differs in two ways, not one. It is the right trade only because the
-// comparison that matters most, evo vs grdC, has both sides carrying and both warmed up.
+// The compensation is for a STALE optimiser, not a cold one. Adam's bias correction is done after
+// ~5,000 steps and the race takes 200 steps per industry-day, so a cold start is warm inside ~25
+// days and needs no help. What does need help is a CARRIED entry crossing a pass boundary: its
+// moment estimates were fitted against the previous champion's order distribution, and the pass
+// re-seeds StockNN from a new champion/challenger blend. The extra days let those moments
+// re-adapt to the new distribution before the scoring window opens.
+//
+// Pass 1 therefore gets no extension, and that is the useful part: with nothing yet to carry and
+// the same training start, grad and grdC are identical but for their RNG seed. Pass 1's gap
+// between them IS the noise floor, measured in the same table by the same procedure -- so a gap in
+// passes 2-5 can be read against it rather than against an assumption.
 static constexpr int   MT1_BP_WARM_DAY     = 100;
 
 // ── the MT1 race: 3 architectures x 2 search methods ────────────────────────────
@@ -234,8 +238,9 @@ struct RaceEntry {
 };
 
 // Day this entry starts TRAINING. Measurement always begins at MT1_BP_START_DAY.
-static inline int race_train_start(const RaceEntry& e) {
-    return (e.search == SRCH_GRAD && e.carry) ? MT1_BP_WARM_DAY : MT1_BP_START_DAY;
+// pass is 0-based: the warm-up applies only where there is carried state to re-adapt.
+static inline int race_train_start(const RaceEntry& e, int pass) {
+    return (e.search == SRCH_GRAD && e.carry && pass > 0) ? MT1_BP_WARM_DAY : MT1_BP_START_DAY;
 }
 // CARRY is the third axis, and it is deliberate rather than incidental.
 //
@@ -4961,7 +4966,7 @@ int main(int argc, char* argv[]) {
                             // training start: the warm-up days buy Adam maturity, not a longer
                             // scoring window.
                             const bool measure = blk_actual_day[d] >= MT1_BP_START_DAY;
-                            const bool train   = blk_actual_day[d] >= race_train_start(e);
+                            const bool train   = blk_actual_day[d] >= race_train_start(e, pass);
                             if (!measure && !train) continue;
                             if (measure)
                             for (int m = 0; m < nm; m++) {
@@ -5001,7 +5006,7 @@ int main(int argc, char* argv[]) {
                                 // Selection sees one scalar per model, so there is no per-row
                                 // notion here and nm plays no part.
                                 mt1_step_day(i, r.pool[i], ind_in, actual,
-                                             blk_actual_day[d] >= race_train_start(e),
+                                             blk_actual_day[d] >= race_train_start(e, pass),
                                              blk_actual_day[d], cur_mt1_sigma,
                                              race_forward(e.arch));
                             } else {
@@ -5463,8 +5468,10 @@ int main(int argc, char* argv[]) {
                 {
                     char c[192];
                     snprintf(c, sizeof(c),
-                             "   grdC also trains from day %d (Adam warm-up) but is SCORED from "
-                             "day %d, same as everything else.",
+                             "   grdC trains from day %d in passes 2+ (stale-Adam re-adaptation) "
+                             "but is SCORED from day %d like everything else. In PASS 1 it has "
+                             "nothing to carry and the same start as grad, so their gap here is "
+                             "the noise floor.",
                              MT1_BP_WARM_DAY, MT1_BP_START_DAY);
                     log_msg(c);
                 }
