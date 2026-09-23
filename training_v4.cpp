@@ -238,6 +238,8 @@ static inline int race_params(RaceArch a) {
 static inline float mt1s_forward_mt1f(const float* W, const float* in, float /*extra*/) {
     return mt1s_forward(W, in);
 }
+using MT1Init2 = void (*)(float*, uint64_t);
+
 static inline MT1Forward race_forward(RaceArch a) {
     return a == ARCH_MT1 ? mt1net_forward : a == ARCH_MT1C ? mt1cnet_forward : mt1s_forward_mt1f;
 }
@@ -2435,12 +2437,26 @@ static void mt1_init_weights(float* W, uint64_t seed) {
 }
 
 // Kaiming-init one MT1CNet. Plain taper, so the layer list is short.
+static inline MT1Init2 race_init(RaceArch a);
+
+static void mt1s_init_weights(float* W, uint64_t seed) {
+    PCG32 rng; rng.seed(mix_seed(seed));
+    kaiming_init(W + SS_L1_W, MT1S_H1, MT1S_PER_SYM, rng);
+    kaiming_init(W + SS_L2_W, MT1S_H2, MT1S_H1,      rng);
+    kaiming_init(W + SS_L3_W, 1,       MT1S_H2,      rng);
+}
+
 static void mt1c_init_weights(float* W, uint64_t seed) {
     PCG32 rng; rng.seed(mix_seed(seed));
     kaiming_init(W + CN_L1_W, 64, MT1C_IN, rng);
     kaiming_init(W + CN_L2_W, 24, 64, rng);
     kaiming_init(W + CN_L3_W,  8, 24, rng);
     kaiming_init(W + CN_L4_W,  1,  8, rng);
+}
+
+static inline MT1Init2 race_init(RaceArch a) {
+    return a == ARCH_MT1 ? mt1_init_weights
+         : a == ARCH_MT1C ? mt1c_init_weights : mt1s_init_weights;
 }
 
 // Kaiming-init one MT2INet.
@@ -3283,34 +3299,6 @@ static void load_or_init_industry(const std::string& dir, const std::string& loa
 // age and lineage. The sidecar is a SEPARATE file on purpose: save_bin/load_bin are raw
 // headerless float arrays validated by exact element count, so appending metadata to a weight
 // file makes the loader reject it and fall back to random init SILENTLY — the failure mode that
-// already cost this project a full run (see the v0.6.0.0 STOCKNN_PARAMS note in CLAUDE.md).
-static constexpr uint32_t MT1_META_MAGIC   = 0x4D543150u;   // "MT1P"
-static constexpr uint32_t MT1_META_VERSION = 1u;
-
-static std::string mt1_pool_path(const std::string& dir, int ind_i, int slot,
-                                 const char* tag = "mt1") {
-    return dir + "/" + tag + "_" + g_ind_names[ind_i] + "_slot_" + std::to_string(slot) + ".bin";
-}
-static std::string mt1_meta_path(const std::string& dir, int ind_i, const char* tag = "mt1") {
-    return dir + "/" + tag + "_" + g_ind_names[ind_i] + "_meta.bin";
-}
-
-static void save_mt1_pool(const std::string& dir, int ind_i, const MT1PoolScratch& sc,
-                          const char* tag = "mt1") {
-    for (int s = 0; s < MT1_POOL_SLOTS; s++)
-        save_bin(mt1_pool_path(dir, ind_i, s, tag), sc.slot(s), sc.n_params);
-    FILE* f = fopen(mt1_meta_path(dir, ind_i, tag).c_str(), "wb");
-    if (!f) return;
-    uint32_t hdr[4] = {MT1_META_MAGIC, MT1_META_VERSION, (uint32_t)MT1_POOL_SLOTS,
-                       (uint32_t)MT1_SCORE_HIST};
-    fwrite(hdr, sizeof(uint32_t), 4, f);
-    fwrite(sc.meta, sizeof(MT1SlotMeta), MT1_POOL_SLOTS, f);
-    int32_t ints[5] = {sc.best_slot, sc.actual_head, sc.actual_count, sc.last_pushed_day,
-                       (int32_t)sc.next_lineage};
-    fwrite(ints, sizeof(int32_t), 5, f);
-    fwrite(sc.actual_buf, sizeof(float), MT1_BASELINE_DAYS, f);
-    fclose(f);
-}
 
 // `load_dir` is a SEED, consulted only when `dir` has nothing — the same contract as
 // load_or_init_industry. Checking it every day is what made --load-dir runs stand still before
@@ -3439,6 +3427,18 @@ static std::string race_weight_path(const std::string& dir, int v, int ind_i, in
 
 
 
+
+// already cost this project a full run (see the v0.6.0.0 STOCKNN_PARAMS note in CLAUDE.md).
+static constexpr uint32_t MT1_META_MAGIC   = 0x4D543150u;   // "MT1P"
+static constexpr uint32_t MT1_META_VERSION = 1u;
+
+static std::string mt1_pool_path(const std::string& dir, int ind_i, int slot,
+                                 const char* tag = "mt1") {
+    return dir + "/" + tag + "_" + g_ind_names[ind_i] + "_slot_" + std::to_string(slot) + ".bin";
+}
+static std::string mt1_meta_path(const std::string& dir, int ind_i, const char* tag = "mt1") {
+    return dir + "/" + tag + "_" + g_ind_names[ind_i] + "_meta.bin";
+}
 
 static void load_or_init_mt1_pool(const std::string& dir, const std::string& load_dir,
                                   int ind_i, MT1PoolScratch& sc,
@@ -4472,12 +4472,8 @@ int main(int argc, char* argv[]) {
     bool  bo_have[N_IND] = {};
     FILE* bo_csv = nullptr;
 
-    auto mt1_scratches = std::make_unique<MT1PoolScratch[]>(N_IND);   // 12 × ~2.8 MB
     // The competitor: same pool, same lifecycle, same score, same target — only the network and
     // its inputs differ, so a difference in outcome is a difference in FEATURE SET.
-    auto mt1c_scratches = std::make_unique<MT1PoolScratch[]>(N_IND);
-    if (!g_no_nn_race)
-    for (int i = 0; i < N_IND; i++) mt1c_scratches[i].alloc(MT1CNET_PARAMS);
     // The independent allocator: all 888 features, so it sees the cross-section the other two
     // cannot. ~278 MB of pool across 12 industries — the largest of the three by far, because
     // 888 inputs cannot be read by a small first layer.
@@ -4608,7 +4604,25 @@ int main(int argc, char* argv[]) {
             for (int i = 0; i < N_IND; i++) {
                 const uint64_t sd = 0xB901ULL ^ ((uint64_t)(pass + 1) << 32)
                                              ^ ((uint64_t)v << 16) ^ (uint64_t)i;
-                if (RACE[v].search == SRCH_EVO) continue;   // pools load/init below
+                if (RACE[v].search == SRCH_EVO) {
+                    // FRESH every pass, exactly like the gradient entries. This is the fix for a
+                    // real asymmetry: load_or_init_mt1_pool consults output_dir first and the
+                    // pools are written there every block, so from pass 2 on the evolutionary
+                    // side silently RELOADED its previous pass while the gradient side restarted.
+                    // "Evolutionary vs gradient" would then have been measuring five passes of
+                    // accumulated search against one.
+                    //
+                    // Restarting is also the right semantics on its own terms: every pass re-seeds
+                    // StockNN from a fresh champion/challenger blend, which is a different model,
+                    // so an MT1 carried across the boundary is predicting behaviour it never saw.
+                    MT1PoolScratch& sc = race[v].pool[i];
+                    for (int slot = 0; slot < MT1_POOL_SLOTS; slot++) {
+                        race_init(RACE[v].arch)(sc.slot(slot), sd ^ ((uint64_t)slot << 8));
+                        mt1_slot_init(sc.meta[slot], sc.next_lineage++);
+                    }
+                    sc.best_slot = 0;
+                    continue;
+                }
                 PCG32 rng; rng.seed(mix_seed(sd));
                 std::vector<float>& W = r.w[i];
                 // Same scale the evolutionary pools start from, so neither search method begins
@@ -4647,9 +4661,6 @@ int main(int argc, char* argv[]) {
         // Load MT1 head+tail pools (heads/tails redesign) and MT2 once at pass start
         for (int i = 0; i < N_IND; i++) {
             if (!g_no_nn_race) {
-                load_or_init_mt1_pool(output_dir, load_dir, i, mt1_scratches[i]);
-                load_or_init_mt1_pool(output_dir, load_dir, i, mt1c_scratches[i],
-                                      "mt1c", mt1c_init_weights);
             }
         }
         load_or_init_mt2(output_dir, load_dir, *mt2_scratch);
@@ -4703,7 +4714,6 @@ int main(int argc, char* argv[]) {
             //    prediction each model parked yesterday IS its out-of-sample record, so the
             //    snapshot twin, the skill ring and the OOS/in-sample gap they measured are all
             //    gone with the design that needed them.
-            MT1DayResult blk_mt1_res[N_IND];
             static MT1DayResult mt1_day_res[N_IND][MT1_DAYS];
             static MT1DayResult mt1c_day_res[N_IND][MT1_DAYS];
             memset(mt1_day_res, 0, sizeof(mt1_day_res));
@@ -4732,30 +4742,7 @@ int main(int argc, char* argv[]) {
                     // means. See CHANGELOG / mt1_target notes.
                     const IndResult& ir = blk_results[d][i];
                     const float actual = ir.slot0_score - ir.book_prev;
-                    if (!g_no_nn_race) {
-                        MT1DayResult dr = mt1_step_day(i, mt1_scratches[i],
-                                                       &blk_888[d][i * 74], actual,
-                                                       blk_actual_day[d] >= MT1_START_DAY,
-                                                       blk_actual_day[d], cur_mt1_sigma);
-                        mt1_day_res[i][d] = dr;
-                        blk_mt1_res[i]    = dr;
-                        in12[i]           = dr.pred0;
-                    } else {
-                        in12[i] = 0.f;
-                    }
-
-                    // Competitor, on the same day against the same target. Its prediction does
-                    // NOT feed MT2 — it is scored and logged only, so the two pools cannot
-                    // interfere and MT2's input is unchanged from the MT1-only run.
-                    if (blk_day[d] && !g_no_nn_race) {
-                        float cin[MT1C_IN];
-                        build_mt1c_input(blk_day[d]->sym[i], ir, cin);
-                        MT1DayResult cr = mt1_step_day(i, mt1c_scratches[i], cin, actual,
-                                                       blk_actual_day[d] >= MT1_START_DAY,
-                                                       blk_actual_day[d], cur_mt1_sigma,
-                                                       mt1cnet_forward);
-                        mt1c_day_res[i][d] = cr;
-                    }
+                    in12[i] = 0.f;
 
                     // ── gradient-trained MT1 ────────────────────────────────────────────
                     // PREDICT first, then LEARN, so nothing is ever scored on an outcome it has
@@ -5170,7 +5157,9 @@ int main(int argc, char* argv[]) {
                     rec.actual_day = (uint32_t)blk_actual_day[d];
                     for (int i = 0; i < N_IND; i++) {
                         const MT1DayResult& m = mt1_day_res[i][d];
-                        const MT1PoolScratch& sc = mt1_scratches[i];
+                        // RACE[0] is MT1 evo: same architecture, same lifecycle as
+                        // the standalone pool this used to read.
+                        const MT1PoolScratch& sc = race[0].pool[i];
                         rec.mt1_pred[i]       = m.pred0;
                         rec.mt1_actual_d[i]   = m.actual;
                         rec.mt1_baseline[i]   = m.baseline;
@@ -5215,8 +5204,6 @@ int main(int argc, char* argv[]) {
                              sc.slot(sc.best_slot), sc.n_params);
                 }
                 if (!g_no_nn_race) {
-                    save_mt1_pool(output_dir, i, mt1_scratches[i]);
-                    save_mt1_pool(output_dir, i, mt1c_scratches[i], "mt1c");
                 }
             }
             save_mt2_elites(output_dir, *mt2_scratch);
@@ -5374,8 +5361,6 @@ int main(int argc, char* argv[]) {
         {
             log_msg("Pass " + std::to_string(pass+1) + " complete — saving MT1/MT2 elites");
             for (int i = 0; i < N_IND; i++) {
-                save_mt1_pool(output_dir, i, mt1_scratches[i]);
-                save_mt1_pool(output_dir, i, mt1c_scratches[i], "mt1c");
             }
             save_mt2_elites(output_dir, *mt2_scratch);
 
