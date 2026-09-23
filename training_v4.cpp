@@ -4385,6 +4385,13 @@ int main(int argc, char* argv[]) {
         std::vector<std::vector<float>>   w, m, v, g;   // gradient: weights + Adam moments + grad
         double loss_sum = 0.0; long loss_n = 0;
         double rank_sum = 0.0; long rank_n = 0;
+        // Distinct PREDICTIONS per industry-day, not distinct inputs. Two different order sets can
+        // still map to the same number, and it is prediction ties the rank function has to break.
+        // MT1Net ties on all 200 by construction (no order intent in its inputs), which is how it
+        // serves as the control; MT1S collapses 146 features into twelve per-symbol slices, so it
+        // may tie more than MT1C even where the inputs differ. The residual bias from mishandled
+        // ties scales as (k/n)^2 in the tie width, so this is the number that bounds it.
+        double distinct_sum = 0.0; long distinct_n = 0;
         std::vector<double> bk_sum = std::vector<double>(16, 0.0);
         std::vector<long>   bk_n   = std::vector<long>(16, 0);
         // across-day: the deployed model's prediction against the realised industry P&L
@@ -4392,6 +4399,22 @@ int main(int argc, char* argv[]) {
         std::vector<long>   dn;
         long adam_step = 0;
     };
+    // ── how many GENUINELY distinct training rows each architecture is handed ──────
+    //
+    // A row is (input, next-day bars) -> outcome. Within an industry-day the bars are common to
+    // all 200 models, so the count is driven by the inputs; across days the bars differ, so no two
+    // days duplicate each other even where the order sets repeat.
+    //
+    // Counted on INPUTS, not predictions. Two models can agree on a number while being different
+    // rows, and the data available is a property of the inputs, not of what a particular net makes
+    // of them. This also turns the MT1 control claim into a measurement: feat74 carries no order
+    // intent, so it must come back at exactly 1.0 distinct rows per industry-day. If it does not,
+    // the claim that MT1 cannot rank order sets is false and its row is not a control.
+    //
+    // Per-architecture rather than per-entry: six of the eight entries share one input set.
+    struct RowCount { double sum = 0.0; long n = 0; };
+    RowCount rows_feat74, rows_cfeat146, rows_persym;
+
     std::vector<RaceState> race(RACE_N);
     for (int v = 0; v < RACE_N; v++) {
         RaceState& r = race[v];
@@ -4600,12 +4623,14 @@ int main(int argc, char* argv[]) {
                 std::fill(r.g[i].begin(), r.g[i].end(), 0.f);
             }
             r.loss_sum = 0.0; r.loss_n = 0; r.rank_sum = 0.0; r.rank_n = 0; r.adam_step = 0;
+            r.distinct_sum = 0.0; r.distinct_n = 0;
             std::fill(r.bk_sum.begin(), r.bk_sum.end(), 0.0);
             std::fill(r.bk_n.begin(),   r.bk_n.end(),   0);
             std::fill(r.xy.begin(), r.xy.end(), 0.0); std::fill(r.xx.begin(), r.xx.end(), 0.0);
             std::fill(r.yy.begin(), r.yy.end(), 0.0); std::fill(r.sx.begin(), r.sx.end(), 0.0);
             std::fill(r.sy.begin(), r.sy.end(), 0.0); std::fill(r.dn.begin(), r.dn.end(), 0);
         }
+        rows_feat74 = RowCount{}; rows_cfeat146 = RowCount{}; rows_persym = RowCount{};
         std::fill(bp_bk_sum.begin(), bp_bk_sum.end(), 0.0);
         std::fill(bp_bk_n.begin(), bp_bk_n.end(), 0);
 
@@ -4853,6 +4878,40 @@ int main(int argc, char* argv[]) {
                             nm++;
                         }
 
+                        // Distinct-row census, once per industry-day for the three input sets.
+                        if (nm >= 3) {
+                            auto row_hash = [](const float* v, int n) {
+                                uint64_t h = 1469598103934665603ULL;
+                                for (int q = 0; q < n; q++) {
+                                    uint32_t b; memcpy(&b, &v[q], sizeof(b));
+                                    h ^= b; h *= 1099511628211ULL;
+                                }
+                                return h;
+                            };
+                            static thread_local std::vector<uint64_t> hs;
+                            auto n_distinct = [&]() {
+                                std::sort(hs.begin(), hs.end());
+                                return (double)(std::unique(hs.begin(), hs.end()) - hs.begin());
+                            };
+                            hs.clear();
+                            for (int m = 0; m < nm; m++)
+                                hs.push_back(row_hash(&blk_888[d][i * 74], 74));
+                            rows_feat74.sum += n_distinct(); rows_feat74.n++;
+
+                            hs.clear();
+                            for (int m = 0; m < nm; m++) hs.push_back(row_hash(mrows[m], MT1C_IN));
+                            rows_cfeat146.sum += n_distinct(); rows_cfeat146.n++;
+
+                            // MT1S-stock's rows are (model, symbol) pairs, so its census runs over
+                            // the twelve per-symbol slices of each model rather than whole vectors.
+                            hs.clear();
+                            for (int m = 0; m < nm; m++)
+                                for (int j = 0; j < MT1C_SYMS; j++)
+                                    hs.push_back(row_hash(mrows[m] + (size_t)j * MT1C_PER_SYM,
+                                                          MT1C_PER_SYM));
+                            rows_persym.sum += n_distinct(); rows_persym.n++;
+                        }
+
                         for (int v = 0; v < RACE_N; v++) {
                             const RaceEntry& e = RACE[v];
                             RaceState& r = race[v];
@@ -4871,6 +4930,14 @@ int main(int argc, char* argv[]) {
                                                                  : mt1s_forward(W, row);
                             }
                             if (nm >= 3) {
+                                static thread_local float srt[MT1_BP_MODELS];
+                                memcpy(srt, mpred, (size_t)nm * sizeof(float));
+                                std::sort(srt, srt + nm);
+                                int dist = 1;
+                                for (int m = 1; m < nm; m++)
+                                    if (srt[m] != srt[m - 1]) dist++;
+                                r.distinct_sum += dist; r.distinct_n++;
+
                                 const float rc = bp_rank_corr(mpred, mreal, nm);
                                 if (std::isfinite(rc)) {
                                     r.rank_sum += rc; r.rank_n++;
@@ -5348,6 +5415,22 @@ int main(int argc, char* argv[]) {
                         "leaks.");
                 log_msg("   MT1S-stk evo is a SEED REPLICATE of MT1S-sum evo -- the gap between "
                         "them is noise.");
+                {
+                    char c[256];
+                    auto line = [&](const char* lab, const RowCount& rc, int per_day) {
+                        if (rc.n == 0) return;
+                        const double dm = rc.sum / (double)rc.n;
+                        snprintf(c, sizeof(c),
+                                 "   distinct rows/ind-day  %-14s %7.1f of %4d  (%.1f%% duplicated)",
+                                 lab, dm, per_day, 100.0 * (1.0 - dm / per_day));
+                        log_msg(c);
+                    };
+                    line("feat74  (MT1)", rows_feat74,   MT1_BP_MODELS);
+                    line("cfeat146(MT1C)", rows_cfeat146, MT1_BP_MODELS);
+                    line("per-sym (MT1S-stk)", rows_persym, MT1_BP_MODELS * MT1C_SYMS);
+                    log_msg("   feat74 must read 1.0: no order intent, so all 200 models look "
+                            "identical to MT1.");
+                }
                 for (int v = 0; v < RACE_N; v++) {
                     const RaceState& r = race[v];
                     if (r.rank_n == 0) continue;
@@ -5361,6 +5444,19 @@ int main(int argc, char* argv[]) {
                                  "   %-14s loss    --   | within-day rank %+.4f over %ld ind-days",
                                  RACE[v].name, r.rank_sum / (double)r.rank_n, r.rank_n);
                     log_msg(m);
+                    if (r.distinct_n > 0) {
+                        const double dm = r.distinct_sum / (double)r.distinct_n;
+                        const double tie_frac = 1.0 - dm / (double)MT1_BP_MODELS;
+                        // (k/n)^2 bounds how far mishandled ties can move a Spearman, with k the
+                        // mean tie-group width. Printed next to the rank so the two are read
+                        // together rather than the bias being assumed negligible.
+                        const double kbar = tie_frac > 0 ? (double)MT1_BP_MODELS / dm : 1.0;
+                        snprintf(m, sizeof(m),
+                                 "        distinct preds %.1f/%d (%.1f%% tied, tie-bias bound ~%.1e)",
+                                 dm, MT1_BP_MODELS, 100.0 * tie_frac,
+                                 (kbar / MT1_BP_MODELS) * (kbar / MT1_BP_MODELS));
+                        log_msg(m);
+                    }
                     std::string traj = "        by day:";
                     for (size_t b = 0; b < r.bk_n.size(); b++) {
                         if (r.bk_n[b] < 12) continue;
