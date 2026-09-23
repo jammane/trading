@@ -1207,6 +1207,13 @@ struct IndResult {
     // makes ranking candidate order sets possible at all: the across-model outcome spread is
     // ~$166/industry-day, and nothing in a shared input can explain a single dollar of it.
     float slot_score[N_SLOTS];                 // scored book, every slot (elite_score is the first 20)
+    // Per-SYMBOL decomposition of each slot's book P&L. MT1S-stock trains one row per symbol-day
+    // rather than per industry-day, which is what turns ~855 industry-days into ~10,260 rows and
+    // attacks the sample-size ceiling the variant race exposed. The twelve entries sum EXACTLY to
+    // slot_score[s] - book_prev; tests/test_mt1_grad.cpp's twin in the C++ suite pins that, because
+    // a decomposition that silently fails to close would train the per-stock model on a residual
+    // that belongs to no stock.
+    float slot_sym_pnl[N_SLOTS][IND_SYMS];
     float slot_bqty [N_SLOTS][IND_SYMS];
     float slot_bfrac[N_SLOTS][IND_SYMS];
     float slot_sfrac[N_SLOTS][IND_SYMS];
@@ -1464,6 +1471,8 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     // (both are gated on `ok`), but CN_BFRAC/CN_SFRAC are not gated, so stale intent from another
     // industry would land in the feature vector. The old slot-0 arrays were plain zero-initialised
     // locals, which is where that safety came from.
+    static thread_local float res_sym_pnl[N_SLOTS][IND_SYMS];
+    memset(res_sym_pnl, 0, sizeof(res_sym_pnl));
     static thread_local float res_slot_bq[N_SLOTS][IND_SYMS], res_slot_bf[N_SLOTS][IND_SYMS];
     static thread_local float res_slot_sf[N_SLOTS][IND_SYMS], res_slot_sq[N_SLOTS][IND_SYMS];
     memset(res_slot_bq, 0, sizeof(res_slot_bq));
@@ -1493,6 +1502,10 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         stock_forward(W, history_arr, today_arr, out48);
 
         float local_buy = 0.f, local_sell = 0.f;
+        // Cash moved BY each symbol: negative when this symbol's buy consumed cash, positive when
+        // its sell returned some. Every cash mutation below happens inside the per-symbol loop, so
+        // the attribution is exact rather than apportioned.
+        float sym_cash[IND_SYMS] = {};
 
         // ── Phase 1: partial sells, gap sell_all, high-first sell_all, stops, buys ─
         for (int j = 0; j < IND_SYMS; j++) {
@@ -1566,6 +1579,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                 float amt = whole_shares(std::min(sell_qty, port.holdings[j]));
                 port.holdings[j] -= amt;
                 port.cash        += sell_net(amt, nd_open);
+                sym_cash[j]        += sell_net(amt, nd_open);
                 local_sell       += amt;
             }
 
@@ -1574,6 +1588,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                 float amt = port.holdings[j];
                 port.holdings[j] = 0.f;
                 port.cash        += sell_net(amt, nd_open);
+                sym_cash[j]        += sell_net(amt, nd_open);
                 local_sell       += amt;
             }
 
@@ -1584,6 +1599,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                 float amt = port.holdings[j];
                 port.holdings[j] = 0.f;
                 port.cash        += sell_net(amt, slipped);
+                sym_cash[j]        += sell_net(amt, slipped);
                 local_sell       += amt;
             }
 
@@ -1594,12 +1610,14 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                     float amt = port.holdings[j];
                     port.holdings[j] = 0.f;
                     port.cash        += sell_net(amt, nd_open);
+                    sym_cash[j]        += sell_net(amt, nd_open);
                     local_sell       += amt;
                 } else if (nd_low <= stop_p) {
                     float slipped = stop_p * (1.f - SLIPPAGE_RATE);
                     float amt = port.holdings[j];
                     port.holdings[j] = 0.f;
                     port.cash        += sell_net(amt, slipped);
+                    sym_cash[j]        += sell_net(amt, slipped);
                     local_sell       += amt;
                 }
             }
@@ -1631,6 +1649,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                     if (buy_amount > 1e-6f) {
                         port.holdings[j]    += buy_amount;
                         port.cash           -= buy_amount * fill_price;
+                        sym_cash[j]           -= buy_amount * fill_price;
                         port.stop_prices[j]  = stop_loss;
                         local_buy           += buy_amount;
                     }
@@ -1655,11 +1674,42 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                 float amt = port.holdings[j];
                 port.holdings[j] = 0.f;
                 port.cash        += sell_net(amt, slipped);
+                sym_cash[j]        += sell_net(amt, slipped);
                 local_sell       += amt;
             }
         }
 
         slot_scores[slot] = compute_value_ind(port, day_sym, fill_sym);
+        // book P&L for symbol j = what the position is worth now, minus what it was worth at
+        // yesterday's close, plus the cash this symbol moved. Summed over j the cash terms telescope
+        // into the slot's total cash change and the identity closes exactly -- see the assert below.
+        for (int j = 0; j < IND_SYMS; j++) {
+            const float pf = fill_sym[j].valid ? fill_sym[j].close :
+                             day_sym[j].valid  ? day_sym[j].close  : 0.f;
+            const float pt = day_sym[j].valid  ? day_sym[j].close :
+                             fill_sym[j].valid ? fill_sym[j].close : 0.f;
+            res_sym_pnl[slot][j] = port.holdings[j] * pf - ref_hold[j] * pt + sym_cash[j];
+        }
+        // The identity is the only thing standing between MT1S-stock and training on a residual
+        // that belongs to no symbol. Checked on slot 0 -- the deployed model, so the one whose
+        // numbers get read -- and only reported when it actually breaks, because a per-day log
+        // line that always says "fine" is a line nobody reads. The tolerance is relative: these
+        // are float sums over twelve terms against a book of ~$25-50k, so ~1e-4 relative is the
+        // floor that float can hold.
+        if (slot == 0) {
+            double sum = 0.0;
+            for (int j = 0; j < IND_SYMS; j++) sum += res_sym_pnl[0][j];
+            const double want = (double)slot_scores[0] - (double)book_prev;
+            const double scale = std::max(1.0, std::fabs((double)book_prev));
+            if (std::fabs(sum - want) / scale > 1e-4) {
+                char m[192];
+                snprintf(m, sizeof(m),
+                         "   WARNING: per-symbol P&L does not close: sum %.2f vs book %.2f "
+                         "(diff %.2f) -- MT1S-stock targets are unreliable",
+                         sum, want, sum - want);
+                log_msg(std::string("[") + IND_SHORT[ind_i] + "]" + m);
+            }
+        }
         trade_count[slot] = (int)((local_buy + local_sell) > 1e-6f);
         buy_exec  += local_buy;
         sell_exec += local_sell;
@@ -2130,6 +2180,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         memcpy(res.slot_bfrac[s], res_slot_bf[s], IND_SYMS * sizeof(float));
         memcpy(res.slot_sfrac[s], res_slot_sf[s], IND_SYMS * sizeof(float));
         memcpy(res.slot_sqty [s], res_slot_sq[s], IND_SYMS * sizeof(float));
+        memcpy(res.slot_sym_pnl[s], res_sym_pnl[s], IND_SYMS * sizeof(float));
     }
     res.book_prev     = book_prev;
     res.baseline      = baseline;
@@ -3247,16 +3298,36 @@ using MT1Init = void (*)(float*, uint64_t);
 // resets to slot 0's portfolio, so the market move is common and the ranking IS the trading
 // outcome. Ordinal ranks; exact ties are vanishingly rare in float P&L and cost at most a hair of
 // precision when they happen.
+static void bp_avg_ranks(const float* v, int n, std::vector<int>& idx, std::vector<float>& out)
+{
+    idx.resize(n); out.resize(n);
+    for (int k = 0; k < n; k++) idx[k] = k;
+    std::sort(idx.begin(), idx.end(), [&](int x, int y) { return v[x] < v[y]; });
+    // AVERAGE ranks over ties. Ordinal ranks were a defect, not a simplification: with every
+    // prediction equal -- which is exactly what the CONTROL variant produces, since it hands all
+    // 200 models slot 0's input -- the sort leaves them in original order and the "ranks" come
+    // back as 0,1,2,...,199, i.e. the SLOT INDEX. That is not arbitrary: slots 0-16 are the
+    // selected elites, 17-19 the blends, 20-199 this day's mutation children. So the control was
+    // measuring "do elite slots beat mutation children", a very real +0.039, instead of reading
+    // the 0.0000 that proves the harness does not leak. Averaging ties makes a constant vector
+    // produce zero rank variance, which the caller then skips.
+    int k = 0;
+    while (k < n) {
+        int j = k + 1;
+        while (j < n && !(v[idx[k]] < v[idx[j]]) && !(v[idx[j]] < v[idx[k]])) j++;
+        const float avg = 0.5f * (float)(k + j - 1);
+        for (int t = k; t < j; t++) out[idx[t]] = avg;
+        k = j;
+    }
+}
+
 static float bp_rank_corr(const float* a, const float* b, int n)
 {
     if (n < 3) return NAN;
     static thread_local std::vector<int> ia, ib;
     static thread_local std::vector<float> ra, rb;
-    ia.resize(n); ib.resize(n); ra.resize(n); rb.resize(n);
-    for (int k = 0; k < n; k++) { ia[k] = k; ib[k] = k; }
-    std::sort(ia.begin(), ia.end(), [&](int x, int y) { return a[x] < a[y]; });
-    std::sort(ib.begin(), ib.end(), [&](int x, int y) { return b[x] < b[y]; });
-    for (int k = 0; k < n; k++) { ra[ia[k]] = (float)k; rb[ib[k]] = (float)k; }
+    bp_avg_ranks(a, n, ia, ra);
+    bp_avg_ranks(b, n, ib, rb);
     double ma = 0.0, mb = 0.0;
     for (int k = 0; k < n; k++) { ma += ra[k]; mb += rb[k]; }
     ma /= n; mb /= n;
@@ -3267,6 +3338,66 @@ static float bp_rank_corr(const float* a, const float* b, int n)
     }
     if (da <= 0.0 || db <= 0.0) return NAN;
     return (float)(num / sqrt(da * db));
+}
+
+// ── memory pressure, logged so the fallback decision is data-driven ──────────────
+//
+// The box has under 2 GB and the trainer already mlocks ~720 MB (elite_buf + hist_buf are
+// PER-WORKER, ~315 MB each). Adding the MT1 race pools costs a measured 127 MB, which fits but
+// not generously. The lever if it stops fitting is `--workers 1`: it halves the mlocked StockNN
+// buffers, freeing ~315 MB -- more than the pools take -- at roughly 2x wall-clock.
+//
+// This logs the numbers that decide it, once per block, so churn shows up in the training log
+// instead of needing someone to be watching `free -m` at the right moment. It does NOT switch
+// workers on its own: changing thread count mid-run would silently change the work distribution
+// and make the pass incomparable to the one before it.
+struct MemStat { long rss_mb = 0, avail_mb = 0, swap_used_mb = 0; };
+
+static MemStat read_mem_stat()
+{
+    MemStat m;
+    char line[256];
+    if (FILE* f = fopen("/proc/self/status", "r")) {
+        while (fgets(line, sizeof(line), f)) {
+            long kb;
+            if (sscanf(line, "VmRSS: %ld kB", &kb) == 1) { m.rss_mb = kb / 1024; break; }
+        }
+        fclose(f);
+    }
+    if (FILE* f = fopen("/proc/meminfo", "r")) {
+        long total_swap = 0, free_swap = 0, kb;
+        while (fgets(line, sizeof(line), f)) {
+            if (sscanf(line, "MemAvailable: %ld kB", &kb) == 1) m.avail_mb = kb / 1024;
+            else if (sscanf(line, "SwapTotal: %ld kB", &kb) == 1) total_swap = kb;
+            else if (sscanf(line, "SwapFree: %ld kB", &kb) == 1) free_swap = kb;
+        }
+        fclose(f);
+        m.swap_used_mb = (total_swap - free_swap) / 1024;
+    }
+    return m;
+}
+
+// Warns when available memory is low enough that the run is at risk of thrashing, and names the
+// remedy. The threshold is deliberately generous: by the time a 2-core box with 1.9 GB is
+// swapping hard, a training day takes minutes instead of seconds.
+static void log_mem_stat(int workers)
+{
+    static long prev_swap = -1;
+    const MemStat m = read_mem_stat();
+    const long dswap = (prev_swap < 0) ? 0 : m.swap_used_mb - prev_swap;
+    prev_swap = m.swap_used_mb;
+    char buf[256];
+    snprintf(buf, sizeof(buf), "   mem: rss %ld MB | avail %ld MB | swap %ld MB (%+ld)",
+             m.rss_mb, m.avail_mb, m.swap_used_mb, dswap);
+    log_msg(buf);
+    if (m.avail_mb < 150 || dswap > 100) {
+        snprintf(buf, sizeof(buf),
+                 "   WARNING: memory is tight (avail %ld MB, swap %+ld MB this block).%s",
+                 m.avail_mb, dswap,
+                 workers > 1 ? "  Re-run with --workers 1 to free ~315 MB of mlocked buffers."
+                             : "  Already at 1 worker.");
+        log_msg(buf);
+    }
 }
 
 static std::string mt1_bp_path(const std::string& dir, int ind_i) {
@@ -4908,6 +5039,7 @@ int main(int argc, char* argv[]) {
                 }
             }
             // 5. Save (per block ≈ 25 days). Always — under --no-save output_dir is the scratch.
+            log_mem_stat(num_workers);
             for (int i = 0; i < N_IND; i++) {
                 if (bp_var[0].net[i].W.size()) save_mt1_bp(output_dir, i, bp_var[0].net[i]);
                 if (!g_no_nn_race) {
