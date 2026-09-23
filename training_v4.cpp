@@ -217,17 +217,38 @@ struct RaceEntry {
     const char* name;
     RaceArch    arch;
     RaceSrch    search;
-    bool        per_symbol;      // gradient only: one row per symbol instead of one per industry
+    bool        per_symbol;   // gradient only: one row per symbol instead of one per industry
+    bool        carry;        // keep the model across a pass boundary, or start fresh
+    const char* tag;          // pool file prefix; must be unique per evolutionary entry
 };
+// CARRY is the third axis, and it is deliberate rather than incidental.
+//
+// The evolutionary pools have always carried: the champion store seeds the next pass, so a pool
+// that reset would throw away the search that produced the champion it is paired with. Gradient
+// entries appear BOTH ways -- restart and carry -- for two reasons. It keeps the evo-vs-grad
+// comparison honest, since comparing a carried pool against a restarted net would measure five
+// passes of accumulated search against one rather than anything about search method. And the
+// grad-restart vs grad-carry pair answers a question nothing here has tested: whether accumulating
+// across passes helps at all. It is not obvious that it does -- measured on StockNN, pass 5
+// performs at 0.96-1.02x of pass 1, which is no detectable carryover whatsoever.
+//
+// Carried gradient entries keep their Adam moments along with their weights. The moments are
+// somewhat stale across a boundary, since the pass re-seeds StockNN and the target distribution
+// shifts, but Adam re-adapts within a few hundred steps and zeroing them would make "carry" a
+// different thing than simply continuing to train.
 static const RaceEntry RACE[] = {
-    {"MT1      evo ", ARCH_MT1,  SRCH_EVO,  false},   // control for within-day rank
-    {"MT1      grad", ARCH_MT1,  SRCH_GRAD, false},   // control for within-day rank
-    {"MT1C     evo ", ARCH_MT1C, SRCH_EVO,  false},
-    {"MT1C     grad", ARCH_MT1C, SRCH_GRAD, false},
-    {"MT1S-sum evo ", ARCH_MT1S, SRCH_EVO,  false},
-    {"MT1S-sum grad", ARCH_MT1S, SRCH_GRAD, false},
-    {"MT1S-stk evo ", ARCH_MT1S, SRCH_EVO,  true },   // seed replicate of MT1S-sum evo
-    {"MT1S-stk grad", ARCH_MT1S, SRCH_GRAD, true },
+    {"MT1      evo ", ARCH_MT1,  SRCH_EVO,  false, true,  "r_mt1"   },  // control for rank
+    {"MT1      grad", ARCH_MT1,  SRCH_GRAD, false, false, nullptr   },  // control for rank
+    {"MT1      grdC", ARCH_MT1,  SRCH_GRAD, false, true,  nullptr   },
+    {"MT1C     evo ", ARCH_MT1C, SRCH_EVO,  false, true,  "r_mt1c"  },
+    {"MT1C     grad", ARCH_MT1C, SRCH_GRAD, false, false, nullptr   },
+    {"MT1C     grdC", ARCH_MT1C, SRCH_GRAD, false, true,  nullptr   },
+    {"MT1S-sum evo ", ARCH_MT1S, SRCH_EVO,  false, true,  "r_mt1s"  },
+    {"MT1S-sum grad", ARCH_MT1S, SRCH_GRAD, false, false, nullptr   },
+    {"MT1S-sum grdC", ARCH_MT1S, SRCH_GRAD, false, true,  nullptr   },
+    {"MT1S-stk evo ", ARCH_MT1S, SRCH_EVO,  true,  true,  "r_mt1s2" },  // seed replicate
+    {"MT1S-stk grad", ARCH_MT1S, SRCH_GRAD, true,  false, nullptr   },
+    {"MT1S-stk grdC", ARCH_MT1S, SRCH_GRAD, true,  true,  nullptr   },
 };
 static constexpr int RACE_N = (int)(sizeof(RACE) / sizeof(RACE[0]));
 
@@ -3440,6 +3461,25 @@ static std::string mt1_meta_path(const std::string& dir, int ind_i, const char* 
     return dir + "/" + tag + "_" + g_ind_names[ind_i] + "_meta.bin";
 }
 
+// Written every block, which is what makes evolutionary carryover work: load_or_init_mt1_pool
+// reads these back at the next pass start so the pool continues rather than restarting.
+static void save_mt1_pool(const std::string& dir, int ind_i, const MT1PoolScratch& sc,
+                          const char* tag = "mt1") {
+    for (int s = 0; s < MT1_POOL_SLOTS; s++)
+        save_bin(mt1_pool_path(dir, ind_i, s, tag), sc.slot(s), sc.n_params);
+    FILE* f = fopen(mt1_meta_path(dir, ind_i, tag).c_str(), "wb");
+    if (!f) return;
+    uint32_t hdr[4] = {MT1_META_MAGIC, MT1_META_VERSION, (uint32_t)MT1_POOL_SLOTS,
+                       (uint32_t)MT1_SCORE_HIST};
+    fwrite(hdr, sizeof(uint32_t), 4, f);
+    fwrite(sc.meta, sizeof(MT1SlotMeta), MT1_POOL_SLOTS, f);
+    int32_t ints[5] = {sc.best_slot, sc.actual_head, sc.actual_count, sc.last_pushed_day,
+                       (int32_t)sc.next_lineage};
+    fwrite(ints, sizeof(int32_t), 5, f);
+    fwrite(sc.actual_buf, sizeof(float), MT1_BASELINE_DAYS, f);
+    fclose(f);
+}
+
 static void load_or_init_mt1_pool(const std::string& dir, const std::string& load_dir,
                                   int ind_i, MT1PoolScratch& sc,
                                   const char* tag = "mt1", MT1Init init = mt1_init_weights) {
@@ -4605,24 +4645,15 @@ int main(int argc, char* argv[]) {
                 const uint64_t sd = 0xB901ULL ^ ((uint64_t)(pass + 1) << 32)
                                              ^ ((uint64_t)v << 16) ^ (uint64_t)i;
                 if (RACE[v].search == SRCH_EVO) {
-                    // FRESH every pass, exactly like the gradient entries. This is the fix for a
-                    // real asymmetry: load_or_init_mt1_pool consults output_dir first and the
-                    // pools are written there every block, so from pass 2 on the evolutionary
-                    // side silently RELOADED its previous pass while the gradient side restarted.
-                    // "Evolutionary vs gradient" would then have been measuring five passes of
-                    // accumulated search against one.
-                    //
-                    // Restarting is also the right semantics on its own terms: every pass re-seeds
-                    // StockNN from a fresh champion/challenger blend, which is a different model,
-                    // so an MT1 carried across the boundary is predicting behaviour it never saw.
-                    MT1PoolScratch& sc = race[v].pool[i];
-                    for (int slot = 0; slot < MT1_POOL_SLOTS; slot++) {
-                        race_init(RACE[v].arch)(sc.slot(slot), sd ^ ((uint64_t)slot << 8));
-                        mt1_slot_init(sc.meta[slot], sc.next_lineage++);
-                    }
-                    sc.best_slot = 0;
+                    // Carries by design: load_or_init consults output_dir first, where the pool
+                    // was written each block, so the search that produced this pass's champion is
+                    // the search the next pass continues. Falls back to a fresh kaiming init on
+                    // the first pass, or whenever no file exists.
+                    load_or_init_mt1_pool(output_dir, load_dir, i, race[v].pool[i],
+                                          RACE[v].tag, race_init(RACE[v].arch));
                     continue;
                 }
+                if (RACE[v].carry && pass > 0) continue;   // keep weights AND Adam moments
                 PCG32 rng; rng.seed(mix_seed(sd));
                 std::vector<float>& W = r.w[i];
                 // Same scale the evolutionary pools start from, so neither search method begins
@@ -5200,8 +5231,11 @@ int main(int argc, char* argv[]) {
                 for (int v = 0; v < RACE_N; v++) {
                     if (RACE[v].search != SRCH_EVO) continue;
                     const MT1PoolScratch& sc = race[v].pool[i];
+                    // Per-pass snapshot of the deployed model, for the weight comparison...
                     save_bin(race_weight_path(output_dir, v, i, pass + 1),
                              sc.slot(sc.best_slot), sc.n_params);
+                    // ...and the whole pool, which is what the NEXT pass loads to carry on.
+                    save_mt1_pool(output_dir, i, sc, RACE[v].tag);
                 }
                 if (!g_no_nn_race) {
                 }
@@ -5400,6 +5434,8 @@ int main(int argc, char* argv[]) {
                         "leaks.");
                 log_msg("   MT1S-stk evo is a SEED REPLICATE of MT1S-sum evo -- the gap between "
                         "them is noise.");
+                log_msg("   grdC = gradient CARRIED across the pass boundary; grad = restarted. "
+                        "evo always carries.");
                 {
                     char c[256];
                     auto line = [&](const char* lab, const RowCount& rc, int per_day) {
