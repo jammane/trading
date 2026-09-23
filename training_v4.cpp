@@ -34,7 +34,8 @@
 #include <cblas.h>
 #include <sys/mman.h>
 
-#include "mt1_pool.h"   // MT1Net layout/forward + pool scoring (shared with tests/test_mt1_pool.cpp)
+#include "mt1_pool.h"
+#include "mt1_grad.h"   // MT1Net layout/forward + pool scoring (shared with tests/test_mt1_pool.cpp)
 #include "pass_seeding.h"   // pass-boundary share + interleave (shared with tests/test_pass_seeding.cpp)
 #include "sort_util.h"      // small fixed-buffer index sort (shared with tests/test_sort_util.cpp)
 #include "bayes_online.h"   // online conditional models trained during the pass
@@ -176,39 +177,70 @@ static constexpr int   MT1_BP_START_DAY    = 400;
 // Cost is ~2.05M gradient steps on a 4,977-param net over a full pass, which is nothing.
 static constexpr int   MT1_BP_MODELS       = N_SLOTS;
 
-// ── the gradient-MT1 variant race ───────────────────────────────────────────────────
+// ── the MT1 race: 3 architectures x 2 search methods ────────────────────────────
 //
-// Every variant trains in the SAME daily loop, on the SAME 200 order sets, in the same order.
-// That is strictly better than logging the rows and fitting offline: no 400 MB artefact, no
-// reader to keep in sync, and no risk that an offline reconstruction quietly differs from what
-// the trainer actually does. It is also a true head-to-head -- the variants cannot disagree about
-// the data because they are handed the same bytes.
+// Every entry trains in the SAME daily loop on the SAME order sets, in the same order. Holding
+// the architecture constant across the two search methods is what makes "evolutionary vs
+// gradient" a statement about SEARCH rather than about shape -- and it is also what makes the
+// final weights of each pass comparable element-wise, which is why they are kept.
 //
-// Cost is negligible next to StockNN: each variant is a few thousand parameters against
-// StockNN's 200 forward passes over 928,825.
+// Two metrics, and they answer different questions:
 //
-// per_model_in = false is the CONTROL, and it is the most important row. It hands every one of
-// the 200 models slot 0's intent, which is exactly the defect this work fixed. Its inputs are
-// then identical across the 200, so it CANNOT rank them and its within-day rank must come back
-// at 0.000. If it does not, the measurement leaks and no other row means anything.
+//   within-day rank  Spearman across the 200 order sets scored that industry-day. They share the
+//                    day's market move, so this ranks the TRADING and nothing else.
+//   across-day corr  the deployed model's prediction against the realised industry P&L. This
+//                    still contains the common market move, so it is the easier number, and it
+//                    is the one an allocator would consume.
 //
-// Note the targets deliberately do not vary: within a day, total book P&L and trade delta differ
-// by a constant (the market move is common to all 200), so they induce the SAME ranking. Target
-// choice moves the loss and the across-day number, not the thing being raced here.
-struct BPVariant {
+// MT1Net CANNOT rank order sets, and that is not a defect -- its 74 inputs are market and
+// portfolio curves with no order intent in them, so all 200 models present it with an identical
+// vector. Its within-day rank must therefore come back ~0.0000, which makes it a built-in control
+// for that metric: a real architecture, trained the same way, that structurally cannot see what
+// is being ranked. If it reads non-zero the measurement leaks. (The previous artificial control
+// read +0.06 because ordinal ranks over tied predictions recovered the slot index; see
+// bp_avg_ranks.) On the across-day metric MT1Net is a full competitor.
+//
+// MT1S-stock differs from MT1S-sum only on the GRADIENT side, where per-symbol labels give twelve
+// rows per industry-day instead of one. Evolutionary selection sees a single scalar score per
+// model per day, so the per-symbol target has no meaning there without a different score function
+// -- which would need per-symbol predictions in MT1PoolScratch. Rather than leave the slot empty
+// it runs as a SEED REPLICATE of MT1S-sum-evo: identical in every way but its RNG seed, so the
+// gap between the two measures run-to-run variance of the evolutionary search directly. This
+// project has been misled by that variance before (trade delta -$81,021 on one run against
+// +$406,381 on another), so having the noise floor measured inside the same table is worth a slot.
+using MT1Forward = float (*)(const float*, const float*, float);
+
+enum RaceArch  { ARCH_MT1, ARCH_MT1C, ARCH_MT1S };
+enum RaceSrch  { SRCH_EVO, SRCH_GRAD };
+
+struct RaceEntry {
     const char* name;
-    int  hidden_a, hidden_b;
-    bool pooled;          // one net shared across all industries, vs one per industry
-    bool per_model_in;    // false = every model gets slot 0's intent (the control)
+    RaceArch    arch;
+    RaceSrch    search;
+    bool        per_symbol;      // gradient only: one row per symbol instead of one per industry
 };
-static const BPVariant BP_VARIANTS[] = {
-    {"per-ind 32/8 ", 32,  8, false, true },   // what the trainer ships
-    {"pooled  32/8 ", 32,  8, true,  true },   // 12x the rows, no specialisation
-    {"per-ind 64/16", 64, 16, false, true },   // more capacity
-    {"per-ind 16/4 ", 16,  4, false, true },   // less
-    {"CONTROL slot0", 32,  8, false, false},   // must read 0.000
+static const RaceEntry RACE[] = {
+    {"MT1      evo ", ARCH_MT1,  SRCH_EVO,  false},   // control for within-day rank
+    {"MT1      grad", ARCH_MT1,  SRCH_GRAD, false},   // control for within-day rank
+    {"MT1C     evo ", ARCH_MT1C, SRCH_EVO,  false},
+    {"MT1C     grad", ARCH_MT1C, SRCH_GRAD, false},
+    {"MT1S-sum evo ", ARCH_MT1S, SRCH_EVO,  false},
+    {"MT1S-sum grad", ARCH_MT1S, SRCH_GRAD, false},
+    {"MT1S-stk evo ", ARCH_MT1S, SRCH_EVO,  true },   // seed replicate of MT1S-sum evo
+    {"MT1S-stk grad", ARCH_MT1S, SRCH_GRAD, true },
 };
-static constexpr int BP_N_VAR = (int)(sizeof(BP_VARIANTS) / sizeof(BP_VARIANTS[0]));
+static constexpr int RACE_N = (int)(sizeof(RACE) / sizeof(RACE[0]));
+
+static inline int race_params(RaceArch a) {
+    return a == ARCH_MT1 ? MT1NET_PARAMS : a == ARCH_MT1C ? MT1CNET_PARAMS : MT1SNET_PARAMS;
+}
+// MT1Forward-compatible wrapper so MT1S can use the existing evolutionary pool machinery.
+static inline float mt1s_forward_mt1f(const float* W, const float* in, float /*extra*/) {
+    return mt1s_forward(W, in);
+}
+static inline MT1Forward race_forward(RaceArch a) {
+    return a == ARCH_MT1 ? mt1net_forward : a == ARCH_MT1C ? mt1cnet_forward : mt1s_forward_mt1f;
+}
 // 146 -> 32 -> 8 -> 1. Deliberately smaller than MT1CNet's 11,177: measured offline, the larger
 // shape scored WORSE on the same data (+0.0077 vs +0.0184). The target is close to pure noise,
 // so capacity buys memorisation rather than skill.
@@ -2412,13 +2444,6 @@ static void mt1c_init_weights(float* W, uint64_t seed) {
 }
 
 // Kaiming-init one MT2INet.
-static void mt2i_init_weights(float* W, uint64_t seed) {
-    PCG32 rng; rng.seed(mix_seed(seed));
-    kaiming_init(W + MI_L1_W, 16, MT2I_IN, rng);
-    kaiming_init(W + MI_L2_W,  8, 16, rng);
-    kaiming_init(W + MI_L3_W,  4,  8, rng);
-    kaiming_init(W + MI_L4_W,  1,  4, rng);
-}
 
 // Rank every slot by its rolling register. Immature models sort last regardless of score: with
 // MT1_POOL_MIN_AGE = 8 calls behind it, a fresh model's single lucky prediction would otherwise
@@ -2467,7 +2492,6 @@ static bool mt1_is_barred(const MT1PoolScratch& sc, uint32_t lineage) {
 // One MT1 day for one industry. `actual` is the P&L this industry's StockNN realised from the
 // previous session's close to this one — the thing yesterday's prediction was a prediction OF.
 // `have_actual` is false only on the first day of a pass, before any outcome exists.
-using MT1Forward = float (*)(const float*, const float*, float);
 
 static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in,
                                  float actual, bool have_actual, int actual_day, float sigma,
@@ -3400,23 +3424,21 @@ static void log_mem_stat(int workers)
     }
 }
 
-static std::string mt1_bp_path(const std::string& dir, int ind_i) {
-    return dir + "/mt1bp_" + g_ind_names[ind_i] + ".bin";
+// Per-PASS snapshot of every race entry's final model, kept rather than overwritten so the
+// weights can be compared afterwards -- evolutionary against gradient for the same architecture,
+// and pass against pass for the same entry. Both sides of a pair share a layout (see mt1_grad.h),
+// so W[k] denotes the same parameter in both and an element-wise diff is meaningful.
+// Name carries the entry so a directory listing is self-describing.
+static std::string race_weight_path(const std::string& dir, int v, int ind_i, int pass_num) {
+    std::string nm = RACE[v].name;
+    for (char& c : nm) if (c == ' ') c = '_';
+    while (!nm.empty() && nm.back() == '_') nm.pop_back();
+    return dir + "/race_p" + std::to_string(pass_num) + "_" + nm + "_" +
+           g_ind_names[ind_i] + ".bin";
 }
 
-// The gradient-trained MT1 is PAIRED with the StockNN champion it was raised against, and travels
-// with it into champion/. MT1 predicts one specific network's P&L, and the champion store is a
-// per-industry COMPOSITE -- energy's elites may come from pass 2 while financials' come from pass 4
-// -- so an MT1 taken from the run root would be predicting behaviour it never observed. It is also
-// never carried ACROSS a pass boundary: the next pass seeds StockNN from a fresh champion/
-// challenger blend, which is a different model, so its MT1 starts from scratch to grow with it.
-static void save_mt1_bp(const std::string& dir, int ind_i, const MT1Backprop& net) {
-    save_bin(mt1_bp_path(dir, ind_i), net.W.data(), (int)net.W.size());
-}
 
-static bool load_mt1_bp(const std::string& dir, int ind_i, MT1Backprop& net) {
-    return load_bin(mt1_bp_path(dir, ind_i), net.W.data(), (int)net.W.size());
-}
+
 
 static void load_or_init_mt1_pool(const std::string& dir, const std::string& load_dir,
                                   int ind_i, MT1PoolScratch& sc,
@@ -4354,18 +4376,53 @@ int main(int argc, char* argv[]) {
     // pass seeds StockNN from a fresh champion/challenger blend, which is a different network, and
     // an MT1 carried across would be predicting a model that no longer exists.
     std::vector<float> bp_pred(N_IND, 0.f);
-    // One net-array per variant: N_IND nets, or a single shared net when pooled.
-    struct BPState {
-        std::unique_ptr<MT1Backprop[]> net;
+    // One state per race entry. Evolutionary entries own a 200-slot pool per industry and reuse
+    // the existing lifecycle (score registers, maturity, culling, lineage) via mt1_step_day;
+    // gradient entries own one net per industry plus its Adam state. Measured on the droplet:
+    // 127 MB for all eight across twelve industries, 0.39 s/day of work.
+    struct RaceState {
+        std::unique_ptr<MT1PoolScratch[]> pool;   // evolutionary
+        std::vector<std::vector<float>>   w, m, v, g;   // gradient: weights + Adam moments + grad
         double loss_sum = 0.0; long loss_n = 0;
         double rank_sum = 0.0; long rank_n = 0;
         std::vector<double> bk_sum = std::vector<double>(16, 0.0);
         std::vector<long>   bk_n   = std::vector<long>(16, 0);
+        // across-day: the deployed model's prediction against the realised industry P&L
+        std::vector<double> xy, xx, yy, sx, sy;
+        std::vector<long>   dn;
+        long adam_step = 0;
     };
-    std::vector<BPState> bp_var(BP_N_VAR);
-    for (int v = 0; v < BP_N_VAR; v++)
-        bp_var[v].net = std::make_unique<MT1Backprop[]>(BP_VARIANTS[v].pooled ? 1 : N_IND);
-    double bp_loss_sum = 0.0; long bp_loss_n = 0;
+    std::vector<RaceState> race(RACE_N);
+    for (int v = 0; v < RACE_N; v++) {
+        RaceState& r = race[v];
+        const int np = race_params(RACE[v].arch);
+        if (RACE[v].search == SRCH_EVO) {
+            r.pool = std::make_unique<MT1PoolScratch[]>(N_IND);
+            for (int i = 0; i < N_IND; i++) r.pool[i].alloc(np);
+        } else {
+            r.w.assign(N_IND, std::vector<float>(np, 0.f));
+            r.m.assign(N_IND, std::vector<float>(np, 0.f));
+            r.v.assign(N_IND, std::vector<float>(np, 0.f));
+            r.g.assign(N_IND, std::vector<float>(np, 0.f));
+        }
+        r.xy.assign(N_IND, 0.0); r.xx.assign(N_IND, 0.0); r.yy.assign(N_IND, 0.0);
+        r.sx.assign(N_IND, 0.0); r.sy.assign(N_IND, 0.0); r.dn.assign(N_IND, 0);
+    }
+
+    // Adam on a flat array, shared by every gradient entry so the optimiser is not a confound.
+    auto race_adam = [](RaceState& r, int ind, long step) {
+        const float lr = 3e-3f, b1 = 0.9f, b2 = 0.999f, eps = 1e-8f, decay = 1e-3f;
+        const float bc1 = 1.f - powf(b1, (float)step), bc2 = 1.f - powf(b2, (float)step);
+        std::vector<float>& W = r.w[ind]; std::vector<float>& M = r.m[ind];
+        std::vector<float>& V = r.v[ind]; std::vector<float>& G = r.g[ind];
+        for (size_t k = 0; k < W.size(); k++) {
+            M[k] = b1 * M[k] + (1.f - b1) * G[k];
+            V[k] = b2 * V[k] + (1.f - b2) * G[k] * G[k];
+            W[k] -= lr * ((M[k] / bc1) / (sqrtf(V[k] / bc2) + eps) + decay * W[k]);
+            G[k] = 0.f;
+        }
+    };
+
     // How well MT1 predicts the TRADING OUTCOME, measured two ways, both out-of-sample by
     // construction because every prediction is made before that day is trained on.
     //   within-day : Spearman across the MT1_BP_MODELS order sets, one value per industry-day.
@@ -4373,7 +4430,6 @@ int main(int argc, char* argv[]) {
     //                them, so ranking them IS ranking the trading.
     //   across-day : Pearson of slot 0's prediction against slot 0's realised P&L, per industry.
     //                This is what an allocator would consume.
-    double bp_rank_sum = 0.0; long bp_rank_n = 0;
     // ...and the same split into 100-day buckets. MT1 starts from random weights at
     // MT1_BP_START_DAY, so a single pass-average blends "has not learned yet" with "has", and a
     // flat number could not tell a net that never learns from one that learns slowly. The
@@ -4381,9 +4437,6 @@ int main(int argc, char* argv[]) {
     static constexpr int BP_BUCKET = 100;
     std::vector<double> bp_bk_sum(16, 0.0);
     std::vector<long>   bp_bk_n(16, 0);
-    std::vector<double> bp_xy(N_IND, 0.0), bp_xx(N_IND, 0.0), bp_yy(N_IND, 0.0);
-    std::vector<double> bp_sx(N_IND, 0.0), bp_sy(N_IND, 0.0);
-    std::vector<long>   bp_dn(N_IND, 0);
     // Yesterday's conditioning comes from ALL of yesterday's scored elites, not only the
     // deployed slot. The chain is coherent because every slot resets to slot 0's portfolio each
     // morning: slot0(t-2) -> elite_e(t-1) -> slot0(t) is a genuine two-step trajectory for elite
@@ -4405,9 +4458,6 @@ int main(int argc, char* argv[]) {
     // The independent allocator: all 888 features, so it sees the cross-section the other two
     // cannot. ~278 MB of pool across 12 industries — the largest of the three by far, because
     // 888 inputs cannot be read by a small first layer.
-    auto mt2i_scratches = std::make_unique<MT1PoolScratch[]>(N_IND);
-    if (!g_no_nn_race)
-    for (int i = 0; i < N_IND; i++) mt2i_scratches[i].alloc(MT2INET_PARAMS);
     auto mt2_scratch  = std::make_unique<MT2Scratch>();            // ~5.5 MB
 
     // Open CSV log (goes to log_dir, not output_dir)
@@ -4526,36 +4576,38 @@ int main(int argc, char* argv[]) {
         float judge_start[N_IND] = {}, judge_end[N_IND] = {};
 
         // Fresh MT1 for this pass -- see the declaration for why it is never carried over.
-        for (int v = 0; v < BP_N_VAR; v++) {
-            const BPVariant& cfg = BP_VARIANTS[v];
-            const int nnet = cfg.pooled ? 1 : N_IND;
-            for (int k = 0; k < nnet; k++)
-                bp_var[v].net[k].init({MT1C_IN, cfg.hidden_a, cfg.hidden_b, 1},
-                                      0xB901ULL ^ ((uint64_t)(pass + 1) << 32)
-                                               ^ ((uint64_t)v << 16) ^ (uint64_t)k);
-            bp_var[v].loss_sum = 0.0; bp_var[v].loss_n = 0;
-            bp_var[v].rank_sum = 0.0; bp_var[v].rank_n = 0;
-            std::fill(bp_var[v].bk_sum.begin(), bp_var[v].bk_sum.end(), 0.0);
-            std::fill(bp_var[v].bk_n.begin(),   bp_var[v].bk_n.end(),   0);
+        for (int v = 0; v < RACE_N; v++) {
+            RaceState& r = race[v];
+            const int np = race_params(RACE[v].arch);
+            // Seed mixes the entry index, so MT1S-stk-evo really is a different draw from
+            // MT1S-sum-evo and the gap between them measures run-to-run variance rather than
+            // a difference in method.
+            for (int i = 0; i < N_IND; i++) {
+                const uint64_t sd = 0xB901ULL ^ ((uint64_t)(pass + 1) << 32)
+                                             ^ ((uint64_t)v << 16) ^ (uint64_t)i;
+                if (RACE[v].search == SRCH_EVO) continue;   // pools load/init below
+                PCG32 rng; rng.seed(mix_seed(sd));
+                std::vector<float>& W = r.w[i];
+                // Same scale the evolutionary pools start from, so neither search method begins
+                // at an advantage. Box-Muller from the shared PCG32 keeps the stream identical in
+                // kind to the mutation RNG.
+                for (int k = 0; k < np; k++) {
+                    const float u1 = fmaxf(rng.next_float(), 1e-7f), u2 = rng.next_float();
+                    W[k] = sqrtf(-2.f * logf(u1)) * cosf(6.2831853f * u2) * 0.05f;
+                }
+                std::fill(r.m[i].begin(), r.m[i].end(), 0.f);
+                std::fill(r.v[i].begin(), r.v[i].end(), 0.f);
+                std::fill(r.g[i].begin(), r.g[i].end(), 0.f);
+            }
+            r.loss_sum = 0.0; r.loss_n = 0; r.rank_sum = 0.0; r.rank_n = 0; r.adam_step = 0;
+            std::fill(r.bk_sum.begin(), r.bk_sum.end(), 0.0);
+            std::fill(r.bk_n.begin(),   r.bk_n.end(),   0);
+            std::fill(r.xy.begin(), r.xy.end(), 0.0); std::fill(r.xx.begin(), r.xx.end(), 0.0);
+            std::fill(r.yy.begin(), r.yy.end(), 0.0); std::fill(r.sx.begin(), r.sx.end(), 0.0);
+            std::fill(r.sy.begin(), r.sy.end(), 0.0); std::fill(r.dn.begin(), r.dn.end(), 0);
         }
-        // Variant 0 is the net that ships, so it is the only one with a champion pairing to
-        // restore. The ONE case it applies is the first pass of a run seeded from a champion
-        // store: those elites ARE what this MT1 was raised against, so its paired weights are
-        // still valid and loading them preserves the pairing across a restart. A later pass
-        // re-seeds from a new blend, which is a different model, and must start over. The other
-        // variants are measurement only and always start from scratch.
-        if (pass == 0 && !load_dir.empty())
-            for (int i = 0; i < N_IND; i++)
-                if (load_mt1_bp(load_dir, i, bp_var[0].net[i]))
-                    log_msg(std::string("[") + IND_SHORT[i] +
-                            "]   mt1-bp: loaded the champion's paired weights");
-        bp_loss_sum = 0.0; bp_loss_n = 0;
-        bp_rank_sum = 0.0; bp_rank_n = 0;
         std::fill(bp_bk_sum.begin(), bp_bk_sum.end(), 0.0);
         std::fill(bp_bk_n.begin(), bp_bk_n.end(), 0);
-        std::fill(bp_xy.begin(), bp_xy.end(), 0.0); std::fill(bp_xx.begin(), bp_xx.end(), 0.0);
-        std::fill(bp_yy.begin(), bp_yy.end(), 0.0); std::fill(bp_sx.begin(), bp_sx.end(), 0.0);
-        std::fill(bp_sy.begin(), bp_sy.end(), 0.0); std::fill(bp_dn.begin(), bp_dn.end(), 0);
 
         // Init portfolios; industry elites are loaded per-day inside step_industry
         for (int i = 0; i < N_IND; i++) {
@@ -4573,8 +4625,6 @@ int main(int argc, char* argv[]) {
                 load_or_init_mt1_pool(output_dir, load_dir, i, mt1_scratches[i]);
                 load_or_init_mt1_pool(output_dir, load_dir, i, mt1c_scratches[i],
                                       "mt1c", mt1c_init_weights);
-                load_or_init_mt1_pool(output_dir, load_dir, i, mt2i_scratches[i],
-                                      "mt2i", mt2i_init_weights);
             }
         }
         load_or_init_mt2(output_dir, load_dir, *mt2_scratch);
@@ -4631,10 +4681,8 @@ int main(int argc, char* argv[]) {
             MT1DayResult blk_mt1_res[N_IND];
             static MT1DayResult mt1_day_res[N_IND][MT1_DAYS];
             static MT1DayResult mt1c_day_res[N_IND][MT1_DAYS];
-            static MT1DayResult mt2i_day_res[N_IND][MT1_DAYS];
             memset(mt1_day_res, 0, sizeof(mt1_day_res));
             memset(mt1c_day_res, 0, sizeof(mt1c_day_res));
-            memset(mt2i_day_res, 0, sizeof(mt2i_day_res));
             // 2. MT2 M phase: replay block days with the post-block composed MT1 (head0+tail0).
             //    MT2 is now GRADED/TRAINED on the deployed slot-0 StockNN portfolio delta
             //    (perf_pf = slot0_score/baseline − 1) — the quantity that actually earns — instead
@@ -4683,15 +4731,6 @@ int main(int argc, char* argv[]) {
                                                        mt1cnet_forward);
                         mt1c_day_res[i][d] = cr;
                     }
-                    // Independent allocator: the WHOLE 888 vector, not this industry's slice.
-                    // Also scored and logged only — it never reaches in12 either.
-                    if (!g_no_nn_race) {
-                        MT1DayResult ir2 = mt1_step_day(i, mt2i_scratches[i], blk_888[d], actual,
-                                                        blk_actual_day[d] >= MT1_START_DAY,
-                                                        blk_actual_day[d], cur_mt1_sigma,
-                                                        mt2inet_forward);
-                        mt2i_day_res[i][d] = ir2;
-                    }
 
                     // ── gradient-trained MT1 ────────────────────────────────────────────
                     // PREDICT first, then LEARN, so nothing is ever scored on an outcome it has
@@ -4723,9 +4762,6 @@ int main(int argc, char* argv[]) {
                         for (int q = 0; q < MT1C_IN; q++)
                             if (!std::isfinite(bin[q])) { finite_in = false; break; }
                         // Published in DOLLARS -- the predicted next-session book P&L for this
-                        // industry, signed, on the same scale as MT1Net's tanh(out)*MT1_PRED_SCALE.
-                        // The magnitude IS the allocation signal MT2 ranks on.
-                        if (finite_in) bp_pred[i] = bp_var[0].net[i].forward(bin) * MT1_PRED_SCALE;
 
                         // The whole change is a no-op if every model builds the same input, and
                         // nothing else in the run would say so -- the loss would simply be a 200x
@@ -4788,20 +4824,20 @@ int main(int argc, char* argv[]) {
                                                   : ""));
                             bp_spread_logged = true;
                         }
-                        // Build every model's row ONCE, then hand the same bytes to every
-                        // variant. Two passes per variant, and the order is the measurement:
-                        // predict all MT1_BP_MODELS with that net FROZEN, then train on them.
-                        // Training inside the prediction loop would score model m+1 with a net
-                        // that had already seen model m's outcome -- same day, same market move,
-                        // so that leaks hard and manufactures a ranking out of nothing.
+                        // Build every model's row ONCE, then hand the same bytes to all eight
+                        // race entries. Two passes per entry, and the order is the measurement:
+                        // score all MT1_BP_MODELS order sets with the model FROZEN, then learn.
+                        // Scoring inside the learning loop would grade model m+1 with a net that
+                        // had already seen model m's outcome -- same day, same market move -- and
+                        // manufacture a ranking out of nothing.
                         static thread_local float mrows[MT1_BP_MODELS][MT1C_IN];
                         static thread_local float mpred[MT1_BP_MODELS], mreal[MT1_BP_MODELS];
+                        static thread_local float msym[MT1_BP_MODELS][IND_SYMS];
                         int nm = 0;
                         for (int m = 0; m < MT1_BP_MODELS; m++) {
-                            // RAW DOLLARS, in units of the CONSTANT MT1_PRED_SCALE. Dividing by
-                            // the industry's own book would be a per-industry rescaling, not a
-                            // unit change, and MT2 ranks these to allocate: +$500 has to read the
-                            // same whether the book that earned it is $25k or $45k.
+                            // RAW DOLLARS in units of the CONSTANT MT1_PRED_SCALE. Dividing by the
+                            // industry's own book would be a per-industry rescaling, and whatever
+                            // consumes these has to read +$500 the same on a $25k book and a $45k one.
                             const float y = (ir.slot_score[m] - ir.book_prev) / MT1_PRED_SCALE;
                             if (!std::isfinite(y)) continue;
                             build_mt1c_input_for(blk_day[d]->sym[i], ir,
@@ -4812,45 +4848,102 @@ int main(int argc, char* argv[]) {
                                 if (!std::isfinite(mrows[nm][q])) { ok_in = false; break; }
                             if (!ok_in) continue;
                             mreal[nm] = y;
+                            for (int j = 0; j < IND_SYMS; j++)
+                                msym[nm][j] = ir.slot_sym_pnl[m][j] / MT1_PRED_SCALE;
                             nm++;
                         }
 
-                        for (int v = 0; v < BP_N_VAR; v++) {
-                            const BPVariant& cfg = BP_VARIANTS[v];
-                            MT1Backprop& net = bp_var[v].net[cfg.pooled ? 0 : i];
-                            // The control sees slot 0's intent for every model, so its rows are
-                            // identical and it has nothing to rank -- that is the point of it.
-                            const float* row0 = bin;
-                            for (int m = 0; m < nm; m++)
-                                mpred[m] = net.forward(cfg.per_model_in ? mrows[m] : row0);
+                        for (int v = 0; v < RACE_N; v++) {
+                            const RaceEntry& e = RACE[v];
+                            RaceState& r = race[v];
+                            // MT1Net reads the industry's 74 curves, which carry no order intent,
+                            // so every model presents it the same vector -- see the RACE comment.
+                            const float* ind_in = (e.arch == ARCH_MT1)
+                                                  ? &blk_888[d][i * 74] : bin;
+                            const float* W = (e.search == SRCH_EVO)
+                                             ? r.pool[i].slot(r.pool[i].best_slot)
+                                             : r.w[i].data();
+
+                            for (int m = 0; m < nm; m++) {
+                                const float* row = (e.arch == ARCH_MT1) ? ind_in : mrows[m];
+                                mpred[m] = (e.arch == ARCH_MT1)  ? mt1net_forward(W, row, 0.f)
+                                         : (e.arch == ARCH_MT1C) ? mt1cnet_forward(W, row, 0.f)
+                                                                 : mt1s_forward(W, row);
+                            }
                             if (nm >= 3) {
                                 const float rc = bp_rank_corr(mpred, mreal, nm);
                                 if (std::isfinite(rc)) {
-                                    bp_var[v].rank_sum += rc; bp_var[v].rank_n++;
+                                    r.rank_sum += rc; r.rank_n++;
                                     const int bk = (blk_actual_day[d] - MT1_BP_START_DAY) / BP_BUCKET;
-                                    if (bk >= 0 && bk < (int)bp_var[v].bk_n.size()) {
-                                        bp_var[v].bk_sum[bk] += rc; bp_var[v].bk_n[bk]++;
+                                    if (bk >= 0 && bk < (int)r.bk_n.size()) {
+                                        r.bk_sum[bk] += rc; r.bk_n[bk]++;
                                     }
                                 }
                             }
-                            for (int m = 0; m < nm; m++) {
-                                net.forward(cfg.per_model_in ? mrows[m] : row0);
-                                bp_var[v].loss_sum += net.train_step(mreal[m]);
-                                bp_var[v].loss_n++;
+                            if (nm > 0) {          // across-day: slot 0 is what production places
+                                const double px = mpred[0], py = mreal[0];
+                                r.sx[i] += px; r.sy[i] += py;
+                                r.xy[i] += px * py; r.xx[i] += px * px; r.yy[i] += py * py;
+                                r.dn[i]++;
                             }
-                            if (v == 0) {
-                                // variant 0 is what the trainer ships; keep the legacy counters
-                                // and the deployed prediction pointing at it.
-                                bp_loss_sum = bp_var[v].loss_sum; bp_loss_n = bp_var[v].loss_n;
-                                bp_rank_sum = bp_var[v].rank_sum; bp_rank_n = bp_var[v].rank_n;
-                                if (nm > 0) {
-                                    const double px = mpred[0], py = mreal[0];
-                                    bp_sx[i] += px; bp_sy[i] += py;
-                                    bp_xy[i] += px * py; bp_xx[i] += px * px; bp_yy[i] += py * py;
-                                    bp_dn[i]++;
+
+                            if (e.search == SRCH_EVO) {
+                                // One step per industry-day through the existing pool lifecycle.
+                                // Selection sees one scalar per model, so there is no per-row
+                                // notion here and nm plays no part.
+                                mt1_step_day(i, r.pool[i], ind_in, actual,
+                                             blk_actual_day[d] >= MT1_BP_START_DAY,
+                                             blk_actual_day[d], cur_mt1_sigma,
+                                             race_forward(e.arch));
+                            } else {
+                                for (int m = 0; m < nm; m++) {
+                                    const float* row = (e.arch == ARCH_MT1) ? ind_in : mrows[m];
+                                    float* gg = r.g[i].data();
+                                    float* ww = r.w[i].data();
+                                    double loss = 0.0;
+                                    if (e.arch == ARCH_MT1) {
+                                        MT1NetCache c;
+                                        mt1net_forward_cached(ww, row, 0.f, c);
+                                        const float err = c.out - mreal[m];
+                                        mt1net_backward(ww, c, 2.f * err, gg);
+                                        loss = (double)err * err;
+                                    } else if (e.arch == ARCH_MT1C) {
+                                        MT1CNetCache c;
+                                        mt1cnet_forward_cached(ww, row, c);
+                                        const float err = c.out - mreal[m];
+                                        mt1cnet_backward(ww, c, 2.f * err, gg);
+                                        loss = (double)err * err;
+                                    } else {
+                                        MT1SCache c;
+                                        mt1s_forward_cached(ww, row, c);
+                                        float ds[MT1C_SYMS];
+                                        if (e.per_symbol) {
+                                            // TWELVE rows from one industry-day: each symbol is
+                                            // graded on its own realised P&L, which is what the
+                                            // decomposition in step_industry exists for.
+                                            for (int j = 0; j < MT1C_SYMS; j++) {
+                                                const float ej = c.per_sym[j] - msym[m][j];
+                                                ds[j] = 2.f * ej;
+                                                loss += (double)ej * ej;
+                                            }
+                                            loss /= MT1C_SYMS;
+                                        } else {
+                                            const float err = c.out - mreal[m];
+                                            for (int j = 0; j < MT1C_SYMS; j++) ds[j] = 2.f * err;
+                                            loss = (double)err * err;
+                                        }
+                                        mt1s_backward(ww, c, ds, gg);
+                                    }
+                                    r.adam_step++;
+                                    race_adam(r, i, r.adam_step);
+                                    r.loss_sum += loss; r.loss_n++;
                                 }
                             }
                         }
+                        // the deployed prediction stays MT1C-grad, published in dollars
+                        if (finite_in && !race[3].w[i].empty())
+                            bp_pred[i] = mt1cnet_forward(race[3].w[i].data(), bin, 0.f)
+                                         * MT1_PRED_SCALE;
                     }
 
                     // ── online conditional models ───────────────────────────────────────
@@ -4991,8 +5084,10 @@ int main(int argc, char* argv[]) {
                         ds.m_score[i] = mt1_day_res[i][d].score0;
                         ds.c_pred[i]  = mt1c_day_res[i][d].pred0;
                         ds.c_score[i] = mt1c_day_res[i][d].score0;
-                        ds.i_pred[i]  = mt2i_day_res[i][d].pred0;
-                        ds.i_score[i] = mt2i_day_res[i][d].score0;
+                        // MT2INet retired in v0.8.1.28; the fields stay so the
+                        // dataset layout and its reader are unchanged.
+                        ds.i_pred[i]  = 0.f;
+                        ds.i_score[i] = 0.f;
                     }
                     write_ds_log_record(ds_log, ds);
                 }
@@ -5041,11 +5136,20 @@ int main(int argc, char* argv[]) {
             // 5. Save (per block ≈ 25 days). Always — under --no-save output_dir is the scratch.
             log_mem_stat(num_workers);
             for (int i = 0; i < N_IND; i++) {
-                if (bp_var[0].net[i].W.size()) save_mt1_bp(output_dir, i, bp_var[0].net[i]);
+                for (int v = 0; v < RACE_N; v++) {
+                    if (RACE[v].search != SRCH_GRAD || race[v].w[i].empty()) continue;
+                    save_bin(race_weight_path(output_dir, v, i, pass + 1),
+                             race[v].w[i].data(), (int)race[v].w[i].size());
+                }
+                for (int v = 0; v < RACE_N; v++) {
+                    if (RACE[v].search != SRCH_EVO) continue;
+                    const MT1PoolScratch& sc = race[v].pool[i];
+                    save_bin(race_weight_path(output_dir, v, i, pass + 1),
+                             sc.slot(sc.best_slot), sc.n_params);
+                }
                 if (!g_no_nn_race) {
                     save_mt1_pool(output_dir, i, mt1_scratches[i]);
                     save_mt1_pool(output_dir, i, mt1c_scratches[i], "mt1c");
-                    save_mt1_pool(output_dir, i, mt2i_scratches[i], "mt2i");
                 }
             }
             save_mt2_elites(output_dir, *mt2_scratch);
@@ -5205,7 +5309,6 @@ int main(int argc, char* argv[]) {
             for (int i = 0; i < N_IND; i++) {
                 save_mt1_pool(output_dir, i, mt1_scratches[i]);
                 save_mt1_pool(output_dir, i, mt1c_scratches[i], "mt1c");
-                save_mt1_pool(output_dir, i, mt2i_scratches[i], "mt2i");
             }
             save_mt2_elites(output_dir, *mt2_scratch);
 
@@ -5232,47 +5335,61 @@ int main(int argc, char* argv[]) {
             // days. That series still contains the common market move, so it is the easier
             // number and the one an allocator would consume -- do not read it as evidence about
             // the trading.
-            if (bp_var[0].loss_n > 0) {
+            if (race[0].rank_n > 0) {
                 char m[256];
-                log_msg("   ===== gradient-MT1 variant race, pass " + std::to_string(pass + 1) +
-                        " =====");
+                log_msg("   ===== MT1 race, pass " + std::to_string(pass + 1) +
+                        " : 3 architectures x 2 search methods =====");
                 log_msg("   within-day rank = Spearman across the 200 order sets scored that "
                         "industry-day.");
-                log_msg("   They share the day's market move, so this ranks the TRADING and "
-                        "nothing else.");
-                log_msg("   CONTROL hands every model slot 0's intent: identical rows, so it MUST "
-                        "read 0.0000.");
-                for (int v = 0; v < BP_N_VAR; v++) {
-                    const BPState& st = bp_var[v];
-                    if (st.loss_n == 0) continue;
-                    snprintf(m, sizeof(m),
-                             "   %-14s loss %.5f | within-day rank %+.4f over %ld industry-days",
-                             BP_VARIANTS[v].name, st.loss_sum / (double)st.loss_n,
-                             st.rank_n ? st.rank_sum / (double)st.rank_n : NAN, st.rank_n);
+                log_msg("   They share the day's market move, so it ranks the TRADING alone.");
+                log_msg("   MT1 rows MUST read ~0.0000: their 74 inputs carry no order intent, so "
+                        "all 200");
+                log_msg("   models look identical to them. Non-zero there means the measurement "
+                        "leaks.");
+                log_msg("   MT1S-stk evo is a SEED REPLICATE of MT1S-sum evo -- the gap between "
+                        "them is noise.");
+                for (int v = 0; v < RACE_N; v++) {
+                    const RaceState& r = race[v];
+                    if (r.rank_n == 0) continue;
+                    if (r.loss_n > 0)
+                        snprintf(m, sizeof(m),
+                                 "   %-14s loss %.5f | within-day rank %+.4f over %ld ind-days",
+                                 RACE[v].name, r.loss_sum / (double)r.loss_n,
+                                 r.rank_sum / (double)r.rank_n, r.rank_n);
+                    else
+                        snprintf(m, sizeof(m),
+                                 "   %-14s loss    --   | within-day rank %+.4f over %ld ind-days",
+                                 RACE[v].name, r.rank_sum / (double)r.rank_n, r.rank_n);
                     log_msg(m);
                     std::string traj = "        by day:";
-                    for (size_t b = 0; b < st.bk_n.size(); b++) {
-                        if (st.bk_n[b] < 12) continue;
+                    for (size_t b = 0; b < r.bk_n.size(); b++) {
+                        if (r.bk_n[b] < 12) continue;
                         char c[64];
                         snprintf(c, sizeof(c), " %d:%+.4f",
                                  MT1_BP_START_DAY + (int)b * BP_BUCKET,
-                                 st.bk_sum[b] / (double)st.bk_n[b]);
+                                 r.bk_sum[b] / (double)r.bk_n[b]);
                         traj += c;
                     }
                     if (traj.size() > 16) log_msg(traj);
-                }
-                // slot-0 prediction vs its realised P&L, across days, for the shipped variant.
-                // This series still contains the common market move, so it is the easier number
-                // and the one an allocator would consume -- not evidence about the trading.
-                for (int i = 0; i < N_IND; i++) {
-                    if (bp_dn[i] < 3) continue;
-                    const double n = (double)bp_dn[i];
-                    const double cov = bp_xy[i] - bp_sx[i] * bp_sy[i] / n;
-                    const double vx  = bp_xx[i] - bp_sx[i] * bp_sx[i] / n;
-                    const double vy  = bp_yy[i] - bp_sy[i] * bp_sy[i] / n;
-                    const double r   = (vx > 0.0 && vy > 0.0) ? cov / sqrt(vx * vy) : NAN;
-                    snprintf(m, sizeof(m), "   mt1-bp slot-0 corr %+.4f over %ld days", r, bp_dn[i]);
-                    log_msg(std::string("[") + IND_SHORT[i] + "]" + m);
+                    // across-day: the deployed model against realised industry P&L, averaged over
+                    // industries. This series still contains the common market move, so it is the
+                    // easier number and the one an allocator would consume -- not evidence about
+                    // the trading.
+                    double rsum = 0.0; int rn = 0;
+                    for (int i = 0; i < N_IND; i++) {
+                        if (r.dn[i] < 3) continue;
+                        const double n = (double)r.dn[i];
+                        const double cov = r.xy[i] - r.sx[i] * r.sy[i] / n;
+                        const double vx  = r.xx[i] - r.sx[i] * r.sx[i] / n;
+                        const double vy  = r.yy[i] - r.sy[i] * r.sy[i] / n;
+                        if (vx > 0.0 && vy > 0.0) { rsum += cov / sqrt(vx * vy); rn++; }
+                    }
+                    if (rn > 0) {
+                        snprintf(m, sizeof(m),
+                                 "        across-day corr %+.4f (mean of %d industries)",
+                                 rsum / rn, rn);
+                        log_msg(m);
+                    }
                 }
             }
         }
