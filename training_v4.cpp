@@ -5466,14 +5466,14 @@ int main(int argc, char* argv[]) {
                 log_msg("   grdC = gradient CARRIED across the pass boundary; grad = restarted. "
                         "evo always carries.");
                 {
-                    char c[192];
+                    char c[160];
                     snprintf(c, sizeof(c),
-                             "   grdC trains from day %d in passes 2+ (stale-Adam re-adaptation) "
-                             "but is SCORED from day %d like everything else. In PASS 1 it has "
-                             "nothing to carry and the same start as grad, so their gap here is "
-                             "the noise floor.",
+                             "   grdC trains from day %d in passes 2+ (stale-Adam re-adaptation); "
+                             "SCORED from day %d like everything else.",
                              MT1_BP_WARM_DAY, MT1_BP_START_DAY);
                     log_msg(c);
+                    log_msg("   In PASS 1 grdC has nothing to carry and the same start as grad, "
+                            "so their gap there is the noise floor.");
                 }
                 {
                     char c[256];
