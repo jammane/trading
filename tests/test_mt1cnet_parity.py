@@ -112,6 +112,28 @@ class TestParity:
         assert widths == sorted(widths, reverse=True), f'not tapering: {widths}'
         assert widths[-1] == 1
 
+    def test_leak_slope_matches_cpp(self):
+        """MT1_LEAK and MT1CNet.LEAK must agree. The parity test only compares outputs at one
+        random draw, where a slope mismatch shows up only on negative pre-activations."""
+        import re
+        from pathlib import Path
+        hdr = (Path(__file__).resolve().parent.parent / 'mt1_pool.h').read_text()
+        m = re.search(r'constexpr float MT1_LEAK\s*=\s*([0-9.]+)f', hdr)
+        assert m, 'MT1_LEAK not found in mt1_pool.h'
+        assert float(m.group(1)) == pytest.approx(MT1CNet.LEAK)
+
+    def test_all_negative_net_still_responds(self):
+        """The point of the leak: with every bias driven far negative -- the state plain ReLU died
+        in -- the output must still depend on the input, and so still carry a gradient."""
+        torch.manual_seed(3)
+        net = MT1CNet()
+        with torch.no_grad():
+            for layer in (net.l1, net.l2, net.l3):
+                layer.bias.fill_(-50.0)
+        x = torch.rand(8, MT1CNet.N_IN)
+        out = net(x).squeeze(1)
+        assert out.unique().numel() == 8, 'all-negative leaky net collapsed to a constant'
+
     def test_volume_is_not_in_the_layout(self):
         """Excluded deliberately: with no history there is no norm to read a raw volume against."""
         from pathlib import Path
