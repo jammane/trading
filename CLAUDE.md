@@ -786,9 +786,13 @@ mirrored as `models.MT1CNet.LEAK`, pinned by `test_mt1cnet_parity.py`). With pla
 entries died under Adam: a unit negative on every row gets zero gradient forever, and once the last
 hidden layer went the output was its bias, so all 200 predictions tied — MT1C grad measured 12.9
 distinct predictions of 200 and was rankable on 29 of 298 industry-days. MT1Net stays ReLU
-(production loads it). Each gradient entry also carries a per-industry lr: halved when half or more
-of the last hidden layer is dead that day (floor `BP_LR_MIN = 1e-4`), recovering 5%/day toward
-`BP_LR_BASE = 3e-3` on a clean day. It reads activations only, never outcomes. The race table
+(production loads it). Each gradient entry also carries a per-industry lr, halved on a bad day
+(floor `BP_LR_MIN = 1e-4`) and recovering 5%/day toward `BP_LR_BASE = 3e-3`. For MT1C/MT1S a bad
+day is the frozen net's distinct predictions falling below `BP_DISTINCT_CUT = 0.8` of the day's
+distinct inputs -- the collapse itself. A dead-unit rule was tried first and is wrong under leaky
+ReLU (a leaky unit negative on every row still trains): it floored every healthy net within ~5
+days. MT1Net keeps the dead-unit rule (plain ReLU, and its predictions always tie by design). Both
+read activations/predictions only, never outcomes. The race table
 prints `lr end mean/min`, cuts, floor hits and mean dead fraction per entry.
 
 **Per-entry seeds.** Each evolutionary entry draws its own clock salt at every pass start and XORs

@@ -245,17 +245,22 @@ static inline int race_train_start(const RaceEntry& e, int pass) {
 
 // ── Adaptive learning rate for the gradient entries ────────────────────────────────
 // Per entry AND per industry, because collapse is local: one industry's net can die while the
-// other eleven are fine. The signal is DEAD UNITS in the last hidden layer -- a unit negative on
-// every row of a day -- because that is the mechanism by which the ReLU versions collapsed: once
-// the last layer is dead the output is its bias and all 200 predictions tie. It reads only
-// activations, never an outcome, so it cannot leak into the measurement.
+// other eleven are fine. Halve on a bad day, recover 5%/day on a clean one, never below the floor.
+// Signals read activations and predictions only, never an outcome, so they cannot leak.
 //
-// Leaky ReLU (MT1_LEAK) already stops death being permanent; this stops Adam driving the net
-// there in the first place. Halve on a bad day, recover 5%/day on a clean one, never below the
-// floor. MT1Net keeps plain ReLU (production loads it), so for its rows this is the only defence.
+//   MT1C / MT1S  DISTINCT PREDICTIONS from the frozen net before the day's training, against the
+//                day's distinct inputs. That is the failure itself: collapsed nets tie. Dead units
+//                were tried first and are wrong under leaky ReLU -- a leaky unit negative on every
+//                row still passes signal and gradient -- so that rule floored every healthy net.
+//   MT1Net       DEAD UNITS in the last hidden layer. It is plain ReLU (production loads it), so a
+//                unit negative on every row really is dead; and its 200 inputs are identical by
+//                construction, so it always predicts one value and cannot use the other signal.
 static constexpr float BP_LR_BASE    = 3e-3f;
 static constexpr float BP_LR_MIN     = 1e-4f;
-static constexpr float BP_DEAD_CUT   = 0.5f;    // halve when >= this fraction is dead
+static constexpr float BP_DEAD_CUT   = 0.5f;    // MT1Net: halve when >= this fraction is dead
+// MT1C/MT1S: halve when distinct predictions fall below this fraction of distinct inputs. Inputs
+// run ~175-182 distinct of 200 per industry-day, so a fixed count would misfire on thin days.
+static constexpr float BP_DISTINCT_CUT = 0.8f;
 static constexpr float BP_LR_RECOVER = 1.05f;
 // CARRY is the third axis, and it is deliberate rather than incidental.
 //
@@ -5017,6 +5022,24 @@ int main(int argc, char* argv[]) {
                             rows_persym.sum += n_distinct(); rows_persym.n++;
                         }
 
+                        // Distinct INPUT rows today, the ceiling on distinct predictions -- what the
+                        // lr controller compares against. Computed every day, not only from
+                        // MT1_BP_START_DAY, because carried entries train from MT1_BP_WARM_DAY.
+                        int in_distinct = 0;
+                        {
+                            static thread_local uint64_t ih[MT1_BP_MODELS];
+                            for (int m = 0; m < nm; m++) {
+                                uint64_t h = 1469598103934665603ULL;
+                                for (int q = 0; q < MT1C_IN; q++) {
+                                    uint32_t b; memcpy(&b, &mrows[m][q], sizeof(b));
+                                    h ^= b; h *= 1099511628211ULL;
+                                }
+                                ih[m] = h;
+                            }
+                            std::sort(ih, ih + nm);
+                            in_distinct = (int)(std::unique(ih, ih + nm) - ih);
+                        }
+
                         for (int v = 0; v < RACE_N; v++) {
                             const RaceEntry& e = RACE[v];
                             RaceState& r = race[v];
@@ -5034,20 +5057,51 @@ int main(int argc, char* argv[]) {
                             const bool measure = blk_actual_day[d] >= MT1_BP_START_DAY;
                             const bool train   = blk_actual_day[d] >= race_train_start(e, pass);
                             if (!measure && !train) continue;
-                            if (measure)
                             for (int m = 0; m < nm; m++) {
                                 const float* row = (e.arch == ARCH_MT1) ? ind_in : mrows[m];
                                 mpred[m] = (e.arch == ARCH_MT1)  ? mt1net_forward(W, row, 0.f)
                                          : (e.arch == ARCH_MT1C) ? mt1cnet_forward(W, row, 0.f)
                                                                  : mt1s_forward(W, row);
                             }
-                            if (measure && nm >= 3) {
+                            // Distinct predictions from the FROZEN net, before today's training.
+                            int dist = 0;
+                            if (nm >= 3) {
                                 static thread_local float srt[MT1_BP_MODELS];
                                 memcpy(srt, mpred, (size_t)nm * sizeof(float));
                                 std::sort(srt, srt + nm);
-                                int dist = 1;
+                                dist = 1;
                                 for (int m = 1; m < nm; m++)
                                     if (srt[m] != srt[m - 1]) dist++;
+                            }
+                            // lr control for MT1C/MT1S: react to the failure itself -- predictions
+                            // collapsing onto each other -- before today's steps can deepen it. A
+                            // leaky unit negative on every row is NOT dead (it still passes signal
+                            // and gradient), so the dead-unit signal fired on healthy nets: the
+                            // v0.8.1.29 smoke put every restarted entry at the lr floor in all 12
+                            // industries within ~5 days while predictions stayed ~179/200 distinct.
+                            if (train && e.search == SRCH_GRAD && e.arch != ARCH_MT1 &&
+                                nm >= 3 && in_distinct >= 3) {
+                                float& lr = r.lr[i];
+                                if ((float)dist < BP_DISTINCT_CUT * (float)in_distinct) {
+                                    if (lr > BP_LR_MIN) {
+                                        lr = fmaxf(BP_LR_MIN, lr * 0.5f);
+                                        r.lr_cuts++;
+                                        if (lr <= BP_LR_MIN) {
+                                            r.lr_floor_hits++;
+                                            char c[160];
+                                            snprintf(c, sizeof(c),
+                                                     "[%s]   race %s: lr at floor %.0e "
+                                                     "(%d distinct preds of %d distinct inputs) day %d",
+                                                     IND_SHORT[i], e.name, BP_LR_MIN, dist,
+                                                     in_distinct, blk_actual_day[d]);
+                                            log_msg(c);
+                                        }
+                                    }
+                                } else if (lr < BP_LR_BASE) {
+                                    lr = fminf(BP_LR_BASE, lr * BP_LR_RECOVER);
+                                }
+                            }
+                            if (measure && nm >= 3) {
                                 r.distinct_sum += dist; r.distinct_n++;
 
                                 const float rc = bp_rank_corr(mpred, mreal, nm);
@@ -5138,7 +5192,13 @@ int main(int argc, char* argv[]) {
                                     const float frac = (float)dead / (float)n_last;
                                     r.dead_sum += frac; r.dead_n++;
                                     float& lr = r.lr[i];
-                                    if (frac >= BP_DEAD_CUT) {
+                                    // Dead units drive lr only for MT1Net: plain ReLU, so a unit
+                                    // negative on every row really is dead. It cannot use the
+                                    // distinct-prediction signal -- its inputs are identical across
+                                    // all 200 by construction, so it always predicts one value.
+                                    if (e.arch != ARCH_MT1) {
+                                        // reported only; MT1C/MT1S are steered above
+                                    } else if (frac >= BP_DEAD_CUT) {
                                         if (lr > BP_LR_MIN) {
                                             lr = fmaxf(BP_LR_MIN, lr * 0.5f);
                                             r.lr_cuts++;
@@ -5153,7 +5213,7 @@ int main(int argc, char* argv[]) {
                                                 log_msg(c);
                                             }
                                         }
-                                    } else if (dead == 0 && lr < BP_LR_BASE) {
+                                    } else if (dead == 0 && lr < BP_LR_BASE) {   // MT1Net only
                                         lr = fminf(BP_LR_BASE, lr * BP_LR_RECOVER);
                                     }
                                 }
