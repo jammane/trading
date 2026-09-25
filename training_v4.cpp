@@ -258,9 +258,13 @@ static inline int race_train_start(const RaceEntry& e, int pass) {
 static constexpr float BP_LR_BASE    = 3e-3f;
 static constexpr float BP_LR_MIN     = 1e-4f;
 static constexpr float BP_DEAD_CUT   = 0.5f;    // MT1Net: halve when >= this fraction is dead
-// MT1C/MT1S: halve when distinct predictions fall below this fraction of distinct inputs. Inputs
-// run ~175-182 distinct of 200 per industry-day, so a fixed count would misfire on thin days.
-static constexpr float BP_DISTINCT_CUT = 0.8f;
+// MT1C/MT1S: halve when distinct predictions fall below this fraction of distinct inputs. Relative
+// because inputs run 87-182 distinct of 200 per industry-day. 0.3 sits between the two measured
+// regimes: the ReLU collapse ran 0.03-0.07, while healthy MT1S dips to 0.49 -- it sums twelve
+// per-symbol outputs and 94% of per-symbol slices are duplicates, so order sets differing only
+// where the shared encoder is flat round to the same float. 0.8 (MT1C-calibrated) floored MT1S-sum
+// grdC in 5 industries on healthy nets in the v0.8.1.30 smoke.
+static constexpr float BP_DISTINCT_CUT = 0.3f;
 static constexpr float BP_LR_RECOVER = 1.05f;
 // CARRY is the third axis, and it is deliberate rather than incidental.
 //
