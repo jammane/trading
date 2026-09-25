@@ -788,8 +788,9 @@ hidden layer went the output was its bias, so all 200 predictions tied — MT1C 
 distinct predictions of 200 and was rankable on 29 of 298 industry-days. MT1Net stays ReLU
 (production loads it). Each gradient entry also carries a per-industry lr, halved on a bad day
 (floor `BP_LR_MIN = 1e-4`) and recovering 5%/day toward `BP_LR_BASE = 3e-3`. For MT1C/MT1S a bad
-day is the frozen net's distinct predictions falling below `BP_DISTINCT_CUT = 0.8` of the day's
-distinct inputs -- the collapse itself. A dead-unit rule was tried first and is wrong under leaky
+day is the frozen net's distinct predictions falling below `BP_DISTINCT_CUT = 0.3` of the day's
+distinct inputs -- the collapse itself (measured 0.03-0.07; healthy MT1S dips to 0.49, since its
+summed per-symbol outputs tie more than MT1C's, so 0.8 floored healthy MT1S nets). A dead-unit rule was tried first and is wrong under leaky
 ReLU (a leaky unit negative on every row still trains): it floored every healthy net within ~5
 days. MT1Net keeps the dead-unit rule (plain ReLU, and its predictions always tie by design). Both
 read activations/predictions only, never outcomes. The race table
