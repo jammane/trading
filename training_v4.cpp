@@ -257,7 +257,7 @@ static inline int race_train_start(const RaceEntry& e, int pass) {
 // somewhat stale across a boundary, since the pass re-seeds StockNN and the target distribution
 // shifts, but Adam re-adapts within a few hundred steps and zeroing them would make "carry" a
 // different thing than simply continuing to train.
-static const RaceEntry RACE[] = {
+static constexpr RaceEntry RACE[] = {
     {"MT1      evo ", ARCH_MT1,  SRCH_EVO,  false, true,  "r_mt1"   },  // control for rank
     {"MT1      grad", ARCH_MT1,  SRCH_GRAD, false, false, nullptr   },  // control for rank
     {"MT1      grdC", ARCH_MT1,  SRCH_GRAD, false, true,  nullptr   },
@@ -272,6 +272,18 @@ static const RaceEntry RACE[] = {
     {"MT1S-stk grdC", ARCH_MT1S, SRCH_GRAD, true,  true,  nullptr   },
 };
 static constexpr int RACE_N = (int)(sizeof(RACE) / sizeof(RACE[0]));
+
+// Entries read by position outside the race loop. Named and asserted because a bare index went
+// stale when the table grew from 5 variants to 12: race[3] had been MT1C grad and became MT1C evo,
+// whose gradient vectors are never allocated, so .w[i] dereferenced null and the smoke segfaulted.
+// Reordering the table now fails the build instead.
+static constexpr int RACE_DEPLOYED = 4;   // MT1C grad (restart): publishes bp_pred
+static constexpr int RACE_LOG_POOL = 0;   // MT1 evo: the pool mt_training_log.bin records
+static_assert(RACE[RACE_DEPLOYED].arch == ARCH_MT1C && RACE[RACE_DEPLOYED].search == SRCH_GRAD &&
+              !RACE[RACE_DEPLOYED].per_symbol && !RACE[RACE_DEPLOYED].carry,
+              "RACE_DEPLOYED must name MT1C grad (restart)");
+static_assert(RACE[RACE_LOG_POOL].arch == ARCH_MT1 && RACE[RACE_LOG_POOL].search == SRCH_EVO,
+              "RACE_LOG_POOL must name MT1 evo");
 
 static inline int race_params(RaceArch a) {
     return a == ARCH_MT1 ? MT1NET_PARAMS : a == ARCH_MT1C ? MT1CNET_PARAMS : MT1SNET_PARAMS;
@@ -5080,8 +5092,8 @@ int main(int argc, char* argv[]) {
                             }
                         }
                         // the deployed prediction stays MT1C-grad, published in dollars
-                        if (finite_in && !race[3].w[i].empty())
-                            bp_pred[i] = mt1cnet_forward(race[3].w[i].data(), bin, 0.f)
+                        if (finite_in && !race[RACE_DEPLOYED].w[i].empty())
+                            bp_pred[i] = mt1cnet_forward(race[RACE_DEPLOYED].w[i].data(), bin, 0.f)
                                          * MT1_PRED_SCALE;
                     }
 
@@ -5281,9 +5293,9 @@ int main(int argc, char* argv[]) {
                     rec.actual_day = (uint32_t)blk_actual_day[d];
                     for (int i = 0; i < N_IND; i++) {
                         const MT1DayResult& m = mt1_day_res[i][d];
-                        // RACE[0] is MT1 evo: same architecture, same lifecycle as
-                        // the standalone pool this used to read.
-                        const MT1PoolScratch& sc = race[0].pool[i];
+                        // MT1 evo: same architecture, same lifecycle as the standalone
+                        // pool this used to read.
+                        const MT1PoolScratch& sc = race[RACE_LOG_POOL].pool[i];
                         rec.mt1_pred[i]       = m.pred0;
                         rec.mt1_actual_d[i]   = m.actual;
                         rec.mt1_baseline[i]   = m.baseline;
@@ -5514,7 +5526,12 @@ int main(int argc, char* argv[]) {
             // days. That series still contains the common market move, so it is the easier
             // number and the one an allocator would consume -- do not read it as evidence about
             // the trading.
-            if (race[0].rank_n > 0) {
+            // Gate on whether anything was MEASURED, not on race[0]'s rank count: race[0] is the
+            // MT1 control, whose predictions tie on all 200 by design, so bp_rank_corr returns NaN
+            // every day and its rank_n stays 0 -- gating on it would suppress the whole table.
+            bool race_measured = false;
+            for (int v = 0; v < RACE_N; v++) race_measured |= race[v].distinct_n > 0;
+            if (race_measured) {
                 char m[256];
                 log_msg("   ===== MT1 race, pass " + std::to_string(pass + 1) +
                         " : 3 architectures x 2 search methods =====");
@@ -5559,16 +5576,21 @@ int main(int argc, char* argv[]) {
                 }
                 for (int v = 0; v < RACE_N; v++) {
                     const RaceState& r = race[v];
-                    if (r.rank_n == 0) continue;
-                    if (r.loss_n > 0)
-                        snprintf(m, sizeof(m),
-                                 "   %-14s loss %.5f | within-day rank %+.4f over %ld ind-days",
-                                 RACE[v].name, r.loss_sum / (double)r.loss_n,
-                                 r.rank_sum / (double)r.rank_n, r.rank_n);
-                    else
-                        snprintf(m, sizeof(m),
-                                 "   %-14s loss    --   | within-day rank %+.4f over %ld ind-days",
-                                 RACE[v].name, r.rank_sum / (double)r.rank_n, r.rank_n);
+                    if (r.distinct_n == 0) continue;   // never measured this pass
+                    // rank_n == 0 is the CONTROL's correct outcome, not a missing row: all 200
+                    // predictions tie every day, so no day yields a finite Spearman. Print it
+                    // explicitly -- dropping the row would hide the one result the control exists
+                    // to show, along with its alloc and corr lines.
+                    char rk[48];
+                    if (r.rank_n > 0) snprintf(rk, sizeof(rk), "%+.4f", r.rank_sum / (double)r.rank_n);
+                    else              snprintf(rk, sizeof(rk), "  n/a  ");
+                    char ls[24];
+                    if (r.loss_n > 0) snprintf(ls, sizeof(ls), "%.5f", r.loss_sum / (double)r.loss_n);
+                    else              snprintf(ls, sizeof(ls), "   --  ");
+                    snprintf(m, sizeof(m),
+                             "   %-14s loss %s | within-day rank %s over %ld ind-days%s",
+                             RACE[v].name, ls, rk, r.rank_n,
+                             r.rank_n == 0 ? "  (all tied every day: cannot rank)" : "");
                     log_msg(m);
                     if (r.distinct_n > 0) {
                         const double dm = r.distinct_sum / (double)r.distinct_n;
