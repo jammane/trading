@@ -781,6 +781,20 @@ from one that learns slowly. Also logged is `slot-0 corr` — the deployed model
 its realised P&L across days — which still contains the common market move and so is the easier,
 allocator-facing number, not evidence about the trading.
 
+**Leaky ReLU and the adaptive lr (race nets).** MT1CNet and MT1S use leaky ReLU (`MT1_LEAK = 0.1`,
+mirrored as `models.MT1CNet.LEAK`, pinned by `test_mt1cnet_parity.py`). With plain ReLU the gradient
+entries died under Adam: a unit negative on every row gets zero gradient forever, and once the last
+hidden layer went the output was its bias, so all 200 predictions tied — MT1C grad measured 12.9
+distinct predictions of 200 and was rankable on 29 of 298 industry-days. MT1Net stays ReLU
+(production loads it). Each gradient entry also carries a per-industry lr: halved when half or more
+of the last hidden layer is dead that day (floor `BP_LR_MIN = 1e-4`), recovering 5%/day toward
+`BP_LR_BASE = 3e-3` on a clean day. It reads activations only, never outcomes. The race table
+prints `lr end mean/min`, cuts, floor hits and mean dead fraction per entry.
+
+**Per-entry seeds.** Each evolutionary entry draws its own clock salt at every pass start and XORs
+it into both its pool init and its mutation seeds. Before this, entries of one architecture shared
+both bases and ran bit-identically (the MT1S-stk "seed replicate" reproduced MT1S-sum to every digit).
+
 Both measures are out-of-sample by construction: the net predicts a day before training on it, and
 **within a day it predicts all 200 with the net frozen, then trains**. Training inside the
 prediction loop would score model *m+1* with a net that had already seen model *m*'s outcome —

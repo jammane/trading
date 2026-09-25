@@ -105,6 +105,24 @@ static inline void mt1net_matvec_relu(const float* W, const float* B, const floa
     }
 }
 
+// Leaky ReLU for the RACE architectures (MT1CNet, MT1S) -- not MT1Net, which production loads and
+// a torch twin pins. Under Adam the plain ReLU versions died: a unit negative on every row gets
+// exactly zero gradient and never comes back, and once the last hidden layer went the output was
+// its bias alone. The v0.8.1.29 smoke measured MT1C grad at 12.9 distinct predictions of 200 on
+// inputs that were 172 distinct, rankable on 29 of 298 industry-days. A slope of 0.1 keeps every
+// unit trainable; 0.01 would too in principle, but through three layers it is 1e-6 of signal.
+static constexpr float MT1_LEAK = 0.1f;
+
+static inline void mt1net_matvec_lrelu(const float* W, const float* B, const float* x,
+                                       float* out, int n_out, int n_in) {
+    for (int o = 0; o < n_out; o++) {
+        float acc = B[o];
+        const float* row = W + (size_t)o * n_in;
+        for (int i = 0; i < n_in; i++) acc += row[i] * x[i];
+        out[o] = acc > 0.f ? acc : MT1_LEAK * acc;
+    }
+}
+
 // One trunk: 37 features -> 28, keeping the three feature blocks separate for two layers.
 static inline void mt1net_trunk(const float* W, int base, const float* in37, float* out28) {
     const float* xb = in37;        // daily    [0:10]
@@ -206,7 +224,7 @@ static inline float mt2inet_forward(const float* W, const float* in, float /*ext
 // in defs order, each [weights (out x in)] then [bias (out)]. KEEP IN SYNC — load_bin validates
 // by element count alone, so a drift with an unchanged total loads silently.
 //
-//   146 -> 64 -> 24 -> 8 -> 1
+//   146 -> 64 -> 24 -> 8 -> 1    (leaky ReLU, slope MT1_LEAK, on every hidden layer)
 //
 // Input, per industry, all from TODAY's close and nothing earlier:
 //   per symbol (x12): O H L C | close_pos, close_vs_wap, (H-L)/A | holdings
@@ -234,9 +252,9 @@ static constexpr int CN_BOOK = CN_CASH + 1;                     // 145
 
 static inline float mt1cnet_forward(const float* W, const float* in, float /*extra*/) {
     float a[64], b[24], c[8];
-    mt1net_matvec_relu(W + CN_L1_W, W + CN_L1_B, in, a, 64, MT1C_IN);
-    mt1net_matvec_relu(W + CN_L2_W, W + CN_L2_B, a,  b, 24, 64);
-    mt1net_matvec_relu(W + CN_L3_W, W + CN_L3_B, b,  c,  8, 24);
+    mt1net_matvec_lrelu(W + CN_L1_W, W + CN_L1_B, in, a, 64, MT1C_IN);
+    mt1net_matvec_lrelu(W + CN_L2_W, W + CN_L2_B, a,  b, 24, 64);
+    mt1net_matvec_lrelu(W + CN_L3_W, W + CN_L3_B, b,  c,  8, 24);
     float out = W[CN_L4_B];
     for (int i = 0; i < 8; i++) out += W[CN_L4_W + i] * c[i];
     return out;

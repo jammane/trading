@@ -46,6 +46,25 @@ static inline void mt1_dense_relu_bwd(const float* W, const float* x, const floa
     }
 }
 
+// Leaky twin, for MT1CNet and MT1S. Never gates: every unit passes at least MT1_LEAK of its gradient.
+static inline void mt1_dense_lrelu_bwd(const float* W, const float* x, const float* out,
+                                      const float* d_out, float* dW, float* dB, float* d_x,
+                                      int n_out, int n_in)
+{
+    if (d_x) for (int i = 0; i < n_in; i++) d_x[i] = 0.f;
+    for (int o = 0; o < n_out; o++) {
+        // out > 0 exactly when the pre-activation was, since the leak slope is positive
+        const float g = d_out[o] * (out[o] > 0.f ? 1.f : MT1_LEAK);
+        dB[o] += g;
+        float* drow = dW + (size_t)o * n_in;
+        const float* wrow = W + (size_t)o * n_in;
+        for (int i = 0; i < n_in; i++) {
+            drow[i] += g * x[i];
+            if (d_x) d_x[i] += g * wrow[i];
+        }
+    }
+}
+
 // ── MT1Net (74 -> 1, 3501 params) ────────────────────────────────────────────────
 
 struct MT1NetCache {
@@ -148,9 +167,9 @@ struct MT1CNetCache {
 static inline float mt1cnet_forward_cached(const float* W, const float* in, MT1CNetCache& k)
 {
     memcpy(k.in, in, MT1C_IN * sizeof(float));
-    mt1net_matvec_relu(W + CN_L1_W, W + CN_L1_B, in,  k.a, 64, MT1C_IN);
-    mt1net_matvec_relu(W + CN_L2_W, W + CN_L2_B, k.a, k.b, 24, 64);
-    mt1net_matvec_relu(W + CN_L3_W, W + CN_L3_B, k.b, k.c,  8, 24);
+    mt1net_matvec_lrelu(W + CN_L1_W, W + CN_L1_B, in,  k.a, 64, MT1C_IN);
+    mt1net_matvec_lrelu(W + CN_L2_W, W + CN_L2_B, k.a, k.b, 24, 64);
+    mt1net_matvec_lrelu(W + CN_L3_W, W + CN_L3_B, k.b, k.c,  8, 24);
     float acc = W[CN_L4_B];
     for (int i = 0; i < 8; i++) acc += W[CN_L4_W + i] * k.c[i];
     k.out = acc;
@@ -166,9 +185,9 @@ static inline void mt1cnet_backward(const float* W, const MT1CNetCache& k, float
         d_c[i] = d_out * W[CN_L4_W + i];
     }
     float d_b[24], d_a[64];
-    mt1_dense_relu_bwd(W + CN_L3_W, k.b, k.c, d_c, g + CN_L3_W, g + CN_L3_B, d_b, 8, 24);
-    mt1_dense_relu_bwd(W + CN_L2_W, k.a, k.b, d_b, g + CN_L2_W, g + CN_L2_B, d_a, 24, 64);
-    mt1_dense_relu_bwd(W + CN_L1_W, k.in, k.a, d_a, g + CN_L1_W, g + CN_L1_B, nullptr,
+    mt1_dense_lrelu_bwd(W + CN_L3_W, k.b, k.c, d_c, g + CN_L3_W, g + CN_L3_B, d_b, 8, 24);
+    mt1_dense_lrelu_bwd(W + CN_L2_W, k.a, k.b, d_b, g + CN_L2_W, g + CN_L2_B, d_a, 24, 64);
+    mt1_dense_lrelu_bwd(W + CN_L1_W, k.in, k.a, d_a, g + CN_L1_W, g + CN_L1_B, nullptr,
                        64, MT1C_IN);
 }
 
@@ -223,8 +242,8 @@ static inline float mt1s_forward_cached(const float* W, const float* in146, MT1S
     float total = 0.f;
     for (int j = 0; j < MT1C_SYMS; j++) {
         mt1s_slice(in146, j, k.in[j]);
-        mt1net_matvec_relu(W + SS_L1_W, W + SS_L1_B, k.in[j], k.h1[j], MT1S_H1, MT1S_PER_SYM);
-        mt1net_matvec_relu(W + SS_L2_W, W + SS_L2_B, k.h1[j], k.h2[j], MT1S_H2, MT1S_H1);
+        mt1net_matvec_lrelu(W + SS_L1_W, W + SS_L1_B, k.in[j], k.h1[j], MT1S_H1, MT1S_PER_SYM);
+        mt1net_matvec_lrelu(W + SS_L2_W, W + SS_L2_B, k.h1[j], k.h2[j], MT1S_H2, MT1S_H1);
         float acc = W[SS_L3_B];
         for (int i = 0; i < MT1S_H2; i++) acc += W[SS_L3_W + i] * k.h2[j][i];
         k.per_sym[j] = acc;
@@ -256,9 +275,9 @@ static inline void mt1s_backward(const float* W, const MT1SCache& k, const float
             d_h2[i] = d_out * W[SS_L3_W + i];
         }
         float d_h1[MT1S_H1];
-        mt1_dense_relu_bwd(W + SS_L2_W, k.h1[j], k.h2[j], d_h2, g + SS_L2_W, g + SS_L2_B,
+        mt1_dense_lrelu_bwd(W + SS_L2_W, k.h1[j], k.h2[j], d_h2, g + SS_L2_W, g + SS_L2_B,
                            d_h1, MT1S_H2, MT1S_H1);
-        mt1_dense_relu_bwd(W + SS_L1_W, k.in[j], k.h1[j], d_h1, g + SS_L1_W, g + SS_L1_B,
+        mt1_dense_lrelu_bwd(W + SS_L1_W, k.in[j], k.h1[j], d_h1, g + SS_L1_W, g + SS_L1_B,
                            nullptr, MT1S_H1, MT1S_PER_SYM);
     }
 }

@@ -290,10 +290,14 @@ class MT1CNet(nn.Module):
         self.l3 = nn.Linear(24, 8)
         self.l4 = nn.Linear(8, 1)
 
+    # Leaky, slope LEAK -- mirrors mt1cnet_forward / MT1_LEAK in mt1_pool.h. Plain ReLU died
+    # under Adam in the race: a unit negative on every row gets zero gradient forever.
+    LEAK = 0.1
+
     def forward(self, x):
-        x = F.relu(self.l1(x))
-        x = F.relu(self.l2(x))
-        x = F.relu(self.l3(x))
+        x = F.leaky_relu(self.l1(x), self.LEAK)
+        x = F.leaky_relu(self.l2(x), self.LEAK)
+        x = F.leaky_relu(self.l3(x), self.LEAK)
         return self.l4(x)                 # raw logit; tanh x MT1_PRED_SCALE at decode
 
 

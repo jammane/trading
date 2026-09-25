@@ -242,6 +242,21 @@ struct RaceEntry {
 static inline int race_train_start(const RaceEntry& e, int pass) {
     return (e.search == SRCH_GRAD && e.carry && pass > 0) ? MT1_BP_WARM_DAY : MT1_BP_START_DAY;
 }
+
+// ── Adaptive learning rate for the gradient entries ────────────────────────────────
+// Per entry AND per industry, because collapse is local: one industry's net can die while the
+// other eleven are fine. The signal is DEAD UNITS in the last hidden layer -- a unit negative on
+// every row of a day -- because that is the mechanism by which the ReLU versions collapsed: once
+// the last layer is dead the output is its bias and all 200 predictions tie. It reads only
+// activations, never an outcome, so it cannot leak into the measurement.
+//
+// Leaky ReLU (MT1_LEAK) already stops death being permanent; this stops Adam driving the net
+// there in the first place. Halve on a bad day, recover 5%/day on a clean one, never below the
+// floor. MT1Net keeps plain ReLU (production loads it), so for its rows this is the only defence.
+static constexpr float BP_LR_BASE    = 3e-3f;
+static constexpr float BP_LR_MIN     = 1e-4f;
+static constexpr float BP_DEAD_CUT   = 0.5f;    // halve when >= this fraction is dead
+static constexpr float BP_LR_RECOVER = 1.05f;
 // CARRY is the third axis, and it is deliberate rather than incidental.
 //
 // The evolutionary pools have always carried: the champion store seeds the next pass, so a pool
@@ -2565,7 +2580,7 @@ static bool mt1_is_barred(const MT1PoolScratch& sc, uint32_t lineage) {
 
 static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in,
                                  float actual, bool have_actual, int actual_day, float sigma,
-                                 MT1Forward fwd = mt1net_forward) {
+                                 MT1Forward fwd = mt1net_forward, uint64_t salt = 0) {
     MT1DayResult r{};
     r.actual = actual;
 
@@ -2635,7 +2650,8 @@ static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in,
             if (victim == sc.best_slot) continue;
             const int par = parents[c % n_par];
             const uint64_t seed = (uint64_t)actual_day * 0x9E3779B97F4A7C15ULL
-                                ^ ((uint64_t)ind_i << 32) ^ ((uint64_t)victim * 2654435761ULL);
+                                ^ ((uint64_t)ind_i << 32) ^ ((uint64_t)victim * 2654435761ULL)
+                                ^ salt;
             const uint32_t age = sc.meta[victim].n_pred;
             mt1_mutate(sc.slot(par), sc.slot(victim), sc.n_params, sigma, seed);
             mt1_slot_init(sc.meta[victim], sc.meta[par].lineage);
@@ -3515,7 +3531,8 @@ static void save_mt1_pool(const std::string& dir, int ind_i, const MT1PoolScratc
 
 static void load_or_init_mt1_pool(const std::string& dir, const std::string& load_dir,
                                   int ind_i, MT1PoolScratch& sc,
-                                  const char* tag = "mt1", MT1Init init = mt1_init_weights) {
+                                  const char* tag = "mt1", MT1Init init = mt1_init_weights,
+                                  uint64_t salt = 0) {
     int loaded = 0;
     for (int s = 0; s < MT1_POOL_SLOTS; s++) {
         if (load_bin(mt1_pool_path(dir, ind_i, s, tag), sc.slot(s), sc.n_params) ||
@@ -3524,7 +3541,7 @@ static void load_or_init_mt1_pool(const std::string& dir, const std::string& loa
             loaded++;
         } else {
             init(sc.slot(s), 0xB1A5E0000000ULL ^ ((uint64_t)ind_i << 20) ^ (uint64_t)s
-                            ^ ((uint64_t)tag[0] << 40));
+                            ^ ((uint64_t)tag[0] << 40) ^ salt);
             mt1_slot_init(sc.meta[s], sc.next_lineage++);
         }
     }
@@ -4482,6 +4499,14 @@ int main(int argc, char* argv[]) {
         std::vector<double> xy, xx, yy, sx, sy;
         std::vector<long>   dn;
         long adam_step = 0;
+        // Per-entry salt, drawn from the clock at every pass start and XORed into the evolutionary
+        // pool's init AND mutation seeds. Without it two evo entries of the same architecture got
+        // identical base seeds at both sites and ran bit-identically -- MT1S-stk evo, meant as a
+        // seed replicate of MT1S-sum evo, reproduced it to every printed digit.
+        uint64_t salt = 0;
+        std::vector<float> lr;                        // gradient: per-industry learning rate
+        long   lr_cuts = 0, lr_floor_hits = 0;
+        double dead_sum = 0.0; long dead_n = 0;       // mean dead fraction of the last layer
     };
     // ── how many GENUINELY distinct training rows each architecture is handed ──────
     //
@@ -4511,6 +4536,7 @@ int main(int argc, char* argv[]) {
             r.m.assign(N_IND, std::vector<float>(np, 0.f));
             r.v.assign(N_IND, std::vector<float>(np, 0.f));
             r.g.assign(N_IND, std::vector<float>(np, 0.f));
+            r.lr.assign(N_IND, BP_LR_BASE);
         }
         r.xy.assign(N_IND, 0.0); r.xx.assign(N_IND, 0.0); r.yy.assign(N_IND, 0.0);
         r.sx.assign(N_IND, 0.0); r.sy.assign(N_IND, 0.0); r.dn.assign(N_IND, 0);
@@ -4518,7 +4544,7 @@ int main(int argc, char* argv[]) {
 
     // Adam on a flat array, shared by every gradient entry so the optimiser is not a confound.
     auto race_adam = [](RaceState& r, int ind, long step) {
-        const float lr = 3e-3f, b1 = 0.9f, b2 = 0.999f, eps = 1e-8f, decay = 1e-3f;
+        const float lr = r.lr[ind], b1 = 0.9f, b2 = 0.999f, eps = 1e-8f, decay = 1e-3f;
         const float bc1 = 1.f - powf(b1, (float)step), bc2 = 1.f - powf(b2, (float)step);
         std::vector<float>& W = r.w[ind]; std::vector<float>& M = r.m[ind];
         std::vector<float>& V = r.v[ind]; std::vector<float>& G = r.g[ind];
@@ -4682,6 +4708,13 @@ int main(int argc, char* argv[]) {
         for (int v = 0; v < RACE_N; v++) {
             RaceState& r = race[v];
             const int np = race_params(RACE[v].arch);
+            // A fresh clock read per entry: splitmix64 avalanches, so reads microseconds apart
+            // give unrelated streams. +v only guards two reads landing on the same tick. Under
+            // --seed (debug repro) it derives from the pass seed instead.
+            r.salt = g_seed_arg
+                ? splitmix64(g_run_seed ^ ((uint64_t)(v + 1) * 0xD1B54A32D192ED03ULL))
+                : (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count()
+                  + (uint64_t)v;
             // Seed mixes the entry index, so MT1S-stk-evo really is a different draw from
             // MT1S-sum-evo and the gap between them measures run-to-run variance rather than
             // a difference in method.
@@ -4694,10 +4727,11 @@ int main(int argc, char* argv[]) {
                     // the search the next pass continues. Falls back to a fresh kaiming init on
                     // the first pass, or whenever no file exists.
                     load_or_init_mt1_pool(output_dir, load_dir, i, race[v].pool[i],
-                                          RACE[v].tag, race_init(RACE[v].arch));
+                                          RACE[v].tag, race_init(RACE[v].arch), r.salt);
                     continue;
                 }
-                if (RACE[v].carry && pass > 0) continue;   // keep weights AND Adam moments
+                if (RACE[v].carry && pass > 0) continue;   // keep weights, Adam moments AND lr
+                r.lr[i] = BP_LR_BASE;
                 PCG32 rng; rng.seed(mix_seed(sd));
                 std::vector<float>& W = r.w[i];
                 // Same scale the evolutionary pools start from, so neither search method begins
@@ -4713,6 +4747,7 @@ int main(int argc, char* argv[]) {
             }
             r.loss_sum = 0.0; r.loss_n = 0; r.rank_sum = 0.0; r.rank_n = 0; r.adam_step = 0;
             r.distinct_sum = 0.0; r.distinct_n = 0;
+            r.lr_cuts = 0; r.lr_floor_hits = 0; r.dead_sum = 0.0; r.dead_n = 0;
             r.alloc_flat = r.alloc_top4 = r.alloc_top6 = r.alloc_bot4 = 0.0; r.alloc_n = 0;
             std::fill(r.bk_sum.begin(), r.bk_sum.end(), 0.0);
             std::fill(r.bk_n.begin(),   r.bk_n.end(),   0);
@@ -5045,8 +5080,12 @@ int main(int argc, char* argv[]) {
                                 mt1_step_day(i, r.pool[i], ind_in, actual,
                                              blk_actual_day[d] >= race_train_start(e, pass),
                                              blk_actual_day[d], cur_mt1_sigma,
-                                             race_forward(e.arch));
+                                             race_forward(e.arch), r.salt);
                             } else {
+                                // bit u set = last-hidden unit u was positive on some row today
+                                uint32_t alive = 0;
+                                const int n_last = (e.arch == ARCH_MT1)  ? 10
+                                                 : (e.arch == ARCH_MT1C) ? 8 : MT1S_H2;
                                 for (int m = 0; m < nm; m++) {
                                     const float* row = (e.arch == ARCH_MT1) ? ind_in : mrows[m];
                                     float* gg = r.g[i].data();
@@ -5058,12 +5097,14 @@ int main(int argc, char* argv[]) {
                                         const float err = c.out - mreal[m];
                                         mt1net_backward(ww, c, 2.f * err, gg);
                                         loss = (double)err * err;
+                                        for (int u = 0; u < 10; u++) if (c.d2[u] > 0.f) alive |= 1u << u;
                                     } else if (e.arch == ARCH_MT1C) {
                                         MT1CNetCache c;
                                         mt1cnet_forward_cached(ww, row, c);
                                         const float err = c.out - mreal[m];
                                         mt1cnet_backward(ww, c, 2.f * err, gg);
                                         loss = (double)err * err;
+                                        for (int u = 0; u < 8; u++) if (c.c[u] > 0.f) alive |= 1u << u;
                                     } else {
                                         MT1SCache c;
                                         mt1s_forward_cached(ww, row, c);
@@ -5084,10 +5125,37 @@ int main(int argc, char* argv[]) {
                                             loss = (double)err * err;
                                         }
                                         mt1s_backward(ww, c, ds, gg);
+                                        for (int j = 0; j < MT1C_SYMS; j++)
+                                            for (int u = 0; u < MT1S_H2; u++)
+                                                if (c.h2[j][u] > 0.f) alive |= 1u << u;
                                     }
                                     r.adam_step++;
                                     race_adam(r, i, r.adam_step);
                                     r.loss_sum += loss; r.loss_n++;
+                                }
+                                if (nm > 0) {
+                                    const int dead = n_last - __builtin_popcount(alive);
+                                    const float frac = (float)dead / (float)n_last;
+                                    r.dead_sum += frac; r.dead_n++;
+                                    float& lr = r.lr[i];
+                                    if (frac >= BP_DEAD_CUT) {
+                                        if (lr > BP_LR_MIN) {
+                                            lr = fmaxf(BP_LR_MIN, lr * 0.5f);
+                                            r.lr_cuts++;
+                                            if (lr <= BP_LR_MIN) {
+                                                r.lr_floor_hits++;
+                                                char c[160];
+                                                snprintf(c, sizeof(c),
+                                                         "[%s]   race %s: lr at floor %.0e "
+                                                         "(%d/%d last-layer units dead) day %d",
+                                                         IND_SHORT[i], e.name, BP_LR_MIN, dead,
+                                                         n_last, blk_actual_day[d]);
+                                                log_msg(c);
+                                            }
+                                        }
+                                    } else if (dead == 0 && lr < BP_LR_BASE) {
+                                        lr = fminf(BP_LR_BASE, lr * BP_LR_RECOVER);
+                                    }
                                 }
                             }
                         }
@@ -5592,6 +5660,16 @@ int main(int argc, char* argv[]) {
                              RACE[v].name, ls, rk, r.rank_n,
                              r.rank_n == 0 ? "  (all tied every day: cannot rank)" : "");
                     log_msg(m);
+                    if (!r.lr.empty() && r.dead_n > 0) {
+                        float lo = r.lr[0], sum = 0.f;
+                        for (float x : r.lr) { lo = fminf(lo, x); sum += x; }
+                        snprintf(m, sizeof(m),
+                                 "        lr end mean %.1e min %.1e | cuts %ld, at floor %ld | "
+                                 "last-layer dead %.1f%% (mean over training days)",
+                                 sum / (float)r.lr.size(), lo, r.lr_cuts, r.lr_floor_hits,
+                                 100.0 * r.dead_sum / (double)r.dead_n);
+                        log_msg(m);
+                    }
                     if (r.distinct_n > 0) {
                         const double dm = r.distinct_sum / (double)r.distinct_n;
                         const double tie_frac = 1.0 - dm / (double)MT1_BP_MODELS;
