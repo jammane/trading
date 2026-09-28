@@ -225,7 +225,12 @@ static constexpr int   MT1_BP_WARM_DAY     = 100;
 // +$406,381 on another), so having the noise floor measured inside the same table is worth a slot.
 using MT1Forward = float (*)(const float*, const float*, float);
 
-enum RaceArch  { ARCH_MT1, ARCH_MT1C, ARCH_MT1S };
+// ARCH_TANH32 is the REFERENCE: MT1Backprop (mt1_backprop.h) used verbatim -- 146->32->8->1, tanh,
+// Xavier init, its own Adam with coupled L2. It is the net that ranked +0.017..+0.027 within-day
+// in the v0.8.1.27 run, against +0.005 for the best race net in v0.8.1.30. Carried unchanged so the
+// race measures whether that gap is real, on the same days and the same 200 order sets. Gradient
+// only: it has no flat-array forward for the evolutionary pool (asserted below).
+enum RaceArch  { ARCH_MT1, ARCH_MT1C, ARCH_MT1S, ARCH_TANH32 };
 enum RaceSrch  { SRCH_EVO, SRCH_GRAD };
 
 struct RaceEntry {
@@ -294,6 +299,7 @@ static constexpr RaceEntry RACE[] = {
     {"MT1S-stk evo ", ARCH_MT1S, SRCH_EVO,  true,  true,  "r_mt1s2" },  // seed replicate
     {"MT1S-stk grad", ARCH_MT1S, SRCH_GRAD, true,  false, nullptr   },
     {"MT1S-stk grdC", ARCH_MT1S, SRCH_GRAD, true,  true,  nullptr   },
+    {"TANH32   grad", ARCH_TANH32, SRCH_GRAD, false, false, nullptr },  // reference, see enum
 };
 static constexpr int RACE_N = (int)(sizeof(RACE) / sizeof(RACE[0]));
 
@@ -309,8 +315,17 @@ static_assert(RACE[RACE_DEPLOYED].arch == ARCH_MT1C && RACE[RACE_DEPLOYED].searc
 static_assert(RACE[RACE_LOG_POOL].arch == ARCH_MT1 && RACE[RACE_LOG_POOL].search == SRCH_EVO,
               "RACE_LOG_POOL must name MT1 evo");
 
+static constexpr int TANH32_PARAMS = MT1C_IN * 32 + 32 + 32 * 8 + 8 + 8 + 1;   // 4,977
+static constexpr bool race_tanh32_is_grad_only() {
+    for (const RaceEntry& e : RACE)
+        if (e.arch == ARCH_TANH32 && e.search != SRCH_GRAD) return false;
+    return true;
+}
+static_assert(race_tanh32_is_grad_only(), "TANH32 has no evolutionary forward; gradient only");
+
 static inline int race_params(RaceArch a) {
-    return a == ARCH_MT1 ? MT1NET_PARAMS : a == ARCH_MT1C ? MT1CNET_PARAMS : MT1SNET_PARAMS;
+    return a == ARCH_MT1 ? MT1NET_PARAMS : a == ARCH_MT1C ? MT1CNET_PARAMS
+         : a == ARCH_MT1S ? MT1SNET_PARAMS : TANH32_PARAMS;
 }
 // MT1Forward-compatible wrapper so MT1S can use the existing evolutionary pool machinery.
 static inline float mt1s_forward_mt1f(const float* W, const float* in, float /*extra*/) {
@@ -4513,6 +4528,7 @@ int main(int argc, char* argv[]) {
         // identical base seeds at both sites and ran bit-identically -- MT1S-stk evo, meant as a
         // seed replicate of MT1S-sum evo, reproduced it to every printed digit.
         uint64_t salt = 0;
+        std::vector<MT1Backprop> tanh32;              // ARCH_TANH32 only: owns its weights + Adam
         std::vector<float> lr;                        // gradient: per-industry learning rate
         long   lr_cuts = 0, lr_floor_hits = 0;
         double dead_sum = 0.0; long dead_n = 0;       // mean dead fraction of the last layer
@@ -4540,6 +4556,13 @@ int main(int argc, char* argv[]) {
         if (RACE[v].search == SRCH_EVO) {
             r.pool = std::make_unique<MT1PoolScratch[]>(N_IND);
             for (int i = 0; i < N_IND; i++) r.pool[i].alloc(np);
+        } else if (RACE[v].arch == ARCH_TANH32) {
+            // MT1Backprop owns weights and moments. w/m/v/g are still sized to N_IND -- EMPTY, not
+            // absent -- so every `.w[i].empty()` guard stays in bounds (the v0.8.1.29 segfault was
+            // exactly an out-of-bounds .w[i] on an entry that never allocated it).
+            r.tanh32.resize(N_IND);
+            r.w.assign(N_IND, {}); r.m.assign(N_IND, {}); r.v.assign(N_IND, {}); r.g.assign(N_IND, {});
+            r.lr.assign(N_IND, BP_LR_BASE);
         } else {
             r.w.assign(N_IND, std::vector<float>(np, 0.f));
             r.m.assign(N_IND, std::vector<float>(np, 0.f));
@@ -4741,6 +4764,10 @@ int main(int argc, char* argv[]) {
                 }
                 if (RACE[v].carry && pass > 0) continue;   // keep weights, Adam moments AND lr
                 r.lr[i] = BP_LR_BASE;
+                if (RACE[v].arch == ARCH_TANH32) {         // its own Xavier init, as in v0.8.1.27
+                    r.tanh32[i].init({MT1C_IN, 32, 8, 1}, mix_seed(sd));
+                    continue;
+                }
                 PCG32 rng; rng.seed(mix_seed(sd));
                 std::vector<float>& W = r.w[i];
                 // Same scale the evolutionary pools start from, so neither search method begins
@@ -5063,9 +5090,10 @@ int main(int argc, char* argv[]) {
                             if (!measure && !train) continue;
                             for (int m = 0; m < nm; m++) {
                                 const float* row = (e.arch == ARCH_MT1) ? ind_in : mrows[m];
-                                mpred[m] = (e.arch == ARCH_MT1)  ? mt1net_forward(W, row, 0.f)
-                                         : (e.arch == ARCH_MT1C) ? mt1cnet_forward(W, row, 0.f)
-                                                                 : mt1s_forward(W, row);
+                                mpred[m] = (e.arch == ARCH_MT1)    ? mt1net_forward(W, row, 0.f)
+                                         : (e.arch == ARCH_MT1C)   ? mt1cnet_forward(W, row, 0.f)
+                                         : (e.arch == ARCH_TANH32) ? r.tanh32[i].forward(row)
+                                                                   : mt1s_forward(W, row);
                             }
                             // Distinct predictions from the FROZEN net, before today's training.
                             int dist = 0;
@@ -5146,6 +5174,15 @@ int main(int argc, char* argv[]) {
                                                  : (e.arch == ARCH_MT1C) ? 8 : MT1S_H2;
                                 for (int m = 0; m < nm; m++) {
                                     const float* row = (e.arch == ARCH_MT1) ? ind_in : mrows[m];
+                                    if (e.arch == ARCH_TANH32) {
+                                        // verbatim v0.8.1.27: forward, then its own Adam step;
+                                        // only the lr is steered, by the distinct-pred rule
+                                        MT1Backprop& net = r.tanh32[i];
+                                        net.lr = r.lr[i];
+                                        net.forward(row);
+                                        r.loss_sum += net.train_step(mreal[m]); r.loss_n++;
+                                        continue;
+                                    }
                                     float* gg = r.g[i].data();
                                     float* ww = r.w[i].data();
                                     double loss = 0.0;
@@ -5191,7 +5228,7 @@ int main(int argc, char* argv[]) {
                                     race_adam(r, i, r.adam_step);
                                     r.loss_sum += loss; r.loss_n++;
                                 }
-                                if (nm > 0) {
+                                if (nm > 0 && e.arch != ARCH_TANH32) {   // tanh saturates, never dies
                                     const int dead = n_last - __builtin_popcount(alive);
                                     const float frac = (float)dead / (float)n_last;
                                     r.dead_sum += frac; r.dead_n++;
@@ -5461,7 +5498,15 @@ int main(int argc, char* argv[]) {
             log_mem_stat(num_workers);
             for (int i = 0; i < N_IND; i++) {
                 for (int v = 0; v < RACE_N; v++) {
-                    if (RACE[v].search != SRCH_GRAD || race[v].w[i].empty()) continue;
+                    if (RACE[v].search != SRCH_GRAD) continue;
+                    if (RACE[v].arch == ARCH_TANH32) {
+                        const std::vector<float>& tw = race[v].tanh32[i].W;
+                        if (!tw.empty())
+                            save_bin(race_weight_path(output_dir, v, i, pass + 1),
+                                     tw.data(), (int)tw.size());
+                        continue;
+                    }
+                    if (race[v].w[i].empty()) continue;
                     save_bin(race_weight_path(output_dir, v, i, pass + 1),
                              race[v].w[i].data(), (int)race[v].w[i].size());
                 }
@@ -5724,14 +5769,15 @@ int main(int argc, char* argv[]) {
                              RACE[v].name, ls, rk, r.rank_n,
                              r.rank_n == 0 ? "  (all tied every day: cannot rank)" : "");
                     log_msg(m);
-                    if (!r.lr.empty() && r.dead_n > 0) {
+                    if (!r.lr.empty() && r.loss_n > 0) {
                         float lo = r.lr[0], sum = 0.f;
                         for (float x : r.lr) { lo = fminf(lo, x); sum += x; }
-                        snprintf(m, sizeof(m),
-                                 "        lr end mean %.1e min %.1e | cuts %ld, at floor %ld | "
-                                 "last-layer dead %.1f%% (mean over training days)",
-                                 sum / (float)r.lr.size(), lo, r.lr_cuts, r.lr_floor_hits,
-                                 100.0 * r.dead_sum / (double)r.dead_n);
+                        char dd[64] = "";
+                        if (r.dead_n > 0)
+                            snprintf(dd, sizeof(dd), " | last-layer dead %.1f%% (mean over training days)",
+                                     100.0 * r.dead_sum / (double)r.dead_n);
+                        snprintf(m, sizeof(m), "        lr end mean %.1e min %.1e | cuts %ld, at floor %ld%s",
+                                 sum / (float)r.lr.size(), lo, r.lr_cuts, r.lr_floor_hits, dd);
                         log_msg(m);
                     }
                     if (r.distinct_n > 0) {

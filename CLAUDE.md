@@ -796,6 +796,13 @@ days. MT1Net keeps the dead-unit rule (plain ReLU, and its predictions always ti
 read activations/predictions only, never outcomes. The race table
 prints `lr end mean/min`, cuts, floor hits and mean dead fraction per entry.
 
+**TANH32 reference entry.** The 13th race entry is `MT1Backprop` (`mt1_backprop.h`) used verbatim:
+146->32->8->1, tanh, Xavier init, its own Adam with coupled L2 — the net that ranked +0.017..+0.027
+within-day in the v0.8.1.27 run, against +0.005 for the best race net in v0.8.1.30. Gradient-only
+(static_assert), restarts each pass as it did then; only its lr is steered, by the distinct-pred
+rule. It answers whether that 4x gap is real on the same days and order sets, and if so it isolates
+the cause to the architecture/activation/init/decay bundle rather than the race machinery.
+
 **Per-entry seeds.** Each evolutionary entry draws its own clock salt at every pass start and XORs
 it into both its pool init and its mutation seeds. Before this, entries of one architecture shared
 both bases and ran bit-identically (the MT1S-stk "seed replicate" reproduced MT1S-sum to every digit).
