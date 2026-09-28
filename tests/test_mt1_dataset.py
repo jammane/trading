@@ -382,21 +382,6 @@ class TestCompetitorInput:
         for k in D.PAIRED:
             assert np.allclose(ds[k], want[k]), f'{k} did not round-trip'
 
-    def test_the_competitor_does_not_feed_mt2(self):
-        """Its prediction is scored and logged only. If it reached in12 the two pools would
-        interfere and MT2's input would differ from the MT1-only run, so neither could be
-        compared against anything."""
-        body = CPP[CPP.index('MT1DayResult cr = mt1_step_day'):]
-        body = body[:body.index('mt1c_day_res[i][d] = cr;') + 40]
-        assert 'in12' not in re.sub(r'//[^\n]*', '', body), 'the competitor is feeding MT2'
-
-    def test_both_pools_share_one_step_function(self):
-        """Same selection, lifecycle and scoring — only the network and inputs differ, or the
-        comparison measures the machinery instead of the feature set."""
-        assert CPP.count('mt1_step_day(i, mt1_scratches[i]') == 1
-        assert CPP.count('mt1_step_day(i, mt1c_scratches[i]') == 1
-
-
     def test_builder_sanitises_non_finite_raw_outputs(self):
         """StockNN's raw head is non-finite for a large share of symbol-days — the fill path hides
         it because every comparison against NaN is false. One NaN input poisons an entire forward
@@ -502,22 +487,34 @@ class TestCompetitorInput:
         for k in D.PAIRED:
             assert np.allclose(ds[k], want[k]), f'{k} did not round-trip'
 
-    def test_the_independent_allocator_sees_the_whole_master_vector(self):
-        """MT1Net gets its own 74, MT1CNet its own 146. MT2INet gets all 888 — that is the
-        difference being tested, so it must not be handed a slice."""
-        body = CPP[CPP.index('Independent allocator'):]
-        body = body[:body.index('mt2i_day_res[i][d] = ir2;')]
-        assert 'blk_888[d],' in body, 'must receive the whole vector, not blk_888[d][i * 74]'
-        assert 'i * 74' not in body
 
-    def test_no_competitor_feeds_mt2(self):
-        """Neither extra pool may reach in12, or MT2's input differs from an MT1-only run and
-        none of the three can be compared against anything."""
-        seg = CPP[CPP.index('MT1DayResult cr = mt1_step_day'):]
-        seg = seg[:seg.index('mt2i_day_res[i][d] = ir2;') + 40]
-        # strip comments: they necessarily mention in12 to explain why it is excluded
-        assert 'in12' not in re.sub(r'//[^\n]*', '', seg)
+class TestRaceInvariants:
+    """What the retired standalone-pool tests guarded, restated against the race.
 
-    def test_all_three_share_one_step_function(self):
-        for tag in ('mt1_scratches[i]', 'mt1c_scratches[i]', 'mt2i_scratches[i]'):
-            assert CPP.count(f'mt1_step_day(i, {tag}') == 1, f'{tag} not stepped exactly once'
+    MT1Net and MT1CNet used to be separate pools (mt1_scratches / mt1c_scratches) and MT2INet a
+    third; the race replaced all three with RACE entries (e9b049f, v0.8.1.28). The invariants did
+    not go away -- same step function for every evolutionary entry, and nothing the race computes
+    may reach MT2's input -- so they are pinned here on the code that now carries them.
+    """
+
+    @staticmethod
+    def _race_day_loop():
+        start = CPP.index('for (int v = 0; v < RACE_N; v++) {\n                            const RaceEntry& e = RACE[v];')
+        return CPP[start:CPP.index('bp_pred[i] = mt1cnet_forward', start)]
+
+    def test_every_evolutionary_entry_shares_one_step_function(self):
+        """One call site inside the race loop, so every evo entry gets the same selection,
+        lifecycle and scoring -- only network and inputs differ, or the race measures machinery."""
+        assert self._race_day_loop().count('mt1_step_day(i, r.pool[i]') == 1
+        assert CPP.count('mt1_step_day(i, r.pool[i]') == 1
+
+    def test_no_race_entry_feeds_mt2(self):
+        """in12 is MT2's input. If any entry wrote it, MT2 would differ between runs with different
+        race tables and nothing downstream could be compared."""
+        body = re.sub(r'//[^\n]*', '', self._race_day_loop())
+        assert 'in12' not in body, 'a race entry is feeding MT2'
+
+    def test_retired_pools_are_gone(self):
+        """A half-removed pool would still be stepped and saved while no longer reported."""
+        for tag in ('mt1_scratches[', 'mt1c_scratches[', 'mt2i_scratches['):
+            assert tag not in CPP, f'{tag} still referenced after its pool was retired'
