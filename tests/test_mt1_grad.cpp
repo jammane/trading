@@ -239,6 +239,33 @@ int main()
         check(bad > 10, "a 1.5x-scaled gradient is rejected (the FD check has teeth)");
     }
 
+    // ── ListNet: analytic dL/ds against central differences, plus its invariances ───
+    {
+        const int n = 7;
+        float s[n] = {0.3f, -1.2f, 0.8f, 0.05f, -0.4f, 1.5f, -0.9f};
+        float y[n] = {120.f, -40.f, 300.f, 10.f, -250.f, 90.f, 0.f};
+        double g[n];
+        listnet_grad(s, y, n, g);
+        double worst = 0.0;
+        for (int m = 0; m < n; m++) {
+            double gd[n];
+            const float s0 = s[m], h = 1e-3f;
+            s[m] = s0 + h; const double lp = listnet_grad(s, y, n, gd);
+            s[m] = s0 - h; const double lm = listnet_grad(s, y, n, gd);
+            s[m] = s0;
+            worst = std::fmax(worst, std::fabs((lp - lm) / (2.0 * h) - g[m]));
+        }
+        check(worst < 1e-4, "ListNet gradient matches central differences");
+        double sum = 0.0; for (int m = 0; m < n; m++) sum += g[m];
+        check(std::fabs(sum) < 1e-9, "ListNet gradient sums to zero (shift-invariant in the scores)");
+        float y2[n]; for (int m = 0; m < n; m++) y2[m] = 3.f * y[m] + 1000.f;
+        double g2[n]; listnet_grad(s, y2, n, g2);
+        double dmax = 0.0; for (int m = 0; m < n; m++) dmax = std::fmax(dmax, std::fabs(g2[m] - g[m]));
+        check(dmax < 1e-6, "ListNet is invariant to affine rescaling of the targets");
+        float yc[n]; for (int m = 0; m < n; m++) yc[m] = 5.f;
+        check(std::isnan(listnet_grad(s, yc, n, g2)), "ListNet refuses a list with no target spread");
+    }
+
     printf(failures ? "\n%d FAILURE(S)\n" : "\nall gradients verified\n", failures);
     return failures ? 1 : 0;
 }

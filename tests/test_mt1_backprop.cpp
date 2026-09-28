@@ -124,6 +124,22 @@ int main() {
               "nets trained on opposite targets diverge from an identical seed");
     }
 
+    // ── the race's arbitrary-gradient injection: backward(out - g/2) == g * dOut/dW ───
+    {
+        MT1Backprop net; net.init({6, 5, 3, 1}, 77);
+        float x[6] = {0.2f, -0.7f, 0.4f, 0.9f, -0.1f, 0.3f};
+        const float out = net.forward(x);
+        net.backward(out - 0.5f);                  // d_out = 1: the plain dOut/dW
+        std::vector<float> base = net.grad;
+        const float g = -0.37f;
+        net.forward(x);
+        net.backward(out - 0.5f * g);
+        double worst = 0.0;
+        for (size_t k = 0; k < base.size(); k++)
+            worst = std::fmax(worst, std::fabs(net.grad[k] - g * base[k]));
+        check(worst < 1e-6, "backward(out - g/2) injects exactly g as the output gradient");
+    }
+
     printf(failures ? "\n%d FAILURE(S)\n" : "\nbackprop verified\n", failures);
     return failures ? 1 : 0;
 }
