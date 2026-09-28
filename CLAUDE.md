@@ -125,9 +125,13 @@ weights are only needed to seed a run (`--load-dir`) or convert to `.pt`.
 **`--load-dir` is a SEED, consulted only when the working store has nothing** (fixed v0.6.6.0).
 It used to be checked *first, every day*, so a run seeded from a populated directory reloaded that
 seed daily and never made progress — the same root cause as the `--no-save` bug: neither path had
-any notion of "first day only". `/root/prune_runs.sh [KEEP]`
-(default 2, `--dry-run` previews) strips weights from all but the N most recent `/root/ht_train*`
-runs while preserving every log, and skips a run detected in flight. Run it before a full pass.
+any notion of "first day only". `prune_runs.sh [KEEP] [--dry-run]` (in the repo root; the droplet
+copy is `/root/prune_runs.sh`, default KEEP 2) strips StockNN weights from all but the N most
+recent `/root/ht_*` runs while preserving every log, and skips a run detected in flight. Run it
+before a full pass. It deletes a **whitelist** of StockNN weight patterns (`*_elite_*`,
+`*_hist.bin` except `mt2_hist.bin`, `champion/`) — the pre-repo version deleted every `.bin`
+except `mt_training_log.bin`, which silently took `mt1_dataset.bin` (a log) with it, and only
+scanned `ht_train*`.
 Always use real disk paths (`models/acct0/training`, `logs/`, `/root/diag_logs`) — never `/tmp` which is a 978 MB RAM-backed tmpfs on the droplet. Training and production can run concurrently; both write to real disk only.
 
 **Training pauses for production (v0.6.5.0).** The droplet has 2 cores and a training run uses
