@@ -803,6 +803,19 @@ within-day in the v0.8.1.27 run, against +0.005 for the best race net in v0.8.1.
 rule. It answers whether that 4x gap is real on the same days and order sets, and if so it isolates
 the cause to the architecture/activation/init/decay bundle rather than the race machinery.
 
+**Demeaned and ranking losses, and the Bayesian allocator (17 race entries).** Four entries test
+the two fixes for what the v0.8.1.30 race showed: its MSE nets took 200 same-day Adam steps on rows
+sharing the day's market move and became "yesterday's P&L" predictors (0.82-0.87 correlated with it
+in an offline replica), which industry P&L's mild lag-1 mean reversion turns wrong-way.
+`gdmn` trains squared error on P&L minus the industry-day's mean across the 200 order sets;
+`grnk` trains ListNet (`listnet_grad` in `mt1_grad.h`, FD-checked) with ONE batched step per
+industry-day. Each exists for MT1C and TANH32, beside the unchanged MSE entries. Both remove the day
+level, so their across-day corr and alloc lines print `[n/a]` -- only within-day rank counts.
+`ALLOC bayes` is a separate allocator (it reads no order intent): a discounted Gaussian posterior
+(gamma 0.98) on each industry's daily return, top 4 funded by posterior mean or by a Thompson draw.
+Every industry is observed daily whatever is funded, so it is full-information and the Thompson
+line is the mean line plus noise; read the mean line.
+
 **Per-entry seeds.** Each evolutionary entry draws its own clock salt at every pass start and XORs
 it into both its pool init and its mutation seeds. Before this, entries of one architecture shared
 both bases and ran bit-identically (the MT1S-stk "seed replicate" reproduced MT1S-sum to every digit).

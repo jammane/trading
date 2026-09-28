@@ -281,3 +281,36 @@ static inline void mt1s_backward(const float* W, const MT1SCache& k, const float
                            nullptr, MT1S_H1, MT1S_PER_SYM);
     }
 }
+
+// ── ListNet (listwise ranking loss) ─────────────────────────────────────────────
+// L = -sum_m softmax(z)_m * log softmax(s)_m, with s the model's scores and z the targets z-scored
+// across the list. dL/ds_m = softmax(s)_m - softmax(z)_m. Scale-free in the targets and invariant
+// to a constant added to every score, so it trains on the ORDERING alone. Writes the gradient to
+// g[0..n) and returns the loss; returns NaN (g untouched) when the targets have no spread.
+static inline double listnet_grad(const float* score, const float* y, int n, double* g)
+{
+    double mu = 0.0, sd = 0.0;
+    for (int m = 0; m < n; m++) mu += y[m];
+    mu /= n;
+    for (int m = 0; m < n; m++) sd += (y[m] - mu) * (y[m] - mu);
+    sd = std::sqrt(sd / n);
+    if (!(sd > 0.0)) return NAN;
+    double zmax = -1e300, smax = -1e300;
+    for (int m = 0; m < n; m++) {
+        zmax = std::fmax(zmax, (y[m] - mu) / sd);
+        smax = std::fmax(smax, (double)score[m]);
+    }
+    double zt = 0.0, zp = 0.0;
+    for (int m = 0; m < n; m++) {
+        zt += std::exp((y[m] - mu) / sd - zmax);
+        zp += std::exp(score[m] - smax);
+    }
+    double loss = 0.0;
+    for (int m = 0; m < n; m++) {
+        const double pt = std::exp((y[m] - mu) / sd - zmax) / zt;
+        const double pp = std::exp(score[m] - smax) / zp;
+        loss -= pt * std::log(std::fmax(pp, 1e-300));
+        g[m] = pp - pt;
+    }
+    return loss;
+}

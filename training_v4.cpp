@@ -232,6 +232,18 @@ using MT1Forward = float (*)(const float*, const float*, float);
 // only: it has no flat-array forward for the evolutionary pool (asserted below).
 enum RaceArch  { ARCH_MT1, ARCH_MT1C, ARCH_MT1S, ARCH_TANH32 };
 enum RaceSrch  { SRCH_EVO, SRCH_GRAD };
+// Gradient loss. MSE is the original: squared error on the order set's raw dollar P&L.
+//   DEMEAN  squared error on (P&L - that industry-day's mean across the 200 order sets). The
+//           day's market move is common to all 200, so it carries no ranking information, and
+//           training on it is what turned the MSE nets into "yesterday's P&L" predictors
+//           (200 same-day steps; see race_grad_anticorr notes). Per-row steps, as MSE.
+//   LIST    ListNet: softmax cross-entropy between the net's scores and softmax(z-scored P&L)
+//           over the day's order sets -- trains on the within-day ORDERING, which is what the
+//           race scores. Listwise needs every row at once, so it takes ONE batched step per
+//           industry-day rather than one per row.
+// Both remove the day level by construction, so their across-day corr and allocation lines
+// are not meaningful; only within-day rank is.
+enum RaceLoss  { LOSS_MSE, LOSS_DEMEAN, LOSS_LIST };
 
 struct RaceEntry {
     const char* name;
@@ -240,6 +252,7 @@ struct RaceEntry {
     bool        per_symbol;   // gradient only: one row per symbol instead of one per industry
     bool        carry;        // keep the model across a pass boundary, or start fresh
     const char* tag;          // pool file prefix; must be unique per evolutionary entry
+    RaceLoss    loss = LOSS_MSE;
 };
 
 // Day this entry starts TRAINING. Measurement always begins at MT1_BP_START_DAY.
@@ -300,6 +313,10 @@ static constexpr RaceEntry RACE[] = {
     {"MT1S-stk grad", ARCH_MT1S, SRCH_GRAD, true,  false, nullptr   },
     {"MT1S-stk grdC", ARCH_MT1S, SRCH_GRAD, true,  true,  nullptr   },
     {"TANH32   grad", ARCH_TANH32, SRCH_GRAD, false, false, nullptr },  // reference, see enum
+    {"MT1C     gdmn", ARCH_MT1C,   SRCH_GRAD, false, false, nullptr, LOSS_DEMEAN },
+    {"MT1C     grnk", ARCH_MT1C,   SRCH_GRAD, false, false, nullptr, LOSS_LIST   },
+    {"TANH32   gdmn", ARCH_TANH32, SRCH_GRAD, false, false, nullptr, LOSS_DEMEAN },
+    {"TANH32   grnk", ARCH_TANH32, SRCH_GRAD, false, false, nullptr, LOSS_LIST   },
 };
 static constexpr int RACE_N = (int)(sizeof(RACE) / sizeof(RACE[0]));
 
@@ -322,6 +339,15 @@ static constexpr bool race_tanh32_is_grad_only() {
     return true;
 }
 static_assert(race_tanh32_is_grad_only(), "TANH32 has no evolutionary forward; gradient only");
+static constexpr bool race_losses_are_supported() {
+    for (const RaceEntry& e : RACE) {
+        if (e.loss == LOSS_MSE) continue;
+        if (e.search != SRCH_GRAD || e.per_symbol) return false;
+        if (e.arch != ARCH_MT1C && e.arch != ARCH_TANH32) return false;
+    }
+    return true;
+}
+static_assert(race_losses_are_supported(), "DEMEAN/LIST are implemented for MT1C and TANH32 grad only");
 
 static inline int race_params(RaceArch a) {
     return a == ARCH_MT1 ? MT1NET_PARAMS : a == ARCH_MT1C ? MT1CNET_PARAMS
@@ -4547,6 +4573,25 @@ int main(int argc, char* argv[]) {
     //
     // Per-architecture rather than per-entry: six of the eight entries share one input set.
     struct RowCount { double sum = 0.0; long n = 0; };
+
+    // ── Bayesian industry allocator (not a race entry: it reads no order intent) ─────────
+    // A discounted Gaussian posterior on each industry's daily book return (gamma = 0.98, ~50-day
+    // memory). Each day, BEFORE that day's returns are folded in, it ranks the twelve two ways and
+    // funds the top four:
+    //   mean      by posterior mean -- shrinkage momentum; the real test
+    //   thompson  by one draw from each posterior
+    // Every industry's return is observed every day whatever is funded (the sim runs all twelve,
+    // as production does), so this is a FULL-INFORMATION problem: exploration buys nothing and the
+    // Thompson draw is the mean plus noise. It is reported because it was asked for; expect it to
+    // match or trail the mean ranking.
+    struct BayesAlloc {
+        double mu[N_IND] = {}, m2[N_IND] = {}, w[N_IND] = {};
+        double flat = 0, top4[2] = {0, 0}, bot4[2] = {0, 0};
+        long   n = 0;
+        PCG32  rng;
+    };
+    BayesAlloc balloc;
+    static constexpr double BALLOC_GAMMA = 0.98, BALLOC_MIN_W = 5.0;
     RowCount rows_feat74, rows_cfeat146, rows_persym;
 
     std::vector<RaceState> race(RACE_N);
@@ -4792,6 +4837,8 @@ int main(int argc, char* argv[]) {
             std::fill(r.sy.begin(), r.sy.end(), 0.0); std::fill(r.dn.begin(), r.dn.end(), 0);
         }
         rows_feat74 = RowCount{}; rows_cfeat146 = RowCount{}; rows_persym = RowCount{};
+        balloc = BayesAlloc{};
+        balloc.rng.seed(mix_seed(0xBA1106ULL));
         std::fill(bp_bk_sum.begin(), bp_bk_sum.end(), 0.0);
         std::fill(bp_bk_n.begin(), bp_bk_n.end(), 0);
 
@@ -5172,6 +5219,53 @@ int main(int argc, char* argv[]) {
                                 uint32_t alive = 0;
                                 const int n_last = (e.arch == ARCH_MT1)  ? 10
                                                  : (e.arch == ARCH_MT1C) ? 8 : MT1S_H2;
+                                // Per-row target for the squared-error losses.
+                                static thread_local float tgt[MT1_BP_MODELS];
+                                {
+                                    double ybar = 0.0;
+                                    for (int m = 0; m < nm; m++) ybar += mreal[m];
+                                    ybar = nm ? ybar / nm : 0.0;
+                                    for (int m = 0; m < nm; m++)
+                                        tgt[m] = (e.loss == LOSS_DEMEAN) ? mreal[m] - (float)ybar
+                                                                         : mreal[m];
+                                }
+                                if (e.loss == LOSS_LIST && nm >= 3) {
+                                    // ListNet. dL/ds_m = softmax(s)_m - softmax(z)_m, with s the
+                                    // frozen net's scores (mpred, computed above) and z the day's
+                                    // z-scored P&L. One accumulated gradient, one Adam step.
+                                    static thread_local double lg[MT1_BP_MODELS];
+                                    const double loss = listnet_grad(mpred, mreal, nm, lg);
+                                    if (std::isfinite(loss)) {
+                                        if (e.arch == ARCH_MT1C) {
+                                            float* gg = r.g[i].data();
+                                            float* ww = r.w[i].data();
+                                            for (int m = 0; m < nm; m++) {
+                                                MT1CNetCache c;
+                                                mt1cnet_forward_cached(ww, mrows[m], c);
+                                                mt1cnet_backward(ww, c, (float)lg[m], gg);
+                                                for (int u = 0; u < 8; u++) if (c.c[u] > 0.f) alive |= 1u << u;
+                                            }
+                                            r.adam_step++;
+                                            race_adam(r, i, r.adam_step);
+                                        } else {   // ARCH_TANH32: backward() OVERWRITES grad, so sum it
+                                            MT1Backprop& net = r.tanh32[i];
+                                            net.lr = r.lr[i];
+                                            static thread_local std::vector<float> acc;
+                                            acc.assign(net.W.size(), 0.f);
+                                            for (int m = 0; m < nm; m++) {
+                                                const float out = net.forward(mrows[m]);
+                                                // backward() seeds d_out = 2(out - target); this
+                                                // target makes d_out exactly the ListNet gradient
+                                                net.backward(out - 0.5f * (float)lg[m]);
+                                                for (size_t k = 0; k < acc.size(); k++) acc[k] += net.grad[k];
+                                            }
+                                            net.grad = acc;
+                                            net.adam_step();
+                                        }
+                                        r.loss_sum += loss; r.loss_n++;
+                                    }
+                                }
+                                if (e.loss != LOSS_LIST)
                                 for (int m = 0; m < nm; m++) {
                                     const float* row = (e.arch == ARCH_MT1) ? ind_in : mrows[m];
                                     if (e.arch == ARCH_TANH32) {
@@ -5180,7 +5274,7 @@ int main(int argc, char* argv[]) {
                                         MT1Backprop& net = r.tanh32[i];
                                         net.lr = r.lr[i];
                                         net.forward(row);
-                                        r.loss_sum += net.train_step(mreal[m]); r.loss_n++;
+                                        r.loss_sum += net.train_step(tgt[m]); r.loss_n++;
                                         continue;
                                     }
                                     float* gg = r.g[i].data();
@@ -5189,14 +5283,14 @@ int main(int argc, char* argv[]) {
                                     if (e.arch == ARCH_MT1) {
                                         MT1NetCache c;
                                         mt1net_forward_cached(ww, row, 0.f, c);
-                                        const float err = c.out - mreal[m];
+                                        const float err = c.out - tgt[m];
                                         mt1net_backward(ww, c, 2.f * err, gg);
                                         loss = (double)err * err;
                                         for (int u = 0; u < 10; u++) if (c.d2[u] > 0.f) alive |= 1u << u;
                                     } else if (e.arch == ARCH_MT1C) {
                                         MT1CNetCache c;
                                         mt1cnet_forward_cached(ww, row, c);
-                                        const float err = c.out - mreal[m];
+                                        const float err = c.out - tgt[m];
                                         mt1cnet_backward(ww, c, 2.f * err, gg);
                                         loss = (double)err * err;
                                         for (int u = 0; u < 8; u++) if (c.c[u] > 0.f) alive |= 1u << u;
@@ -5215,7 +5309,7 @@ int main(int argc, char* argv[]) {
                                             }
                                             loss /= MT1C_SYMS;
                                         } else {
-                                            const float err = c.out - mreal[m];
+                                            const float err = c.out - tgt[m];
                                             for (int j = 0; j < MT1C_SYMS; j++) ds[j] = 2.f * err;
                                             loss = (double)err * err;
                                         }
@@ -5228,7 +5322,8 @@ int main(int argc, char* argv[]) {
                                     race_adam(r, i, r.adam_step);
                                     r.loss_sum += loss; r.loss_n++;
                                 }
-                                if (nm > 0 && e.arch != ARCH_TANH32) {   // tanh saturates, never dies
+                                if (nm > 0 && e.arch != ARCH_TANH32 &&   // tanh saturates, never dies
+                                    (e.loss != LOSS_LIST || nm >= 3)) {
                                     const int dead = n_last - __builtin_popcount(alive);
                                     const float frac = (float)dead / (float)n_last;
                                     r.dead_sum += frac; r.dead_n++;
@@ -5311,6 +5406,40 @@ int main(int argc, char* argv[]) {
                             r.alloc_bot4 += mean_of(std::max(0, n - 4), std::min(4, n));
                             r.alloc_n++;
                         }
+                    }
+                    // Bayesian allocator: decide from the posterior over days < d, then learn d.
+                    bool warm = ok_n == N_IND;
+                    for (int i = 0; i < N_IND && warm; i++) warm = balloc.w[i] >= BALLOC_MIN_W;
+                    if (warm) {
+                        double key[2][N_IND];
+                        for (int i = 0; i < N_IND; i++) {
+                            const double var = fmax(balloc.m2[i] / balloc.w[i], 1e-12);
+                            const float u1 = fmaxf(balloc.rng.next_float(), 1e-7f);
+                            const float u2 = balloc.rng.next_float();
+                            const double zn = sqrt(-2.0 * log(u1)) * cos(6.283185307 * u2);
+                            key[0][i] = balloc.mu[i];
+                            key[1][i] = balloc.mu[i] + sqrt(var / balloc.w[i]) * zn;
+                        }
+                        double flat = 0.0;
+                        for (int i = 0; i < N_IND; i++) flat += race_day_ret[i];
+                        balloc.flat += flat / N_IND;
+                        for (int k = 0; k < 2; k++) {
+                            int ix[N_IND];
+                            for (int i = 0; i < N_IND; i++) ix[i] = i;
+                            sort_index_prefix(ix, N_IND, [&](int a, int b) { return key[k][a] > key[k][b]; });
+                            double t = 0.0, b = 0.0;
+                            for (int q = 0; q < 4; q++) { t += race_day_ret[ix[q]]; b += race_day_ret[ix[N_IND - 1 - q]]; }
+                            balloc.top4[k] += t / 4; balloc.bot4[k] += b / 4;
+                        }
+                        balloc.n++;
+                    }
+                    for (int i = 0; i < N_IND; i++) {
+                        if (!race_day_ok[i]) continue;
+                        const double x = race_day_ret[i];
+                        balloc.w[i] = BALLOC_GAMMA * balloc.w[i] + 1.0;
+                        const double dlt = x - balloc.mu[i];
+                        balloc.mu[i] += dlt / balloc.w[i];
+                        balloc.m2[i] = BALLOC_GAMMA * balloc.m2[i] + dlt * (x - balloc.mu[i]);
                     }
                 }
 
@@ -5748,6 +5877,20 @@ int main(int argc, char* argv[]) {
                     line("feat74  (MT1)", rows_feat74,   MT1_BP_MODELS);
                     line("cfeat146(MT1C)", rows_cfeat146, MT1_BP_MODELS);
                     line("per-sym (MT1S-stk)", rows_persym, MT1_BP_MODELS * MT1C_SYMS);
+                    if (balloc.n > 0) {
+                        const double n = (double)balloc.n, fl = 1e4 * balloc.flat / n;
+                        const char* lab[2] = {"mean    ", "thompson"};
+                        for (int k = 0; k < 2; k++) {
+                            const double t4 = 1e4 * balloc.top4[k] / n, b4 = 1e4 * balloc.bot4[k] / n;
+                            snprintf(c, sizeof(c),
+                                     "   ALLOC bayes %s (gamma %.2f) bp/day over %ld days: flat %+.2f | "
+                                     "top4 %+.2f (%+.2f vs flat) | long-short %+.2f",
+                                     lab[k], BALLOC_GAMMA, balloc.n, fl, t4, t4 - fl, t4 - b4);
+                            log_msg(c);
+                        }
+                        log_msg("   ALLOC is full-information (all 12 observed daily): thompson = mean + "
+                                "noise, so read the mean line.");
+                    }
                     log_msg("   feat74 must read 1.0: no order intent, so all 200 models look "
                             "identical to MT1.");
                 }
@@ -5806,8 +5949,9 @@ int main(int argc, char* argv[]) {
                         const double b4 = 1e4 * r.alloc_bot4 / n;
                         snprintf(m, sizeof(m),
                                  "        alloc bp/day: flat %+.2f | top4 %+.2f (%+.2f vs flat) | "
-                                 "top6 %+.2f (%+.2f) | long-short %+.2f",
-                                 fl, t4, t4 - fl, t6, t6 - fl, t4 - b4);
+                                 "top6 %+.2f (%+.2f) | long-short %+.2f%s",
+                                 fl, t4, t4 - fl, t6, t6 - fl, t4 - b4,
+                                 RACE[v].loss == LOSS_MSE ? "" : "  [n/a]");
                         log_msg(m);
                     }
                     std::string traj = "        by day:";
@@ -5835,8 +5979,9 @@ int main(int argc, char* argv[]) {
                     }
                     if (rn > 0) {
                         snprintf(m, sizeof(m),
-                                 "        across-day corr %+.4f (mean of %d industries)",
-                                 rsum / rn, rn);
+                                 "        across-day corr %+.4f (mean of %d industries)%s",
+                                 rsum / rn, rn,
+                                 RACE[v].loss == LOSS_MSE ? "" : "  [n/a: loss removes the day level]");
                         log_msg(m);
                     }
                 }
