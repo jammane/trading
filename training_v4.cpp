@@ -225,11 +225,14 @@ static constexpr int   MT1_BP_WARM_DAY     = 100;
 // +$406,381 on another), so having the noise floor measured inside the same table is worth a slot.
 using MT1Forward = float (*)(const float*, const float*, float);
 
-// ARCH_TANH32 is the REFERENCE: MT1Backprop (mt1_backprop.h) used verbatim -- 146->32->8->1, tanh,
-// Xavier init, its own Adam with coupled L2. It is the net that ranked +0.017..+0.027 within-day
-// in the v0.8.1.27 run, against +0.005 for the best race net in v0.8.1.30. Carried unchanged so the
-// race measures whether that gap is real, on the same days and the same 200 order sets. Gradient
-// only: it has no flat-array forward for the evolutionary pool (asserted below).
+// ARCH_TANH32 is MT1Backprop (mt1_backprop.h) -- 146->32->8->1, tanh, Xavier init, its own Adam
+// with coupled L2 -- the net that ranked +0.017..+0.027 within-day in the v0.8.1.27 run. Raced
+// verbatim in v0.8.1.33-35, it did not reproduce that (+0.004/+0.001/+0.0006 over three passes)
+// and its per-row training collapsed it: 200 Adam steps per industry-day left grad and gdmn at a
+// handful of tied predictions (lr floor hit 123 and 788 times per pass; grnk, one batched step,
+// never). Since v0.8.1.36 every TANH32 loss takes ONE step per industry-day (train_batch), so it
+// is no longer the verbatim reference. Gradient only: it has no flat-array forward for the
+// evolutionary pool (asserted below).
 enum RaceArch  { ARCH_MT1, ARCH_MT1C, ARCH_MT1S, ARCH_TANH32 };
 enum RaceSrch  { SRCH_EVO, SRCH_GRAD };
 // Gradient loss. MSE is the original: squared error on the order set's raw dollar P&L.
@@ -5265,18 +5268,19 @@ int main(int argc, char* argv[]) {
                                         r.loss_sum += loss; r.loss_n++;
                                     }
                                 }
-                                if (e.loss != LOSS_LIST)
+                                if (e.arch == ARCH_TANH32 && e.loss != LOSS_LIST && nm > 0) {
+                                    // ONE mean-gradient step per industry-day, like grnk. The
+                                    // v0.8.1.27 per-row form (200 train_step calls) collapsed the
+                                    // net to a handful of tied predictions -- see train_batch.
+                                    MT1Backprop& net = r.tanh32[i];
+                                    net.lr = r.lr[i];
+                                    static thread_local const float* rp[MT1_BP_MODELS];
+                                    for (int m = 0; m < nm; m++) rp[m] = mrows[m];
+                                    r.loss_sum += net.train_batch(rp, tgt, nm); r.loss_n++;
+                                }
+                                if (e.loss != LOSS_LIST && e.arch != ARCH_TANH32)
                                 for (int m = 0; m < nm; m++) {
                                     const float* row = (e.arch == ARCH_MT1) ? ind_in : mrows[m];
-                                    if (e.arch == ARCH_TANH32) {
-                                        // verbatim v0.8.1.27: forward, then its own Adam step;
-                                        // only the lr is steered, by the distinct-pred rule
-                                        MT1Backprop& net = r.tanh32[i];
-                                        net.lr = r.lr[i];
-                                        net.forward(row);
-                                        r.loss_sum += net.train_step(tgt[m]); r.loss_n++;
-                                        continue;
-                                    }
                                     float* gg = r.g[i].data();
                                     float* ww = r.w[i].data();
                                     double loss = 0.0;
@@ -5322,7 +5326,7 @@ int main(int argc, char* argv[]) {
                                     race_adam(r, i, r.adam_step);
                                     r.loss_sum += loss; r.loss_n++;
                                 }
-                                if (nm > 0 && e.arch != ARCH_TANH32 &&   // tanh saturates, never dies
+                                if (nm > 0 && e.arch != ARCH_TANH32 &&   // no ReLU units to count
                                     (e.loss != LOSS_LIST || nm >= 3)) {
                                     const int dead = n_last - __builtin_popcount(alive);
                                     const float frac = (float)dead / (float)n_last;
@@ -5852,6 +5856,8 @@ int main(int argc, char* argv[]) {
                         "them is noise.");
                 log_msg("   grdC = gradient CARRIED across the pass boundary; grad = restarted. "
                         "evo always carries.");
+                log_msg("   TANH32 rows take ONE batched step per industry-day (v0.8.1.36+); "
+                        "before that grad/gdmn were per-row and collapsed.");
                 {
                     char c[160];
                     snprintf(c, sizeof(c),

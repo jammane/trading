@@ -34,6 +34,7 @@ struct MT1Backprop {
     std::vector<std::vector<float>> act;   // act[0] = input, act[k] = layer k output
     std::vector<std::vector<float>> del;   // per-layer error
     std::vector<float> grad;               // same shape as W; exposed so it can be gradient-checked
+    std::vector<float> batch_acc;          // train_batch's gradient accumulator
 
     int n_params() const {
         int n = 0;
@@ -122,7 +123,8 @@ struct MT1Backprop {
         return err * err * weight;
     }
 
-    // Adam update from whatever is currently in `grad`, plus decoupled weight decay.
+    // Adam update from whatever is currently in `grad`, with COUPLED L2: the decay term is added to
+    // the gradient before Adam normalises it (race_adam in training_v4.cpp is the decoupled form).
     void adam_step() {
         step++;
         const float b1t = 1.f - std::pow(beta1, (float)step);
@@ -139,6 +141,33 @@ struct MT1Backprop {
         const float loss = backward(target, weight);
         adam_step();
         return loss;
+    }
+
+    // ONE Adam step on the MEAN gradient over n rows. Returns the mean loss.
+    //
+    // This is how a day's order sets must be trained, not n calls to train_step. Measured in a
+    // simulation of the race (146->32->8->1, 200 rows/day, O(1) inputs mostly shared across the
+    // rows): 200 per-row steps a day collapsed the net to 1-8 distinct predictions of 200 within
+    // ~150 days in EVERY configuration tried -- raw or demeaned target, coupled, decoupled or no
+    // decay. With coupled L2 the weights shrink to exactly zero (|W1| 7.2 -> 1e-23); without it
+    // 20-100% of hidden units pin at |tanh| > 0.999. Adam normalises every step to ~lr whatever
+    // the gradient's size, so 200 steps on rows sharing one day move each weight up to 200 x lr
+    // per day. One mean-gradient step stayed at 200/200 distinct, 0% saturated, in all of them.
+    // The live race agreed: TANH32 grad/gdmn (per-row) hit the lr floor 123/788 times per pass,
+    // TANH32 grnk (one batched step) never.
+    float train_batch(const float* const* rows, const float* targets, int n) {
+        if (n <= 0) return 0.f;
+        batch_acc.assign(W.size(), 0.f);
+        double loss = 0.0;
+        for (int r = 0; r < n; r++) {
+            forward(rows[r]);
+            loss += backward(targets[r]);
+            for (size_t k = 0; k < W.size(); k++) batch_acc[k] += grad[k];
+        }
+        const float inv = 1.f / (float)n;
+        for (size_t k = 0; k < W.size(); k++) grad[k] = batch_acc[k] * inv;
+        adam_step();
+        return (float)(loss / n);
     }
 
     float loss_for(const float* in, float target) {

@@ -140,6 +140,78 @@ int main() {
         check(worst < 1e-6, "backward(out - g/2) injects exactly g as the output gradient");
     }
 
+    // ── train_batch: ONE Adam step on the MEAN gradient ─────────────────────────────
+    // n = 1 must be exactly train_step, and the gradient it steps on must be the mean of the
+    // per-row gradients -- a sum would quietly scale the step with the day's row count.
+    {
+        MT1Backprop a, b; a.init({6, 5, 3, 1}, 21); b.init({6, 5, 3, 1}, 21);
+        float x[6] = {0.2f, -0.7f, 0.4f, 0.9f, -0.1f, 0.3f};
+        const float* rows[1] = {x}; const float t[1] = {0.25f};
+        a.forward(x); a.train_step(0.25f);
+        b.train_batch(rows, t, 1);
+        double worst = 0.0;
+        for (size_t k = 0; k < a.W.size(); k++) worst = std::fmax(worst, std::fabs(a.W[k] - b.W[k]));
+        check(worst == 0.0, "train_batch over one row is exactly train_step");
+    }
+    {
+        MT1Backprop net; net.init({6, 5, 3, 1}, 33);
+        float r0[6] = {0.1f, 0.2f, -0.3f, 0.4f, 0.0f, -0.5f};
+        float r1[6] = {-0.6f, 0.3f, 0.2f, -0.1f, 0.8f, 0.1f};
+        float r2[6] = {0.5f, -0.4f, 0.7f, 0.2f, -0.2f, 0.6f};
+        const float* rows[3] = {r0, r1, r2}; const float t[3] = {0.3f, -0.2f, 0.05f};
+        std::vector<double> mean(net.W.size(), 0.0);
+        for (int r = 0; r < 3; r++) {
+            net.forward(rows[r]); net.backward(t[r]);
+            for (size_t k = 0; k < mean.size(); k++) mean[k] += net.grad[k] / 3.0;
+        }
+        net.train_batch(rows, t, 3);                 // grad is left holding what it stepped on
+        double worst = 0.0;
+        for (size_t k = 0; k < mean.size(); k++) worst = std::fmax(worst, std::fabs(net.grad[k] - mean[k]));
+        check(worst < 1e-6, "train_batch steps on the mean of the per-row gradients");
+    }
+    // The regression itself. A race-shaped day -- 200 rows sharing most of their O(1) inputs, a
+    // demeaned noise target -- trained per-row collapses to a handful of tied predictions; one
+    // batched step per day must not. Both arms are run so the test also proves it can see the
+    // failure: if per-row stops collapsing, the scenario no longer exercises what it guards.
+    {
+        auto run = [](bool batched) {
+            MT1Backprop net; net.init({146, 32, 8, 1}, 15);
+            uint64_t s = 0x5EED;
+            auto u = [&s]() { s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+                              return (float)((s >> 11) * (1.0 / 9007199254740992.0)); };
+            auto gauss = [&u]() { return std::sqrt(-2.f * std::log(u() + 1e-12f)) *
+                                         std::cos(6.2831853f * u()); };
+            const int R = 200;
+            static float rows[200][146]; static float tgt[200]; const float* rp[200];
+            float base[146];
+            int dist = 0;
+            for (int d = 0; d < 150; d++) {
+                for (int q = 0; q < 146; q++) base[q] = (q % 12 < 4) ? 1.f + 0.02f * gauss() : 0.3f * gauss();
+                double mu = 0.0;
+                for (int m = 0; m < R; m++) {
+                    for (int q = 0; q < 146; q++)
+                        rows[m][q] = base[q] + ((q % 12 >= 8 && u() < 0.33f) ? 0.5f * gauss() : 0.f);
+                    tgt[m] = 0.0166f * gauss(); mu += tgt[m]; rp[m] = rows[m];
+                }
+                for (int m = 0; m < R; m++) tgt[m] -= (float)(mu / R);
+                if (batched) net.train_batch(rp, tgt, R);
+                else for (int m = 0; m < R; m++) { net.forward(rows[m]); net.train_step(tgt[m]); }
+            }
+            std::vector<float> p(R);
+            for (int m = 0; m < R; m++) p[m] = net.forward(rows[m]);
+            std::sort(p.begin(), p.end());
+            dist = (int)(std::unique(p.begin(), p.end()) - p.begin());
+            return dist;
+        };
+        const int per_row = run(false), batched = run(true);
+        char msg[160];
+        snprintf(msg, sizeof(msg), "per-row training collapses on a race-shaped day "
+                 "(%d distinct of 200)", per_row);
+        check(per_row < 60, msg);
+        snprintf(msg, sizeof(msg), "one batched step per day does not (%d distinct of 200)", batched);
+        check(batched >= 190, msg);
+    }
+
     printf(failures ? "\n%d FAILURE(S)\n" : "\nbackprop verified\n", failures);
     return failures ? 1 : 0;
 }
