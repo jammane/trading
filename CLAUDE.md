@@ -800,12 +800,25 @@ days. MT1Net keeps the dead-unit rule (plain ReLU, and its predictions always ti
 read activations/predictions only, never outcomes. The race table
 prints `lr end mean/min`, cuts, floor hits and mean dead fraction per entry.
 
-**TANH32 reference entry.** The 13th race entry is `MT1Backprop` (`mt1_backprop.h`) used verbatim:
-146->32->8->1, tanh, Xavier init, its own Adam with coupled L2 — the net that ranked +0.017..+0.027
-within-day in the v0.8.1.27 run, against +0.005 for the best race net in v0.8.1.30. Gradient-only
-(static_assert), restarts each pass as it did then; only its lr is steered, by the distinct-pred
-rule. It answers whether that 4x gap is real on the same days and order sets, and if so it isolates
-the cause to the architecture/activation/init/decay bundle rather than the race machinery.
+**TANH32 entries.** The 13th race entry is `MT1Backprop` (`mt1_backprop.h`): 146->32->8->1, tanh,
+Xavier init, its own Adam with coupled L2 -- the net that ranked +0.017..+0.027 within-day in the
+v0.8.1.27 run. Raced verbatim in v0.8.1.33-35 it did **not** reproduce that (+0.004, +0.001,
++0.0006 over three passes), and its training collapsed it. **Since v0.8.1.36 every TANH32 loss
+takes ONE mean-gradient step per industry-day** (`MT1Backprop::train_batch`), so it is no longer
+the verbatim reference.
+
+The collapse, because it is easy to misdiagnose: the log showed 5-27 distinct predictions of ~125
+distinct inputs, which reads like tanh saturation. It is not, or not only. Adam normalises every
+step to ~lr whatever the gradient's size, so 200 per-row steps on rows sharing one day move each
+weight up to 200 x lr per day. Simulated (146->32->8->1, 200 rows/day, race-shaped inputs), per-row
+training collapsed to 1-8 distinct of 200 in EVERY configuration: with coupled L2 the weights shrink
+to exactly zero (|W1| 7.2 -> 1e-23); with decoupled or no decay 20-100% of hidden units pin at
+|tanh| > 0.999. One batched step stayed 200/200 distinct in all of them, and in the live race
+TANH32 grnk (batched) never hit the lr floor while grad/gdmn (per-row) hit it 123 and 788 times a
+pass. `tests/test_mt1_backprop.cpp` runs both arms on a race-shaped day and requires the per-row
+arm to collapse, so it also proves the scenario still exercises the failure. The MT1C/MT1S
+gradient entries are still per-row; their leaky ReLU has not collapsed (0 floor hits), but the
+per-row scheme is also what makes them "yesterday's P&L" predictors.
 
 **Demeaned and ranking losses, and the Bayesian allocator (17 race entries).** Four entries test
 the two fixes for what the v0.8.1.30 race showed: its MSE nets took 200 same-day Adam steps on rows
