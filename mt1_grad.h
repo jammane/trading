@@ -282,6 +282,67 @@ static inline void mt1s_backward(const float* W, const MT1SCache& k, const float
     }
 }
 
+// ── MT1S-stk: one net PER STOCK (MT1P_*) ────────────────────────────────────────
+// Each of the 144 stocks gets its OWN 18->16->8->1 leaky-ReLU net, trained only on that stock's
+// realised P&L. Unlike MT1S, nothing is shared across the industry's twelve symbols. Inputs:
+//   0-11   that stock's 12 MT1C features (7 bar-shape, holding weight, 4 order-intent ratios)
+//   12-13  industry cash / book and book / starting cash (the MT1C tail, repeated per stock)
+//   14-17  StockNN's four outputs for that stock: buy_qty, buy_price_frac, sell_all_price_frac,
+//          sell_qty. The GRADIENT entries read them RAW (share counts unrounded and unscaled);
+//          the EVOLUTIONARY entry reads the quantities as unrounded, uncapped ratios
+//          (buy_qty / affordable shares, sell_qty / held shares). The price fractions are the
+//          raw sigmoids in both, so they repeat MT1C features 9-10 bit-for-bit.
+// The raw quantities are what MT1C's CN_BQTY / CN_SQTY discard: those are floored to whole
+// shares and capped at what is affordable or held, which ties many order sets.
+static constexpr int MT1P_IN = MT1C_PER_SYM + 2 + 4;          // 18
+static constexpr int MT1P_H1 = 16, MT1P_H2 = 8;
+static constexpr int SP_L1_W = 0,
+                     SP_L1_B = MT1P_H1 * MT1P_IN,                         // 288
+                     SP_L2_W = SP_L1_B + MT1P_H1,                         // 304
+                     SP_L2_B = SP_L2_W + MT1P_H2 * MT1P_H1,               // 432
+                     SP_L3_W = SP_L2_B + MT1P_H2,                         // 440
+                     SP_L3_B = SP_L3_W + MT1P_H2;                         // 448
+static constexpr int MT1P_PARAMS = SP_L3_B + 1;                           // 449, ONE stock's net
+static_assert(MT1P_PARAMS == 449, "MT1P layout");
+
+struct MT1PCache {
+    float in[MT1P_IN];
+    float h1[MT1P_H1], h2[MT1P_H2];
+    float out = 0.f;
+};
+
+static inline float mt1p_forward_cached(const float* W, const float* in18, MT1PCache& k)
+{
+    memcpy(k.in, in18, sizeof(k.in));
+    mt1net_matvec_lrelu(W + SP_L1_W, W + SP_L1_B, k.in, k.h1, MT1P_H1, MT1P_IN);
+    mt1net_matvec_lrelu(W + SP_L2_W, W + SP_L2_B, k.h1, k.h2, MT1P_H2, MT1P_H1);
+    float acc = W[SP_L3_B];
+    for (int i = 0; i < MT1P_H2; i++) acc += W[SP_L3_W + i] * k.h2[i];
+    k.out = acc;
+    return acc;
+}
+
+static inline float mt1p_forward(const float* W, const float* in18)
+{
+    MT1PCache k; return mt1p_forward_cached(W, in18, k);
+}
+
+// Accumulates dL/dW into g for one stock's net, given dL/d(out).
+static inline void mt1p_backward(const float* W, const MT1PCache& k, float d_out, float* g)
+{
+    if (d_out == 0.f) return;
+    float d_h2[MT1P_H2], d_h1[MT1P_H1];
+    g[SP_L3_B] += d_out;
+    for (int i = 0; i < MT1P_H2; i++) {
+        g[SP_L3_W + i] += d_out * k.h2[i];
+        d_h2[i] = d_out * W[SP_L3_W + i];
+    }
+    mt1_dense_lrelu_bwd(W + SP_L2_W, k.h1, k.h2, d_h2, g + SP_L2_W, g + SP_L2_B,
+                        d_h1, MT1P_H2, MT1P_H1);
+    mt1_dense_lrelu_bwd(W + SP_L1_W, k.in, k.h1, d_h1, g + SP_L1_W, g + SP_L1_B,
+                        nullptr, MT1P_H1, MT1P_IN);
+}
+
 // ── ListNet (listwise ranking loss) ─────────────────────────────────────────────
 // L = -sum_m softmax(z)_m * log softmax(s)_m, with s the model's scores and z the targets z-scored
 // across the list. dL/ds_m = softmax(s)_m - softmax(z)_m. Scale-free in the targets and invariant

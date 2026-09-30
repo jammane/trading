@@ -503,10 +503,14 @@ class TestRaceInvariants:
         return CPP[start:CPP.index('bp_pred[i] = mt1cnet_forward', start)]
 
     def test_every_evolutionary_entry_shares_one_step_function(self):
-        """One call site inside the race loop, so every evo entry gets the same selection,
-        lifecycle and scoring -- only network and inputs differ, or the race measures machinery."""
-        assert self._race_day_loop().count('mt1_step_day(i, r.pool[i]') == 1
-        assert CPP.count('mt1_step_day(i, r.pool[i]') == 1
+        """Every evo entry goes through mt1_step_day, so all get the same selection, lifecycle and
+        scoring -- only network and inputs differ, or the race measures machinery. Two call sites:
+        the per-industry pools, and MT1S-stk's per-stock pools (twelve per industry)."""
+        loop = self._race_day_loop()
+        assert loop.count('mt1_step_day(i, r.pool[i]') == 1
+        assert loop.count('mt1_step_day(i, r.pool[i * MT1C_SYMS + j]') == 1
+        assert loop.count('mt1_step_day(') == 2
+        assert CPP.count('mt1_step_day(i, r.pool[') == 2
 
     def test_no_race_entry_feeds_mt2(self):
         """in12 is MT2's input. If any entry wrote it, MT2 would differ between runs with different
