@@ -239,6 +239,27 @@ int main()
         check(bad > 10, "a 1.5x-scaled gradient is rejected (the FD check has teeth)");
     }
 
+    // ── MT1S-stk: one 18-input net per stock ─────────────────────────────────────
+    // Inputs span raw share counts (hundreds) down to O(1) ratios, as the gradient entries see.
+    {
+        std::vector<float> W(MT1P_PARAMS), g(MT1P_PARAMS, 0.f);
+        for (auto& w : W) w = 0.4f * rnd();
+        float in[MT1P_IN];
+        for (int i = 0; i < MT1P_IN; i++) in[i] = rnd();
+        MT1PCache k;
+        mt1p_forward_cached(W.data(), in, k);
+        mt1p_backward(W.data(), k, 1.0f, g.data());
+        fd_check("MT1S-stk", [&]() -> FdProbe {
+            MT1PCache t; const double v = mt1p_forward_cached(W.data(), in, t);
+            uint64_t m = 1469598103934665603ULL;
+            m = fnv_bits(t.h1, MT1P_H1, m); m = fnv_bits(t.h2, MT1P_H2, m);
+            return {v, m};
+        }, W, g.data(), 2e-3f);
+        MT1PCache c2;
+        check(std::fabs(mt1p_forward(W.data(), in) - mt1p_forward_cached(W.data(), in, c2)) < 1e-7f,
+              "MT1S-stk: forward == cached forward");
+    }
+
     // ── ListNet: analytic dL/ds against central differences, plus its invariances ───
     {
         const int n = 7;
