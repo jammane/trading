@@ -4677,6 +4677,11 @@ int main(int argc, char* argv[]) {
     BayesAlloc balloc;
     static constexpr double BALLOC_GAMMA = 0.98, BALLOC_MIN_W = 5.0;
     RowCount rows_feat74, rows_cfeat146, rows_persym, rows_mt1p;
+    // StockNN raw-output census: how many price fractions sit at exactly 0 / 1 (or within 1e-4 of
+    // an end), and how many quantities are zero. Per pass, scored days only.
+    struct FracCensus { long n = 0, b0 = 0, b1 = 0, s0 = 0, s1 = 0, bnear = 0, snear = 0,
+                        bq0 = 0, sq0 = 0; };
+    FracCensus frac_census;
 
     std::vector<RaceState> race(RACE_N);
     for (int v = 0; v < RACE_N; v++) {
@@ -4931,6 +4936,7 @@ int main(int argc, char* argv[]) {
         }
         rows_feat74 = RowCount{}; rows_cfeat146 = RowCount{}; rows_persym = RowCount{};
         rows_mt1p = RowCount{};
+        frac_census = FracCensus{};
         balloc = BayesAlloc{};
         balloc.rng.seed(mix_seed(0xBA1106ULL));
         std::fill(bp_bk_sum.begin(), bp_bk_sum.end(), 0.0);
@@ -5213,6 +5219,25 @@ int main(int argc, char* argv[]) {
                                 for (int j = 0; j < MT1C_SYMS; j++)
                                     hs.push_back(row_hash(mp_raw[m][j], MT1P_IN));
                             rows_mt1p.sum += n_distinct(); rows_mt1p.n++;
+
+                            // Are StockNN's price fractions prices, or switches? Only ~39 of 2400
+                            // (order set, stock) slices differ per industry-day, which continuous
+                            // sigmoids could not produce unless they sit at the ends: in float,
+                            // sigmoid is exactly 1.0 above ~17 and exactly 0.0 below ~-88. Counted
+                            // on the RAW outputs of every order set, over valid bars only.
+                            for (int m = 0; m < MT1_BP_MODELS; m++)
+                                for (int j = 0; j < MT1C_SYMS; j++) {
+                                    const OHLCV& b = blk_day[d]->sym[i][j];
+                                    if (!b.valid || b.close <= 1e-6f) continue;
+                                    const float bf = ir.slot_bfrac[m][j], sf = ir.slot_sfrac[m][j];
+                                    const float bq = ir.slot_bqty[m][j],  sq = ir.slot_sqty[m][j];
+                                    frac_census.n++;
+                                    frac_census.b0 += (bf == 0.f); frac_census.b1 += (bf == 1.f);
+                                    frac_census.s0 += (sf == 0.f); frac_census.s1 += (sf == 1.f);
+                                    frac_census.bnear += (bf < 1e-4f || bf > 1.f - 1e-4f);
+                                    frac_census.snear += (sf < 1e-4f || sf > 1.f - 1e-4f);
+                                    frac_census.bq0 += !(bq > 0.f); frac_census.sq0 += !(sq > 0.f);
+                                }
                         }
 
                         // Distinct INPUT rows today, the ceiling on distinct predictions -- what the
@@ -6067,6 +6092,23 @@ int main(int argc, char* argv[]) {
                     line("cfeat146(MT1C)", rows_cfeat146, MT1_BP_MODELS);
                     line("per-sym (MT1S-shr)", rows_persym, MT1_BP_MODELS * MT1C_SYMS);
                     line("stk18raw(MT1S-stk)", rows_mt1p,   MT1_BP_MODELS * MT1C_SYMS);
+                    if (frac_census.n > 0) {
+                        const double n = (double)frac_census.n;
+                        snprintf(c, sizeof(c),
+                                 "   StockNN price fracs over %ld order-set x stock outputs: "
+                                 "buy ==0 %.1f%% ==1 %.1f%% (within 1e-4 of an end %.1f%%) | "
+                                 "sell ==0 %.1f%% ==1 %.1f%% (%.1f%%)",
+                                 frac_census.n, 100.0 * frac_census.b0 / n,
+                                 100.0 * frac_census.b1 / n, 100.0 * frac_census.bnear / n,
+                                 100.0 * frac_census.s0 / n, 100.0 * frac_census.s1 / n,
+                                 100.0 * frac_census.snear / n);
+                        log_msg(c);
+                        snprintf(c, sizeof(c),
+                                 "   StockNN quantities: buy_qty == 0 on %.1f%%, sell_qty == 0 on "
+                                 "%.1f%% (ReLU at or below zero = no order)",
+                                 100.0 * frac_census.bq0 / n, 100.0 * frac_census.sq0 / n);
+                        log_msg(c);
+                    }
                     if (balloc.n > 0) {
                         const double n = (double)balloc.n, fl = 1e4 * balloc.flat / n;
                         const char* lab[2] = {"mean    ", "thompson"};
