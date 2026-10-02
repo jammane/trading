@@ -820,18 +820,27 @@ arm to collapse, so it also proves the scenario still exercises the failure. The
 gradient entries are still per-row; their leaky ReLU has not collapsed (0 floor hits), but the
 per-row scheme is also what makes them "yesterday's P&L" predictors.
 
-**Demeaned and ranking losses, and the Bayesian allocator (17 race entries).** Four entries test
+**Demeaned and ranking losses, and the Bayesian allocator.** Four entries tested
 the two fixes for what the v0.8.1.30 race showed: its MSE nets took 200 same-day Adam steps on rows
 sharing the day's market move and became "yesterday's P&L" predictors (0.82-0.87 correlated with it
 in an offline replica), which industry P&L's mild lag-1 mean reversion turns wrong-way.
 `gdmn` trains squared error on P&L minus the industry-day's mean across the 200 order sets;
 `grnk` trains ListNet (`listnet_grad` in `mt1_grad.h`, FD-checked) with ONE batched step per
-industry-day. Each exists for MT1C and TANH32, beside the unchanged MSE entries. Both remove the day
+industry-day. Each was raced for MT1C and TANH32, beside the unchanged MSE entries (TANH32 grnk
+was pruned with the losers below). Both remove the day
 level, so their across-day corr and alloc lines print `[n/a]` -- only within-day rank counts.
 `ALLOC bayes` is a separate allocator (it reads no order intent): a discounted Gaussian posterior
 (gamma 0.98) on each industry's daily return, top 4 funded by posterior mean or by a Thompson draw.
 Every industry is observed daily whatever is funded, so it is full-information and the Thompson
 line is the mean line plus noise; read the mean line.
+
+**Pruning the losers (17 race entries, after the v0.8.1.34 race).** Entries that beat flat
+allocation (top-4 vs flat, long-only) in at most 1 of 5 passes were removed: **MT1C grdC** (1/5,
+mean −0.96 bp/day), **MT1S-sum grad** (1/5, −0.03) and **TANH32 grnk** (0/5, −2.20). TANH32 grad and
+gdmn also scored ≤1/5 but stay, because v0.8.1.36 changed their training (per-row → one batched
+step), so v3 measured a different thing. MT1C grad and MT1S-sum grdC lose their carry/restart
+sibling; the grad-vs-grdC noise-floor read survives on MT1, MT1S-shr and MT1S-stk. For scale: the no-intent MT1 grdC control itself scored 4/5 and +1.88 bp/day, so no
+remaining entry has cleared noise either -- this removes the clearest losers, not the losers.
 
 **Per-entry seeds.** Each evolutionary entry draws its own clock salt at every pass start and XORs
 it into both its pool init and its mutation seeds. Before this, entries of one architecture shared

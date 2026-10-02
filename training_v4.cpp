@@ -306,15 +306,16 @@ static constexpr float BP_LR_RECOVER = 1.05f;
 // somewhat stale across a boundary, since the pass re-seeds StockNN and the target distribution
 // shifts, but Adam re-adapts within a few hundred steps and zeroing them would make "carry" a
 // different thing than simply continuing to train.
+// Pruned after the v0.8.1.34 5-pass race: MT1C grdC, MT1S-sum grad and TANH32 grnk
+// beat flat allocation (top4) in at most 1 of 5 passes. TANH32 grad/gdmn scored as badly but
+// were trained per-row then and batched since, so they stay to be measured as they now are.
 static constexpr RaceEntry RACE[] = {
     {"MT1      evo ", ARCH_MT1,  SRCH_EVO,  false, true,  "r_mt1"   },  // control for rank
     {"MT1      grad", ARCH_MT1,  SRCH_GRAD, false, false, nullptr   },  // control for rank
     {"MT1      grdC", ARCH_MT1,  SRCH_GRAD, false, true,  nullptr   },
     {"MT1C     evo ", ARCH_MT1C, SRCH_EVO,  false, true,  "r_mt1c"  },
     {"MT1C     grad", ARCH_MT1C, SRCH_GRAD, false, false, nullptr   },
-    {"MT1C     grdC", ARCH_MT1C, SRCH_GRAD, false, true,  nullptr   },
     {"MT1S-sum evo ", ARCH_MT1S, SRCH_EVO,  false, true,  "r_mt1s"  },
-    {"MT1S-sum grad", ARCH_MT1S, SRCH_GRAD, false, false, nullptr   },
     {"MT1S-sum grdC", ARCH_MT1S, SRCH_GRAD, false, true,  nullptr   },
     {"MT1S-rep evo ", ARCH_MT1S, SRCH_EVO,  true,  true,  "r_mt1s2" },  // seed replicate
     {"MT1S-shr grad", ARCH_MT1S, SRCH_GRAD, true,  false, nullptr   },  // shared encoder
@@ -323,7 +324,6 @@ static constexpr RaceEntry RACE[] = {
     {"MT1C     gdmn", ARCH_MT1C,   SRCH_GRAD, false, false, nullptr, LOSS_DEMEAN },
     {"MT1C     grnk", ARCH_MT1C,   SRCH_GRAD, false, false, nullptr, LOSS_LIST   },
     {"TANH32   gdmn", ARCH_TANH32, SRCH_GRAD, false, false, nullptr, LOSS_DEMEAN },
-    {"TANH32   grnk", ARCH_TANH32, SRCH_GRAD, false, false, nullptr, LOSS_LIST   },
     {"MT1S-stk evo ", ARCH_MT1P,   SRCH_EVO,  true,  true,  "r_mt1stk" },  // one pool per stock
     {"MT1S-stk grad", ARCH_MT1P,   SRCH_GRAD, true,  false, nullptr },     // one net per stock
     {"MT1S-stk grdC", ARCH_MT1P,   SRCH_GRAD, true,  true,  nullptr },
