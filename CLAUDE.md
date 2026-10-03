@@ -165,24 +165,35 @@ MT1 and MT2 are saved to the run root. So the deliverable is:
 python convert_weights.py --account acct0 --industry-dir models/acct0/training/champion
 ```
 
-**The champion judging metric is known to be too short (open, v0.8.1.0).** Champions are crowned on
-slot-0's percent book change over the last `PASS_JUDGE_DAYS = 15` days of a pass. `PASS_SEEDING.md`
-records that gate producing **13 dethronings against a null expectation of exactly 13.0** — i.e.
-indistinguishable from choosing at random. The mechanism is now understood: daily book volatility
-is ~1.5-2%, so a 15-day return has sd ~7% while a real skill difference between two model sets
-might be 1.5% over that window — SNR ≈ 0.2, nearly all noise.
+**Champion judging (pass_reference v2) — the same criterion as the race's allocation lines.**
+A finishing pass is judged against the standing champion, per industry, on slot 0's
+**recency-weighted mean daily book return over the whole pass**: `r_d = (slot0_score − book_prev) /
+book_prev`, weighted `PASS_JUDGE_RECENCY = 0.995`^(days before the pass's last day), half-life ~138
+days, effective sample ~390 days on a full pass. `PassJudge` in `pass_seeding.h` is the one
+implementation, graded by `tests/test_pass_seeding.cpp`; the race's `ALLOC_RECENCY` is defined from
+`PASS_JUDGE_RECENCY`, so the champion pick and the race scoring cannot drift apart. Log lines read
+`pass-seed: p2 +9.10 vs p3 +8.42 bp/day ...`.
 
-Two things that are NOT the problem, recorded because both were asserted and both were wrong: the
-window sits at the *end* of a pass, which is the most-trained point, not inside the learning curve;
-and market beta largely cancels because every pass is judged on the same calendar days.
+**Why v1 was replaced.** v1 crowned on slot 0's percent book change over the last 15 days. It
+produced **13 dethronings against a null expectation of exactly 13.0** — indistinguishable from
+choosing at random. Daily book volatility is ~1.5-2%, so a 15-day return has sd ~7% against skill
+differences of ~1.5%: SNR ≈ 0.2. A hard-floor reset inside the window also jumped `baseline`
+~$22,400 → $25,000, a spurious **+11.6%** that hit ~6% of judgements. v2 fixes both: a reset day has
+`book_prev == slot0_score`, so it scores exactly 0; and the weighting keeps most of the pass while
+leaning on its end, which answers v1's reason for a short window (the end-of-pass pool is not the
+mid-pass pool) without discarding 95% of the data. A hard last-N-days window was rejected for the
+race and the champion alike: the last N days of every pass are the same calendar days.
 
-One genuine contamination: a hard-floor reset inside the judging window jumps `baseline` from
-~$22,400 to $25,000, a spurious **+11.6%** on a metric whose real spread is a few percent. At 83
-resets per ~20,000 industry-days that hits roughly 6% of judgements.
+The score is a mean **return**, not dollars, so a pass that grew its book is not judged on a larger
+base. `pass_share_new` uses only sign and ratio, so the seed blend works unchanged on the new scale.
+`pass_reference.csv` is **schema v2**: same columns, but `*_pct` now hold the v2 score (~1e-3, not
+~1e-2). A file of another version is renamed `pass_reference.v<N>.csv` and champions restart —
+mixing the two would crown on a units mismatch. `PASS_JUDGE_MIN_DAYS = 15` is now only the
+shortest pass that is judged at all.
 
-The fix is to judge on the **sum of daily book P&L** over the window — exactly $0 on reset days
-rather than jumping — and to lengthen the window. This matters beyond seeding: the champion store
-is what decides which models get promoted to paper.
+The champion store decides what is promoted to paper, and since v0.8.1.40 `champion/` carries each
+industry's race models from the same pass as its StockNN elites (see **Pairing and the pass
+boundary**).
 
 Pointing `--source-dir` at `champion/` instead would convert the industries and silently skip
 master/MT1/MT2. The script errors out if the industry directory has no elite files at all, and
@@ -956,7 +967,8 @@ A `PostToolUse` hook in `.claude/settings.json` auto-updates `CHANGELOG.md` and 
 | `MT1_RECENCY_W` | 1.0/0.8/0.6/0.4 | Register weights, newest-first, in blocks of 4 |
 | `MT1_DAYS` | 1 | MT1 steps once per session; vestigial staging-array extent |
 | `DS_FEAT` | 74 | Features per industry in `mt1_dataset.bin`; must equal MT1Net's input width |
-| `PASS_JUDGE_DAYS` | 15 | Champion judging window. **Known too short** — see the champion note under `convert_weights.py` |
+| `PASS_JUDGE_RECENCY` | 0.995 | Champion score: recency-weighted mean daily book return, half-life ~138 d (= race `ALLOC_RECENCY`) |
+| `PASS_JUDGE_MIN_DAYS` | 15 | Shortest pass that is judged for a champion at all |
 | `--mt1-sigma` | master_sigma | One MT1 mutation sigma (was four per-channel sigmas) |
 | `IND_STARTING_CASH` | $25,000 | Per-industry starting capital |
 | `MST_STARTING_CASH` | $300,000 | Master starting capital |

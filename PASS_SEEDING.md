@@ -1,3 +1,9 @@
+> **SUPERSEDED (pass_reference v2): the judging metric is now slot 0's recency-weighted mean daily
+> book return over the whole pass** (`PassJudge`, `PASS_JUDGE_RECENCY = 0.995`, half-life ~138 days)
+> — the same criterion the MT1 race's allocation lines use. Reset days score exactly 0. The seed
+> blend (`pass_share_new`, `pass_interleave`) is unchanged. The 15-day metric described below is
+> historical; see CLAUDE.md, "Champion judging".
+
 > **UPDATE (v0.8.1.0) — the 13-vs-13.0 result now has a mechanism.**
 >
 > The gate judges on slot-0's percent book change over the last `PASS_JUDGE_DAYS = 15` days.

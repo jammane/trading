@@ -11,14 +11,54 @@
 
 #include <cmath>
 
-// Trailing window used to judge a finishing pass against the standing champion. Deliberately
-// near-term: the pool at a pass end is not the pool that existed mid-pass — those models are long
-// since culled — so a full-pass percentage measures the trajectory rather than the models that
-// actually seed the next pass.
-static constexpr int PASS_JUDGE_DAYS  = 15;
+// ── The champion judging metric (pass_reference v2) ──────────────────────────────────────────
+// A finishing pass is judged against the standing champion on slot 0's RECENCY-WEIGHTED MEAN DAILY
+// BOOK RETURN over the whole pass -- the same criterion the MT1 race's allocation lines use
+// (ALLOC_RECENCY in training_v4.cpp is defined from PASS_JUDGE_RECENCY, so the two cannot drift):
+//
+//   r_d   = (slot0_score - book_prev) / book_prev          one session's book return
+//   w_d   = PASS_JUDGE_RECENCY ^ (days before the pass's last day)     half-life ~138 days
+//   score = sum(w_d r_d) / sum(w_d)
+//
+// v1 judged the percent change in slot 0's book over the LAST 15 DAYS. That measured no better
+// than chance: 13 dethronings against a null expectation of 13.0. Daily book volatility is ~1.5-2%,
+// so a 15-day return has sd ~7% against skill differences of ~1.5% -- SNR ~0.2. A hard-floor reset
+// inside the window also jumped the book $22.4k -> $25k, a spurious +11.6%.
+//
+// v2 fixes both. The decay keeps an effective sample of ~400 days while leaning toward the end of
+// the pass, which is what the seeded models are: v1's reason for a short window -- the pool at the
+// end of a pass is not the mid-pass pool, which has long since been culled -- is answered by the
+// weighting rather than by discarding 95% of the pass. A reset day has book_prev == slot0_score by
+// construction, so it contributes a return of exactly 0 instead of a jump. Summing RETURNS rather
+// than dollars keeps a pass that grew its book from being judged on a bigger base.
+//
+// pass_share_new only uses the two scores' signs and ratio, so it works unchanged on this scale.
+static constexpr double PASS_JUDGE_RECENCY = 0.995;
 
-// pass_reference.csv schema version. Bump when columns change.
-static constexpr int PASS_REF_VERSION = 1;
+// A pass shorter than this is not judged (smoke runs, short diagnostics).
+static constexpr int PASS_JUDGE_MIN_DAYS = 15;
+
+// pass_reference.csv schema version. Bump when columns change -- OR WHEN WHAT A COLUMN MEANS
+// CHANGES: v2 kept every column but champ_pct/chal_pct/new_champ_pct now hold the v2 score (a
+// mean daily return, ~1e-3) instead of a 15-day percent change (~1e-2). Mixing the two would crown
+// on a units mismatch, so a file of another version is set aside, never read.
+static constexpr int PASS_REF_VERSION = 2;
+
+struct PassJudge {
+    double w = 0.0, w2 = 0.0, wr = 0.0;
+    long   n = 0;
+    // book_prev / book_now: slot 0's reference book at today's close and its post-trade book at
+    // the next close. age: days before the pass's last day (0 on the last day).
+    void add(double book_prev, double book_now, int age) {
+        if (!(book_prev > 1.0) || !std::isfinite(book_now)) return;
+        const double wt = std::pow(PASS_JUDGE_RECENCY, (double)(age > 0 ? age : 0));
+        w += wt; w2 += wt * wt; wr += wt * (book_now - book_prev) / book_prev;
+        n++;
+    }
+    bool   have()     const { return w > 0.0; }
+    double score()    const { return w > 0.0 ? wr / w : 0.0; }
+    double eff_days() const { return w2 > 0.0 ? w * w / w2 : 0.0; }   // Kish effective sample
+};
 
 // Fraction of the seed slots that should come from the CHALLENGER — the pass that just finished —
 // given each side's percent portfolio change over the judging window.
