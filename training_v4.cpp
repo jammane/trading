@@ -3352,21 +3352,40 @@ static PassRefRow read_pass_ref(const std::string& path, const std::string& ind)
     return r;
 }
 
-static bool copy_elites(const std::string& from, const std::string& to, const char* ind) {
+// Race entry name as it appears in file names: "MT1S-sum evo " -> "MT1S-sum_evo",
+// "MT1      evo " -> "MT1______evo". Shared by the per-pass snapshots and champion/.
+static std::string race_slug(int v) {
+    std::string nm = RACE[v].name;
+    for (char& c : nm) if (c == ' ') c = '_';
+    while (!nm.empty() && nm.back() == '_') nm.pop_back();
+    return nm;
+}
+
+// pass_num > 0: copy from the per-pass snapshots (race_p<N>_<entry>_<ind>.bin) in the run root.
+// pass_num == 0: copy pass-agnostic race_<entry>_<ind>.bin, i.e. staging -> champion/.
+static bool copy_elites(const std::string& from, const std::string& to, const char* ind,
+                        int pass_num = 0) {
     for (int slot = 0; slot < ELITE_POOL; slot++) {
         std::error_code ec;
         fs::copy_file(elite_path(from, ind, slot), elite_path(to, ind, slot),
                       fs::copy_options::overwrite_existing, ec);
         if (ec) return false;
     }
-    // The gradient-trained MT1 travels WITH the elites it was raised against. Missing is not an
-    // error: a pass that ran before MT1_BP_START_DAY, or with the feature off, has none to copy,
-    // and the elites are still a valid champion.
-    {
+    // Every race model travels WITH the StockNN elites it was trained beside: a champion is the
+    // pass's StockNN plus the MT1 entries raised against it that pass. Champions are crowned per
+    // industry, so champion/ is a per-industry composite -- energy's models may be pass 2's while
+    // financials' are pass 5's -- and each industry's race files come from the same pass as its
+    // elites. Missing is not an error: a pass shorter than MT1_BP_START_DAY has no race models,
+    // and the elites are still a valid champion. (Replaces mt1bp_<ind>.bin, which nothing has
+    // written since the race superseded MT1Backprop as a standalone net.)
+    for (int v = 0; v < RACE_N; v++) {
+        const std::string nm = race_slug(v);
+        const std::string src = from + (pass_num > 0 ? "/race_p" + std::to_string(pass_num) + "_"
+                                                     : std::string("/race_")) +
+                                nm + "_" + ind + ".bin";
         std::error_code ec2;
-        const std::string f = from + "/mt1bp_" + ind + ".bin";
-        if (fs::exists(f, ec2))
-            fs::copy_file(f, to + "/mt1bp_" + ind + ".bin",
+        if (fs::exists(src, ec2))
+            fs::copy_file(src, to + "/race_" + nm + "_" + ind + ".bin",
                           fs::copy_options::overwrite_existing, ec2);
     }
     return true;
@@ -3408,7 +3427,7 @@ static void pass_boundary(const std::string& out_dir, int pass_num,
         const float chal_pct = have ? (judge_end[i] / judge_start[i] - 1.f) : 0.f;
         char msg[320];
 
-        if (!copy_elites(out_dir, stage_dir, ind)) {
+        if (!copy_elites(out_dir, stage_dir, ind, pass_num)) {
             log_msg(std::string("[") + IND_SHORT[i] +
                     "]   pass-seed: cannot stage elites — seed left unchanged");
             continue;
@@ -3638,10 +3657,7 @@ static void log_mem_stat(int workers)
 // so W[k] denotes the same parameter in both and an element-wise diff is meaningful.
 // Name carries the entry so a directory listing is self-describing.
 static std::string race_weight_path(const std::string& dir, int v, int ind_i, int pass_num) {
-    std::string nm = RACE[v].name;
-    for (char& c : nm) if (c == ' ') c = '_';
-    while (!nm.empty() && nm.back() == '_') nm.pop_back();
-    return dir + "/race_p" + std::to_string(pass_num) + "_" + nm + "_" +
+    return dir + "/race_p" + std::to_string(pass_num) + "_" + race_slug(v) + "_" +
            g_ind_names[ind_i] + ".bin";
 }
 
