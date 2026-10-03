@@ -376,6 +376,24 @@ static constexpr RaceEntry RACE[] = {
 };
 static constexpr int RACE_N = (int)(sizeof(RACE) / sizeof(RACE[0]));
 
+// --race-skip "MT1C gdmn,ALLOC bayes": entries switched off at RUNTIME -- not allocated, trained,
+// scored, reported or saved. This is how a qualifier race (race_qualify.py) narrows the field for
+// the next run without editing the table, so a skipped entry costs nothing and the table above
+// stays the full roster. Names compare with runs of spaces collapsed ("MT1C     grad" == "MT1C
+// grad"). "ALLOC bayes" switches off the Bayesian allocator, which is not a RACE entry. The
+// deployed entry and the logged pool cannot be skipped: other code reads them by index.
+static bool g_race_off[RACE_N] = {};
+static bool g_bayes_off = false;
+static std::string race_norm_name(const char* raw) {
+    std::string out;
+    for (const char* c = raw; *c; c++) {
+        if (*c == ' ' && (out.empty() || out.back() == ' ')) continue;
+        out += *c;
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    return out;
+}
+
 // Entries read by position outside the race loop. Named and asserted because a bare index went
 // stale when the table grew from 5 variants to 12: race[3] had been MT1C grad and became MT1C evo,
 // whose gradient vectors are never allocated, so .w[i] dereferenced null and the smoke segfaulted.
@@ -4577,6 +4595,31 @@ int main(int argc, char* argv[]) {
         else if (arg == "--workers"  && a+1<argc) { num_workers=atoi(argv[++a]);}
         else if (arg == "--master-only") master_only = true;
         else if (arg == "--no-nn-race") g_no_nn_race = true;
+        else if (arg == "--race-skip" && a+1<argc) {
+            std::string list = argv[++a];
+            size_t pos = 0;
+            while (pos <= list.size()) {
+                size_t comma = list.find(',', pos);
+                if (comma == std::string::npos) comma = list.size();
+                const std::string want = race_norm_name(list.substr(pos, comma - pos).c_str());
+                pos = comma + 1;
+                if (want.empty()) continue;
+                if (want == "ALLOC bayes") { g_bayes_off = true; continue; }
+                int hit = -1;
+                for (int v = 0; v < RACE_N; v++)
+                    if (race_norm_name(RACE[v].name) == want) hit = v;
+                if (hit < 0) {
+                    fprintf(stderr, "ERROR: --race-skip: no race entry named \"%s\"\n", want.c_str());
+                    return 1;
+                }
+                if (hit == RACE_DEPLOYED || hit == RACE_LOG_POOL) {
+                    fprintf(stderr, "ERROR: --race-skip: \"%s\" cannot be skipped (deployed entry / "
+                                    "logged pool, read by index)\n", want.c_str());
+                    return 1;
+                }
+                g_race_off[hit] = true;
+            }
+        }
         else if (arg == "--no-save") g_no_save = true;
         else if (arg == "--control-untrained") g_control_untrained = true;
         else if (arg == "--control-random") g_control_random = true;
@@ -4766,7 +4809,15 @@ int main(int argc, char* argv[]) {
     FracCensus frac_census;
 
     std::vector<RaceState> race(RACE_N);
+    {
+        std::string off;
+        for (int v = 0; v < RACE_N; v++)
+            if (g_race_off[v]) off += (off.empty() ? "" : ", ") + race_norm_name(RACE[v].name);
+        if (g_bayes_off) off += (off.empty() ? "" : ", ") + std::string("ALLOC bayes");
+        if (!off.empty()) log_msg("MT1 race: SKIPPED by --race-skip (did not qualify): " + off);
+    }
     for (int v = 0; v < RACE_N; v++) {
+        if (g_race_off[v]) continue;
         RaceState& r = race[v];
         const int np = race_params(RACE[v].arch);
         if (RACE[v].search == SRCH_EVO) {
@@ -4954,6 +5005,7 @@ int main(int argc, char* argv[]) {
 
         // Fresh MT1 for this pass -- see the declaration for why it is never carried over.
         for (int v = 0; v < RACE_N; v++) {
+            if (g_race_off[v]) continue;
             RaceState& r = race[v];
             const int np = race_params(RACE[v].arch);
             // A fresh clock read per entry: splitmix64 avalanches, so reads microseconds apart
@@ -5341,6 +5393,7 @@ int main(int argc, char* argv[]) {
                         }
 
                         for (int v = 0; v < RACE_N; v++) {
+                            if (g_race_off[v]) continue;
                             const RaceEntry& e = RACE[v];
                             RaceState& r = race[v];
                             // MT1Net reads the industry's 74 curves, which carry no order intent,
@@ -5664,6 +5717,7 @@ int main(int argc, char* argv[]) {
                         flat /= ok_n;
                         int idx[N_IND];
                         for (int v = 0; v < RACE_N; v++) {
+                            if (g_race_off[v]) continue;
                             RaceState& r = race[v];
                             int n = 0;
                             for (int i = 0; i < N_IND; i++) if (race_day_ok[i]) idx[n++] = i;
@@ -5687,7 +5741,7 @@ int main(int argc, char* argv[]) {
                         }
                     }
                     // Bayesian allocator: decide from the posterior over days < d, then learn d.
-                    bool warm = ok_n == N_IND;
+                    bool warm = ok_n == N_IND && !g_bayes_off;
                     for (int i = 0; i < N_IND && warm; i++) warm = balloc.w[i] >= BALLOC_MIN_W;
                     if (warm) {
                         double key[2][N_IND];
@@ -5907,7 +5961,7 @@ int main(int argc, char* argv[]) {
             log_mem_stat(num_workers);
             for (int i = 0; i < N_IND; i++) {
                 for (int v = 0; v < RACE_N; v++) {
-                    if (RACE[v].search != SRCH_GRAD) continue;
+                    if (g_race_off[v] || RACE[v].search != SRCH_GRAD) continue;
                     if (RACE[v].arch == ARCH_TANH32) {
                         const std::vector<float>& tw = race[v].tanh32[i].W;
                         if (!tw.empty())
@@ -5920,7 +5974,7 @@ int main(int argc, char* argv[]) {
                              race[v].w[i].data(), (int)race[v].w[i].size());
                 }
                 for (int v = 0; v < RACE_N; v++) {
-                    if (RACE[v].search != SRCH_EVO) continue;
+                    if (g_race_off[v] || RACE[v].search != SRCH_EVO) continue;
                     if (RACE[v].arch == ARCH_MT1P) {
                         // Snapshot = the twelve deployed stock nets back to back, the same layout
                         // the gradient entries save; then each stock's whole pool, to carry on.
@@ -6193,7 +6247,7 @@ int main(int argc, char* argv[]) {
                                  100.0 * frac_census.bq0 / n, 100.0 * frac_census.sq0 / n);
                         log_msg(c);
                     }
-                    if (balloc.n > 0) {
+                    if (balloc.n > 0 && !g_bayes_off) {
                         const double n = (double)balloc.n, fl = 1e4 * balloc.flat / n;
                         const char* lab[2] = {"mean    ", "thompson"};
                         for (int k = 0; k < 2; k++) {
@@ -6212,6 +6266,7 @@ int main(int argc, char* argv[]) {
                             "identical to MT1.");
                 }
                 for (int v = 0; v < RACE_N; v++) {
+                    if (g_race_off[v]) continue;
                     const RaceState& r = race[v];
                     if (r.distinct_n == 0) continue;   // never measured this pass
                     // rank_n == 0 is the CONTROL's correct outcome, not a missing row: all 200
