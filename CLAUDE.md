@@ -128,7 +128,8 @@ seed daily and never made progress — the same root cause as the `--no-save` bu
 any notion of "first day only". `prune_runs.sh [KEEP] [--dry-run]` (in the repo root; the droplet
 copy is `/root/prune_runs.sh`, default KEEP 2) strips StockNN weights from all but the N most
 recent `/root/ht_*` runs while preserving every log, and skips a run detected in flight. Run it
-before a full pass. It deletes a **whitelist** of StockNN weight patterns (`*_elite_*`,
+before a full pass. A run directory holding a file named `KEEP` is never stripped — use it for runs
+whose weights are a deliverable (`echo "v5 champions -> paper" > /root/ht_race_v5/KEEP`). It deletes a **whitelist** of StockNN weight patterns (`*_elite_*`,
 `*_hist.bin` except `mt2_hist.bin`, `champion/`) — the pre-repo version deleted every `.bin`
 except `mt_training_log.bin`, which silently took `mt1_dataset.bin` (a log) with it, and only
 scanned `ht_train*`.
@@ -841,6 +842,19 @@ gdmn also scored ≤1/5 but stay, because v0.8.1.36 changed their training (per-
 step), so v3 measured a different thing. MT1C grad and MT1S-sum grdC lose their carry/restart
 sibling; the grad-vs-grdC noise-floor read survives on MT1, MT1S-shr and MT1S-stk. For scale: the no-intent MT1 grdC control itself scored 4/5 and +1.88 bp/day, so no
 remaining entry has cleared noise either -- this removes the clearest losers, not the losers.
+
+**Recency-weighted and trend allocation lines (v5).** Under every `alloc bp/day` line — each race
+entry and both `ALLOC bayes` lines — two more: `alloc recency-wtd`, top4-vs-flat with day weights
+`ALLOC_RECENCY = 0.995`^(days before the pass's last day), half-life ~138 days, printed with its Kish
+effective sample size; and `alloc by day`, the same gap per `ALLOC_BUCKET = 100`-day segment from
+day 400. Recent days are the most like the market an allocator will face, so they count most —
+but a hard last-30-days or last-quarter window was rejected: the daily top4-flat gap swings
+~90-120 bp (back-calculated from pass-to-pass spread), so 30 days carry ±16-22 bp of noise against
+2-3 bp edges, and the last N days of every pass are the **same calendar days**, so five passes
+judged that way are one sample. The trend line is the direct read on "is the edge recent": one
+that grows toward the end of a pass supports it, one that fades is a warning even when the
+full-pass number looks good. `race_watch.py [train.log] [--all] [--trend]` tabulates all three
+per pass (default: the newest `/root/ht_race_v*/train.log`).
 
 **Per-entry seeds.** Each evolutionary entry draws its own clock salt at every pass start and XORs
 it into both its pool init and its mutation seeds. Before this, entries of one architecture shared

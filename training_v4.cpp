@@ -309,6 +309,52 @@ static constexpr float BP_LR_RECOVER = 1.05f;
 // Pruned after the v0.8.1.34 5-pass race: MT1C grdC, MT1S-sum grad and TANH32 grnk
 // beat flat allocation (top4) in at most 1 of 5 passes. TANH32 grad/gdmn scored as badly but
 // were trained per-row then and batched since, so they stay to be measured as they now are.
+// ── Allocation judging: recency weight and trend ─────────────────────────────────────
+// The plain alloc line weights every scored day of a pass equally. Recent days are the ones most
+// like the market the allocator will actually face, so each pass also reports top4-vs-flat with
+// day weights ALLOC_RECENCY^(age in days before the pass's last day): half-life ~138 days. A
+// last-30-day or last-quarter window was rejected -- the daily top4-flat gap swings ~90-120 bp, so
+// a 30-day mean carries +-16-22 bp of noise against edges of 2-3 bp, and the last N days of every
+// pass are the SAME calendar days, so five passes judged that way are one sample, not five. The
+// decay keeps most of the sample while leaning it toward the present; "eff days" printed beside it
+// is the Kish effective sample size, (sum w)^2 / sum w^2.
+//
+// The trend line splits the same gap into ALLOC_BUCKET-day segments of the pass, so an edge that
+// grows toward the end (or fades) is visible rather than averaged away.
+static void log_msg(const std::string& msg);   // defined in the Logging section
+static constexpr double ALLOC_RECENCY  = 0.995;
+static constexpr int    ALLOC_BUCKET   = 100;
+static constexpr int    ALLOC_BUCKETS  = 16;
+static constexpr int    ALLOC_BK_MIN   = 10;   // days a segment needs before it is printed
+struct AllocTrend {
+    double w = 0.0, w2 = 0.0, wgap = 0.0;          // recency-weighted top4 - flat
+    double bk_gap[ALLOC_BUCKETS] = {};
+    long   bk_n[ALLOC_BUCKETS]   = {};
+    // gap = top4 - flat for one day; age = days before the pass's last day; seg = segment index
+    void add(double gap, int age, int seg) {
+        const double wt = pow(ALLOC_RECENCY, (double)std::max(0, age));
+        w += wt; w2 += wt * wt; wgap += wt * gap;
+        if (seg >= 0 && seg < ALLOC_BUCKETS) { bk_gap[seg] += gap; bk_n[seg]++; }
+    }
+    // Two lines under an alloc line: the weighted gap, then the segment trend (bp/day).
+    void report(const char* indent, int first_day, const char* suffix) const {
+        if (w <= 0.0) return;
+        char m[512];
+        snprintf(m, sizeof(m), "%salloc recency-wtd (%.3f/day, half-life %.0f d, eff %.0f days): "
+                 "top4 vs flat %+.2f bp/day%s", indent, ALLOC_RECENCY,
+                 log(0.5) / log(ALLOC_RECENCY), w * w / w2, 1e4 * wgap / w, suffix);
+        log_msg(m);
+        std::string t = std::string(indent) + "alloc by day (top4 vs flat, bp/day):";
+        for (int b = 0; b < ALLOC_BUCKETS; b++) {
+            if (bk_n[b] < ALLOC_BK_MIN) continue;
+            snprintf(m, sizeof(m), " %d:%+.2f", first_day + b * ALLOC_BUCKET,
+                     1e4 * bk_gap[b] / (double)bk_n[b]);
+            t += m;
+        }
+        log_msg(t);
+    }
+};
+
 static constexpr RaceEntry RACE[] = {
     {"MT1      evo ", ARCH_MT1,  SRCH_EVO,  false, true,  "r_mt1"   },  // control for rank
     {"MT1      grad", ARCH_MT1,  SRCH_GRAD, false, false, nullptr   },  // control for rank
@@ -4627,6 +4673,7 @@ int main(int argc, char* argv[]) {
         // holds information, since it cancels the market move common to all 12.
         double alloc_flat = 0.0, alloc_top4 = 0.0, alloc_top6 = 0.0, alloc_bot4 = 0.0;
         long   alloc_n = 0;
+        AllocTrend alloc_tr;   // recency-weighted top4-vs-flat and its 100-day trend
         std::vector<double> bk_sum = std::vector<double>(16, 0.0);
         std::vector<long>   bk_n   = std::vector<long>(16, 0);
         // across-day: the deployed model's prediction against the realised industry P&L
@@ -4672,6 +4719,7 @@ int main(int argc, char* argv[]) {
         double mu[N_IND] = {}, m2[N_IND] = {}, w[N_IND] = {};
         double flat = 0, top4[2] = {0, 0}, bot4[2] = {0, 0};
         long   n = 0;
+        AllocTrend tr[2];
         PCG32  rng;
     };
     BayesAlloc balloc;
@@ -4928,6 +4976,7 @@ int main(int argc, char* argv[]) {
             r.distinct_sum = 0.0; r.distinct_n = 0;
             r.lr_cuts = 0; r.lr_floor_hits = 0; r.dead_sum = 0.0; r.dead_n = 0;
             r.alloc_flat = r.alloc_top4 = r.alloc_top6 = r.alloc_bot4 = 0.0; r.alloc_n = 0;
+            r.alloc_tr = AllocTrend{};
             std::fill(r.bk_sum.begin(), r.bk_sum.end(), 0.0);
             std::fill(r.bk_n.begin(),   r.bk_n.end(),   0);
             std::fill(r.xy.begin(), r.xy.end(), 0.0); std::fill(r.xx.begin(), r.xx.end(), 0.0);
@@ -5573,6 +5622,8 @@ int main(int argc, char* argv[]) {
                 {
                     int ok_n = 0;
                     for (int i = 0; i < N_IND; i++) if (race_day_ok[i]) ok_n++;
+                    const int alloc_age = (day_end - 1) - blk_actual_day[d];
+                    const int alloc_seg = (blk_actual_day[d] - MT1_BP_START_DAY) / ALLOC_BUCKET;
                     if (ok_n >= 8) {
                         double flat = 0.0;
                         for (int i = 0; i < N_IND; i++)
@@ -5595,6 +5646,7 @@ int main(int argc, char* argv[]) {
                                 return cnt ? t / cnt : 0.0;
                             };
                             r.alloc_flat += flat;
+                            r.alloc_tr.add(mean_of(0, std::min(4, n)) - flat, alloc_age, alloc_seg);
                             r.alloc_top4 += mean_of(0, std::min(4, n));
                             r.alloc_top6 += mean_of(0, std::min(6, n));
                             r.alloc_bot4 += mean_of(std::max(0, n - 4), std::min(4, n));
@@ -5624,6 +5676,7 @@ int main(int argc, char* argv[]) {
                             double t = 0.0, b = 0.0;
                             for (int q = 0; q < 4; q++) { t += race_day_ret[ix[q]]; b += race_day_ret[ix[N_IND - 1 - q]]; }
                             balloc.top4[k] += t / 4; balloc.bot4[k] += b / 4;
+                            balloc.tr[k].add(t / 4 - flat / N_IND, alloc_age, alloc_seg);
                         }
                         balloc.n++;
                     }
@@ -6119,6 +6172,7 @@ int main(int argc, char* argv[]) {
                                      "top4 %+.2f (%+.2f vs flat) | long-short %+.2f",
                                      lab[k], BALLOC_GAMMA, balloc.n, fl, t4, t4 - fl, t4 - b4);
                             log_msg(c);
+                            balloc.tr[k].report("      ", MT1_BP_START_DAY, "");
                         }
                         log_msg("   ALLOC is full-information (all 12 observed daily): thompson = mean + "
                                 "noise, so read the mean line.");
@@ -6185,6 +6239,8 @@ int main(int argc, char* argv[]) {
                                  fl, t4, t4 - fl, t6, t6 - fl, t4 - b4,
                                  RACE[v].loss == LOSS_MSE ? "" : "  [n/a]");
                         log_msg(m);
+                        r.alloc_tr.report("        ", MT1_BP_START_DAY,
+                                          RACE[v].loss == LOSS_MSE ? "" : "  [n/a]");
                     }
                     std::string traj = "        by day:";
                     for (size_t b = 0; b < r.bk_n.size(); b++) {
