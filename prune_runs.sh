@@ -16,6 +16,10 @@
 # Scans every /root/ht_* run directory (ht_train*, ht_race*, ht_collect*, ...), not just ht_train*.
 #
 # Usage: prune_runs.sh [KEEP] [--dry-run]     (KEEP default 2)
+#
+# A run directory holding a file named KEEP is never stripped and does not count toward KEEP.
+# Use it for runs whose weights are a deliverable -- e.g. champion/ being promoted to paper:
+#   echo "v5 champions -> paper" > /root/ht_race_v5/KEEP
 set -euo pipefail
 KEEP=2; DRY=""
 for a in "$@"; do
@@ -45,6 +49,7 @@ kept=0
 for d in "${DIRS[@]}"; do
     [ -d "$d" ] || continue
     [ "$d" = "$LIVE" ] && continue
+    if [ -e "$d/KEEP" ]; then echo "KEEP marker  : $d ($(head -c 80 "$d/KEEP"))"; continue; fi
     n=$(weight_files "$d" | wc -l)
     [ "$n" -eq 0 ] && continue                    # already logs-only
     kept=$((kept+1))
