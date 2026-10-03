@@ -322,7 +322,7 @@ static constexpr float BP_LR_RECOVER = 1.05f;
 // The trend line splits the same gap into ALLOC_BUCKET-day segments of the pass, so an edge that
 // grows toward the end (or fades) is visible rather than averaged away.
 static void log_msg(const std::string& msg);   // defined in the Logging section
-static constexpr double ALLOC_RECENCY  = 0.995;
+static constexpr double ALLOC_RECENCY  = PASS_JUDGE_RECENCY;   // SAME criterion as the champion pick
 static constexpr int    ALLOC_BUCKET   = 100;
 static constexpr int    ALLOC_BUCKETS  = 16;
 static constexpr int    ALLOC_BK_MIN   = 10;   // days a segment needs before it is printed
@@ -3317,7 +3317,7 @@ static void save_industry_elites(const std::string& dir, int ind_i,
 
 // ── Pass-boundary seeding (v0.6.3.0) ──────────────────────────────────────────
 // At each pass boundary, judge the finishing pass against the standing champion on slot-0's
-// percent portfolio change over the last PASS_JUDGE_DAYS, PER INDUSTRY, and seed the next pass
+// recency-weighted mean daily book return (PassJudge, pass_seeding.h), PER INDUSTRY, and seed the next pass
 // with a rank-preserving proportional interleave of the two 20-elite sets.
 //
 // ORDERING HAZARD: load_or_init_industry reads, and save_industry_elites writes, the SAME output
@@ -3396,14 +3396,30 @@ static bool copy_elites(const std::string& from, const std::string& to, const ch
 // nor the final pass's models. The deliverable is champion/ either way.
 static void pass_boundary(const std::string& out_dir, int pass_num,
                           int day_start, int day_end,
-                          const float* judge_start, const float* judge_end,
-                          bool seed_next) {
+                          const PassJudge* judge, bool seed_next) {
     const std::string champ_dir = out_dir + "/champion";
     const std::string stage_dir = out_dir + "/stage";
     const std::string ref_path  = out_dir + "/pass_reference.csv";
     std::error_code ec;
     fs::create_directories(champ_dir, ec);
     fs::create_directories(stage_dir, ec);
+
+    // A file of another schema version holds scores in other units (v1: 15-day % change). Set it
+    // aside rather than read it: comparing across versions would crown on a units mismatch.
+    {
+        int ver = -1;
+        if (FILE* f = fopen(ref_path.c_str(), "r")) {
+            if (fscanf(f, "# pass_reference v%d", &ver) != 1) ver = -1;
+            fclose(f);
+            if (ver != PASS_REF_VERSION) {
+                const std::string old = out_dir + "/pass_reference.v" + std::to_string(ver) + ".csv";
+                fs::rename(ref_path, old, ec);
+                log_msg("pass-seed: " + ref_path + " is schema v" + std::to_string(ver) +
+                        ", not v" + std::to_string(PASS_REF_VERSION) +
+                        " -- set aside as " + old + "; champions restart from this pass");
+            }
+        }
+    }
 
     // Read every industry's standing champion BEFORE opening the file for append, so buffered
     // writes from this same boundary can never be read back as prior state.
@@ -3423,8 +3439,10 @@ static void pass_boundary(const std::string& out_dir, int pass_num,
 
     for (int i = 0; i < N_IND; i++) {
         const char* ind  = g_ind_names[i].c_str();
-        const bool  have = judge_start[i] > 1e-6f;
-        const float chal_pct = have ? (judge_end[i] / judge_start[i] - 1.f) : 0.f;
+        // "pct" names kept for the CSV columns; since schema v2 the value is the recency-weighted
+        // mean daily book return (PassJudge), printed in bp/day.
+        const bool  have = judge[i].have();
+        const float chal_pct = have ? (float)judge[i].score() : 0.f;
         char msg[320];
 
         if (!copy_elites(out_dir, stage_dir, ind, pass_num)) {
@@ -3444,11 +3462,11 @@ static void pass_boundary(const std::string& out_dir, int pass_num,
             // First boundary, missing champion, or no usable metric: this pass becomes the
             // champion outright and the seed is left as-is — the pre-v0.6.3.0 behaviour.
             copy_elites(stage_dir, champ_dir, ind);
-            fprintf(csv, "%d,%s,%d,%d,%d,%+.6f,%d,%+.6f,%s,%.4f,%d,%d,%+.6f\n",
+            fprintf(csv, "%d,%s,%d,%d,%d,%+.8f,%d,%+.8f,%s,%.4f,%d,%d,%+.8f\n",
                     pass_num, ind, day_start + 1, day_end, pass_num, chal_pct, 0, 0.f,
                     "seed", 1.0, ELITE_POOL, pass_num, chal_pct);
-            snprintf(msg, sizeof(msg), "   pass-seed: champion = pass %d (%+.2f%%), seed unchanged",
-                     pass_num, chal_pct * 100.f);
+            snprintf(msg, sizeof(msg), "   pass-seed: champion = pass %d (%+.2f bp/day, eff %.0f days), "
+                     "seed unchanged", pass_num, chal_pct * 1e4f, judge[i].eff_days());
             log_msg(std::string("[") + IND_SHORT[i] + "]" + msg);
             continue;
         }
@@ -3474,14 +3492,14 @@ static void pass_boundary(const std::string& out_dir, int pass_num,
         const float nc_pct    = chal_wins ? chal_pct : prev[i].champ_pct;
         if (chal_wins) copy_elites(stage_dir, champ_dir, ind);
 
-        fprintf(csv, "%d,%s,%d,%d,%d,%+.6f,%d,%+.6f,%s,%.4f,%d,%d,%+.6f\n",
+        fprintf(csv, "%d,%s,%d,%d,%d,%+.8f,%d,%+.8f,%s,%.4f,%d,%d,%+.8f\n",
                 pass_num, ind, day_start + 1, day_end,
                 prev[i].champ_pass, prev[i].champ_pct, pass_num, chal_pct,
                 pass_regime(prev[i].champ_pct, chal_pct), share, slots_new, nc_pass, nc_pct);
 
         snprintf(msg, sizeof(msg),
-                 "   pass-seed: p%d %+.2f%% vs p%d %+.2f%% [%s] -> %d/%d slots from p%d%s, champion = p%d",
-                 prev[i].champ_pass, prev[i].champ_pct * 100.f, pass_num, chal_pct * 100.f,
+                 "   pass-seed: p%d %+.2f vs p%d %+.2f bp/day [%s] -> %d/%d slots from p%d%s, champion = p%d",
+                 prev[i].champ_pass, prev[i].champ_pct * 1e4f, pass_num, chal_pct * 1e4f,
                  pass_regime(prev[i].champ_pct, chal_pct), slots_new, ELITE_POOL, pass_num,
                  seed_next ? "" : " (final pass — not seeded)", nc_pass);
         log_msg(std::string("[") + IND_SHORT[i] + "]" + msg);
@@ -4930,10 +4948,9 @@ int main(int argc, char* argv[]) {
                 " | mt1=" + std::to_string(cur_mt1_sigma).substr(0,6) +
                 " | mt2=" + std::to_string(cur_mt2_sigma).substr(0,6) + " =====");
 
-        // Slot-0 portfolio value at the two ends of the pass-boundary judging window. Captured
-        // from results[i].baseline, which is what the log prints as prod=$ — the same quantity the
-        // offline study measured. Zeroed each pass so a short pass cannot reuse stale values.
-        float judge_start[N_IND] = {}, judge_end[N_IND] = {};
+        // Pass-boundary champion score, per industry: slot 0's recency-weighted mean daily book
+        // return over the whole pass (PassJudge). Fresh each pass so a pass is judged on itself.
+        PassJudge judge[N_IND];
 
         // Fresh MT1 for this pass -- see the declaration for why it is never carried over.
         for (int v = 0; v < RACE_N; v++) {
@@ -5938,10 +5955,8 @@ int main(int argc, char* argv[]) {
             // threads are parked here, so this idles the whole trainer.
             wait_while_trading();
 
-            // Pass-boundary metric: slot-0 value PASS_JUDGE_DAYS before the end, and on the final
-            // day. Logged "Day N" is actual_day + 1, so the window matches days
-            // (day_end - PASS_JUDGE_DAYS) .. day_end in log terms.
-            const bool judge_win = (day_end - day_start) > PASS_JUDGE_DAYS;
+            // Pass-boundary metric: every day of the pass, weighted toward its end (PassJudge).
+            const bool judge_win = (day_end - day_start) > PASS_JUDGE_MIN_DAYS;
             const DayData* day_ptr  = &all_days[actual_day];
             const DayData* fill_ptr = (actual_day + 1 < total_days) ? &all_days[actual_day + 1] : nullptr;
 
@@ -6039,10 +6054,10 @@ int main(int argc, char* argv[]) {
                     ? (mst->ind_hist_count < IND_HIST_CAP ? mst->ind_val_hist[i][mst->ind_hist_count - 1]
                                                           : mst->ind_val_hist[i][IND_HIST_CAP - 1])
                     : static_cast<float>(IND_STARTING_CASH);
-                if (judge_win) {
-                    if (actual_day == day_end - PASS_JUDGE_DAYS - 1) judge_start[i] = results[i].baseline;
-                    if (actual_day == day_end - 1)                   judge_end[i]   = results[i].baseline;
-                }
+                // Reset days carry book_prev == slot0_score, so they score exactly 0, not a jump.
+                if (judge_win)
+                    judge[i].add(results[i].book_prev, results[i].slot0_score,
+                                 (day_end - 1) - actual_day);
                 // The portfolio index now compounds the BOOK's return, not the trading ratio.
                 // It used to be slot0_score/baseline - 1, which is the trade delta over the
                 // reference book -- so the curve MT1 saw ended pass 1 near -7% while the book it
@@ -6091,9 +6106,9 @@ int main(int argc, char* argv[]) {
             // shorter than the judging window.
             // Never in control mode: crowning a champion from random weights would write those
             // weights into champion/, where the NEXT real run would seed from them.
-            if (!master_only && !g_control_untrained && (day_end - day_start) > PASS_JUDGE_DAYS)
+            if (!master_only && !g_control_untrained && (day_end - day_start) > PASS_JUDGE_MIN_DAYS)
                 pass_boundary(output_dir, pass + 1, day_start, day_end,
-                              judge_start, judge_end, /*seed_next=*/pass + 1 < passes);
+                              judge, /*seed_next=*/pass + 1 < passes);
 
             // ── how well did the gradient MT1 predict the TRADING OUTCOME? ──────────────
             //
