@@ -750,8 +750,14 @@ slot 0 and slot 199, printing `<-- BROKEN` at zero. Without it a broken intent c
 it just looks like a 200× learning rate.
 
 **Pairing and the pass boundary.** Each industry's MT1 is raised against *that industry's* elites, so
-it is meaningful only next to them. `copy_elites()` carries `mt1bp_<ind>.bin` into `champion/` with
-the elites it was trained beside (a missing file is not an error). At a pass boundary a new champion
+it is meaningful only next to them. StockNN chooses the champion; every race model trained in that
+same pass is its associated champion. `copy_elites()` copies each entry's per-pass snapshot
+(`race_p<N>_<entry>_<ind>.bin`) into `champion/` as `race_<entry>_<ind>.bin` beside the elites it
+was trained with, so the per-industry composite stays paired — energy's race models come from
+energy's champion pass (a missing file is not an error). Until v0.8.1.40 it copied only
+`mt1bp_<ind>.bin`, which nothing had written since the race replaced MT1Backprop as a standalone
+net, so `champion/` held StockNN alone. Two entries are not per-industry and so have no champion
+file: the `ALLOC bayes` allocator (no weights; it is a posterior over returns) and MT2. At a pass boundary a new champion
 seed is **a new model**: MT1 is re-initialised from `0xB901 ^ (pass+1)<<32 ^ ind` and grows with it
 rather than being carried over. The one exception is the first pass of a run seeded with
 `--load-dir`, where those elites *are* what this MT1 was raised against, so its paired weights load.
