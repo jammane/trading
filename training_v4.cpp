@@ -325,6 +325,12 @@ static void log_msg(const std::string& msg);   // defined in the Logging section
 static constexpr double ALLOC_RECENCY  = PASS_JUDGE_RECENCY;   // SAME criterion as the champion pick
 static constexpr int    ALLOC_BUCKET   = 100;
 static constexpr int    ALLOC_BUCKETS  = 16;
+// race_daily.csv: every entry's daily choice and its result over the last RACE_LOG_DAYS of each
+// pass (~one trading year), so allocation decisions can be audited day by day offline. One row
+// per entry-day: its 12 raw predictions (the ALLOC bayes lines: posterior mean / Thompson draw,
+// bp), the top 4 it funded, and top4 / flat / gap in bp. A REALIZED row per day carries each
+// industry's actual return in bp. ~12 MB for a 10-pass run.
+static constexpr int    RACE_LOG_DAYS  = 252;
 static constexpr int    ALLOC_BK_MIN   = 10;   // days a segment needs before it is printed
 struct AllocTrend {
     double w = 0.0, w2 = 0.0, wgap = 0.0;          // recency-weighted top4 - flat
@@ -4881,6 +4887,7 @@ int main(int argc, char* argv[]) {
     float bo_el_today[N_IND][ELITE_POOL] = {};
     bool  bo_have[N_IND] = {};
     FILE* bo_csv = nullptr;
+    FILE* rd_csv = nullptr;   // race_daily.csv (RACE_LOG_DAYS)
 
     // The competitor: same pool, same lifecycle, same score, same target — only the network and
     // its inputs differ, so a difference in outcome is a difference in FEATURE SET.
@@ -5710,6 +5717,47 @@ int main(int argc, char* argv[]) {
                     for (int i = 0; i < N_IND; i++) if (race_day_ok[i]) ok_n++;
                     const int alloc_age = (day_end - 1) - blk_actual_day[d];
                     const int alloc_seg = (blk_actual_day[d] - MT1_BP_START_DAY) / ALLOC_BUCKET;
+                    const bool rd_log = alloc_age < RACE_LOG_DAYS
+                                        && blk_actual_day[d] >= MT1_BP_START_DAY;
+                    if (rd_log && !rd_csv) {
+                        std::string rp = log_dir + "/race_daily.csv";
+                        rd_csv = fopen(rp.c_str(), "w");
+                        if (rd_csv) {
+                            fprintf(rd_csv, "pass,day,date,entry,ok_n,flat_bp,top4_bp,gap_bp,"
+                                            "pick1,pick2,pick3,pick4");
+                            for (int i = 0; i < N_IND; i++) fprintf(rd_csv, ",%s", g_ind_names[i].c_str());
+                            fprintf(rd_csv, "\n");
+                        }
+                    }
+                    const char* rd_date = (blk_actual_day[d] < (int)dates.size())
+                                          ? dates[blk_actual_day[d]].c_str() : "";
+                    // one row: vals[i] printed for ok industries, blank otherwise; picks optional
+                    auto rd_row = [&](const std::string& entry, double flat_r, double top4_r,
+                                      const int* picks, const double* vals, bool have_alloc) {
+                        if (!rd_csv) return;
+                        fprintf(rd_csv, "%d,%d,%s,%s,%d,", pass + 1, blk_actual_day[d], rd_date,
+                                entry.c_str(), ok_n);
+                        if (have_alloc)
+                            fprintf(rd_csv, "%.4f,%.4f,%.4f", 1e4 * flat_r, 1e4 * top4_r,
+                                    1e4 * (top4_r - flat_r));
+                        else
+                            fprintf(rd_csv, "%.4f,,", 1e4 * flat_r);
+                        for (int q = 0; q < 4; q++)
+                            fprintf(rd_csv, ",%s", picks ? g_ind_names[picks[q]].c_str() : "");
+                        for (int i = 0; i < N_IND; i++) {
+                            if (race_day_ok[i]) fprintf(rd_csv, ",%.10g", vals[i]);
+                            else                fprintf(rd_csv, ",");
+                        }
+                        fprintf(rd_csv, "\n");
+                    };
+                    if (rd_log) {
+                        double rv[N_IND], fl = 0.0;
+                        for (int i = 0; i < N_IND; i++) {
+                            rv[i] = 1e4 * race_day_ret[i];
+                            if (race_day_ok[i]) fl += race_day_ret[i];
+                        }
+                        rd_row("REALIZED", ok_n ? fl / ok_n : 0.0, 0.0, nullptr, rv, false);
+                    }
                     if (ok_n >= 8) {
                         double flat = 0.0;
                         for (int i = 0; i < N_IND; i++)
@@ -5738,6 +5786,11 @@ int main(int argc, char* argv[]) {
                             r.alloc_top6 += mean_of(0, std::min(6, n));
                             r.alloc_bot4 += mean_of(std::max(0, n - 4), std::min(4, n));
                             r.alloc_n++;
+                            if (rd_log && n >= 4) {
+                                double pv[N_IND];
+                                for (int i = 0; i < N_IND; i++) pv[i] = race_day_pred[v][i];
+                                rd_row(race_norm_name(RACE[v].name), flat, mean_of(0, 4), idx, pv, true);
+                            }
                         }
                     }
                     // Bayesian allocator: decide from the posterior over days < d, then learn d.
@@ -5764,6 +5817,12 @@ int main(int argc, char* argv[]) {
                             for (int q = 0; q < 4; q++) { t += race_day_ret[ix[q]]; b += race_day_ret[ix[N_IND - 1 - q]]; }
                             balloc.top4[k] += t / 4; balloc.bot4[k] += b / 4;
                             balloc.tr[k].add(t / 4 - flat / N_IND, alloc_age, alloc_seg);
+                            if (rd_log) {
+                                double kv[N_IND];
+                                for (int i = 0; i < N_IND; i++) kv[i] = 1e4 * key[k][i];
+                                rd_row(k ? "ALLOC bayes thompson" : "ALLOC bayes mean",
+                                       flat / N_IND, t / 4, ix, kv, true);
+                            }
                         }
                         balloc.n++;
                     }
@@ -5776,6 +5835,8 @@ int main(int argc, char* argv[]) {
                         balloc.m2[i] = BALLOC_GAMMA * balloc.m2[i] + dlt * (x - balloc.mu[i]);
                     }
                 }
+
+                if (rd_csv) fflush(rd_csv);
 
                 // ── online conditional models: predict, score, then learn ────────────────
                 // Order matters: every model is asked for day d BEFORE day d is folded in, so
@@ -6381,6 +6442,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (bo_csv) { fclose(bo_csv); bo_csv = nullptr; }
+    if (rd_csv) { fclose(rd_csv); rd_csv = nullptr; }
 
     log_msg("Training complete.");
     return 0;
