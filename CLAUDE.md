@@ -453,7 +453,8 @@ pytest tests across the files in `tests/`:
   block spanning the dependence must give an SE more than 2× larger.
 - `test_race_qualify.py` — the qualifier rule (`race_qualify.py`): the >40% boundary on both sides
   for v3+v4 and v4-only entries, v3's renamed rows read under their v4 names, infrastructure entries
-  never skipped, the Bayesian allocator skipped as one switch, and a partial log refusing to decide.
+  never skipped, the Bayesian allocator skipped as one switch, and a partial log refusing to decide; the contender tier (mean strictly above the qualifiers' mean) and
+  the allocator staying as a contender.
 - `test_zip_strict.py` — parallel-array guards for the `zip(..., strict=True)` conversion (ruff
   B905). Bare `zip` truncates silently, so a length mismatch yielded a plausible wrong number
   instead of an error; these assert `ValueError` on mismatch and pin the cross-module industry-list
@@ -868,13 +869,18 @@ Rule: an entry must beat flat (whole-pass top-4 vs flat) in **more than 40%** of
 Entries unchanged since v3 count v3 + v4 (5/10 in, 4/10 out); entries whose model changed in v4
 (TANH32 grad/gdmn, the per-stock MT1S-stk trio) count v4 only (3/5 in, 2/5 out). `race_qualify.py
 V3_LOG V4_LOG` applies it and prints `RACE_SKIP=...`; it refuses (exit 2) if either log is missing
-a pass. `ALLOC bayes` qualifies if either of its lines does. MT1C grad (deployed, `bp_pred`) and
+a pass. A second tier, **CONTENDER**, keeps an entry that misses
+the 40% bar but whose mean gap over its counted passes is strictly above the plain average of the
+qualifiers' means (each qualifying `ALLOC bayes` line is one row; infrastructure rows count only if
+they qualified on their own) -- few but large wins, not ready to be abandoned. Contenders run in
+the next race exactly like qualifiers. `ALLOC bayes` stays if either of its lines qualifies or
+contends. MT1C grad (deployed, `bp_pred`) and
 MT1 evo (the logged pool) are read by index, so they always run and are reported as
 infrastructure. Losers are switched off at runtime with `training_v4_cpp --race-skip "A,B,..."`
 (names with spaces collapsed; `ALLOC bayes` for the allocator): not allocated, trained, scored,
 reported or saved, and logged once as `SKIPPED by --race-skip`. The RACE table stays the full
 roster. An unknown name, or the deployed/logged entry, is a startup error. `tests/test_race_qualify.py`
-pins the rule's boundaries on both sides.
+pins the rule's boundaries on both sides, and the contender bar (equal to it is out).
 
 **Recency-weighted and trend allocation lines (v5).** Under every `alloc bp/day` line — each race
 entry and both `ALLOC bayes` lines — two more: `alloc recency-wtd`, top4-vs-flat with day weights

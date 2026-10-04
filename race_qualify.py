@@ -11,12 +11,17 @@ Changed in v4: TANH32 grad and gdmn (per-row Adam -> one batched step, v0.8.1.36
 per-stock MT1S-stk entries (new in v0.8.1.35). v3's "MT1S-stk" rows were the shared encoder and
 the seed replicate, renamed MT1S-shr / MT1S-rep; they are read under their v4 names.
 
+Second tier (set 2026-10-04): an entry that misses the 40% bar but whose mean gap over its
+counted passes is ABOVE the mean of the qualifiers' means is a CONTENDER -- not ready to be
+abandoned, so it still runs. The bar is the plain average of every qualifying row's mean
+(each qualifying ALLOC bayes line is a row; infrastructure rows count only if they qualified).
+
 "ALLOC bayes" is one allocator printed as two lines (mean, thompson); it qualifies if either
 line does. MT1C grad (the deployed entry) and MT1 evo (the logged pool) are read by index
 elsewhere in the trainer, so they always run -- reported, but marked infrastructure.
 
 usage: race_qualify.py V3_LOG V4_LOG [--skip-only]
-Prints the table, then `RACE_SKIP=<comma list>` for training_v4_cpp --race-skip.
+Prints the table (QUALIFY / CONTENDER / OUT), then `RACE_SKIP=<comma list>` for training_v4_cpp --race-skip.
 Exits 2 if either log is missing a pass, so a partial race never decides the field.
 """
 import re
@@ -78,22 +83,29 @@ def main():
         wins = sum(x > 0 for x in xs)
         rows.append((e, basis, wins, len(xs), sum(xs) / len(xs), wins / len(xs) > THRESHOLD))
 
-    bayes_ok = any(q for e, *_, q in rows if e.startswith("ALLOC bayes"))
+    q_means = [mean for *_, mean, ok in rows if ok]
+    bar = sum(q_means) / len(q_means) if q_means else float("inf")
+    tier = {e: "QUALIFY" if ok else ("CONTENDER" if mean > bar else "OUT")
+            for e, _, _, _, mean, ok in rows}
+    bayes_in = any(t != "OUT" for e, t in tier.items() if e.startswith("ALLOC bayes"))
     skip = []
-    if not args or "--skip-only" not in sys.argv:
-        print(f"{'entry':22} {'counted':>7} {'wins':>7} {'mean':>7}  verdict   (rule: > {THRESHOLD:.0%} of passes beat flat)")
+    quiet = "--skip-only" in sys.argv
+    if not quiet:
+        print(f"{'entry':22} {'counted':>7} {'wins':>7} {'mean':>7}  verdict   "
+              f"(rule: > {THRESHOLD:.0%} of passes beat flat; contender: mean > {bar:+.2f}, "
+              f"the qualifiers' mean)")
     for e, basis, w, n, mean, ok in sorted(rows, key=lambda r: (-r[2] / r[3], -r[4])):
-        if e in INFRA:
-            verdict = "QUALIFY" if ok else f"runs ({INFRA[e]})"
-        elif e.startswith("ALLOC bayes"):
-            verdict = "QUALIFY" if ok else ("allocator qualifies" if bayes_ok else "OUT")
-        else:
-            verdict = "QUALIFY" if ok else "OUT"
-            if not ok:
+        verdict = tier[e]
+        if verdict == "OUT":
+            if e in INFRA:
+                verdict = f"runs ({INFRA[e]})"
+            elif e.startswith("ALLOC bayes"):
+                verdict = "allocator stays" if bayes_in else "OUT"
+            else:
                 skip.append(e)
-        if "--skip-only" not in sys.argv:
+        if not quiet:
             print(f"{e:22} {basis:>7} {w:>3}/{n:<3} {mean:+7.2f}  {verdict}")
-    if not bayes_ok:
+    if not bayes_in:
         skip.append("ALLOC bayes")
     print("RACE_SKIP=" + ",".join(skip))
 
