@@ -458,6 +458,10 @@ pytest tests across the files in `tests/`:
 - `test_race_daily_check.py` -- the `race_daily.csv` gate: accepts a consistent file, rejects a
   pick outside the entry's top 4, a top4 that does not match REALIZED, a missing entry, and bayes
   rows when the allocator was skipped.
+- `test_committee_race.py` -- the committee race on synthetic files with a known answer: the
+  entrant rule, the 1.1-step weightings on a hand-worked day, a committee of copies reproducing
+  its model, independent informative models voting better than their best member, pure noise not
+  looking consistent, and the Bayesian tree being causal and finding the one member to trust.
 - `test_zip_strict.py` — parallel-array guards for the `zip(..., strict=True)` conversion (ruff
   B905). Bare `zip` truncates silently, so a length mismatch yielded a plausible wrong number
   instead of an error; these assert `ValueError` on mismatch and pin the cross-module industry-list
@@ -909,6 +913,24 @@ bp). Predictions are in each entry's own units -- only their order within a day 
 Skipped entries write nothing. ~12 MB on a 10-pass run. `race_daily_check.py CSV ROWS BAYES`
 recomputes every row's top4 from the day's REALIZED returns and its picks from its predictions;
 chain7 gates v5 on it.
+
+**`committee_race.py` -- the post-race race of voting committees.** Reads `race_daily.csv` and
+asks whether a small committee of entries, voting, picks the 4 industries better than any one of
+them. Entrants: the entries with the most passes beating flat (at least 6, plus ties with the 6th)
+united with the 6 best by mean gap; committees are every combination of 4, 5 and 6 entrants.
+Methods: `votes` (each member's top 4, one vote each), `votes_pick` (top-4 positions weighted
+1.1^3..1), `votes_member` (members weighted 1.1 per step by standing), `votes_both`, `borda` (mean
+rank over all 12), `zrecord` (mean z-score weighted by each member's causal recency-weighted gap),
+and `bayes_tree` -- a Bayesian tree over the vote pattern (root -> how many voted -> exactly who),
+Gaussian leaves of next-day return minus flat shrunk toward their parent (kappa 20), 0.995/day
+discounting, learned online (day t decided from days < t). Each configuration is scored per pass
+and ranked on consistency: passes beating flat, passes beating its best member, mean gap. The
+passes share calendar days, so the read is robustness to retraining; paper trading is the test on
+new days. A full v5-sized run takes ~15 s.
+
+```bash
+python committee_race.py /root/ht_race_v5/race_daily.csv --out committee_race.csv
+```
 
 **Per-entry seeds.** Each evolutionary entry draws its own clock salt at every pass start and XORs
 it into both its pool init and its mutation seeds. Before this, entries of one architecture shared
