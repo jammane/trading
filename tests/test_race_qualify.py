@@ -4,7 +4,8 @@
 entries changed in v4 count v4 only (3/5 in, 2/5 out). The boundary is the whole rule, so it is
 pinned on both sides. Also: v3's renamed rows are read under their v4 names, infrastructure
 entries are never skipped, the Bayesian allocator qualifies on either line, and a partial log
-refuses to decide.
+refuses to decide. Second tier: a non-qualifier whose mean gap is strictly above the
+qualifiers' mean is a CONTENDER and keeps running.
 """
 import subprocess
 import sys
@@ -103,3 +104,29 @@ def test_partial_race_refuses_to_decide(tmp_path):
     rc, skip, _ = _run(v3, v4)
     assert rc == 2
     assert skip is None                   # no RACE_SKIP line for a caller to act on
+
+
+def test_contender_tier_mean_strictly_above_the_qualifiers_mean(tmp_path):
+    # qualifiers: MT1C evo (+1.00) and both bayes lines (+1.00) -> bar +1.00
+    v3 = _log(tmp_path / "v3", {"MT1C     evo ": W}, BAYES_OK)
+    v4 = _log(tmp_path / "v4", {"MT1C     evo ": W,
+                                "TANH32   grad": [9, 9, -1, -1, -1],    # 2/5, mean +3.00
+                                "TANH32   gdmn": [4, 4, -1, -1, -1],    # 2/5, mean +1.00 == bar
+                                "MT1S-stk grdC": [1, 1, -1, -1, -1]},   # 2/5, mean -0.20
+                 BAYES_OK)
+    rc, skip, out = _run(v3, v4)
+    assert rc == 0
+    assert "TANH32 grad" not in skip      # contender: misses 40% but beats the bar
+    assert "TANH32 gdmn" in skip          # equal to the bar is not above it
+    assert "MT1S-stk grdC" in skip
+    line = next(ln for ln in out.splitlines() if ln.startswith("TANH32 grad"))
+    assert "CONTENDER" in line
+
+
+def test_bayes_can_stay_as_a_contender(tmp_path):
+    # neither bayes line reaches 40%, but thompson's mean beats the qualifiers' mean
+    big = [9, 9, -1, -1, -1]                                              # 4/10, mean +3.00
+    v3 = _log(tmp_path / "v3", {"MT1C     evo ": W}, {"mean": L, "thompson": big})
+    v4 = _log(tmp_path / "v4", {"MT1C     evo ": W}, {"mean": L, "thompson": big})
+    rc, skip, _ = _run(v3, v4)
+    assert rc == 0 and "ALLOC bayes" not in skip
