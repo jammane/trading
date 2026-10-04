@@ -455,6 +455,9 @@ pytest tests across the files in `tests/`:
   for v3+v4 and v4-only entries, v3's renamed rows read under their v4 names, infrastructure entries
   never skipped, the Bayesian allocator skipped as one switch, and a partial log refusing to decide; the contender tier (mean strictly above the qualifiers' mean) and
   the allocator staying as a contender.
+- `test_race_daily_check.py` -- the `race_daily.csv` gate: accepts a consistent file, rejects a
+  pick outside the entry's top 4, a top4 that does not match REALIZED, a missing entry, and bayes
+  rows when the allocator was skipped.
 - `test_zip_strict.py` — parallel-array guards for the `zip(..., strict=True)` conversion (ruff
   B905). Bare `zip` truncates silently, so a length mismatch yielded a plausible wrong number
   instead of an error; these assert `ValueError` on mismatch and pin the cross-module industry-list
@@ -894,6 +897,18 @@ judged that way are one sample. The trend line is the direct read on "is the edg
 that grows toward the end of a pass supports it, one that fades is a warning even when the
 full-pass number looks good. `race_watch.py [train.log] [--all] [--trend]` tabulates all three
 per pass (default: the newest `/root/ht_race_v*/train.log`).
+
+**`race_daily.csv` -- every entry's daily choices and results (v5).** Written to the output
+directory for the last `RACE_LOG_DAYS = 252` days (~one trading year) of **every** pass, from
+`MT1_BP_START_DAY` on. Per day one `REALIZED` row (each industry's actual return that day, bp;
+blank where the industry was not scorable) and one row per running entry, including both
+`ALLOC bayes` lines once the allocator is warm: `pass, day, date` (the decision day; the result is
+realised at the next close), `entry`, `ok_n`, `flat_bp`, `top4_bp`, `gap_bp`, `pick1..4` (the four
+industries it funded) and its 12 raw predictions (the bayes lines: posterior mean / Thompson draw,
+bp). Predictions are in each entry's own units -- only their order within a day is the decision.
+Skipped entries write nothing. ~12 MB on a 10-pass run. `race_daily_check.py CSV ROWS BAYES`
+recomputes every row's top4 from the day's REALIZED returns and its picks from its predictions;
+chain7 gates v5 on it.
 
 **Per-entry seeds.** Each evolutionary entry draws its own clock salt at every pass start and XORs
 it into both its pool init and its mutation seeds. Before this, entries of one architecture shared
