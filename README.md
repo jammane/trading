@@ -17,6 +17,26 @@ paper first, live later.
 
 ---
 
+## Highlights
+
+- **A C++ trainer built for the job.** 12 sector pools of 200 networks evolve daily against a
+  fill simulator, with hand-written forward and backward passes (no autodiff library), each
+  backward pass checked against finite differences, and Python/C++ parity tests that hold the
+  two implementations to the same arithmetic.
+- **Decisions made by measurement.** Competing allocator designs are raced inside the same
+  training loop on identical data, judged against a flat-allocation baseline, and narrowed by
+  qualifier rounds whose rules were fixed before the deciding passes finished.
+- **Controls throughout.** No-learning control runs, planted-signal and shuffled-target checks
+  on every analysis, block-bootstrap error bars for overlapping samples, and pre-registered
+  out-of-sample tests. Several early "results" in this project were overturned by exactly these,
+  and the write-ups are kept.
+- **Production discipline.** Per-account isolation for paper and live trading, whole-share fill
+  semantics matching the broker, position limits, a lock that pauses training during the trading
+  cycle, and Kubernetes deployment with secrets kept out of the repository.
+
+Built with C++20 (OpenBLAS, CMake), Python 3 (PyTorch, NumPy, pytest, ruff), the Alpaca API,
+and k3s on a DigitalOcean droplet.
+
 ## Architecture
 
 ### Industry sub-models (StockNN)
@@ -227,6 +247,21 @@ On the droplet they come from per-account Kubernetes secrets — see CLAUDE.md.
 
 ---
 
+## Testing
+
+28 pytest modules and 6 C++ test binaries (`ctest`), covering model shapes and serialization,
+Python/C++ parity, gradient correctness, the fill simulator, production safety limits, log
+formats, and the analysis tooling. Analysis code is tested against synthetic data with a known
+answer: a planted signal must be found, and noise must not look like one.
+
+```bash
+.venv/bin/pytest tests/ -v          # Python (torch-dependent tests need the full environment)
+cmake --build build && (cd build && ctest)
+ruff check .
+```
+
+---
+
 ## CLI Reference
 
 ### `training_v4_cpp` (C++ binary)
@@ -423,21 +458,21 @@ The CronJob schedule (`"15 20 * * 1-5"`) is in UTC and targets 4:15 PM EDT; use
 
 ## Stock Universe
 
-144 symbols across 12 sectors (12 per sector), selected for high beta and volatility:
+144 symbols across 12 sectors (12 per sector):
 
 `tech_hardware`, `tech_software_ai`, `financials`, `consumer_discretionary`, `consumer_services`, `health_care`, `industrials`, `consumer_staples`, `energy`, `utilities`, `real_estate`, `materials`
 
-Symbols are swapped with `swap_symbols.sh` under fixed rules: a $15 watch floor, a $10 swap floor
-(or a defunct ticker), and a 5-session order hold on any new symbol. Notable changes from the
-original universe:
+The universe is **price-banded** (re-normalized 2026-09-17). Fills are simulated in whole shares,
+as Alpaca executes them, so a symbol's price decides how many distinct position sizes it offers;
+the original universe spanned 73× within a single industry, and its most expensive names could
+not be bought at all at paper capital. Each industry now targets a mean price of ~$60 with every
+symbol between $30 and $90 (at most 3× apart). Within the band, symbols were chosen for the
+largest mean daily range — the strategy earns from intraday movement — with at least five years
+of history and $10M/day median dollar volume, from 185 screened candidates.
 
-| Sector | Removed | Replacement | Reason |
-|--------|---------|-------------|--------|
-| `financials` | SQ | XYZ (Block Inc) | SQ ticker renamed to XYZ in January 2025 |
-| `industrials` | X (US Steel) | BTU (Peabody Energy) | X acquired by Nippon Steel 2025, delisted |
-| `utilities` | NOVA (Sunnova) | ARRY (Array Technologies) | NOVA filed Chapter 11 June 2025, delisted |
-| `real_estate` | RDFN (Redfin) | OPEN (Opendoor Technologies) | RDFN acquired by Rocket Companies July 2025, delisted |
-| `real_estate` | NVR | LGIH (LGI Homes) | NVR share price (~$6,800) is untradeable at small account sizes |
+Drift is tracked with each industry's price mean/median ratio, which is scale-free and so never
+goes stale the way an absolute price floor does. `swap_symbols.sh` performs a replacement, and
+production holds orders on any new symbol for its first five sessions.
 
 ---
 

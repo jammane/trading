@@ -6,7 +6,9 @@ Usage:
     python plot_training.py                       # use existing logs_local/ files, latest pass
     python plot_training.py --download            # pull fresh logs first
     python plot_training.py --pass 2              # display pass 2 (default: latest)
-    python plot_training.py --download --account acct0 --host root@REDACTED-HOST
+    python plot_training.py --download --account acct0 --host user@training-host
+
+The download host defaults to $TRADING_TRAIN_HOST, so no server address lives in the repo.
 
 Outputs (git-ignored):
     plots/industry_performance.svg   — StockNN elite portfolio value per industry
@@ -22,6 +24,7 @@ When more than 100 days are present, values are averaged into ~100 display point
 import argparse
 import csv
 import math
+import os
 import struct
 import subprocess
 import sys
@@ -37,7 +40,7 @@ except ImportError:
     sys.exit("matplotlib is required: pip install matplotlib")
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-DROPLET_HOST    = "root@REDACTED-HOST"
+DROPLET_HOST    = os.environ.get("TRADING_TRAIN_HOST", "")
 REMOTE_LOG      = "/root/trading/logs/{account}/training"
 LOCAL_LOG_DIR   = Path("logs_local")
 PLOT_DIR        = Path("plots")
@@ -456,6 +459,12 @@ def plot_mt1(records: list[dict], pass_num: int, out_path: Path,
     print(f"  wrote {out_path}")
 
 
+# Restored: both were deleted with the old MT1 in v0.8.0.0 while the MT2 chart that reads them
+# stayed, so plotting MT2 raised NameError.
+_MT2_INJ_THRESHOLD = -7.0   # injection fires when >=75% of pool scores below this
+_MT2_BASELINE_WINDOW = 30   # days to look back when computing the random baseline
+
+
 def _ideal_to_tier_counts(ideal_pts: float) -> tuple[int, int, int, int]:
     """Map mt2_ideal_pts → (n0, n1, n2, n3) optimal tier counts for that day."""
     best_n, best_diff = 0, float("inf")
@@ -772,6 +781,8 @@ def main() -> None:
 
     if args.download:
         print("Downloading logs from droplet...")
+        if not args.host:
+            sys.exit("--download needs --host or TRADING_TRAIN_HOST")
         download_logs(args.host, args.account)
 
     csv_path = LOCAL_LOG_DIR / "training_log.csv"

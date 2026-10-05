@@ -11,11 +11,11 @@ find, and re-deriving them is how the same mistake gets made twice.
 | `interval.py` | the same across look-backs 5..120, daily and every-d | monotone 5 > 10 > 20 > 30 |
 | `short_d.py` | sub-5-day look-backs, turnover and cost sensitivity | 43.5%/day turnover; negative net of 10bp |
 | `quarterly.py` | is per-industry efficiency persistent, is there a trend | split-half **-0.223**; no persistence |
-| `qtrly_live.py` | quarterly scorecard of the ONLINE trees in a live pass | k=1 converges to exactly always-up |
+| `qtrly_live.py` | quarterly scorecard of the online trees in a live pass | k=1 converges to exactly always-up |
 | `qtrly_offline.py` | same metric, offline, across the expanded interval set | best cell -0.36pp |
 | `qtrly_start.py` | does feeding the trees the first 400 days hurt | no: 0.03pp difference |
 | `order_level.py` | is the signal per symbol-order rather than per industry | 122,975 symbol-days; replicates across passes to 0.1pp |
-| `order_ev.py` | expected value per order PLACED, passive vs aggressive | passive 10-14x better per order, both sides, both passes |
+| `order_ev.py` | expected value per order *placed*, passive vs aggressive | passive 10-14x better per order, both sides, both passes |
 
 ## Controls these scripts carry, and why
 
@@ -34,7 +34,7 @@ decomposable measure says +2.8%.
 **Identical scoring days across variants.** `qtrly_start.py` scores both learn-from-d17 and
 learn-from-d400 on the same days, or the comparison measures the day set rather than the change.
 
-**Expected value per order PLACED, not per fill.** `order_ev.py` charges an unfilled limit the
+**Expected value per order placed, not per fill.** `order_ev.py` charges an unfilled limit the
 move it missed; comparing only filled orders is biased toward passive placement. For a SELL a
-HIGH limit is passive -- the opposite of the buy convention; labelling both by `frac > 0.5`
+high limit is passive -- the opposite of the buy convention; labelling both by `frac > 0.5`
 inverted the sell side once.

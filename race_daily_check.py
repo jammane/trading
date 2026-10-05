@@ -6,7 +6,8 @@ import sys
 from collections import defaultdict
 
 path, rows_want, bayes = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "1"
-r = list(csv.DictReader(open(path)))
+with open(path) as f:
+    r = list(csv.DictReader(f))
 hdr = list(r[0].keys()) if r else []
 inds = hdr[12:]
 if len(hdr) != 24:

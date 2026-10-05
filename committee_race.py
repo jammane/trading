@@ -5,25 +5,25 @@ Reads the trainer's race_daily.csv (last RACE_LOG_DAYS of every pass: each entry
 predictions per day, plus a REALIZED row of each industry's actual return in bp). Each pass is a
 separately trained version of the same models, so the read is CONSISTENCY across passes.
 
-Entrants (user design, 2026-10-04): the entries with the most passes beating flat -- at least 6,
+Entrants: the entries with the most passes beating flat -- at least 6,
 plus any tied with the 6th -- together with the 6 best by mean gap (overlap expected). Committees
 are every combination of 4, 5 and 6 entrants.
 
 Methods. `pick` weights are per position in a member's own top 4 (#1..#4); `member` weights
 order the committee by entrant standing (wins, then mean), each member 1.1x the one below it.
-  votes        each member's top 4, one vote each                          (user)
-  votes_pick   top-4 positions weighted 1.1^3, 1.1^2, 1.1, 1               (user, 1.1 per step)
-  votes_member members weighted 1.1^(k-1) .. 1.1, 1 by standing            (user, 1.1 per step)
+  votes        each member's top 4, one vote each
+  votes_pick   top-4 positions weighted 1.1^3, 1.1^2, 1.1, 1
+  votes_member members weighted 1.1^(k-1) .. 1.1, 1 by standing
   votes_both   both of the above, multiplied
-  borda        mean rank over all 12 industries, not just the top 4        (suggested)
+  borda        mean rank over all 12 industries, not just the top 4
   zrecord      mean within-day z-score, each member weighted by its own
-               recency-weighted gap so far (0.995/day, causal)             (suggested)
+               recency-weighted gap so far (0.995/day, causal)
   bayes_tree   a Bayesian tree over the vote pattern: root -> number of votes an industry got
                -> exactly which members voted for it. Each node holds a recency-discounted
                (0.995/day) Gaussian posterior of the industry's next-day return minus flat,
                shrunk toward its parent node (kappa = 20 effective days), so a pattern seen
                rarely falls back on "how many voted". Fund the 4 highest leaf posterior means;
-               it learns online, decides day t from days < t only.     (user: a Bayesian option)
+               it learns online, decides day t from days < t only.
 Ties in any method break by vote count, then the members' mean z-score.
 
 Per configuration and pass: gap = mean daily (top4 return - flat) in bp. Reported:
@@ -44,7 +44,7 @@ from collections import defaultdict
 import numpy as np
 
 RECENCY = 0.995        # = PASS_JUDGE_RECENCY / ALLOC_RECENCY in the trainer
-STEP = 1.1             # user: each weight 1.1x the weaker one beneath it
+STEP = 1.1             # each weight 1.1x the one ranked beneath it
 N_PICK = 4
 MIN_BY_WINS = 6
 N_BY_MEAN = 6
@@ -59,7 +59,8 @@ def load(path):
     Only days on which every entry has a row are kept, so every configuration in a pass is
     scored on the same days.
     """
-    rows = list(csv.DictReader(open(path)))
+    with open(path) as f:
+        rows = list(csv.DictReader(f))
     if not rows:
         sys.exit(f"{path}: empty")
     inds = list(rows[0].keys())[12:]

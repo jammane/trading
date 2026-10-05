@@ -1,6 +1,10 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+The detailed engineering reference for this repository, and the working guide for Claude Code
+(claude.ai/code), which is used in its development. The [README](README.md) is the overview; this
+file records how each part works, the constants that govern it, and — where a design was changed —
+the measurement that changed it. Findings that turned out to be wrong are kept and marked as such,
+because the reason a design was abandoned is as useful as the design that replaced it.
 
 ## Development commands
 
@@ -47,7 +51,7 @@ kubectl create secret generic alpaca-credentials-acct0-prod \
     --dry-run=client -o yaml | kubectl apply -f -
 ```
 The full pytest suite (including `test_models.py`) runs on the droplet where torch is available.
-The pre-commit hook runs the full suite automatically before every `git commit`.
+A Claude Code hook runs the suite before every `git commit` or `git push` (see **Tests**).
 
 **Lint:**
 ```bash
@@ -76,7 +80,7 @@ Appends new trading days for all universe symbols; does a full 5-year fetch for 
 python cleanup_stock_data.py           # live removal
 python cleanup_stock_data.py --dry-run # preview only
 ```
-Removes `stock_data/<SYM>.json` for any symbol not in the current universe AND not held in any open Alpaca position (checked via `models/acct*/*/state.json`). Safe to run at any time.
+Removes `stock_data/<SYM>.json` for any symbol not in the current universe *and* not held in any open Alpaca position (checked via `models/acct*/*/state.json`). Safe to run at any time.
 
 **Train (C++ binary — canonical; handles industries, MT1, and MT2):**
 ```bash
@@ -122,7 +126,7 @@ accumulated run directories took the droplet's 58 GB disk to 92% full.
 Analysis only needs the logs (`mt_training_log.bin`, `training_log.csv`, `train.log`, 3–5 MB);
 weights are only needed to seed a run (`--load-dir`) or convert to `.pt`.
 
-**`--load-dir` is a SEED, consulted only when the working store has nothing** (fixed v0.6.6.0).
+**`--load-dir` is a seed, consulted only when the working store is empty** (fixed v0.6.6.0).
 It used to be checked *first, every day*, so a run seeded from a populated directory reloaded that
 seed daily and never made progress — the same root cause as the `--no-save` bug: neither path had
 any notion of "first day only". `prune_runs.sh [KEEP] [--dry-run]` (in the repo root; the droplet
@@ -280,7 +284,7 @@ negative skill in all 12 industries.
 
 `read_mt_log.py` prints, per pass: a **Target** block (mean, sd, mean/sd, % negative, mean baseline
 error, floor), an **MT1** block (score slot-0/mean/max/min, `corr`, % of days above 0.5, mature,
-lineages), a **Pool lifecycle** block, and an **MT2** block. Read the MEAN column, not `best` —
+lineages), a **Pool lifecycle** block, and an **MT2** block. Read the mean column, not `best` —
 `best` is max-of-200 and rises with pool size under a null. `corr` is the prediction on day *t*
 against the P&L realised on *t+1*, and is the only column selection on noise cannot manufacture.
 
@@ -306,7 +310,7 @@ All per-run files (`state.json`, `owners.json`, `master_state.json`, `*.pt`) liv
 Current account is `acct0`. Up to 5 accounts planned; additional accounts will likely
 require a droplet upgrade.
 
-**Scheduling convention (user is US Eastern Time):**
+**Scheduling convention (US Eastern Time):**
 - Market close: 4:00 PM ET
 - acct0 paper: 1h05m after close = 5:05 PM ET
 - acct0 prod:  30 min after paper = 5:35 PM ET
@@ -388,9 +392,18 @@ Training output (`training_v4_cpp`) writes to `models/acct#/training`; after tra
 ```
 Runs all five steps: updates `universe_acct0.py` and regenerates `universe.json`, removes the old symbol's `stock_data/` JSON, runs `download_daily.py` (full 5-year fetch for the new symbol, incremental for all others), prompts to rebuild the Docker image, and prints optional model-cleanup commands for the droplet. The C++ binary reads `universe.json` at startup — no recompile needed after a symbol swap. Run locally — not inside a container.
 
-**Symbol swap thresholds (checked ~monthly — expect 1-2 swaps/month):**
-- **$15 watch floor** — symbol goes into `universe_watchlist.json` `"watch"` section with a candidate. Do NOT download candidate data yet. Do NOT run `swap_symbols.sh`.
-- **$10 swap floor** (or defunct/halted ticker) — perform the swap: run `swap_symbols.sh`, which downloads candidate data. The removed symbol's open positions are auto-liquidated via market order on the next `production_v2.py` run (orphaned-position logic). Update the watchlist accordingly.
+**Symbol swap rules (checked ~monthly).** Since the 2026-09-17 re-normalization the universe is
+price-banded: each industry targets a mean of ~$60 with every symbol inside $30–$90 (max/min 3×),
+because whole-share fills make price decide how many position sizes a symbol offers. The drift
+detector is each industry's price **mean/median ratio** — scale-free, so unlike an absolute price
+floor it never goes stale (`universe_acct0.py` docstring; thresholds in `universe_watchlist.json`):
+- **Watch** above 1.20 or below 0.96 — record the industry and a candidate in
+  `universe_watchlist.json`. Do not download candidate data yet.
+- **Swap** above 1.35 or below 0.93, or immediately for a defunct or halted ticker — run
+  `swap_symbols.sh`, which downloads the candidate's data. The removed symbol's open positions are
+  liquidated by market order on the next `production_v2.py` run (orphaned-position logic).
+- The thresholds are asymmetric because a price can rise without bound but only fall to zero.
+- The old absolute rule ($15 watch, $10 swap) applied to the pre-band universe and is retired.
 - **5-day new-symbol hold** — after any swap, `production_v2.py` automatically detects the new symbol (compares universe to `state['known_symbols']`) and applies a 5-run hold: paper/prod orders are suppressed for that symbol for 5 trading days. Training (regular C++ and daily upkeep) still runs on the new symbol immediately so the model starts adapting.
 
 ## Shared modules
@@ -437,7 +450,7 @@ pytest tests across the files in `tests/`:
   `mt1_slot_better`. Plus the lifecycle (bootstrap, park-then-score-next-run, maturity gate, cull
   and lineage inheritance, deployed model published) and rolling-state persistence.
   Two real defects came out of writing it: the sort key had its two components in the opposite
-  order from the C++ (recency-weighted mean is the PRIMARY key, plain mean only the tie-break —
+  order from the C++ (recency-weighted mean is the primary key, plain mean only the tie-break —
   the swapped version ranks identically on most pairs, so it reads as correct), and
   `production_v2` never persisted the rolling state, which would have left every prediction parked
   and none ever scored. Both are pinned.
@@ -481,7 +494,11 @@ pytest tests across the files in `tests/`:
   invariants. Also pins the known off-by-one in StockNN diversity injection (odd `ELITE_COUNT`
   leaves one inject slot unreplaced) so a deliberate fix surfaces as a failing test.
 
-A `PreToolUse` hook in `.claude/settings.json` runs the suite automatically before every `git commit` or `git push`. Failures are reported before the commit runs, so Claude can self-correct without creating a broken commit. The changelog hook remains `PostToolUse` (it needs the commit hash to exist before it can amend).
+A `PreToolUse` hook in `.claude/settings.json` runs the suite (`.claude/run_tests.sh`) before
+every `git commit` or `git push` made through Claude Code, wherever pytest is installed. It reads
+the command from the hook's JSON on stdin; until 2026-10-04 it read a `$CLAUDE_TOOL_INPUT`
+environment variable that Claude Code no longer sets, and silently never fired. It reports
+failures and never blocks the commit.
 
 ## Architecture
 
@@ -635,7 +652,7 @@ a window that contained the day being scored; all three are gone. What the instr
 replaced measured is worth keeping in mind: **49.54% OOS against 61.09% in-sample**, negative skill
 in all 12 industries.
 
-**Read the MEAN, not the max.** `mt1_score_best` is max-of-200 and rises with pool size under a
+**Read the mean, not the max.** `mt1_score_best` is max-of-200 and rises with pool size under a
 pure null. `read_mt_log.py` prints the pool mean heavy and the max thin for that reason, plus
 `corr` — the correlation between the prediction on day *t* and the P&L realised on *t+1*, over the
 whole window. `corr` is the one column selection on noise cannot manufacture: a pool can hold a
@@ -762,7 +779,7 @@ each row's target being its own realised `slot_score − book_prev`. The predict
 `bp_pred` uses slot 0's intent, because slot 0 is what production places, and it predicts before it
 learns so nothing is scored on an outcome it has seen.
 
-**The target is RAW DOLLARS**, divided only by the constant `MT1_PRED_SCALE` to keep the optimiser
+**The target is raw dollars**, divided only by the constant `MT1_PRED_SCALE` to keep the optimiser
 well-conditioned (targets near O(1) rather than O(750)); `bp_pred` multiplies straight back. This is
 the whole point of MT1: it answers "what will *this order set* earn," in dollars, and MT2 ranks the
 12 dollar amounts to allocate. Dividing by the industry's own book — which an earlier revision did —
@@ -798,7 +815,7 @@ file: the `ALLOC bayes` allocator (no weights; it is a posterior over returns) a
 a run seeded with `--load-dir` loads the paired weights, since those elites *are* what they were
 raised against.
 
-**The race (`RACE` in `training_v4.cpp`).** Every entry trains in the SAME daily loop, on the SAME
+**The race (`RACE` in `training_v4.cpp`).** Every entry trains in the same daily loop, on the same
 200 order sets, in the same order. Racing in-loop rather than logging the rows and fitting offline
 avoids a ~400 MB artefact and a reader to keep in sync -- the entries cannot disagree about the
 data because they are handed the same bytes. Cost is small beside StockNN's 200 forward passes over
@@ -825,7 +842,7 @@ History: the race began (v0.8.1.27-29) as five MT1Backprop variants -- per-ind 3
 capacity did not matter, so those variants were retired for the architecture x search race above.
 
 **Targets deliberately do not vary across variants.** Within a day, total book P&L and trade delta
-differ by a constant, because the market move is common to all 200 — so they induce the SAME
+differ by a constant, because the market move is common to all 200 — so they induce the same
 ranking. Target choice moves the loss and the across-day number, not the thing being raced.
 
 **What is reported, per pass.** Each variant's mean training loss, its mean **within-day rank**
@@ -855,14 +872,14 @@ prints `lr end mean/min`, cuts, floor hits and mean dead fraction per entry.
 Xavier init, its own Adam with coupled L2 -- the net that ranked +0.017..+0.027 within-day in the
 v0.8.1.27 run. Raced verbatim in v0.8.1.33-35 it did **not** reproduce that (+0.004, +0.001,
 +0.0006 over three passes), and its training collapsed it. **Since v0.8.1.36 every TANH32 loss
-takes ONE mean-gradient step per industry-day** (`MT1Backprop::train_batch`), so it is no longer
+takes one mean-gradient step per industry-day** (`MT1Backprop::train_batch`), so it is no longer
 the verbatim reference.
 
 The collapse, because it is easy to misdiagnose: the log showed 5-27 distinct predictions of ~125
 distinct inputs, which reads like tanh saturation. It is not, or not only. Adam normalises every
 step to ~lr whatever the gradient's size, so 200 per-row steps on rows sharing one day move each
 weight up to 200 x lr per day. Simulated (146->32->8->1, 200 rows/day, race-shaped inputs), per-row
-training collapsed to 1-8 distinct of 200 in EVERY configuration: with coupled L2 the weights shrink
+training collapsed to 1-8 distinct of 200 in every configuration: with coupled L2 the weights shrink
 to exactly zero (|W1| 7.2 -> 1e-23); with decoupled or no decay 20-100% of hidden units pin at
 |tanh| > 0.999. One batched step stayed 200/200 distinct in all of them, and in the live race
 TANH32 grnk (batched) never hit the lr floor while grad/gdmn (per-row) hit it 123 and 788 times a
@@ -876,7 +893,7 @@ the two fixes for what the v0.8.1.30 race showed: its MSE nets took 200 same-day
 sharing the day's market move and became "yesterday's P&L" predictors (0.82-0.87 correlated with it
 in an offline replica), which industry P&L's mild lag-1 mean reversion turns wrong-way.
 `gdmn` trains squared error on P&L minus the industry-day's mean across the 200 order sets;
-`grnk` trains ListNet (`listnet_grad` in `mt1_grad.h`, FD-checked) with ONE batched step per
+`grnk` trains ListNet (`listnet_grad` in `mt1_grad.h`, FD-checked) with one batched step per
 industry-day. Each was raced for MT1C and TANH32, beside the unchanged MSE entries (TANH32 grnk
 was pruned with the losers below). Both remove the day
 level, so their across-day corr and alloc lines print `[n/a]` -- only within-day rank counts.
@@ -907,7 +924,7 @@ contends. MT1C grad (deployed, `bp_pred`) and
 MT1 evo (the logged pool) are read by index, so they always run and are reported as
 infrastructure. Losers are switched off at runtime with `training_v4_cpp --race-skip "A,B,..."`
 (names with spaces collapsed; `ALLOC bayes` for the allocator): not allocated, trained, scored,
-reported or saved, and logged once as `SKIPPED by --race-skip`. The RACE table stays the full
+reported or saved, and logged once as `SKIPPED by --race-skip`. The `RACE` table stays the full
 roster. An unknown name, or the deployed/logged entry, is a startup error. `tests/test_race_qualify.py`
 pins the rule's boundaries on both sides, and the contender bar (equal to it is out).
 
@@ -1023,9 +1040,14 @@ When an elite holds ≥50% cash (industry) or ≥80% cash (master), an `UNDER_IN
 
 `--paper` routes all API calls to Alpaca's paper trading endpoint — orders are submitted and portfolio state is read from the paper account, giving real paper trading history without risking real money. Omit `--paper` for live trading.
 
-### Changelog hook
+### Changelog
 
-A `PostToolUse` hook in `.claude/settings.json` auto-updates `CHANGELOG.md` and amends the commit whenever Claude makes a `git commit`. This is intentional — do not skip it.
+`CHANGELOG.md` is curated by release: add an entry under the current release with each change a
+user or reader would notice. It was previously written by a per-commit `PostToolUse` hook
+(`.claude/update_changelog.sh`), which prepended the commit subject and amended the commit. That
+hook read the same unset `$CLAUDE_TOOL_INPUT` variable and has not fired since 2026-09-16; it is
+left dormant because, as written, it amends a commit after the command that made it — including
+after a push in the same command.
 
 ## Key constants (defined at top of each training/production file)
 
@@ -1041,7 +1063,7 @@ A `PostToolUse` hook in `.claude/settings.json` auto-updates `CHANGELOG.md` and 
 | `MT1_FLOOR_FRAC` | 0.5 | `floor = mean(\|actual\|) × frac`, per industry, never below $1 |
 | `MT1_SCORE_HIST` | 16 | Rolling per-model score register (`MT1SlotMeta`) |
 | `MT1_POOL_MIN_AGE` | 8 | Predictions before a model may be culled OR breed |
-| `MT1_POOL_CULL_PCT` | 0.083 | Fraction of MATURE models culled per day (→ ~60% mature) |
+| `MT1_POOL_CULL_PCT` | 0.083 | Fraction of mature models culled per day (→ ~60% mature) |
 | `MT1_POOL_ELITE_PCT` | 0.10 | Top fraction of mature models used as parents |
 | `MT1_POOL_LINEAGE_CAP` | 0.125 | Lineage above this share of the pool stops breeding (25 of 200) |
 | `MT1_POOL_LINEAGE_RESUME` | 0.10 | ...and resumes only below this (hysteresis) |

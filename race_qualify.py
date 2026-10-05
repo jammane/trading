@@ -39,7 +39,9 @@ def parse(path, rename=None):
     """{entry: {pass: top4-minus-flat bp/day}} from a race train.log."""
     rename = rename or {}
     out, p, cur = {}, None, None
-    for line in open(path, errors="replace"):
+    with open(path, errors="replace") as f:
+        lines = f.readlines()
+    for line in lines:
         m = re.search(r"MT1 race, pass (\d+)", line)
         if m:
             p = int(m.group(1))

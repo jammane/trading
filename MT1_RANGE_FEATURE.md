@@ -1,4 +1,4 @@
-> # STILL LIVE, but the destination changed (v0.8.0.0)
+> # Still planned, but the destination changed (v0.8.0.0)
 >
 > This was staged as an input to MT1's **volatility channel**. That channel no longer exists — the
 > four-tail MT1 was deleted and replaced by a single-output `MT1Net`.
@@ -14,7 +14,7 @@
 
 # Staged: add `(H−L)/A` as an MT1 input
 
-**Status: STAGED — do not implement yet.**
+**Status: staged — not to be implemented yet.**
 Two gates must clear first:
 
 1. Paper trading is running (the v0.6.2.1 five-pass run finishes, models deploy, cron enabled).
@@ -53,7 +53,7 @@ R²  trailing vol + (H−L)/A   = 0.4760     delta +0.0338   (+7.6% relative)
 
 `close_pos` alone is weak (0.212). The ratio is what carries the signal.
 
-## Why NOT the direction/delta channel
+## Why not the direction/delta channel
 
 Against MT1's direction target — 10-day forward industry return vs the cross-sectional median,
 sampled every 10th day so windows never overlap (n=123):
@@ -70,7 +70,7 @@ cross-industry level over 10 days, nothing here predicts relative returns. This 
 with direction scoring negative OOS skill in all 12 industries on every run to date, and it
 means adding inputs will not fix that channel. Scope this change to the vol channel only.
 
-## BLOCKING prerequisite — validate against *portfolio* vol
+## Blocking prerequisite — validate against *portfolio* vol
 
 The measurement above used the **industry index's** forward vol. MT1's actual target is the
 forward vol of the **deployed slot-0 portfolio**.

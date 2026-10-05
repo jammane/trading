@@ -1,19 +1,12 @@
 {
-  "_comment": "Symbols between $10-$15 (watch) or queued for swap (pending). Run swap_symbols.sh only when a symbol hits the $10 floor or is defunct. Do NOT download candidate data until the swap actually happens.",
+  "_comment": "Drift watchlist for the price-banded universe (re-normalized 2026-09-17, see universe_acct0.py). The detector is each industry's price mean/median ratio: watch above 1.20 or below 0.96, swap above 1.35 or below 0.93 (asymmetric: a price can rise without bound but only fall to zero). A defunct or halted ticker is swapped immediately. Do not download candidate data until a swap is performed with swap_symbols.sh.",
   "thresholds": {
-    "watch_below": 15,
-    "swap_floor": 10
+    "mean_median_watch_above": 1.2,
+    "mean_median_swap_above": 1.35,
+    "mean_median_watch_below": 0.96,
+    "mean_median_swap_below": 0.93
   },
-  "watch": {
-    "DQ": {
-      "industry": "utilities",
-      "price_when_flagged": 14.18,
-      "flagged_date": "2026-06-20",
-      "candidate": "OKLO",
-      "candidate_price": 61.17,
-      "notes": "Daqo New Energy (Chinese solar polysilicon). Below $15 but above $10 floor. Do not swap yet. Do not download OKLO data yet."
-    }
-  },
+  "watch": {},
   "pending_swap": {},
   "completed": {
     "MYGN": {
@@ -38,5 +31,8 @@
       "ccs_price_at_swap": 60.54,
       "notes": "Century Communities, mid-cap production homebuilder \u2014 closest analog to Taylor Morrison. Ann. vol 42.0% vs real_estate peer range 34.8-52.7%. GRBK ($68.42, 42.2%) and MHO ($139.89, 38.6%) also met all four criteria."
     }
+  },
+  "retired_rules": {
+    "note": "Before 2026-09-17 the rule was an absolute price floor: watch below $15, swap below $10. DQ (watched 2026-06-20 at $14.18) left the universe in the re-normalization."
   }
 }

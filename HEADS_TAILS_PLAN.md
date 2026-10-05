@@ -89,7 +89,7 @@ replay, advance once at block end.
   concat + frozen other-3-tail logits → score one tail slot; dir path reuses balanced weights /
   two-half selection / flip cull / correct-count collapse floor) and `step_mt1_head(...)` (head
   slots → 4 frozen best tails → windowed composite). All three are additive/unused until Inc 3.
-  **No injection slots** (user decision): the old composite→pool injection existed to propagate one
+  **No injection slots** (design decision): the old composite→pool injection existed to propagate one
   component's learning to the others; the shared head trunk now does that. So the head/tail pools
   use `HT_PARENTS=20` (17 elites + 3 wavg, no injected slots) and the reclaimed capacity (former 15
   immigrant children + 5 parent slots) is redistributed into more elite mutations — `HT_MUTS=180`,
