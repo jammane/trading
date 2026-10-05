@@ -10,7 +10,8 @@ entry is in its commit message.
 
 ### Added
 - **Qualifier races.** `race_qualify.py` decides which race entries go on to the next race: an
-  entry must beat flat allocation in more than 40% of its counted passes. Entries whose model
+  entry must beat flat allocation in more than 50% of its counted passes (raised from 40% after
+  13 of 17 entries had qualified with a pass still to run). Entries whose model
   changed count only the passes since the change.
 - **Contender tier.** A non-qualifier whose mean gap over flat is above the qualifiers' average
   still runs in the next race.

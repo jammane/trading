@@ -2,16 +2,17 @@
 """Qualifier: which MT1 race entries go on to the next race.
 
 Rule (set 2026-10-03): an entry must beat flat allocation -- top-4 vs flat, long-only, the
-whole-pass `alloc bp/day` line -- in MORE THAN 40% of its counted passes.
+whole-pass `alloc bp/day` line -- in MORE THAN 50% of its counted passes (raised from 40% on
+2026-10-05: at 40%, 13 of 17 entries had qualified with a pass still to run).
 
-  * entries unchanged since v3: counted over v3 + v4 passes  (5/10 qualifies, 4/10 does not)
+  * entries unchanged since v3: counted over v3 + v4 passes  (6/10 qualifies, 5/10 does not)
   * entries whose model changed in v4: v4 passes only        (3/5 qualifies, 2/5 does not)
 
 Changed in v4: TANH32 grad and gdmn (per-row Adam -> one batched step, v0.8.1.36) and the
 per-stock MT1S-stk entries (new in v0.8.1.35). v3's "MT1S-stk" rows were the shared encoder and
 the seed replicate, renamed MT1S-shr / MT1S-rep; they are read under their v4 names.
 
-Second tier (set 2026-10-04): an entry that misses the 40% bar but whose mean gap over its
+Second tier (set 2026-10-04): an entry that misses the 50% bar but whose mean gap over its
 counted passes is ABOVE the mean of the qualifiers' means is a CONTENDER -- not ready to be
 abandoned, so it still runs. The bar is the plain average of every qualifying row's mean
 (each qualifying ALLOC bayes line is a row; infrastructure rows count only if they qualified).
@@ -27,7 +28,7 @@ Exits 2 if either log is missing a pass, so a partial race never decides the fie
 import re
 import sys
 
-THRESHOLD = 0.40
+THRESHOLD = 0.50
 V3_PASSES = V4_PASSES = 5
 CHANGED_IN_V4 = {"TANH32 grad", "TANH32 gdmn", "MT1S-stk evo", "MT1S-stk grad", "MT1S-stk grdC"}
 V3_RENAME = {"MT1S-stk evo": "MT1S-rep evo", "MT1S-stk grad": "MT1S-shr grad",

@@ -91,7 +91,7 @@ Each entry is scored two ways every pass:
   (0.995/day, half-life ~138 days) and in 100-day segments.
 
 **Qualifier races.** Each race decides the field for the next one: an entry must beat flat in
-**more than 40%** of its counted passes (`race_qualify.py`). A non-qualifier whose mean gap is above
+**more than 50%** of its counted passes (`race_qualify.py`). A non-qualifier whose mean gap is above
 the qualifiers' average is kept as a **contender**. Losers are switched off at runtime with
 `--race-skip`; the roster in the code stays complete.
 

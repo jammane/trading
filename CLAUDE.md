@@ -464,7 +464,7 @@ pytest tests across the files in `tests/`:
   targets give IC ≈ 0, and shuffling must kill a planted signal), and the block bootstrap tested
   against a series with a **known** dependence length — block=1 must recover the iid SE, and a
   block spanning the dependence must give an SE more than 2× larger.
-- `test_race_qualify.py` — the qualifier rule (`race_qualify.py`): the >40% boundary on both sides
+- `test_race_qualify.py` — the qualifier rule (`race_qualify.py`): the >50% boundary on both sides
   for v3+v4 and v4-only entries, v3's renamed rows read under their v4 names, infrastructure entries
   never skipped, the Bayesian allocator skipped as one switch, and a partial log refusing to decide; the contender tier (mean strictly above the qualifiers' mean) and
   the allocator staying as a contender.
@@ -911,12 +911,12 @@ sibling; the grad-vs-grdC noise-floor read survives on MT1, MT1S-shr and MT1S-st
 remaining entry has cleared noise either -- this removes the clearest losers, not the losers.
 
 **Qualifier races and `--race-skip` (v4 → v5).** A race doubles as the qualifier for the next one.
-Rule: an entry must beat flat (whole-pass top-4 vs flat) in **more than 40%** of its counted passes.
-Entries unchanged since v3 count v3 + v4 (5/10 in, 4/10 out); entries whose model changed in v4
+Rule: an entry must beat flat (whole-pass top-4 vs flat) in **more than 50%** of its counted passes.
+Entries unchanged since v3 count v3 + v4 (6/10 in, 5/10 out); entries whose model changed in v4
 (TANH32 grad/gdmn, the per-stock MT1S-stk trio) count v4 only (3/5 in, 2/5 out). `race_qualify.py
 V3_LOG V4_LOG` applies it and prints `RACE_SKIP=...`; it refuses (exit 2) if either log is missing
 a pass. A second tier, **CONTENDER**, keeps an entry that misses
-the 40% bar but whose mean gap over its counted passes is strictly above the plain average of the
+the 50% bar but whose mean gap over its counted passes is strictly above the plain average of the
 qualifiers' means (each qualifying `ALLOC bayes` line is one row; infrastructure rows count only if
 they qualified on their own) -- few but large wins, not ready to be abandoned. Contenders run in
 the next race exactly like qualifiers. `ALLOC bayes` stays if either of its lines qualifies or

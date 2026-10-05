@@ -1,6 +1,6 @@
 """race_qualify.py: the qualifier rule for the next MT1 race.
 
-> 40% of counted passes must beat flat. Unchanged entries count v3 + v4 (5/10 in, 4/10 out);
+> 50% of counted passes must beat flat. Unchanged entries count v3 + v4 (6/10 in, 5/10 out);
 entries changed in v4 count v4 only (3/5 in, 2/5 out). The boundary is the whole rule, so it is
 pinned on both sides. Also: v3's renamed rows are read under their v4 names, infrastructure
 entries are never skipped, the Bayesian allocator qualifies on either line, and a partial log
@@ -44,12 +44,12 @@ L = [-1, -1, -1, -1, -1]
 BAYES_OK = {"mean": W, "thompson": W}
 
 
-def test_unchanged_entry_boundary_is_strictly_above_40pct(tmp_path):
-    # 2/5 in v3 + 3/5 in v4 = 5/10 -> in;  2/5 + 2/5 = 4/10 -> out
-    v3 = _log(tmp_path / "v3", {"MT1C     evo ": [1, 1, -1, -1, -1],
+def test_unchanged_entry_boundary_is_strictly_above_50pct(tmp_path):
+    # 3/5 in v3 + 3/5 in v4 = 6/10 -> in;  2/5 + 3/5 = 5/10 (exactly half) -> out
+    v3 = _log(tmp_path / "v3", {"MT1C     evo ": [1, 1, 1, -1, -1],
                                 "MT1C     gdmn": [1, 1, -1, -1, -1]}, BAYES_OK)
     v4 = _log(tmp_path / "v4", {"MT1C     evo ": [1, 1, 1, -1, -1],
-                                "MT1C     gdmn": [1, 1, -1, -1, -1]}, BAYES_OK)
+                                "MT1C     gdmn": [1, 1, 1, -1, -1]}, BAYES_OK)
     rc, skip, _ = _run(v3, v4)
     assert rc == 0
     assert "MT1C evo" not in skip
@@ -70,10 +70,11 @@ def test_changed_entry_counts_v4_only(tmp_path):
 def test_v3_renamed_rows_count_under_v4_names(tmp_path):
     # v3 "MT1S-stk evo" IS v4 "MT1S-rep evo"; v4 "MT1S-stk evo" is a new per-stock entry.
     v3 = _log(tmp_path / "v3", {"MT1S-stk evo ": W}, BAYES_OK)
-    v4 = _log(tmp_path / "v4", {"MT1S-rep evo ": L, "MT1S-stk evo ": [1, 1, -1, -1, -1]}, BAYES_OK)
+    v4 = _log(tmp_path / "v4", {"MT1S-rep evo ": [1, -1, -1, -1, -1],
+                                "MT1S-stk evo ": [1, 1, -1, -1, -1]}, BAYES_OK)
     rc, skip, _ = _run(v3, v4)
     assert rc == 0
-    assert "MT1S-rep evo" not in skip     # 5/10 via its v3 history
+    assert "MT1S-rep evo" not in skip     # 6/10 via its v3 history
     assert "MT1S-stk evo" in skip         # 2/5, and v3's 5/5 belongs to MT1S-rep
 
 
@@ -116,7 +117,7 @@ def test_contender_tier_mean_strictly_above_the_qualifiers_mean(tmp_path):
                  BAYES_OK)
     rc, skip, out = _run(v3, v4)
     assert rc == 0
-    assert "TANH32 grad" not in skip      # contender: misses 40% but beats the bar
+    assert "TANH32 grad" not in skip      # contender: misses 50% but beats the bar
     assert "TANH32 gdmn" in skip          # equal to the bar is not above it
     assert "MT1S-stk grdC" in skip
     line = next(ln for ln in out.splitlines() if ln.startswith("TANH32 grad"))
@@ -124,7 +125,7 @@ def test_contender_tier_mean_strictly_above_the_qualifiers_mean(tmp_path):
 
 
 def test_bayes_can_stay_as_a_contender(tmp_path):
-    # neither bayes line reaches 40%, but thompson's mean beats the qualifiers' mean
+    # neither bayes line passes 50%, but thompson's mean beats the qualifiers' mean
     big = [9, 9, -1, -1, -1]                                              # 4/10, mean +3.00
     v3 = _log(tmp_path / "v3", {"MT1C     evo ": W}, {"mean": L, "thompson": big})
     v4 = _log(tmp_path / "v4", {"MT1C     evo ": W}, {"mean": L, "thompson": big})
