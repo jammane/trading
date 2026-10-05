@@ -462,6 +462,19 @@ pytest tests across the files in `tests/`:
   entrant rule, the 1.1-step weightings on a hand-worked day, a committee of copies reproducing
   its model, independent informative models voting better than their best member, pure noise not
   looking consistent, and the Bayesian tree being causal and finding the one member to trust.
+- Production safety: `test_allocation_limits.py` (an industry's capital is never over-committed,
+  single-stock cap honoured), `test_whole_shares.py` (the simulator floors to whole shares as
+  production does), `test_bad_bars.py` (non-finite OHLC bars never reach a calculation),
+  `test_trading_lock.py` (the lock the trainer pauses on), `test_production_cli.py` (crontab flags
+  are a contract), `test_cross_environment_universe.py` (shared `stock_data/` across universes).
+- Formats and models: `test_mt_log_layout.py` (the MT log record across the C++ writer and both
+  readers), `test_mt1net.py` (single-output MT1).
+- Studies, each against a process with a known answer: `test_pnl_conditional.py`,
+  `test_pnl_persistence.py`, `test_depth_sweep.py`, `test_dyn_tree.py`, `test_living_bn.py`.
+- C++ (`ctest`): `test_mt1_grad.cpp` (every race backward vs finite differences),
+  `test_sort_util.cpp` (`sort_index_prefix` orders exactly like `std::sort`), `test_fp_guards.cpp`
+  (finiteness guards survive `-ffast-math`), plus `test_mt1_pool.cpp`, `test_mt1_backprop.cpp`,
+  `test_pass_seeding.cpp` described above.
 - `test_zip_strict.py` — parallel-array guards for the `zip(..., strict=True)` conversion (ruff
   B905). Bare `zip` truncates silently, so a length mismatch yielded a plausible wrong number
   instead of an error; these assert `ValueError` on mismatch and pin the cross-module industry-list
@@ -779,28 +792,37 @@ was trained with, so the per-industry composite stays paired — energy's race m
 energy's champion pass (a missing file is not an error). Until v0.8.1.40 it copied only
 `mt1bp_<ind>.bin`, which nothing had written since the race replaced MT1Backprop as a standalone
 net, so `champion/` held StockNN alone. Two entries are not per-industry and so have no champion
-file: the `ALLOC bayes` allocator (no weights; it is a posterior over returns) and MT2. At a pass boundary a new champion
-seed is **a new model**: MT1 is re-initialised from `0xB901 ^ (pass+1)<<32 ^ ind` and grows with it
-rather than being carried over. The one exception is the first pass of a run seeded with
-`--load-dir`, where those elites *are* what this MT1 was raised against, so its paired weights load.
+file: the `ALLOC bayes` allocator (no weights; it is a posterior over returns) and MT2. At a pass boundary a
+**restart** entry (`grad`, `gdmn`, `grnk`) is re-initialised from `0xB901 ^ (pass+1)<<32 ^ entry<<16 ^ ind`
+(and the lr resets to `BP_LR_BASE`) and grows with the new champion seed; a **carry** entry (`evo`, `grdC`) keeps its weights. The first pass of
+a run seeded with `--load-dir` loads the paired weights, since those elites *are* what they were
+raised against.
 
-**The variant race.** Five variants train in the SAME daily loop, on the SAME 200 order sets, in
-the same order (`BP_VARIANTS` in `training_v4.cpp`): `per-ind 32/8` (what ships), `pooled 32/8`,
-`per-ind 64/16`, `per-ind 16/4`, and `CONTROL slot0`. Racing in-loop rather than logging the rows
-and fitting offline avoids a ~400 MB artefact and a reader to keep in sync, and removes the risk
-that an offline reconstruction quietly differs from what the trainer does — the variants cannot
-disagree about the data because they are handed the same bytes. Cost is negligible: a few thousand
-parameters each against StockNN's 200 forward passes over 928,825.
+**The race (`RACE` in `training_v4.cpp`).** Every entry trains in the SAME daily loop, on the SAME
+200 order sets, in the same order. Racing in-loop rather than logging the rows and fitting offline
+avoids a ~400 MB artefact and a reader to keep in sync -- the entries cannot disagree about the
+data because they are handed the same bytes. Cost is small beside StockNN's 200 forward passes over
+928,825 parameters. An entry is four choices:
 
-`pooled` is there because the **+0.0184 that motivated this work was a POOLED fit** —
-`mt1_backprop.py`'s `walk()` reshapes to `(T×N, F)` and fits one model across all 12 industries,
-while the trainer fits 12 per-industry nets with 855 rows each instead of 10,260 (0.17
-samples/param against MT1Net's 0.35). The race settles that on the same days.
+| axis | values |
+|---|---|
+| architecture | `MT1` (MT1Net, 74 trailing features, no order intent), `MT1C` (MT1CNet, `cfeat146` with order intent), `MT1S` (per-symbol nets summed: `-sum`, `-rep` seed replicate, `-shr` shared encoder), `MT1S-stk` (one net per stock, 144), `TANH32` (MT1Backprop 146→32→8→1) |
+| search | `evo` (200-slot evolutionary pool) or gradient (`grad`, `grdC`, `gdmn`, `grnk`) |
+| carry | `grdC` = gradient that **carries** its weights and Adam moments across pass boundaries; `grad` restarts each pass; evo pools always carry |
+| loss | MSE (`grad`/`grdC`), demeaned MSE (`gdmn`), ListNet ranking (`grnk`) |
 
-**`CONTROL slot0` is the row that matters most.** It hands every one of the 200 models slot 0's
-intent — exactly the defect fixed in v0.8.1.27 — so its rows are identical across the 200 and it
-*cannot* rank them. It must read 0.0000. If it does not, the measurement leaks and no other row
-means anything.
+The roster is 17 entries as of v0.8.1.38 (see **Pruning the losers**), plus the `ALLOC bayes`
+allocator, which is not a network. `MT1C grad` is the deployed entry (publishes `bp_pred`) and
+`MT1 evo` is the pool written to `mt_training_log.bin`; both are read by index and always run.
+The `MT1` rows are the **controls for rank**: with no order intent their 200 inputs are identical
+within an industry-day, so they cannot rank order sets and print `n/a` -- the role the old
+`CONTROL slot0` variant played. If an MT1 row ever reads a non-zero within-day rank, the
+measurement leaks and no other row means anything. They still allocate across industries, so
+their alloc lines are real (MT1 grdC is one of the strongest allocators).
+
+History: the race began (v0.8.1.27-29) as five MT1Backprop variants -- per-ind 32/8, pooled 32/8,
+64/16, 16/4 and `CONTROL slot0` -- in `BP_VARIANTS`. Per-industry beat pooled 4/5 passes and
+capacity did not matter, so those variants were retired for the architecture x search race above.
 
 **Targets deliberately do not vary across variants.** Within a day, total book P&L and trade delta
 differ by a constant, because the market move is common to all 200 — so they induce the SAME
@@ -829,7 +851,7 @@ days. MT1Net keeps the dead-unit rule (plain ReLU, and its predictions always ti
 read activations/predictions only, never outcomes. The race table
 prints `lr end mean/min`, cuts, floor hits and mean dead fraction per entry.
 
-**TANH32 entries.** The 13th race entry is `MT1Backprop` (`mt1_backprop.h`): 146->32->8->1, tanh,
+**TANH32 entries.** The TANH32 architecture is `MT1Backprop` (`mt1_backprop.h`): 146->32->8->1, tanh,
 Xavier init, its own Adam with coupled L2 -- the net that ranked +0.017..+0.027 within-day in the
 v0.8.1.27 run. Raced verbatim in v0.8.1.33-35 it did **not** reproduce that (+0.004, +0.001,
 +0.0006 over three passes), and its training collapsed it. **Since v0.8.1.36 every TANH32 loss
@@ -1047,7 +1069,8 @@ Version string is defined in `version.py` (`VERSION`) and mirrored as `TRAINER_V
 - `FEATURE` — increment for any new capability or significant improvement; resets `BUILD` to 0.
 - `BUILD` — increment for bug fixes and minor changes within a `FEATURE`.
 
-Current version: **0.8.1.1**
+Current version: see `version.py` (0.8.1.45 at the time of writing). The CI bot bumps
+`BUILD` on every push to `dev`, so don't hand-edit it for a build bump.
 
 To bump the version, edit `VERSION` in `version.py` and `TRAINER_VERSION` in `training_v4.cpp`, then rebuild the C++ binary.
 

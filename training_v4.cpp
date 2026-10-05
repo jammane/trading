@@ -614,7 +614,9 @@ static inline uint64_t splitmix64(uint64_t z) {
     return z ^ (z >> 31);
 }
 static inline uint64_t mix_seed(uint64_t base) { return splitmix64(base + g_run_seed); }
-// --dir-reps: how many times the direction pool replays each block. The gentle 8.3% cull only turns
+// --dir-reps: NO EFFECT since v0.8.0.0 -- the direction pool it tuned was deleted with the
+// heads/tails MT1. Still parsed so old launch lines do not fail; nothing reads g_dir_reps.
+// Original note: how many times the direction pool replays each block. The gentle 8.3% cull only turns
 // over ~10 of 200 slots a day, so reps are what restore evolutionary throughput. They also mean N
 // epochs over the same 25 days, which is an overfitting risk — hence a flag, so it can be swept and
 // judged on the out-of-sample instrument instead of assumed.
@@ -4223,8 +4225,9 @@ static void print_usage(const char* prog) {
     fprintf(stderr,
         "Usage: %s --account ACCT [--start-day N] [--stop-day N]\n"
         "          [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F]\n"
-        "          [--dir-sigma F] [--rng-sigma F] [--acc-sigma F] [--cfd-sigma F] [--mt2-sigma F]\n"
+        "          [--mt1-sigma F] [--mt2-sigma F]  (defaults: master-sigma, master-sigma/6)\n"
         "          [--workers N] [--master-only] [--no-save] [--no-nn-race]\n"
+        "          [--race-skip \"A,B,...\"]  switch race entries off (race_qualify.py RACE_SKIP)\n"
         "          [--seed N]   (default: clock, RE-SEEDED EVERY PASS; N derives passes from N)\n"
         "          [--trade-lock PATH | --no-trade-lock]  pause while production holds the lock\n"
         "          [--control-untrained]  NO-LEARNING CONTROL: re-randomise StockNN daily\n"

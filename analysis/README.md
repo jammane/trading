@@ -1,7 +1,8 @@
 # Side-test analysis scripts
 
 One-shot studies run against a finished pass (`mt1_dataset.bin`, `holdings_log.csv`,
-`bayes_online.csv`). Kept because each one encodes a control or a correction that was expensive to
+`bayes_online.csv`, the logged orders). Larger studies live in the repo root (see the README's
+**Studies** list). Kept because each one encodes a control or a correction that was expensive to
 find, and re-deriving them is how the same mistake gets made twice.
 
 | script | question | headline result |
@@ -13,6 +14,8 @@ find, and re-deriving them is how the same mistake gets made twice.
 | `qtrly_live.py` | quarterly scorecard of the ONLINE trees in a live pass | k=1 converges to exactly always-up |
 | `qtrly_offline.py` | same metric, offline, across the expanded interval set | best cell -0.36pp |
 | `qtrly_start.py` | does feeding the trees the first 400 days hurt | no: 0.03pp difference |
+| `order_level.py` | is the signal per symbol-order rather than per industry | 122,975 symbol-days; replicates across passes to 0.1pp |
+| `order_ev.py` | expected value per order PLACED, passive vs aggressive | passive 10-14x better per order, both sides, both passes |
 
 ## Controls these scripts carry, and why
 
@@ -30,3 +33,8 @@ decomposable measure says +2.8%.
 
 **Identical scoring days across variants.** `qtrly_start.py` scores both learn-from-d17 and
 learn-from-d400 on the same days, or the comparison measures the day set rather than the change.
+
+**Expected value per order PLACED, not per fill.** `order_ev.py` charges an unfilled limit the
+move it missed; comparing only filled orders is biased toward passive placement. For a SELL a
+HIGH limit is passive -- the opposite of the buy convention; labelling both by `frac > 0.5`
+inverted the sell side once.

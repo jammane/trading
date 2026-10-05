@@ -1,7 +1,7 @@
 # Phase 3 — Lag/Daily Drift Study (design)
 
-**Status:** design (pre-implementation). Target home: a new `--drift-study` mode in
-`training_v4.cpp`. **Not** production upkeep — this is an offline calibration tool whose
+**Status:** implemented as `--drift-study` in `training_v4.cpp` and compile-checked; **not yet
+runtime-validated** -- it runs only on mature models, in phase 3. **Not** production upkeep — this is an offline calibration tool whose
 *only* output is a number: the optimal **lag : dailies** ratio that the separate, memory-efficient
 production upkeep will then be configured with.
 
