@@ -338,7 +338,7 @@ ruff check .
 | `race_watch.py [LOG] [--all] [--trend]` | Per-pass race table (default: newest `/root/ht_race_v*`) |
 | `race_qualify.py V3_LOG V4_LOG` | Apply the qualifier rule; prints `RACE_SKIP=` |
 | `race_daily_check.py CSV ROWS BAYES` | Consistency gate on `race_daily.csv` |
-| `committee_race.py CSV [--sizes 4,5,6] [--pool ...]` | Committee voting race |
+| `committee_race.py CSV [--sizes 4,5,6] [--pool ...] [--watch]` | Committee voting race; `--watch` for the cross-pass watch list |
 | `plot_training.py [--download] [--pass N]` | SVG training charts from the droplet's logs |
 
 ---

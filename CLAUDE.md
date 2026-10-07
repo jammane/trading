@@ -472,9 +472,10 @@ pytest tests across the files in `tests/`:
   pick outside the entry's top 4, a top4 that does not match REALIZED, a missing entry, and bayes
   rows when the allocator was skipped.
 - `test_committee_race.py` -- the committee race on synthetic files with a known answer: the
-  entrant rule, the 1.1-step weightings on a hand-worked day, a committee of copies reproducing
-  its model, independent informative models voting better than their best member, pure noise not
-  looking consistent, and the Bayesian tree being causal and finding the one member to trust.
+  entrant rule and its one-pass form, the 1.1-step weightings on a hand-worked day, a committee
+  of copies reproducing its model, independent informative models voting better than their best
+  member, pure noise not looking consistent, the Bayesian tree being causal and finding the one
+  member to trust, and `--watch` crediting the informative member over noise.
 - Production safety: `test_allocation_limits.py` (an industry's capital is never over-committed,
   single-stock cap honoured), `test_whole_shares.py` (the simulator floors to whole shares as
   production does), `test_bad_bars.py` (non-finite OHLC bars never reach a calculation),
@@ -969,7 +970,19 @@ new days. A full v5-sized run takes ~15 s.
 
 ```bash
 python committee_race.py /root/ht_race_v5/race_daily.csv --out committee_race.csv
+python committee_race.py /root/ht_race_v5/race_daily.csv --watch
 ```
+
+`--watch` races each pass separately on that pass's own entrants (every entry that beat flat in
+the pass, plus the 6 best by gap -- the entrant rule read where wins are 0 or 1) and tracks four
+things across passes: how often each entry becomes an entrant; each member's effect, the mean gap
+of committees containing it minus those without at the same size, and its share of the pass's top
+5% of configurations against its base rate; each method's median gap, configurations beating flat
+and their best member, and passes in which it had the best median; and the committees (and
+committee + method pairs) that recur in a pass's top 5%, counted against the passes in which all
+their members were entrants. On v5 pass 1 the best single entry, MT1 evo, lifted the committees
+it sat on by only +0.14 bp/day and was under-represented at the top (0.88x), while TANH32 grad
+(+0.59) and MT1C evo (+0.45) led -- a member's own score and its value as a voter can differ.
 
 **Per-entry seeds.** Each evolutionary entry draws its own clock salt at every pass start and XORs
 it into both its pool init and its mutation seeds. Before this, entries of one architecture shared

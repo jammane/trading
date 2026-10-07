@@ -129,3 +129,28 @@ def test_bayes_tree_learns_which_member_to_trust(tmp_path):
     _, _, _, res = cr.run(path, sizes=(4,), pool=list(models))
     g = {r["method"]: r["gaps"].mean() for r in res}
     assert g["bayes_tree"] > g["votes"] + 5.0
+
+
+def test_pass_pool_is_winners_plus_the_best_six():
+    s = {e: (int(g > 0), g, np.array([g])) for e, g in
+         zip("ABCDEFGHI", [5, 4, 3, 2, 1, 0.5, 0.2, -1, -2], strict=True)}
+    assert cr.pass_pool(s) == list("ABCDEFG")             # seven winners, no losers needed
+    s = {e: (int(g > 0), g, np.array([g])) for e, g in
+         zip("ABCDEFG", [5, 4, -1, -2, -3, -4, -5], strict=True)}
+    assert cr.pass_pool(s) == list("ABCDEF")              # two winners, filled to six by gap
+
+
+def test_watch_credits_the_informative_member_and_counts_eligibility(tmp_path):
+    models = {"good": 40, "m1": 150, "m2": 150, "m3": 150, "m4": 150, "noise": None,
+              "noise2": None}
+    w = cr.watch(_write(tmp_path / "rd.csv", models, passes=3, days=150, seed=3))
+    assert w["ps"] == [1, 2, 3]
+    assert len(w["entrants"]["good"]) == 3
+    eff = {e: np.mean(list(v.values())) for e, v in w["effect"].items()}
+    assert eff["good"] > 0 and eff["good"] == max(eff.values())
+    for e in ("noise", "noise2"):
+        if e in eff:
+            assert eff[e] < 0, e
+    for c, p in w["top_c"].items():
+        assert len(p) <= w["eligible"](c)
+    assert sum(s["won"] for s in w["methods"].values()) == 3

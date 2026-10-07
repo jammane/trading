@@ -21,7 +21,9 @@ entry is in its commit message.
   `race_daily_check.py` verifies each row against the realised returns.
 - **`committee_race.py`.** Replays `race_daily.csv` to test whether committees of 4–6 entries,
   voting under seven methods (including an online Bayesian vote-pattern tree), beat their best
-  member consistently across passes.
+  member consistently across passes. `--watch` tracks across passes which entries keep becoming
+  entrants, which members lift the committees they sit on, which methods do best, and which
+  committees recur near the top.
 
 ### Changed
 - StockNN champions are crowned on slot 0's **recency-weighted mean daily book return** over the

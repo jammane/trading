@@ -31,8 +31,13 @@ Per configuration and pass: gap = mean daily (top4 return - flat) in bp. Reporte
   w_best  passes where gap > EVERY member's own gap (the committee beat its best member)
   w_mean  passes where gap > the mean of its members' gaps
 
+--watch races each pass separately on that pass's own entrants (every entry that beat flat,
+plus the 6 best) and tracks four things across passes: which entries keep becoming entrants,
+which members lift the committees they sit on, which methods do best, and which committees
+recur near the top.
+
 usage: committee_race.py race_daily.csv [--sizes 4,5,6] [--pool "A,B,..."] [--top 40]
-                         [--out committee_race.csv]
+                         [--out committee_race.csv] [--watch]
 """
 import argparse
 import csv
@@ -49,6 +54,7 @@ N_PICK = 4
 MIN_BY_WINS = 6
 N_BY_MEAN = 6
 TREE_KAPPA = 20.0
+TOP_FRAC = 0.05       # watch: a pass's top configurations
 METHODS = ("votes", "votes_pick", "votes_member", "votes_both", "borda", "zrecord", "bayes_tree")
 PICK_W = np.array([STEP ** 3, STEP ** 2, STEP, 1.0])
 
@@ -99,7 +105,7 @@ def standings(entries, passes):
 
 
 def entrant_pool(stand, min_wins=MIN_BY_WINS, n_mean=N_BY_MEAN):
-    """User rule: the most wins (at least min_wins entries, plus ties with the last one) united
+    """The entrant rule: the most wins (at least min_wins entries, plus ties with the last one) united
     with the n_mean best means. Returned strongest first (wins, then mean)."""
     by_w = sorted(stand, key=lambda e: (-stand[e][0], -stand[e][1]))
     cut = stand[by_w[min(min_wins, len(by_w)) - 1]][0]
@@ -216,17 +222,9 @@ def run_committee(members, rank_w, P, F):
     return out
 
 
-def run(path, sizes=(4, 5, 6), pool=None):
-    """-> (stand, pool, ps, results[list of dict])"""
-    entries, passes = load(path)
-    stand = standings(entries, passes)
-    if pool:
-        missing = set(pool) - set(entries)
-        if missing:
-            sys.exit(f"not in {path}: {', '.join(sorted(missing))}")
-        pool = sorted(pool, key=lambda e: (-stand[e][0], -stand[e][1]))
-    else:
-        pool = entrant_pool(stand)
+def configs(passes, stand, pool, sizes):
+    """Every committee of `sizes` from `pool` (strongest first) under every method, scored on
+    each pass in `passes`. -> list of dict(committee, k, method, gaps, w_flat, w_best, w_mean)"""
     ps = sorted(passes)
     feats = {}
     for p in ps:
@@ -246,7 +244,122 @@ def run(path, sizes=(4, 5, 6), pool=None):
                                     w_flat=int((g > 0).sum()),
                                     w_best=int((g > mem.max(0)).sum()),
                                     w_mean=int((g > mem.mean(0)).sum())))
-    return stand, pool, ps, results
+    return results
+
+
+def run(path, sizes=(4, 5, 6), pool=None):
+    """-> (stand, pool, ps, results[list of dict])"""
+    entries, passes = load(path)
+    stand = standings(entries, passes)
+    if pool:
+        missing = set(pool) - set(entries)
+        if missing:
+            sys.exit(f"not in {path}: {', '.join(sorted(missing))}")
+        pool = sorted(pool, key=lambda e: (-stand[e][0], -stand[e][1]))
+    else:
+        pool = entrant_pool(stand)
+    return stand, pool, sorted(passes), configs(passes, stand, pool, sizes)
+
+
+def pass_pool(stand, n_mean=N_BY_MEAN):
+    """The entrant rule read on ONE pass, where wins are 0 or 1: every entry that beat flat,
+    united with the n_mean best gaps. Strongest first."""
+    by_g = sorted(stand, key=lambda e: -stand[e][1])
+    pool = {e for e in by_g if stand[e][1] > 0} | set(by_g[:n_mean])
+    return [e for e in by_g if e in pool]
+
+
+def watch(path, sizes=(4, 5, 6), top_frac=TOP_FRAC):
+    """The cross-pass watch list, each pass raced on its own entrants (pass_pool):
+      entrants   how often each entry becomes an entrant
+      members    member effect: mean gap of committees containing it minus those without,
+                 within each size and averaged over sizes; and its share of the pass's top
+                 configurations against its base rate
+      methods    per method: median gap, configurations beating flat / their best member,
+                 passes in which it had the best median
+      recurring  committees (and committee+method) in the top `top_frac` of their pass, counted
+                 over the passes in which all their members were entrants
+    -> dict of the four tables plus `ps`."""
+    entries, passes = load(path)
+    ps = sorted(passes)
+    ent = defaultdict(list)                        # entry -> passes it was an entrant
+    eff = defaultdict(dict)                        # entry -> {pass: member effect bp}
+    topshare = defaultdict(dict)                   # entry -> {pass: share of top / base rate}
+    meth = {m: dict(med=[], flat=0, best=0, n=0, won=0) for m in METHODS}
+    top_cm = defaultdict(list)                     # (committee, method) -> [pass, rank]
+    top_c = defaultdict(set)                       # committee -> passes in the top
+    elig = {}                                      # pool per pass, for eligibility
+    for p in ps:
+        one = {p: passes[p]}
+        stand = standings(entries, one)
+        pool = pass_pool(stand)
+        elig[p] = set(pool)
+        for e in pool:
+            ent[e].append(p)
+        res = configs(one, stand, pool, sizes)
+        g = np.array([r["gaps"][0] for r in res])
+        n_top = max(1, int(round(top_frac * len(res))))
+        top = np.argsort(-g, kind="stable")[:n_top]
+        for e in pool:
+            has = np.array([e in r["committee"].split(" + ") for r in res])
+            ks = np.array([r["k"] for r in res])
+            d = [g[(ks == k) & has].mean() - g[(ks == k) & ~has].mean()
+                 for k in sizes if ((ks == k) & has).any() and ((ks == k) & ~has).any()]
+            if d:
+                eff[e][p] = float(np.mean(d))
+            topshare[e][p] = has[top].mean() / has.mean()
+        meds = {}
+        for m in METHODS:
+            sel = [r for r in res if r["method"] == m]
+            meds[m] = float(np.median([r["gaps"][0] for r in sel]))
+            meth[m]["med"].append(meds[m])
+            meth[m]["flat"] += sum(r["w_flat"] for r in sel)
+            meth[m]["best"] += sum(r["w_best"] for r in sel)
+            meth[m]["n"] += len(sel)
+        meth[max(meds, key=meds.get)]["won"] += 1
+        for rank, i in enumerate(top, 1):
+            r = res[i]
+            top_cm[(r["committee"], r["method"])].append((p, rank, r["gaps"][0]))
+            top_c[r["committee"]].add(p)
+
+    def eligible(committee):
+        mem = set(committee.split(" + "))
+        return sum(mem <= elig[p] for p in ps)
+
+    return dict(ps=ps, entrants=ent, effect=eff, topshare=topshare, methods=meth,
+                top_cm=top_cm, top_c=top_c, eligible=eligible)
+
+
+def print_watch(w, show=15):
+    n = len(w["ps"])
+    print(f"WATCH: each pass raced on its own entrants, {n} pass(es)\n")
+    print("1. entrants: passes in which each entry was an entrant")
+    for e, p in sorted(w["entrants"].items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        print(f"   {e:24}{len(p):>3}/{n}")
+    print("\n2. members: effect on committee gap (with - without, bp/day, same size), "
+          "and top-configuration share vs base rate")
+    print(f"   {'entry':24}{'mean eff':>9}{'eff>0':>7}{'top share':>11}")
+    eff, ts = w["effect"], w["topshare"]
+    for e in sorted(eff, key=lambda e: -np.mean(list(eff[e].values()))):
+        v = list(eff[e].values())
+        print(f"   {e:24}{np.mean(v):+9.2f}{sum(x > 0 for x in v):>4}/{len(v):<2}"
+              f"{np.mean(list(ts[e].values())):>10.2f}x")
+    print("\n3. methods: median gap per pass (mean over passes), configs beating flat / best "
+          "member, passes with the best median")
+    for m, s in sorted(w["methods"].items(), key=lambda kv: -np.mean(kv[1]["med"])):
+        print(f"   {m:12}{np.mean(s['med']):+8.2f}   flat {s['flat']:>5}/{s['n']:<5}"
+              f"  best {s['best']:>4}/{s['n']:<5}  top {s['won']}/{n}")
+    print(f"\n4. recurring: committees in a pass's top {TOP_FRAC:.0%} (passes in top / passes "
+          "eligible)")
+    rows = sorted(w["top_c"].items(), key=lambda kv: (-len(kv[1]), -len(kv[1]) / w["eligible"](kv[0])))
+    for c, p in rows[:show]:
+        print(f"   {len(p):>2}/{w['eligible'](c):<2} {c}")
+    print("   committee + method:")
+    rows = sorted(w["top_cm"].items(),
+                  key=lambda kv: (-len(kv[1]), np.mean([x[1] for x in kv[1]])))
+    for (c, m), hits in rows[:show]:
+        print(f"   {len(hits):>2}/{w['eligible'](c):<2} best rank {min(x[1] for x in hits):>4}"
+              f"  {np.mean([x[2] for x in hits]):+7.2f}  {m:12} {c}")
 
 
 def main():
@@ -256,8 +369,13 @@ def main():
     ap.add_argument("--pool", default="", help="override the entrant list (comma separated)")
     ap.add_argument("--top", type=int, default=40)
     ap.add_argument("--out", default="")
+    ap.add_argument("--watch", action="store_true",
+                    help="race each pass on its own entrants and print the cross-pass watch list")
     a = ap.parse_args()
     sizes = tuple(int(x) for x in a.sizes.split(","))
+    if a.watch:
+        print_watch(watch(a.csv, sizes))
+        return
     pool = [x.strip() for x in a.pool.split(",") if x.strip()] or None
     stand, pool, ps, res = run(a.csv, sizes, pool)
     n = len(ps)
