@@ -319,8 +319,10 @@ def watch(path, sizes=(4, 5, 6), top_frac=TOP_FRAC):
         meth[max(meds, key=meds.get)]["won"] += 1
         for rank, i in enumerate(top, 1):
             r = res[i]
-            top_cm[(r["committee"], r["method"])].append((p, rank, r["gaps"][0]))
-            top_c[r["committee"]].add(p)
+            # members are listed strongest-first, and strength differs by pass: key on the set
+            c = " + ".join(sorted(r["committee"].split(" + ")))
+            top_cm[(c, r["method"])].append((p, rank, r["gaps"][0]))
+            top_c[c].add(p)
 
     def eligible(committee):
         mem = set(committee.split(" + "))

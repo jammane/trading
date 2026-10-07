@@ -153,4 +153,5 @@ def test_watch_credits_the_informative_member_and_counts_eligibility(tmp_path):
             assert eff[e] < 0, e
     for c, p in w["top_c"].items():
         assert len(p) <= w["eligible"](c)
+        assert c == " + ".join(sorted(c.split(" + ")))      # one key per set, across passes
     assert sum(s["won"] for s in w["methods"].values()) == 3
