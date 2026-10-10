@@ -977,20 +977,22 @@ python committee_race.py /root/ht_race_v5/race_daily.csv --watch
 python committee_race.py /root/ht_race_v5/race_daily.csv --champions /root/ht_race_v5/pass_reference.csv
 ```
 
-`--champions` races the same configurations once more on the **champion composite**: each
-industry's column (its realised return and every entry's prediction for it) taken from that
-industry's champion pass, the mix `convert_weights.py --industry-dir champion/` deploys. Entry
-gaps are recomputed from the composite's own top 4, since no pass ever made those picks. It
-reports the rank correlation between the per-pass mean and the composite gap, and where the
-per-pass leaders land. It is one 252-day sample, ±5.3 bp/day.
+`--champions` races the committees on the **champion composite**, and this is the race that
+picks the committee to trade. Each industry's column (its realised return and every entry's
+prediction for it) is taken from that industry's champion pass, the mix `convert_weights.py
+--industry-dir champion/` deploys. Entry gaps are recomputed from the composite's own top 4,
+since no pass ever made those picks. Entrants are chosen on the composite (`pass_pool`), and the
+per-pass mean and wins are printed beside each configuration for reference. The composite is one
+252-day sample, ±5.3 bp/day, raced over thousands of configurations, so its maximum is inflated
+by selection. A full run takes ~3 minutes.
 
-On v5 after pass 6 the agreement was weak: rank correlation +0.22, and the per-pass top 5% had a
-median composite rank of 363 of 686. The per-pass leader (`votes_both`, MT1 evo + MT1C evo +
-MT1S-sum evo + bayes mean, +7.50) still beat flat on the composite, at +3.21. Calibrating each
-industry's predictions against their own trailing mean and sd, to remove the scale difference
-between passes, was tested and rejected: it cut MT1 evo's per-pass mean from +7.28 to +3.43. The
-level of an entry's prediction across industries carries the signal, so the raw prediction is
-the one to vote on.
+The composite was adopted because the per-pass ranking did not carry over to it. On v5 after
+pass 6 the rank correlation between the two was +0.23, and the per-pass leader (`votes_both`, MT1
+evo + MT1C evo + MT1S-sum evo + bayes mean, +7.50 per pass) scored +3.21 on the composite.
+Calibrating each industry's predictions against their own trailing mean and sd, to remove the
+scale difference between passes, was tested and rejected: it cut MT1 evo's per-pass mean from
++7.28 to +3.43. The level of an entry's prediction across industries carries the signal, so the
+raw prediction is the one to vote on.
 
 `--watch` races each pass separately on that pass's own entrants (every entry that beat flat in
 the pass, plus the 6 best by gap -- the entrant rule read where wins are 0 or 1) and tracks four
