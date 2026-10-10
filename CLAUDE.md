@@ -475,8 +475,9 @@ pytest tests across the files in `tests/`:
   entrant rule and its one-pass form, the 1.1-step weightings on a hand-worked day, a committee
   of copies reproducing its model, independent informative models voting better than their best
   member, pure noise not looking consistent, the Bayesian tree being causal and finding the one
-  member to trust, `--watch` crediting the informative member over noise, and the champion composite taking each
-  industry from its champion pass.
+  member to trust, `--watch` crediting the informative member over noise, the champion composite taking each
+  industry from its champion pass, and the loser race flagging the worst 4 and crediting a model
+  that knows only the losers.
 - Production safety: `test_allocation_limits.py` (an industry's capital is never over-committed,
   single-stock cap honoured), `test_whole_shares.py` (the simulator floors to whole shares as
   production does), `test_bad_bars.py` (non-finite OHLC bars never reach a calculation),
@@ -993,6 +994,16 @@ Calibrating each industry's predictions against their own trailing mean and sd, 
 scale difference between passes, was tested and rejected: it cut MT1 evo's per-pass mean from
 +7.28 to +3.43. The level of an entry's prediction across industries carries the signal, so the
 raw prediction is the one to vote on.
+
+`--losers` runs any mode as the **loser race**: predictions and returns are negated, so each
+method's "top 4" are the 4 industries the committee expects to do worst, and the gap is flat minus
+their mean return. Leaving those 4 out of an equal book adds half that gap on a 12-industry day.
+The `--champions` report adds the share of flagged industry-days that actually lost money against
+the base rate. On v5 after pass 6 (composite, 7 entrants) the base rate was 43.3% and the best
+committees flagged losers at 44-46%: their +12-14 bp/day comes from flagging industries that fall
+further, not from flagging more down days. The two ends of the ranking are carried by different
+entries -- MT1 evo and MT1C evo, strong at picking the top, score -2.25 and -3.83 at flagging the
+bottom, while TANH32 grad, MT1 grdC and MT1S-stk evo lead both.
 
 `--watch` races each pass separately on that pass's own entrants (every entry that beat flat in
 the pass, plus the 6 best by gap -- the entrant rule read where wins are 0 or 1) and tracks four

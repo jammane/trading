@@ -26,6 +26,9 @@ entry is in its commit message.
   committees recur near the top. `--champions pass_reference.csv` races the committees on the
   champion composite, each industry taken from its champion pass, which is the mix production
   deploys and the race that picks the committee to trade.
+  `--losers` runs the same races on the other end of the ranking: committees flag the 4
+  industries expected to do worst, scored on how far below flat they fall and how often they
+  lost money.
 
 ### Changed
 - StockNN champions are crowned on slot 0's **recency-weighted mean daily book return** over the
