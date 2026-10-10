@@ -130,6 +130,65 @@ def tanh32_forward(W, in146):
     return float(_dense(W, _T32[2], h)[0])
 
 
+IND_STARTING_CASH = 25000.0
+
+
+def whole_shares(q):
+    """training_v4.cpp whole_shares: what an order can actually execute."""
+    w = np.floor(np.float32(q) + np.float32(1e-4))
+    return float(w) if w > 0 else 0.0
+
+
+def build_cfeat146(o, h, lo, c, valid, hold, cash, intent, book_base=IND_STARTING_CASH):
+    """MT1C's 146 inputs for one industry at today's close (build_mt1c_input_for).
+
+    o, h, l, c, valid: today's bars for the 12 symbols. hold: shares held (the book BEFORE
+    today's orders); cash: the industry's cash. intent: [12, 4] StockNN output for the deployed
+    model, columns buy_qty, buy_price_frac, sell_all_price_frac, sell_qty.
+
+    Every feature is scale-free except CN_BOOK, which the trainer reads as book / $25,000 -- the
+    simulated industry's starting cash. `book_base` is the paper industry's own starting capital,
+    so the feature keeps its meaning (the book's growth since the start) at another account size.
+    """
+    from models import stock_close_pos, stock_close_vs_wap
+
+    def fin(v, fb=0.0):
+        return float(v) if np.isfinite(v) else fb
+
+    def clamp(v, lo, hi):
+        v = fin(v)
+        return lo if v < lo else hi if v > hi else v
+
+    out = np.zeros(C_IN, np.float32)
+    book = fin(cash) + sum(fin(hold[j]) * c[j] for j in range(N_SYMS) if valid[j])
+    closes = [c[j] for j in range(N_SYMS) if valid[j] and c[j] > 1e-6]
+    mean_close = float(np.mean(closes)) if closes else 1.0
+    bk = book if book > 1.0 else 1.0
+    for j in range(N_SYMS):
+        f = j * PER_SYM
+        ok = bool(valid[j]) and h[j] > lo[j] and c[j] > 1e-6
+        bq, bf, sf, sq = (intent[j][k] for k in range(4))
+        if ok:
+            A = (2 * o[j] + 3 * c[j] + h[j] + lo[j]) / 7
+            out[f:f + 7] = (o[j] / c[j], h[j] / c[j], lo[j] / c[j], c[j] / mean_close,
+                            stock_close_pos(o[j], h[j], lo[j], c[j]),
+                            stock_close_vs_wap(o[j], h[j], lo[j], c[j]),
+                            (h[j] - lo[j]) / A if A > 1e-6 else 0.0)
+            out[f + 7] = clamp(fin(hold[j]) * c[j] / bk, 0.0, 1.0)
+            afford = whole_shares(fin(cash) / c[j])
+            out[f + 8] = clamp(whole_shares(min(fin(bq), afford)) / afford, 0.0, 1.0) \
+                if afford > 1e-9 else 0.0
+        else:
+            out[f:f + 4] = 1.0
+        pos = whole_shares(fin(hold[j]))
+        out[f + 11] = clamp(whole_shares(min(fin(sq), pos)) / pos, 0.0, 1.0) if pos > 1e-9 else 0.0
+        out[f + 9] = clamp(fin(bf, 0.5), 0.0, 1.0)
+        out[f + 10] = clamp(fin(sf, 0.5), 0.0, 1.0)
+    out[CN_CASH] = clamp(fin(cash) / bk, 0.0, 1.0)
+    out[CN_BOOK] = fin(book) / book_base
+    return out
+
+
 def mt1p_slices(in146, close, valid, cash, hold, bqty, bfrac, sfrac, sqty, raw):
     """[12, 18] MT1S-stk inputs for one order set (build_mt1p_slices in training_v4.cpp): the
     MT1S slice, then that stock's four StockNN outputs. `raw` keeps share counts as StockNN

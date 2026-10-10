@@ -162,3 +162,47 @@ def test_champion_files_load_when_present():
                 n += 1
                 break
     assert n == 120
+
+
+def _bars():
+    o = np.full(12, 50.0)
+    h = np.full(12, 52.0)
+    l_ = np.full(12, 48.0)
+    c = np.full(12, 51.0)
+    c[1] = 102.0
+    h[1], l_[1], o[1] = 104.0, 96.0, 100.0
+    valid = np.ones(12, bool)
+    valid[2] = False
+    return o, h, l_, c, valid
+
+
+def test_cfeat146_hand_worked_symbol_and_industry_fields():
+    o, h, l_, c, valid = _bars()
+    hold = np.zeros(12)
+    hold[0] = 100.0                                  # $5,100 at 51
+    intent = np.zeros((12, 4))
+    intent[0] = (30.7, 0.25, 0.9, 40.6)              # 30 buyable of 30.7; sells 40 of 100
+    intent[1] = (5.0, 1.7, -0.2, 0.0)                # fractions clamp into [0, 1]
+    x = rm.build_cfeat146(o, h, l_, c, valid, hold, 4900.0, intent)
+    book = 4900.0 + 5100.0
+    mean_close = (51.0 * 10 + 102.0) / 11            # valid closes only
+    s0 = x[:12]
+    assert np.allclose(s0[:4], [50 / 51, 52 / 51, 48 / 51, 51 / mean_close], rtol=1e-6)
+    assert np.isclose(s0[6], 4.0 / ((100 + 153 + 52 + 48) / 7), rtol=1e-6)     # (H-L)/A
+    assert np.isclose(s0[7], 5100.0 / book)                                   # position weight
+    assert np.isclose(s0[8], 30.0 / 96.0)            # floor(30.7) of floor(4900/51)=96 affordable
+    assert np.allclose(s0[9:12], [0.25, 0.9, 0.40])
+    assert np.allclose(x[12 + 9:12 + 11], [1.0, 0.0])
+    assert np.allclose(x[24:28], [1, 1, 1, 1]) and not x[28:36].any()          # no valid bar
+    assert np.isclose(x[144], 4900.0 / book)
+    assert np.isclose(x[145], book / 25000.0)
+    assert np.isclose(rm.build_cfeat146(o, h, l_, c, valid, hold, 4900.0, intent,
+                                        book_base=10000.0)[145], 1.0)
+
+
+def test_cfeat146_non_finite_intent_reads_as_no_opinion():
+    o, h, l_, c, valid = _bars()
+    intent = np.full((12, 4), np.nan)
+    x = rm.build_cfeat146(o, h, l_, c, valid, np.zeros(12), 1000.0, intent)
+    assert np.isfinite(x).all()
+    assert np.allclose(x[9:11], 0.5) and x[8] == 0 and x[11] == 0
