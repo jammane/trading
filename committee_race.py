@@ -7,7 +7,7 @@ separately trained version of the same models, so the read is CONSISTENCY across
 
 Entrants: the entries with the most passes beating flat -- at least 6,
 plus any tied with the 6th -- together with the 6 best by mean gap (overlap expected). Committees
-are every combination of 4, 5 and 6 entrants.
+are every combination of 3, 4, 5 and 6 entrants.
 
 Methods. `pick` weights are per position in a member's own top 4 (#1..#4); `member` weights
 order the committee by entrant standing (wins, then mean), each member 1.1x the one below it.
@@ -36,7 +36,7 @@ plus the 6 best) and tracks four things across passes: which entries keep becomi
 which members lift the committees they sit on, which methods do best, and which committees
 recur near the top.
 
-usage: committee_race.py race_daily.csv [--sizes 4,5,6] [--pool "A,B,..."] [--top 40]
+usage: committee_race.py race_daily.csv [--sizes 3,4,5,6] [--pool "A,B,..."] [--top 40]
                          [--out committee_race.csv] [--watch]
 """
 import argparse
@@ -247,7 +247,7 @@ def configs(passes, stand, pool, sizes):
     return results
 
 
-def run(path, sizes=(4, 5, 6), pool=None):
+def run(path, sizes=(3, 4, 5, 6), pool=None):
     """-> (stand, pool, ps, results[list of dict])"""
     entries, passes = load(path)
     stand = standings(entries, passes)
@@ -269,7 +269,7 @@ def pass_pool(stand, n_mean=N_BY_MEAN):
     return [e for e in by_g if e in pool]
 
 
-def watch(path, sizes=(4, 5, 6), top_frac=TOP_FRAC):
+def watch(path, sizes=(3, 4, 5, 6), top_frac=TOP_FRAC):
     """The cross-pass watch list, each pass raced on its own entrants (pass_pool):
       entrants   how often each entry becomes an entrant
       members    member effect: mean gap of committees containing it minus those without,
@@ -367,7 +367,7 @@ def print_watch(w, show=15):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("csv")
-    ap.add_argument("--sizes", default="4,5,6")
+    ap.add_argument("--sizes", default="3,4,5,6")
     ap.add_argument("--pool", default="", help="override the entrant list (comma separated)")
     ap.add_argument("--top", type=int, default=40)
     ap.add_argument("--out", default="")

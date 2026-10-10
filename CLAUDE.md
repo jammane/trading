@@ -957,7 +957,9 @@ chain7 gates v5 on it.
 **`committee_race.py` -- the post-race race of voting committees.** Reads `race_daily.csv` and
 asks whether a small committee of entries, voting, picks the 4 industries better than any one of
 them. Entrants: the entries with the most passes beating flat (at least 6, plus ties with the 6th)
-united with the 6 best by mean gap; committees are every combination of 4, 5 and 6 entrants.
+united with the 6 best by mean gap; committees are every combination of 3, 4, 5 and 6 entrants.
+Size 3 was added after v5 pass 5, where the three evo entries voting alone scored +5.96 bp/day
+against +5.30 for the best four-member committee.
 Methods: `votes` (each member's top 4, one vote each), `votes_pick` (top-4 positions weighted
 1.1^3..1), `votes_member` (members weighted 1.1 per step by standing), `votes_both`, `borda` (mean
 rank over all 12), `zrecord` (mean z-score weighted by each member's causal recency-weighted gap),

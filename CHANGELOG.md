@@ -19,7 +19,7 @@ entry is in its commit message.
 - **`race_daily.csv`.** For the last 252 days of every pass: each entry's 12 predictions, the 4
   industries it funded, its result, and every industry's realised return.
   `race_daily_check.py` verifies each row against the realised returns.
-- **`committee_race.py`.** Replays `race_daily.csv` to test whether committees of 4–6 entries,
+- **`committee_race.py`.** Replays `race_daily.csv` to test whether committees of 3–6 entries,
   voting under seven methods (including an online Bayesian vote-pattern tree), beat their best
   member consistently across passes. `--watch` tracks across passes which entries keep becoming
   entrants, which members lift the committees they sit on, which methods do best, and which
