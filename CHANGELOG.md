@@ -23,7 +23,9 @@ entry is in its commit message.
   voting under seven methods (including an online Bayesian vote-pattern tree), beat their best
   member consistently across passes. `--watch` tracks across passes which entries keep becoming
   entrants, which members lift the committees they sit on, which methods do best, and which
-  committees recur near the top.
+  committees recur near the top. `--champions pass_reference.csv` scores every committee again
+  on the champion composite, each industry taken from its champion pass, which is the mix
+  production deploys.
 
 ### Changed
 - StockNN champions are crowned on slot 0's **recency-weighted mean daily book return** over the

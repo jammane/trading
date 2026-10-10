@@ -155,3 +155,23 @@ def test_watch_credits_the_informative_member_and_counts_eligibility(tmp_path):
         assert len(p) <= w["eligible"](c)
         assert c == " + ".join(sorted(c.split(" + ")))      # one key per set, across passes
     assert sum(s["won"] for s in w["methods"].values()) == 3
+
+
+def test_champion_composite_takes_each_industry_from_its_champion_pass(tmp_path):
+    path = _write(tmp_path / "rd.csv", {"good": 30.0, "noise": None}, passes=3, days=40)
+    ref = tmp_path / "pass_reference.csv"
+    champ = {i: (k % 3) + 1 for k, i in enumerate(INDS)}
+    ref.write_text("# pass_reference v2\npass,industry,new_champ_pass\n"
+                   + "".join(f"2,{i},1\n" for i in INDS)                 # superseded pass
+                   + "".join(f"3,{i},{p}\n" for i, p in champ.items()))
+    assert cr.read_champions(str(ref)) == champ
+    entries, passes = cr.load(path)
+    C = cr.champion_composite(entries, passes, champ)
+    for j, i in enumerate(INDS):
+        assert np.array_equal(C["real"][:, j], passes[champ[i]]["real"][:, j])
+        assert np.array_equal(C["pred"]["good"][:, j], passes[champ[i]]["pred"]["good"][:, j])
+    # the gap is recomputed from the composite's own top 4, not copied from any pass
+    top = np.argsort(-C["pred"]["good"], axis=1, kind="stable")[:, :4]
+    want = np.take_along_axis(C["real"], top, 1).mean(1) - C["real"].mean(1)
+    assert np.allclose(C["gap"]["good"], want)
+    assert C["gap"]["good"].mean() > C["gap"]["noise"].mean()

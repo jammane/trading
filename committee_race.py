@@ -36,8 +36,13 @@ plus the 6 best) and tracks four things across passes: which entries keep becomi
 which members lift the committees they sit on, which methods do best, and which committees
 recur near the top.
 
+--champions pass_reference.csv races the committees once more on the CHAMPION COMPOSITE: each
+industry's column (its realized return and every entry's prediction for it) taken from that
+industry's champion pass, the mix production deploys. It asks whether the per-pass ranking holds
+on the models that will actually trade.
+
 usage: committee_race.py race_daily.csv [--sizes 3,4,5,6] [--pool "A,B,..."] [--top 40]
-                         [--out committee_race.csv] [--watch]
+                         [--out committee_race.csv] [--watch] [--champions pass_reference.csv]
 """
 import argparse
 import csv
@@ -87,11 +92,48 @@ def load(path):
         real = np.array([vec(by[(p, d)]["REALIZED"]) for d in days])
         ok = ~np.isnan(real)
         passes[p] = dict(
-            real=np.nan_to_num(real), ok=ok,
+            days=np.array(days), inds=inds, real=np.nan_to_num(real), ok=ok,
             flat=np.array([real[t][ok[t]].mean() for t in range(len(days))]),
             pred={e: np.array([vec(by[(p, d)][e]) for d in days]) for e in entries},
             gap={e: np.array([float(by[(p, d)][e]["gap_bp"]) for d in days]) for e in entries})
     return entries, passes
+
+
+def read_champions(path):
+    """pass_reference.csv -> {industry: champion pass} as of its last judged pass."""
+    with open(path) as f:
+        rows = [r for r in csv.DictReader(line for line in f if not line.startswith("#"))]
+    last = max(int(r["pass"]) for r in rows)
+    return {r["industry"]: int(r["new_champ_pass"]) for r in rows if int(r["pass"]) == last}
+
+
+def champion_composite(entries, passes, champ):
+    """One synthetic pass in which each industry's column -- its realized return and every
+    entry's prediction for it -- comes from that industry's champion pass: the mix that
+    production deploys. Kept to the days every champion pass logged. Entry gaps are recomputed
+    from the composite predictions (each entry's top 4 of the 12), since no trainer pass ever
+    made those picks."""
+    inds = passes[min(passes)]["inds"]
+    src = [champ[i] for i in inds]
+    missing = sorted(set(src) - set(passes))
+    if missing:
+        sys.exit(f"champion passes not in the log: {missing}")
+    days = sorted(set.intersection(*(set(passes[p]["days"].tolist()) for p in set(src))))
+    at = {p: {d: t for t, d in enumerate(passes[p]["days"].tolist())} for p in set(src)}
+
+    def col(key, j, e=None):
+        p = src[j]
+        a = passes[p][key] if e is None else passes[p][key][e]
+        return a[[at[p][d] for d in days], j]
+
+    real = np.stack([col("real", j) for j in range(len(inds))], 1)
+    ok = np.stack([col("ok", j) for j in range(len(inds))], 1)
+    flat = np.array([real[t][ok[t]].mean() for t in range(len(days))])
+    pred = {e: np.stack([col("pred", j, e) for j in range(len(inds))], 1) for e in entries}
+    zero = np.zeros(real.shape)
+    gap = {e: (fund(np.nan_to_num(pred[e], nan=-np.inf), ok, zero, zero) * real).sum(1) / N_PICK
+           - flat for e in entries}
+    return dict(days=np.array(days), inds=inds, real=real, ok=ok, flat=flat, pred=pred, gap=gap)
 
 
 def standings(entries, passes):
@@ -332,6 +374,62 @@ def watch(path, sizes=(3, 4, 5, 6), top_frac=TOP_FRAC):
                 top_cm=top_cm, top_c=top_c, eligible=eligible)
 
 
+def champion_check(path, champions, sizes=(3, 4, 5, 6), pool=None):
+    """Race the committees once more on the champion composite and set the result beside the
+    per-pass race. -> dict(champ, pool, stand, cstand, res, cres, ps); res and cres are the same
+    configurations in the same order."""
+    entries, passes = load(path)
+    champ = read_champions(champions)
+    stand = standings(entries, passes)
+    pool = sorted(pool, key=lambda e: (-stand[e][0], -stand[e][1])) if pool else entrant_pool(stand)
+    C = {0: champion_composite(entries, passes, champ)}
+    cstand = standings(entries, C)
+    return dict(champ=champ, pool=pool, stand=stand, cstand=cstand, ps=sorted(passes),
+                ndays=len(C[0]["days"]),
+                res=configs(passes, stand, pool, sizes), cres=configs(C, cstand, pool, sizes))
+
+
+def print_champion_check(c, top=15):
+    n = len(c["ps"])
+    print("CHAMPION COMPOSITE: each industry from its champion pass, "
+          f"{c['ndays']} days, {n} passes in the log")
+    print("   " + "  ".join(f"{i}=p{p}" for i, p in c["champ"].items()))
+    st, cs = c["stand"], c["cstand"]
+    print(f"\nsingles, gap vs flat bp/day   {'per-pass mean':>14}{'composite':>11}")
+    for e in sorted(st, key=lambda e: -cs[e][1]):
+        print(f"   {('* ' if e in c['pool'] else '  ') + e:26}{st[e][1]:+14.2f}{cs[e][1]:+11.2f}")
+    res, cres = c["res"], c["cres"]
+    pm = np.array([r["gaps"].mean() for r in res])
+    cg = np.array([r["gaps"][0] for r in cres])
+    crank = np.empty(len(cg), int)
+    crank[np.argsort(-cg, kind="stable")] = np.arange(1, len(cg) + 1)
+
+    def rk(x):
+        r = np.empty(len(x))
+        r[np.argsort(x, kind="stable")] = np.arange(len(x))
+        return r
+    rho = float(np.corrcoef(rk(pm), rk(cg))[0, 1])
+    order = sorted(range(len(res)),
+                   key=lambda i: (-res[i]["w_flat"], -res[i]["w_best"], -pm[i]))
+    n_top = max(1, int(round(TOP_FRAC * len(res))))
+    head = order[:n_top]
+    print(f"\n{len(res)} configurations. Rank correlation, per-pass mean vs composite: {rho:+.2f}")
+    print(f"per-pass top {TOP_FRAC:.0%} ({n_top}): {sum(cg[i] > 0 for i in head)} beat flat on the "
+          f"composite, median composite rank {int(np.median(crank[head]))} of {len(cg)}; "
+          f"all configurations: {int((cg > 0).sum())} beat flat")
+    print(f"\nper-pass top {top}, held to the composite")
+    print(f"{'w_flat':>6}{'mean':>8}{'comp':>8}{'c.rank':>8}  {'method':12} committee")
+    for i in order[:top]:
+        r = res[i]
+        print(f"{r['w_flat']:>3}/{n:<2}{pm[i]:+8.2f}{cg[i]:+8.2f}{crank[i]:>8}  "
+              f"{r['method']:12} {r['committee']}")
+    print(f"\ncomposite top {top}")
+    for i in np.argsort(-cg, kind="stable")[:top]:
+        r = res[i]
+        print(f"{r['w_flat']:>3}/{n:<2}{pm[i]:+8.2f}{cg[i]:+8.2f}{crank[i]:>8}  "
+              f"{r['method']:12} {r['committee']}")
+
+
 def print_watch(w, show=15):
     n = len(w["ps"])
     print(f"WATCH: each pass raced on its own entrants, {n} pass(es)\n")
@@ -373,12 +471,18 @@ def main():
     ap.add_argument("--out", default="")
     ap.add_argument("--watch", action="store_true",
                     help="race each pass on its own entrants and print the cross-pass watch list")
+    ap.add_argument("--champions", default="", metavar="PASS_REFERENCE_CSV",
+                    help="score the committees on the champion composite named by the trainer's "
+                         "pass_reference.csv, beside the per-pass race")
     a = ap.parse_args()
     sizes = tuple(int(x) for x in a.sizes.split(","))
+    pool = [x.strip() for x in a.pool.split(",") if x.strip()] or None
+    if a.champions:
+        print_champion_check(champion_check(a.csv, a.champions, sizes, pool), a.top)
+        return
     if a.watch:
         print_watch(watch(a.csv, sizes))
         return
-    pool = [x.strip() for x in a.pool.split(",") if x.strip()] or None
     stand, pool, ps, res = run(a.csv, sizes, pool)
     n = len(ps)
     print(f"{a.csv}: {len(stand)} entries, {n} passes\n")

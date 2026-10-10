@@ -475,7 +475,8 @@ pytest tests across the files in `tests/`:
   entrant rule and its one-pass form, the 1.1-step weightings on a hand-worked day, a committee
   of copies reproducing its model, independent informative models voting better than their best
   member, pure noise not looking consistent, the Bayesian tree being causal and finding the one
-  member to trust, and `--watch` crediting the informative member over noise.
+  member to trust, `--watch` crediting the informative member over noise, and the champion composite taking each
+  industry from its champion pass.
 - Production safety: `test_allocation_limits.py` (an industry's capital is never over-committed,
   single-stock cap honoured), `test_whole_shares.py` (the simulator floors to whole shares as
   production does), `test_bad_bars.py` (non-finite OHLC bars never reach a calculation),
@@ -973,7 +974,23 @@ new days. A full v5-sized run takes ~15 s.
 ```bash
 python committee_race.py /root/ht_race_v5/race_daily.csv --out committee_race.csv
 python committee_race.py /root/ht_race_v5/race_daily.csv --watch
+python committee_race.py /root/ht_race_v5/race_daily.csv --champions /root/ht_race_v5/pass_reference.csv
 ```
+
+`--champions` races the same configurations once more on the **champion composite**: each
+industry's column (its realised return and every entry's prediction for it) taken from that
+industry's champion pass, the mix `convert_weights.py --industry-dir champion/` deploys. Entry
+gaps are recomputed from the composite's own top 4, since no pass ever made those picks. It
+reports the rank correlation between the per-pass mean and the composite gap, and where the
+per-pass leaders land. It is one 252-day sample, ±5.3 bp/day.
+
+On v5 after pass 6 the agreement was weak: rank correlation +0.22, and the per-pass top 5% had a
+median composite rank of 363 of 686. The per-pass leader (`votes_both`, MT1 evo + MT1C evo +
+MT1S-sum evo + bayes mean, +7.50) still beat flat on the composite, at +3.21. Calibrating each
+industry's predictions against their own trailing mean and sd, to remove the scale difference
+between passes, was tested and rejected: it cut MT1 evo's per-pass mean from +7.28 to +3.43. The
+level of an entry's prediction across industries carries the signal, so the raw prediction is
+the one to vote on.
 
 `--watch` races each pass separately on that pass's own entrants (every entry that beat flat in
 the pass, plus the 6 best by gap -- the entrant rule read where wins are 0 or 1) and tracks four
