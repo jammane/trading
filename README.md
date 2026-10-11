@@ -298,6 +298,7 @@ ruff check .
 | `--account` | Account id (default `acct0`); selects `models/ACCT/paper|prod` |
 | `--flat-allocation` | Even 1/12 split, skipping MT1/MT2 (paper default for now) |
 | `--no-orders` | Run the full cycle but submit and cancel nothing |
+| `--sell-only IND,...` | Put industries in sell-only mode: the model's sells go in, nothing is bought |
 | `--capital` | Cap total deployed capital regardless of account balance |
 | `--withdraw` | Request a cash withdrawal of this dollar amount |
 

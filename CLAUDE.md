@@ -373,6 +373,21 @@ uniform positive `tier_map` comes back unequal. The flat path also **clears** `z
 consecutive tier-0 readings liquidate an industry's holdings, so letting it accumulate would sell
 the book off on day 3.
 
+**`--sell-only IND[,IND...]` — the loser zone.** A sell-only industry keeps running StockNN and
+its sells are placed, but nothing is bought, so it drains at the model's own sell rate (measured
+~50% of the invested book per day in v5). It is **not liquidation**: a position the model does not
+sell stays held, and `zero_counts` is not touched. The model is fed zero cash, the cash the real
+book has, and the industry's allocation goes unspent. An industry closed by the prod entry gate
+still gets its sells while it holds anything, because the gate is about affording a way in.
+
+Stops need care. Each run cancels a held symbol's open stops before selling, because Alpaca
+reserves the shares an open stop covers; a buying industry re-protects through the stop placed
+with each new buy. A sell-only industry places no buys, so `plan_industry_orders` re-places the
+cancelled stop, at its old price, for whatever the day's sells leave held. A symbol that had no
+stop gets none invented. `tests/test_sell_only.py` pins all of this. The flag is the manual and
+test interface; the planned allocator (a loser committee flags 4 industries sell-only, a winner
+committee tilts the rest) will supply the set itself.
+
 Training output (`training_v4_cpp`) writes to `models/acct#/training`; after training run
 `python convert_weights.py --account acct0`, then copy `_best.pt` files to `.../prod`.
 
@@ -479,7 +494,8 @@ pytest tests across the files in `tests/`:
   industry from its champion pass, and the loser race flagging the worst 4 and crediting a model
   that knows only the losers.
 - Production safety: `test_allocation_limits.py` (an industry's capital is never over-committed,
-  single-stock cap honoured), `test_whole_shares.py` (the simulator floors to whole shares as
+  single-stock cap honoured), `test_sell_only.py` (the loser zone sells but never buys or
+  liquidates, and re-protects what it still holds), `test_whole_shares.py` (the simulator floors to whole shares as
   production does), `test_bad_bars.py` (non-finite OHLC bars never reach a calculation),
   `test_trading_lock.py` (the lock the trainer pauses on), `test_production_cli.py` (crontab flags
   are a contract), `test_cross_environment_universe.py` (shared `stock_data/` across universes).

@@ -23,7 +23,7 @@ def help_text():
 
 
 @pytest.mark.parametrize('flag', ['--paper', '--account', '--capital', '--withdraw',
-                                  '--no-orders', '--flat-allocation'])
+                                  '--no-orders', '--flat-allocation', '--sell-only'])
 def test_flag_present(help_text, flag):
     assert flag in help_text
 
