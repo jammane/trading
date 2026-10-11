@@ -257,21 +257,19 @@ def bayes_tree(pos, real, flat, ok, kappa=TREE_KAPPA, recency=RECENCY):
     return score
 
 
-def run_committee(members, rank_w, P, F):
-    """members: entrant names, strongest first; rank_w: their member weights (1.1 steps).
-    P: one pass; F: {entry: (rank, z, pos, rec)} for that pass.
-    -> {method: (gap bp/day, hit rate)}, hit = share of funded industry-days with a positive
-    return (in the loser race: a loss)."""
+def committee_scores(members, rank_w, P, F):
+    """Each method's [T,12] daily score for one committee (higher = fund first), plus the vote
+    count and mean z that break its ties. members: entrant names, strongest first; rank_w: their
+    member weights (1.1 steps). P: one pass; F: {entry: (rank, z, pos, rec)} for that pass.
+    -> ({method: score}, votes, zmean)"""
     rk = np.array([F[e][0] for e in members])
     z = np.array([F[e][1] for e in members])
     pos = np.array([F[e][2] for e in members])
     rec = np.array([F[e][3] for e in members])
-    real, ok, flat = P["real"], P["ok"], P["flat"]
     voted = (pos >= 0).astype(float)
     pw = np.where(pos >= 0, PICK_W[np.clip(pos, 0, 3)], 0.0)
     mw = np.asarray(rank_w)[:, None, None]
     votes = voted.sum(0)
-    zmean = z.mean(0)
     rw = np.maximum(rec, 0.0)[:, :, None]
     rw = np.where(rw.sum(0, keepdims=True) <= 0, 1.0, rw)
     scores = {
@@ -281,8 +279,16 @@ def run_committee(members, rank_w, P, F):
         "votes_both": (mw * pw).sum(0),
         "borda": rk.mean(0),
         "zrecord": (rw * z).sum(0) / rw.sum(0),
-        "bayes_tree": bayes_tree(pos, real, flat, ok),
+        "bayes_tree": bayes_tree(pos, P["real"], P["flat"], P["ok"]),
     }
+    return scores, votes, z.mean(0)
+
+
+def run_committee(members, rank_w, P, F):
+    """-> {method: (gap bp/day, hit rate)} for one committee on one pass (see committee_scores);
+    hit = share of funded industry-days with a positive return (in the loser race: a loss)."""
+    scores, votes, zmean = committee_scores(members, rank_w, P, F)
+    real, ok, flat = P["real"], P["ok"], P["flat"]
     out = {}
     for meth, s in scores.items():
         pick = fund(s, ok, votes, zmean)
