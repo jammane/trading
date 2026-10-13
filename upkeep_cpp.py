@@ -9,17 +9,25 @@ race training: a second implementation is how production's buy loop once drifted
   run_upkeep()   one training day; the trainer refuses a day it has already trained (rc 3)
   read_state()   upkeep_state.txt: the bayes posterior and MT1's value curves, among others
   seed_state()   the first state: the bayes posterior replayed from the race's champion composite
+  race_book()    the champions' simulated books where the race stopped, to start a catch-up from
+  catch_up()     train every session from a book to the newest bars, chaining the simulated books
 
 State lives in one directory (the trainer's --output): StockNN elites and history ring, the
 evolutionary pools, race_<entry>_<ind>.bin (+ .adam.bin) for every entry in use, and
 upkeep_state.txt. The champion store is the --load-dir seed, read only where the state is empty.
 """
+import argparse
+import csv
 import json
 import math
 import os
+import shutil
 import subprocess
+import sys
 
 STATE_FILE = "upkeep_state.txt"
+SIM_BOOK = "book_sim_next.txt"   # written by every --upkeep: slot 0's book after the day
+IND_STARTING_CASH = 25_000.0     # the race's book base
 BOOK_VERSION = 1
 BALLOC_GAMMA = 0.98            # = BALLOC_GAMMA in training_v4.cpp
 # The race's StockNN settings (v5): production's daily step trains as the race did.
@@ -154,3 +162,94 @@ def run_upkeep(binary, book_path, state_dir, seed_dir, race_only, log_path,
         log.write("$ " + " ".join(cmd) + "\n")
         log.flush()
         return subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, timeout=timeout).returncode
+
+
+def race_book(run_dir, path, day=None, universe=None):
+    """Write the champions' simulated books entering race day `day` (0-based, the trainer's
+    actual_day; default the last day race_daily.csv logged) as a BOOK, and return its date.
+
+    holdings_log.csv rows are written 1-based after the day's trades, so row `day` is the book the
+    race carried INTO day `day`: what each industry's champion pass held at that close, before
+    trading on it. Stops are not logged and start at 0."""
+    import committee_race as cr
+    champ = cr.read_champions(os.path.join(run_dir, "pass_reference.csv"))
+    dates = {}
+    with open(os.path.join(run_dir, "race_daily.csv")) as f:
+        for r in csv.DictReader(f):
+            if r["entry"] == "REALIZED":
+                dates[(int(r["pass"]), int(r["day"]))] = r["date"]
+    if day is None:
+        day = max(d for (_, d) in dates)
+    universe = universe or universe_order()
+    rows = {}
+    with open(os.path.join(run_dir, "holdings_log.csv")) as f:
+        for r in csv.DictReader(f):
+            ind = r["industry"]
+            if int(r["day"]) == day and int(r["pass"]) == champ.get(ind):
+                rows[ind] = r
+    missing = set(universe) - set(rows)
+    if missing:
+        raise ValueError(f"holdings_log.csv has no day-{day} row for {sorted(missing)}")
+    date = dates[(champ[next(iter(universe))], day)]
+    books = {ind: {"cash": float(rows[ind]["cash"]),
+                   "holdings": {s: float(rows[ind][f"q{j}"]) for j, s in enumerate(syms)},
+                   "stop_prices": {}}
+             for ind, syms in universe.items()}
+    write_book(path, date, books, {ind: IND_STARTING_CASH for ind in universe}, universe)
+    return date
+
+
+def catch_up(binary, state_dir, seed_dir, race_only, book, log_path, max_days=250):
+    """Train from `book` through the newest session in stock_data, one --upkeep per day, each
+    day's book being the simulated book the day before ended with. -> days trained.
+    Stops cleanly at rc 2 (no later session yet); a day already in the state (rc 3) is skipped by
+    moving on to the book that day left, so an interrupted catch-up can simply be re-run."""
+    nxt = os.path.join(state_dir, SIM_BOOK)
+    cur = os.path.join(state_dir, "book_catchup.txt")
+    if os.path.abspath(book) != os.path.abspath(cur):
+        shutil.copy2(book, cur)
+    trained = 0
+    for _ in range(max_days):
+        rc = run_upkeep(binary, cur, state_dir, seed_dir, race_only, log_path)
+        if rc == 2:
+            break
+        if rc not in (0, 3):
+            raise RuntimeError(f"training_v4_cpp --upkeep failed (rc {rc}); see {log_path}")
+        if rc == 3 and not os.path.exists(nxt):
+            break
+        trained += rc == 0
+        shutil.copy2(nxt, cur)
+    return trained
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="daily C++ training: seed a state, catch up a gap")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    a = sub.add_parser("seed", help="new state with the bayes posterior from the race")
+    a.add_argument("--state", required=True)
+    a.add_argument("--run-dir", required=True, help="the race run (race_daily.csv, pass_reference.csv)")
+    b = sub.add_parser("catch-up", help="train every session since the race stopped")
+    b.add_argument("--state", required=True)
+    b.add_argument("--seed-dir", required=True, help="the champion store")
+    b.add_argument("--run-dir", required=True)
+    b.add_argument("--binary", default="build/training_v4_cpp")
+    b.add_argument("--race-only", required=True, help="comma-separated race entries")
+    b.add_argument("--log", required=True)
+    a = ap.parse_args(argv)
+    if a.cmd == "seed":
+        mu = seed_state(a.state, os.path.join(a.run_dir, "race_daily.csv"),
+                        os.path.join(a.run_dir, "pass_reference.csv"))
+        print("seeded bayes posterior (mean, bp/day): "
+              + ", ".join(f"{k} {v * 1e4:+.1f}" for k, v in mu.items()))
+        return 0
+    book = os.path.join(a.state, "book_race_end.txt")
+    date = race_book(a.run_dir, book)
+    print(f"catch-up from {date}, the race's last decision day, on its champions' books")
+    n = catch_up(a.binary, a.state, a.seed_dir, a.race_only.split(","), book, a.log)
+    st = read_state(a.state)
+    print(f"trained {n} day(s); state now through {st['date'] if st else '(none)'}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

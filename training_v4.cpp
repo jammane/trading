@@ -6596,6 +6596,27 @@ int main(int argc, char* argv[]) {
                 upk_state.mu[i] = balloc.mu[i]; upk_state.m2[i] = balloc.m2[i]; upk_state.w[i] = balloc.w[i];
             }
             upk_state.have_bayes = !g_bayes_off;
+            // The book slot 0 ends the day with, dated the session it filled on, in the BOOK
+            // format: the next run's book when there are no real books to hand over, as when
+            // catching up on sessions production did not trade.
+            {
+                FILE* bf = fopen((output_dir + "/book_sim_next.txt").c_str(), "w");
+                if (bf) {
+                    fprintf(bf, "upkeep_book 1\ndate %s\n", dates[day_start + 1].c_str());
+                    for (int i = 0; i < N_IND; i++) {
+                        const Portfolio& p0 = ind_states[i].portfolios[0];
+                        fprintf(bf, "ind %s base %.6f cash %.6f hold", g_ind_names[i].c_str(),
+                                g_book_base[i], p0.cash);
+                        for (int j = 0; j < IND_SYMS; j++) fprintf(bf, " %.6f", p0.holdings[j]);
+                        fprintf(bf, " stop");
+                        for (int j = 0; j < IND_SYMS; j++) fprintf(bf, " %.6f", p0.stop_prices[j]);
+                        fprintf(bf, "\n");
+                    }
+                    ok &= fclose(bf) == 0;
+                } else {
+                    ok = false;
+                }
+            }
             // The state file goes last: it carries the date that marks this day as done, so a
             // crash before it leaves the day retryable rather than half-recorded.
             if (!ok || !write_upkeep_state(upk_state_path, upk_state)) {
