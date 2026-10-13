@@ -3,7 +3,7 @@
 // Run:   ./build/training_v4_cpp --output models [--load-dir DIR] [--start-day N] [--stop-day N]
 //        [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F] [--workers N]
 
-#define TRAINER_VERSION "0.8.1.53"
+#define TRAINER_VERSION "0.8.1.54"
 
 #include <algorithm>
 #include <atomic>
@@ -574,6 +574,18 @@ static bool g_control_untrained = false;
 // normal run produces.
 static bool g_no_nn_race = false;
 static bool g_no_save = false;
+
+// ── --upkeep: production's daily training step (see UPKEEP in main) ────────────────
+// One day, on the REAL book production hands over, with everything a pass normally keeps in
+// memory -- gradient weights and Adam state, learning rates, the bayes posterior, MT1's value
+// curves -- carried in files in the output directory instead. Three training-only behaviours are
+// off: the hard-floor recapitalisation (the book is real money, not a $25k simulation), the
+// pass-start reset of the StockNN history ring, and the pass-start re-init of gradient entries.
+static bool  g_upkeep = false;
+// CN_BOOK's denominator per industry: the book's starting capital. IND_STARTING_CASH in training;
+// production passes each industry's own, since a paper book is not $25k. race_models.py's
+// build_cfeat146(book_base=) mirrors it.
+static float g_book_base[N_IND];
 
 // ── Trading lock (v0.6.5.0) ───────────────────────────────────────────────────
 // The droplet has 2 cores and a training run uses ~150% CPU. When training and a production cycle
@@ -1516,6 +1528,7 @@ struct IndResult {
     // why the P&L decomposition came back at R^2 ~ 0.0001: a broken regressor, not a finding.
     float hold[IND_SYMS];
     float hold_cash;
+    float book_base;   // CN_BOOK denominator: g_book_base[industry] (see --upkeep)
 };
 
 struct MasterResult {
@@ -1546,8 +1559,9 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                                float sigma, bool freeze, const bool* seq_flags) {
     // Load this industry's elites from disk (or random init on first day)
     load_or_init_industry(models_dir, load_dir, ind_i, scratch.elite_buf, actual_day);
-    // Load per-industry elite history (or reset at pass start)
-    if (day_num == 0) {
+    // Load per-industry elite history (or reset at pass start). --upkeep runs are one-day passes
+    // that continue each other, so the ring carries from file like everything else.
+    if (day_num == 0 && !g_upkeep) {
         scratch.hist_head  = 0;
         scratch.hist_count = 0;
     } else {
@@ -2141,9 +2155,10 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             " | prod=$" + std::to_string(safe_int(baseline)) +
             " | mut_ok=" + std::to_string((int)(mut_success * 100.f + 0.5f)) + "%");
 
-    // Hard floor reset
+    // Hard floor reset. Never under --upkeep: that book is real money, and recapitalising the
+    // simulation would train every race entry on a day that did not happen.
     float abs_floor = IND_STARTING_CASH * 0.9f;
-    if (baseline < abs_floor) {
+    if (!g_upkeep && baseline < abs_floor) {
         log_msg(std::string("[") + IND_SHORT[ind_i] +
                 "] Production below floor — resetting portfolios");
         for (int s = 0; s < N_SLOTS; s++) {
@@ -2159,6 +2174,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         // book P&L of exactly 0 rather than a spurious jump to the reset level.
         IndResult r{};          // value-initialised: order intent is all zero on a reset day
         r.book_prev      = baseline;
+        r.book_base      = g_book_base[ind_i];
         r.baseline       = baseline;
         r.slot0_score    = baseline;
         r.new_streak     = 0;
@@ -2454,6 +2470,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         memcpy(res.slot_sym_pnl[s], res_sym_pnl[s], IND_SYMS * sizeof(float));
     }
     res.book_prev     = book_prev;
+    res.book_base     = g_book_base[ind_i];
     res.baseline      = baseline;
     res.slot0_score   = slot_scores[0];
     res.best_delta    = best_delta;
@@ -3984,7 +4001,7 @@ static void build_mt1c_input_for(const OHLCV* day_sym, const IndResult& ir,
         f[CN_SFRAC] = cn_clamp(cn_ok(si_sfrac[j], 0.5f), 0.f, 1.f);
     }
     out[CN_CASH] = cn_clamp(cn_ok(ir.ref_cash_v) / book, 0.f, 1.f);
-    out[CN_BOOK] = cn_ok(ir.book_prev) / (float)IND_STARTING_CASH;
+    out[CN_BOOK] = cn_ok(ir.book_prev) / (ir.book_base > 0.f ? ir.book_base : (float)IND_STARTING_CASH);
 }
 
 // Slot 0's intent -- the deployed model. Every existing caller wants this.
@@ -4228,13 +4245,16 @@ static void print_usage(const char* prog) {
         "          [--mt1-sigma F] [--mt2-sigma F]  (defaults: master-sigma, master-sigma/6)\n"
         "          [--workers N] [--master-only] [--no-save] [--no-nn-race]\n"
         "          [--race-skip \"A,B,...\"]  switch race entries off (race_qualify.py RACE_SKIP)\n"
+        "          [--race-only \"A,B,...\"]  run only these race entries (plus the deployed/logged two)\n"
         "          [--seed N]   (default: clock, RE-SEEDED EVERY PASS; N derives passes from N)\n"
         "          [--trade-lock PATH | --no-trade-lock]  pause while production holds the lock\n"
         "          [--control-untrained]  NO-LEARNING CONTROL: re-randomise StockNN daily\n"
         "          [--control-random]  pass-1 paired control: score N random models/day\n"
         "       %s --output DIR [--load-dir DIR] ...  (diagnostic/override)\n"
-        "       %s --drift-study --load-dir SEED --drift-scratch DIR  (phase-3 calibration)\n",
-        prog, prog, prog);
+        "       %s --drift-study --load-dir SEED --drift-scratch DIR  (phase-3 calibration)\n"
+        "       %s --upkeep BOOK --output STATE --load-dir SEED [--race-only ...]  (production's\n"
+        "          daily step: one day on the real book, state carried in STATE)\n",
+        prog, prog, prog, prog);
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -4579,6 +4599,130 @@ static int run_drift_study(const std::string& seed_dir, const std::string& scrat
     return 0;
 }
 
+// ── UPKEEP: the daily production training step ──────────────────────────────────
+//
+// production_v2.py runs `training_v4_cpp --upkeep BOOK --output STATE --load-dir SEED` once per
+// session, after the close: ONE trading day, the day production last placed orders on, filled
+// against the bars that arrived since. It is an ordinary one-day pass with three differences --
+//
+//   * the industry books are production's REAL books (BOOK), not $25k of simulated cash;
+//   * what a pass keeps in memory is read from and written back to STATE: gradient weights with
+//     their Adam moments and learning rates, the bayes posterior, and the market / portfolio value
+//     curves MT1's 74 features are built from (upkeep_state.txt plus race_<entry>_<ind>.bin and
+//     .adam.bin files);
+//   * nothing is re-initialised for being "a new pass".
+//
+// SEED (the champion store) is read only where STATE has nothing yet, so the first run starts
+// from the champions and every later run continues from the day before. An evolutionary pool with
+// no files in STATE is rebuilt around the champion's deployed model: slot 0 is the champion, the
+// other 199 are mutations of it, all immature, so slot 0 stays deployed until the pool has scored
+// MT1_POOL_MIN_AGE days.
+//
+// BOOK (text, written by production):
+//   upkeep_book 1
+//   date YYYY-MM-DD                         the decision day; its next session must be in stock_data
+//   ind <name> base B cash C hold q0..q11 stop s0..s11      x 12, symbols in universe.json order
+struct UpkeepBook {
+    std::string date;
+    float base[N_IND] = {}, cash[N_IND] = {};
+    float hold[N_IND][IND_SYMS] = {}, stop[N_IND][IND_SYMS] = {};
+};
+
+static bool read_upkeep_book(const std::string& path, UpkeepBook& b, std::string& err) {
+    std::ifstream f(path);
+    if (!f) { err = "cannot open " + path; return false; }
+    std::string tok; int ver = 0;
+    if (!(f >> tok >> ver) || tok != "upkeep_book" || ver != 1) { err = "not an upkeep_book v1"; return false; }
+    bool seen[N_IND] = {};
+    while (f >> tok) {
+        if (tok == "date") { f >> b.date; continue; }
+        if (tok != "ind") { err = "unexpected token " + tok; return false; }
+        std::string name, k;
+        f >> name;
+        int i = -1;
+        for (int q = 0; q < N_IND; q++) if (g_ind_names[q] == name) i = q;
+        if (i < 0) { err = "unknown industry " + name; return false; }
+        f >> k >> b.base[i];    if (k != "base") { err = name + ": expected base"; return false; }
+        f >> k >> b.cash[i];    if (k != "cash") { err = name + ": expected cash"; return false; }
+        f >> k;                 if (k != "hold") { err = name + ": expected hold"; return false; }
+        for (int j = 0; j < IND_SYMS; j++) f >> b.hold[i][j];
+        f >> k;                 if (k != "stop") { err = name + ": expected stop"; return false; }
+        for (int j = 0; j < IND_SYMS; j++) f >> b.stop[i][j];
+        if (!f) { err = name + ": malformed line"; return false; }
+        seen[i] = true;
+    }
+    if (b.date.empty()) { err = "no date"; return false; }
+    for (int i = 0; i < N_IND; i++) {
+        if (!seen[i]) { err = "missing industry " + g_ind_names[i]; return false; }
+        if (!(b.base[i] > 0.f)) { err = g_ind_names[i] + ": base must be > 0"; return false; }
+    }
+    return true;
+}
+
+// STATE's text half. Keyed scalars (lr, Adam step counts) live in `kv` as "<key> <entry> [<ind>]".
+struct UpkeepState {
+    std::string date;                          // last decision day trained; "" = none yet
+    int   hist_count = 0;
+    float mkt[N_IND][IND_HIST_CAP] = {}, pf[N_IND][IND_HIST_CAP] = {};
+    bool  have_bayes = false;
+    double mu[N_IND] = {}, m2[N_IND] = {}, w[N_IND] = {};
+    std::map<std::string, double> kv;
+};
+
+static bool read_upkeep_state(const std::string& path, UpkeepState& st, std::string& err) {
+    std::ifstream f(path);
+    if (!f) return true;                       // absent = first run
+    std::string tok; int ver = 0;
+    if (!(f >> tok >> ver) || tok != "upkeep_state" || ver != 1) { err = "not an upkeep_state v1"; return false; }
+    auto ind_of = [](const std::string& n) {
+        for (int q = 0; q < N_IND; q++) if (g_ind_names[q] == n) return q;
+        return -1;
+    };
+    std::string line;
+    std::getline(f, line);
+    while (std::getline(f, line)) {
+        std::istringstream ls(line);
+        if (!(ls >> tok)) continue;
+        if (tok == "date") { ls >> st.date; continue; }
+        if (tok == "hist") { ls >> st.hist_count; st.hist_count = std::max(0, std::min(st.hist_count, IND_HIST_CAP)); continue; }
+        if (tok == "mkt" || tok == "pf" || tok == "bayes") {
+            std::string n; ls >> n;
+            const int i = ind_of(n);
+            if (i < 0) { err = "unknown industry " + n; return false; }
+            if (tok == "bayes") { ls >> st.mu[i] >> st.m2[i] >> st.w[i]; st.have_bayes = true; continue; }
+            float* dst = (tok == "mkt") ? st.mkt[i] : st.pf[i];
+            for (int k = 0; k < st.hist_count; k++) ls >> dst[k];
+            if (!ls) { err = tok + " " + n + ": expected " + std::to_string(st.hist_count) + " values"; return false; }
+            continue;
+        }
+        // keyed scalar: everything before the last field is the key
+        const size_t sp = line.find_last_of(' ');
+        if (sp == std::string::npos) { err = "malformed line: " + line; return false; }
+        st.kv[line.substr(0, sp)] = atof(line.c_str() + sp + 1);
+    }
+    return true;
+}
+
+static bool write_upkeep_state(const std::string& path, const UpkeepState& st) {
+    const std::string tmp = path + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "w");
+    if (!f) return false;
+    fprintf(f, "upkeep_state 1\ndate %s\nhist %d\n", st.date.c_str(), st.hist_count);
+    for (int i = 0; i < N_IND; i++) {
+        fprintf(f, "mkt %s", g_ind_names[i].c_str());
+        for (int k = 0; k < st.hist_count; k++) fprintf(f, " %.9g", st.mkt[i][k]);
+        fprintf(f, "\npf %s", g_ind_names[i].c_str());
+        for (int k = 0; k < st.hist_count; k++) fprintf(f, " %.9g", st.pf[i][k]);
+        fprintf(f, "\n");
+    }
+    if (st.have_bayes)
+        for (int i = 0; i < N_IND; i++)
+            fprintf(f, "bayes %s %.17g %.17g %.17g\n", g_ind_names[i].c_str(), st.mu[i], st.m2[i], st.w[i]);
+    for (const auto& [k, v] : st.kv) fprintf(f, "%s %.17g\n", k.c_str(), v);
+    const bool ok = fclose(f) == 0;
+    return ok && rename(tmp.c_str(), path.c_str()) == 0;
+}
+
 int main(int argc, char* argv[]) {
     // Parse args
     std::string output_dir, load_dir, account;
@@ -4587,6 +4731,8 @@ int main(int argc, char* argv[]) {
     float mt1_sigma = -1.f, mt2_sigma_arg = -1.f;
     bool master_only = false;
     bool drift_study = false; std::string drift_scratch;
+    std::string upkeep_book_path, race_only;
+    for (int i = 0; i < N_IND; i++) g_book_base[i] = (float)IND_STARTING_CASH;
 
     for (int a = 1; a < argc; a++) {
         std::string arg(argv[a]);
@@ -4629,6 +4775,8 @@ int main(int argc, char* argv[]) {
                 g_race_off[hit] = true;
             }
         }
+        else if (arg == "--upkeep" && a+1<argc) { g_upkeep = true; upkeep_book_path = argv[++a]; }
+        else if (arg == "--race-only" && a+1<argc) { race_only = argv[++a]; }
         else if (arg == "--no-save") g_no_save = true;
         else if (arg == "--control-untrained") g_control_untrained = true;
         else if (arg == "--control-random") g_control_random = true;
@@ -4640,6 +4788,44 @@ int main(int argc, char* argv[]) {
         else if (arg == "--drift-scratch" && a+1<argc) { drift_scratch = argv[++a]; }
         else if (arg == "--help" || arg == "-h") { print_usage(argv[0]); return 0; }
     }
+    // --race-only "A,B,...": the complement of --race-skip -- run these entries and no others.
+    // Production's upkeep names the committee members. The deployed and logged entries always run
+    // (read by index); "ALLOC bayes", "ALLOC bayes mean" or "ALLOC bayes thompson" keep the
+    // allocator on.
+    if (!race_only.empty()) {
+        bool want[RACE_N] = {}, bayes = false;
+        size_t pos = 0;
+        while (pos <= race_only.size()) {
+            size_t comma = race_only.find(',', pos);
+            if (comma == std::string::npos) comma = race_only.size();
+            const std::string nm = race_norm_name(race_only.substr(pos, comma - pos).c_str());
+            pos = comma + 1;
+            if (nm.empty()) continue;
+            if (nm.rfind("ALLOC bayes", 0) == 0) { bayes = true; continue; }
+            int hit = -1;
+            for (int v = 0; v < RACE_N; v++) if (race_norm_name(RACE[v].name) == nm) hit = v;
+            if (hit < 0) {
+                fprintf(stderr, "ERROR: --race-only: no race entry named \"%s\"\n", nm.c_str());
+                return 1;
+            }
+            want[hit] = true;
+        }
+        for (int v = 0; v < RACE_N; v++)
+            g_race_off[v] = !want[v] && v != RACE_DEPLOYED && v != RACE_LOG_POOL;
+        g_bayes_off = !bayes;
+    }
+    if (g_upkeep) {
+        if (output_dir.empty() || !account.empty()) {
+            fprintf(stderr, "ERROR: --upkeep needs --output STATE (and no --account)\n");
+            return 1;
+        }
+        passes = 1;
+        g_trade_lock.clear();        // production runs this while holding the lock itself
+        if (g_no_save || g_control_untrained || g_control_random || master_only || drift_study) {
+            fprintf(stderr, "ERROR: --upkeep cannot be combined with diagnostic modes\n");
+            return 1;
+        }
+    }
     // --account derives model and log dirs; --output/--load-dir are diagnostic overrides
     std::string log_dir;
     if (!account.empty()) {
@@ -4648,7 +4834,7 @@ int main(int argc, char* argv[]) {
         if (load_dir.empty())   load_dir   = acct_dir;
         log_dir = "logs/" + account + "/training";
     } else {
-        log_dir = output_dir;  // diagnostic: co-locate logs with models
+        log_dir = g_upkeep ? output_dir + "/log" : output_dir;  // diagnostic: co-locate logs with models
     }
     if (output_dir.empty()) { print_usage(argv[0]); return 1; }
     if (master_sigma  < 0.f) master_sigma  = sigma;
@@ -4712,6 +4898,39 @@ int main(int argc, char* argv[]) {
     int day_start  = (start_day >= 0) ? start_day : 0;
     int day_end    = (stop_day  >= 0) ? stop_day  : total_days;
     day_end = std::min(day_end, total_days);
+
+    // --upkeep: the day is the book's date, located in the data; its next session must exist.
+    UpkeepBook upk_book;
+    UpkeepState upk_state;
+    const std::string upk_state_path = output_dir + "/upkeep_state.txt";
+    if (g_upkeep) {
+        std::string err;
+        if (!read_upkeep_book(upkeep_book_path, upk_book, err)) {
+            log_msg("ERROR: --upkeep book " + upkeep_book_path + ": " + err); return 1;
+        }
+        if (!read_upkeep_state(upk_state_path, upk_state, err)) {
+            log_msg("ERROR: " + upk_state_path + ": " + err); return 1;
+        }
+        int idx = -1;
+        for (int k = 0; k < total_days; k++) if (dates[k] == upk_book.date) idx = k;
+        if (idx < 0) { log_msg("ERROR: --upkeep: " + upk_book.date + " is not in stock_data"); return 2; }
+        if (idx + 1 >= total_days) {
+            log_msg("ERROR: --upkeep: no session after " + upk_book.date + " in stock_data yet");
+            return 2;
+        }
+        // Training the same day twice would score it twice; training an older day would rewind.
+        if (!upk_state.date.empty() && upk_book.date <= upk_state.date) {
+            log_msg("ERROR: --upkeep: already trained through " + upk_state.date +
+                    "; refusing " + upk_book.date);
+            return 3;
+        }
+        day_start = idx; day_end = idx + 1;
+        for (int i = 0; i < N_IND; i++) g_book_base[i] = upk_book.base[i];
+        log_msg("UPKEEP: decision day " + upk_book.date + " (day " + std::to_string(idx) +
+                "), filled " + dates[idx + 1] + "; state " +
+                (upk_state.date.empty() ? std::string("new, seeding from ") + load_dir
+                                        : "after " + upk_state.date));
+    }
     log_msg("Total trading days: " + std::to_string(total_days) +
             "  Training: days " + std::to_string(day_start) +
             "–" + std::to_string(day_end));
@@ -4988,6 +5207,7 @@ int main(int argc, char* argv[]) {
 
     log_msg("Started " + std::to_string(num_workers) + " worker threads");
 
+    bool upkeep_failed = false;
     // ── Multi-pass loop ─────────────────────────────────────────────────────
     for (int pass = 0; pass < passes; pass++) {
         float decay         = powf(sigma_decay, (float)pass);
@@ -5118,6 +5338,126 @@ int main(int argc, char* argv[]) {
 
         // Warmup history
         warmup_history(ind_states.get(), all_days, day_start);
+
+        // ── UPKEEP: replace this pass's fresh start with what the previous day left ──
+        if (g_upkeep) {
+            // The real books, every slot reset to them as on any training day.
+            for (int i = 0; i < N_IND; i++) {
+                Portfolio& p0 = ind_states[i].portfolios[0];
+                p0.cash = upk_book.cash[i];
+                for (int j = 0; j < IND_SYMS; j++) {
+                    p0.holdings[j]    = upk_book.hold[i][j];
+                    p0.stop_prices[j] = upk_book.stop[i][j];
+                }
+                for (int s2 = 1; s2 < N_SLOTS; s2++) ind_states[i].portfolios[s2] = p0;
+            }
+            // MT1's value curves. A first run has none: rebuild the market index from the bars
+            // (the same compounding the day loop does) and start the portfolio curve on it, so
+            // the 37 portfolio features describe the market until real book returns replace it.
+            if (upk_state.hist_count > 0) {
+                mst->ind_hist_count = upk_state.hist_count;
+                for (int i = 0; i < N_IND; i++) {
+                    memcpy(mst->mkt_val_hist[i], upk_state.mkt[i], sizeof(float) * upk_state.hist_count);
+                    memcpy(mst->ind_val_hist[i], upk_state.pf[i],  sizeof(float) * upk_state.hist_count);
+                }
+            } else {
+                const int n = std::min(IND_HIST_CAP, day_start);
+                for (int i = 0; i < N_IND; i++) {
+                    float v = (float)IND_STARTING_CASH;
+                    for (int k = 0; k < n; k++) {
+                        const int t = day_start - n + k;
+                        float sum = 0.f; int valid = 0;
+                        for (int j = 0; j < IND_SYMS; j++) {
+                            const OHLCV& a = all_days[t].sym[i][j];
+                            const OHLCV& b = all_days[t + 1].sym[i][j];
+                            if (a.valid && b.valid && a.close > 1e-3f) { sum += b.close / a.close - 1.f; valid++; }
+                        }
+                        v *= 1.f + (valid > 0 ? sum / valid : 0.f);
+                        mst->mkt_val_hist[i][k] = v;
+                        mst->ind_val_hist[i][k] = v;
+                    }
+                }
+                mst->ind_hist_count = n;
+                log_msg("UPKEEP: value curves rebuilt from the bars (" + std::to_string(n) + " days)");
+            }
+            if (upk_state.have_bayes) {
+                for (int i = 0; i < N_IND; i++) {
+                    balloc.mu[i] = upk_state.mu[i]; balloc.m2[i] = upk_state.m2[i]; balloc.w[i] = upk_state.w[i];
+                }
+            } else if (!g_bayes_off) {
+                log_msg("UPKEEP: WARNING no bayes posterior in state; it starts empty and abstains "
+                        "until it has BALLOC_MIN_W days");
+            }
+            // Gradient entries: weights (STATE, else the champion in SEED), Adam moments, lr.
+            auto find_w = [&](const std::string& name) {
+                const std::string a = output_dir + "/" + name;
+                if (fs::exists(a)) return a;
+                return load_dir.empty() ? std::string() : load_dir + "/" + name;
+            };
+            for (int v = 0; v < RACE_N; v++) {
+                if (g_race_off[v]) continue;
+                RaceState& r = race[v];
+                const std::string sl = race_slug(v);
+                if (RACE[v].search == SRCH_GRAD) {
+                    const double st = upk_state.kv.count("adam_step " + sl) ? upk_state.kv["adam_step " + sl] : 0.0;
+                    r.adam_step = (long)st;
+                    for (int i = 0; i < N_IND; i++) {
+                        const std::string base = "race_" + sl + "_" + g_ind_names[i];
+                        const std::string wp = find_w(base + ".bin");
+                        const std::string lk = "lr " + sl + " " + g_ind_names[i];
+                        if (upk_state.kv.count(lk)) r.lr[i] = (float)upk_state.kv[lk];
+                        std::vector<float>* W; std::vector<float>* M; std::vector<float>* V;
+                        if (RACE[v].arch == ARCH_TANH32) { W = &r.tanh32[i].W; M = &r.tanh32[i].m; V = &r.tanh32[i].v; }
+                        else                             { W = &r.w[i];        M = &r.m[i];        V = &r.v[i]; }
+                        const int n = (int)W->size();
+                        if (wp.empty() || !load_bin(wp, W->data(), n)) {
+                            log_msg("UPKEEP: WARNING " + base + ".bin not found or wrong size -- "
+                                    "this entry starts from a random init");
+                            continue;
+                        }
+                        std::vector<float> mv((size_t)2 * n);
+                        if (load_bin(output_dir + "/" + base + ".adam.bin", mv.data(), 2 * n)) {
+                            std::copy(mv.begin(), mv.begin() + n, M->begin());
+                            std::copy(mv.begin() + n, mv.end(), V->begin());
+                        }
+                        if (RACE[v].arch == ARCH_TANH32) {
+                            const std::string tk = "tanh32_step " + sl + " " + g_ind_names[i];
+                            r.tanh32[i].step = upk_state.kv.count(tk) ? (long)upk_state.kv[tk] : 0;
+                        }
+                    }
+                    continue;
+                }
+                // Evolutionary pools with no files in STATE: rebuild around the champion.
+                const int np = race_pool_params(RACE[v].arch);
+                const int per = (RACE[v].arch == ARCH_MT1P) ? MT1C_SYMS : 1;
+                for (int i = 0; i < N_IND; i++) {
+                    const std::string base = "race_" + sl + "_" + g_ind_names[i];
+                    std::vector<float> champ((size_t)np * per);
+                    bool have_champ = false;
+                    for (int j = 0; j < per; j++) {
+                        MT1PoolScratch& sc = r.pool[i * per + j];
+                        const char* tag = (per > 1) ? mt1p_pool_tag(RACE[v].tag, j) : RACE[v].tag;
+                        if (fs::exists(mt1_pool_path(output_dir, i, 0, tag))) continue;
+                        if (!have_champ) {
+                            const std::string wp = find_w(base + ".bin");
+                            have_champ = !wp.empty() && load_bin(wp, champ.data(), np * per);
+                            if (!have_champ) {
+                                log_msg("UPKEEP: WARNING no champion " + base + ".bin -- pool "
+                                        "starts from a random init");
+                                break;
+                            }
+                            log_msg("UPKEEP: " + base + ": pool rebuilt around the champion");
+                        }
+                        const float* W = champ.data() + (size_t)j * np;
+                        memcpy(sc.slot(0), W, sizeof(float) * np);
+                        for (int q = 1; q < MT1_POOL_SLOTS; q++)
+                            mt1_mutate(W, sc.slot(q), np, cur_mt1_sigma,
+                                       r.salt ^ ((uint64_t)q * 2654435761ULL) ^ ((uint64_t)(i * per + j) << 40));
+                        sc.best_slot = 0;
+                    }
+                }
+            }
+        }
 
         int num_days = day_end - day_start;
         IndResult results[N_IND] = {};
@@ -6025,7 +6365,7 @@ int main(int argc, char* argv[]) {
             log_mem_stat(num_workers);
             for (int i = 0; i < N_IND; i++) {
                 for (int v = 0; v < RACE_N; v++) {
-                    if (g_race_off[v] || RACE[v].search != SRCH_GRAD) continue;
+                    if (g_race_off[v] || RACE[v].search != SRCH_GRAD || g_upkeep) continue;
                     if (RACE[v].arch == ARCH_TANH32) {
                         const std::vector<float>& tw = race[v].tanh32[i].W;
                         if (!tw.empty())
@@ -6049,14 +6389,16 @@ int main(int argc, char* argv[]) {
                                    MT1P_PARAMS * sizeof(float));
                             save_mt1_pool(output_dir, i, ps, mt1p_pool_tag(RACE[v].tag, j));
                         }
-                        save_bin(race_weight_path(output_dir, v, i, pass + 1),
-                                 snap.data(), (int)snap.size());
+                        if (!g_upkeep)
+                            save_bin(race_weight_path(output_dir, v, i, pass + 1),
+                                     snap.data(), (int)snap.size());
                         continue;
                     }
                     const MT1PoolScratch& sc = race[v].pool[i];
                     // Per-pass snapshot of the deployed model, for the weight comparison...
-                    save_bin(race_weight_path(output_dir, v, i, pass + 1),
-                             sc.slot(sc.best_slot), sc.n_params);
+                    if (!g_upkeep)
+                        save_bin(race_weight_path(output_dir, v, i, pass + 1),
+                                 sc.slot(sc.best_slot), sc.n_params);
                     // ...and the whole pool, which is what the NEXT pass loads to carry on.
                     save_mt1_pool(output_dir, i, sc, RACE[v].tag);
                 }
@@ -6210,6 +6552,79 @@ int main(int argc, char* argv[]) {
             blk_day[0]        = day_ptr;
             blk_actual_day[0] = actual_day;
             process_block(1);
+        }
+
+        // ── UPKEEP: write back everything the next day continues from ──
+        if (g_upkeep) {
+            bool ok = true;
+            for (int v = 0; v < RACE_N; v++) {
+                if (g_race_off[v]) continue;
+                RaceState& r = race[v];
+                const std::string sl = race_slug(v);
+                for (int i = 0; i < N_IND; i++) {
+                    const std::string base = output_dir + "/race_" + sl + "_" + g_ind_names[i];
+                    if (RACE[v].search == SRCH_EVO) {
+                        // The deployed model(s), in the champion store's layout, for inference.
+                        const int per = (RACE[v].arch == ARCH_MT1P) ? MT1C_SYMS : 1;
+                        const int np  = race_pool_params(RACE[v].arch);
+                        std::vector<float> snap((size_t)np * per);
+                        for (int j = 0; j < per; j++) {
+                            const MT1PoolScratch& sc = r.pool[i * per + j];
+                            memcpy(snap.data() + (size_t)j * np, sc.slot(sc.best_slot), sizeof(float) * np);
+                        }
+                        ok &= save_bin(base + ".bin", snap.data(), (int)snap.size());
+                        continue;
+                    }
+                    const bool t32 = RACE[v].arch == ARCH_TANH32;
+                    const std::vector<float>& W = t32 ? r.tanh32[i].W : r.w[i];
+                    const std::vector<float>& M = t32 ? r.tanh32[i].m : r.m[i];
+                    const std::vector<float>& V = t32 ? r.tanh32[i].v : r.v[i];
+                    ok &= save_bin(base + ".bin", W.data(), (int)W.size());
+                    std::vector<float> mv(M);
+                    mv.insert(mv.end(), V.begin(), V.end());
+                    ok &= save_bin(base + ".adam.bin", mv.data(), (int)mv.size());
+                    upk_state.kv["lr " + sl + " " + g_ind_names[i]] = r.lr[i];
+                    if (t32) upk_state.kv["tanh32_step " + sl + " " + g_ind_names[i]] = (double)r.tanh32[i].step;
+                }
+                if (RACE[v].search == SRCH_GRAD) upk_state.kv["adam_step " + sl] = (double)r.adam_step;
+            }
+            upk_state.date = upk_book.date;
+            upk_state.hist_count = mst->ind_hist_count;
+            for (int i = 0; i < N_IND; i++) {
+                memcpy(upk_state.mkt[i], mst->mkt_val_hist[i], sizeof(float) * mst->ind_hist_count);
+                memcpy(upk_state.pf[i],  mst->ind_val_hist[i], sizeof(float) * mst->ind_hist_count);
+                upk_state.mu[i] = balloc.mu[i]; upk_state.m2[i] = balloc.m2[i]; upk_state.w[i] = balloc.w[i];
+            }
+            upk_state.have_bayes = !g_bayes_off;
+            // The book slot 0 ends the day with, dated the session it filled on, in the BOOK
+            // format: the next run's book when there are no real books to hand over, as when
+            // catching up on sessions production did not trade.
+            {
+                FILE* bf = fopen((output_dir + "/book_sim_next.txt").c_str(), "w");
+                if (bf) {
+                    fprintf(bf, "upkeep_book 1\ndate %s\n", dates[day_start + 1].c_str());
+                    for (int i = 0; i < N_IND; i++) {
+                        const Portfolio& p0 = ind_states[i].portfolios[0];
+                        fprintf(bf, "ind %s base %.6f cash %.6f hold", g_ind_names[i].c_str(),
+                                g_book_base[i], p0.cash);
+                        for (int j = 0; j < IND_SYMS; j++) fprintf(bf, " %.6f", p0.holdings[j]);
+                        fprintf(bf, " stop");
+                        for (int j = 0; j < IND_SYMS; j++) fprintf(bf, " %.6f", p0.stop_prices[j]);
+                        fprintf(bf, "\n");
+                    }
+                    ok &= fclose(bf) == 0;
+                } else {
+                    ok = false;
+                }
+            }
+            // The state file goes last: it carries the date that marks this day as done, so a
+            // crash before it leaves the day retryable rather than half-recorded.
+            if (!ok || !write_upkeep_state(upk_state_path, upk_state)) {
+                log_msg("UPKEEP: ERROR writing state to " + output_dir);
+                upkeep_failed = true;
+            } else {
+                log_msg("UPKEEP: trained " + upk_book.date + "; state saved to " + output_dir);
+            }
         }
 
         // Save MT1/MT2 after each pass (industry elites already saved by step_industry)
@@ -6448,5 +6863,5 @@ int main(int argc, char* argv[]) {
     if (rd_csv) { fclose(rd_csv); rd_csv = nullptr; }
 
     log_msg("Training complete.");
-    return 0;
+    return upkeep_failed ? 4 : 0;
 }

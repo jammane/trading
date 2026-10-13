@@ -493,6 +493,9 @@ pytest tests across the files in `tests/`:
   member to trust, `--watch` crediting the informative member over noise, the champion composite taking each
   industry from its champion pass, and the loser race flagging the worst 4 and crediting a model
   that knows only the losers.
+- `test_upkeep_cpp.py` -- the daily C++ training glue: book and state formats shared with the
+  trainer (symbols in universe order), the bayes seed replaying the trainer's exact update, the
+  committee and race settings passed to the binary, and the real books production records.
 - Production safety: `test_allocation_limits.py` (an industry's capital is never over-committed,
   single-stock cap honoured), `test_sell_only.py` (the loser zone sells but never buys or
   liquidates, and re-protects what it still holds), `test_whole_shares.py` (the simulator floors to whole shares as
@@ -1055,6 +1058,84 @@ build_master_features() → today888
 to MasterNN, then equal allocation. The deployed MT1 for each industry is whichever individual its
 pool ranked first, published to `mt1_{ind}_best.pt` on every upkeep run — not a fixed slot 0.
 
+### Daily training with the C++ trainer (`--cpp-upkeep`, `training_v4_cpp --upkeep`)
+
+The daily cycle under `--cpp-upkeep` is: download the day's bars → **train one day** → convert
+the StockNN elites → run the models → place tomorrow's orders. Training is the C++ trainer, not a
+Python copy of it: the committees vote with race entries that only the trainer can train, and a
+second implementation is how production's buy loop once drifted ~8× over budget. The Python
+upkeep step (below) does not run in this mode.
+
+```
+production_v2.py --paper --account acct0 --flat-allocation --cpp-upkeep
+  fetch today's bars (written to stock_data)
+  run_daily_training:  training_v4_cpp --upkeep <model_dir>/cpp/book_next.txt
+                         --output <model_dir>/cpp --load-dir <model_dir>/champion
+                         --race-only "<the committee members>" --sigma 0.008 --master-sigma 0.006
+                       then convert_industry(): <model_dir>/cpp/*_elite_*.bin -> <model_dir>/*.pt
+  decide and queue orders with the updated models
+  save_upkeep_book:    today's real books -> <model_dir>/cpp/book_next.txt, for tomorrow's run
+```
+
+**What `--upkeep` trains.** ONE day: the day the previous run placed orders on, filled against
+the bars that have arrived since, on that run's **real books** (Alpaca holdings, the cash each
+industry was given, the stops queued; a sell-only industry was given none). It is an ordinary
+one-day pass with three training-only behaviours off: the $22.5k hard-floor recapitalisation
+(the book is real money), the pass-start reset of the StockNN history ring, and the pass-start
+re-initialisation of gradient entries. `--race-only` names the entries to train — the committee
+members, `UPKEEP_RACE_ONLY` in `production_v2.py` — plus MT1C grad and MT1 evo, which always run.
+
+**State** lives in `<model_dir>/cpp`, and everything a pass normally holds in memory is carried
+in files: StockNN elites and history ring, the evolutionary pools with their metadata,
+`race_<entry>_<ind>.bin` and `.adam.bin` for each gradient entry, and `upkeep_state.txt` — learning
+rates, Adam step counts, the bayes posterior, and the market and portfolio value curves MT1's 74
+features are built from. The state file is written last and carries the trained date, so the
+trainer refuses (rc 3) a day it has already trained and a crash leaves the day retryable. rc 2
+means the next session is not in `stock_data` yet. Any failure leaves the previous models in
+place; production trades on them and says so.
+
+**Seeding from the champions.** `<model_dir>/champion` is the `--load-dir` seed, read only where
+the state is empty, so the first run starts from the v5 champion store:
+
+- StockNN elites and the gradient entries' weights load from it directly. Their Adam moments were
+  never saved, so the optimiser starts fresh.
+- Each evolutionary pool is rebuilt around the champion's deployed model: slot 0 is the champion,
+  the other 199 are mutations of it (sigma 0.006). All 200 start immature, so the champion stays
+  deployed until the pool has scored `MT1_POOL_MIN_AGE` (8) days. The full end-of-run pools exist
+  but come from pass 10, not each industry's champion pass, so they are not paired with the
+  StockNN elites.
+- The value curves are rebuilt from the bars (92 days); the portfolio curve starts as the market
+  curve until real book returns replace it.
+- The bayes posterior is seeded by `upkeep_cpp.seed_state()`, which replays the race's champion
+  composite (252 days of each industry's champion-pass return) through the trainer's own update.
+
+**Book scale.** MT1C-style inputs carry `CN_BOOK = book / base`. In training the base is
+`IND_STARTING_CASH`; under `--upkeep` it is each industry's starting book, fixed on the first
+`save_upkeep_book` and kept in `cpp/book_base.json`. `race_models.build_cfeat146(book_base=)`
+mirrors it. Dollar targets and predictions are not rescaled, so a paper book much smaller than
+$25k gives the race entries smaller numbers than they were trained on; ranking across industries
+is unaffected because every industry shares the scale.
+
+**Catching up a gap.** Every `--upkeep` also writes `book_sim_next.txt`: slot 0's simulated book
+after the day, dated the session it filled on. When there are no real books to hand over -- the
+sessions between the race's end and the first paper run -- each day trains on the book the day
+before left. `race_book()` reads the starting book from the race's `holdings_log.csv` (row d is
+the book carried INTO day d, each industry from its champion pass), and `catch_up()` chains
+`--upkeep` through the newest session in `stock_data`:
+
+```bash
+python upkeep_cpp.py seed --state models/acct0/paper/cpp --run-dir /root/ht_race_v5
+python upkeep_cpp.py catch-up --state models/acct0/paper/cpp --seed-dir models/acct0/paper/champion \
+    --run-dir /root/ht_race_v5 --race-only "TANH32 grad,MT1 grdC,..." --log logs/acct0/paper/upkeep_cpp.log
+```
+
+The race's last logged decision day is trained again: v5 stopped with no session after its last
+day in `stock_data`, so that day never had a real fill.
+
+`upkeep_cpp.py` holds the Python side (book and state formats, the seed, the subprocess call);
+`tests/test_upkeep_cpp.py` pins the formats, the symbol order, the posterior update and the book
+production records.
+
 ### Daily upkeep (production_v2.py + upkeep.py)
 
 `upkeep.py` handles single-step evolution in production (one day per run):
@@ -1097,7 +1178,7 @@ When an elite holds ≥50% cash (industry) or ≥80% cash (master), an `UNDER_IN
 
 ### Production cycle
 
-`production_v2.py` runs once per trading day: fetch data from yfinance → run MT1×12 + MT2 (or MasterNN fallback) to rebalance capital → run StockNN per active industry → submit limit/stop orders to Alpaca → perform one upkeep evolution step on yesterday's data (via `upkeep.py`). Alpaca credentials are read from `keyring` or environment variables (`ALPACA_API_KEY` / `ALPACA_SECRET_KEY`). All per-account state files (`state.json`, `owners.json`, `master_state.json`, `mt1_rolling_state.json`, `mt_prev_session.json`) live under `--model-dir`, enabling multiple accounts to run independently with different `--model-dir` paths and credentials.
+`production_v2.py` runs once per trading day: fetch data from yfinance → run MT1×12 + MT2 (or MasterNN fallback) to rebalance capital → run StockNN per active industry → submit limit/stop orders to Alpaca → perform one upkeep evolution step on yesterday's data (via `upkeep.py`). Under `--cpp-upkeep` the training step moves to the front and runs in C++ (see **Daily training with the C++ trainer** above). Alpaca credentials are read from `keyring` or environment variables (`ALPACA_API_KEY` / `ALPACA_SECRET_KEY`). All per-account state files (`state.json`, `owners.json`, `master_state.json`, `mt1_rolling_state.json`, `mt_prev_session.json`) live under `--model-dir`, enabling multiple accounts to run independently with different `--model-dir` paths and credentials.
 
 `--paper` routes all API calls to Alpaca's paper trading endpoint — orders are submitted and portfolio state is read from the paper account, giving real paper trading history without risking real money. Omit `--paper` for live trading.
 

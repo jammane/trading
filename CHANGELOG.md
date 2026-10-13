@@ -32,6 +32,11 @@ entry is in its commit message.
 - `production_v2.py --sell-only IND,...` puts industries in sell-only mode: StockNN still runs
   and its sells are placed, but nothing is bought. Positions it does not sell stay held, and the
   stop on any partly sold position is re-placed for the remainder.
+- **Daily training with the C++ trainer.** `training_v4_cpp --upkeep` trains one day on
+  production's real books and carries everything a pass keeps in memory in files, starting from
+  the champion store. `production_v2.py --cpp-upkeep` runs it each session before deciding, then
+  converts the StockNN elites, so the cycle is download → train → convert → decide → order.
+  `--race-only` trains just the committee members.
 
 ### Changed
 - StockNN champions are crowned on slot 0's **recency-weighted mean daily book return** over the
