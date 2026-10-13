@@ -700,6 +700,96 @@ def generate_liquidation_sells(industry, symbols, liquidation_target,
     return liquidated
 
 
+def plan_industry_orders(symbols, sug, holdings, day_data, allocated_cash, holds,
+                         sell_only=False, stops=None):
+    """One industry's orders from StockNN's suggestions. Sells first, then buys.
+
+    sug:   {sym: (buy_qty, buy_price_frac, sell_all_price_frac, sell_qty)}, the model's output
+    holds: {sym: runs left} -- symbols under the new-symbol hold get no orders
+    stops: {sym: stop price} of the open stops the caller cancelled for held symbols
+
+    sell_only=True is the loser zone: StockNN runs as usual and its sells go in, but nothing is
+    bought, so the industry drains at the model's own sell rate. It is NOT liquidation. The
+    caller cancels each held symbol's stops before any sell (Alpaca reserves the shares an open
+    stop covers), so here the stop is re-placed, at its old price, for whatever the day's sells
+    leave held. A buy-side day re-protects through the stop placed with each new buy instead.
+
+    -> list of order dicts in submission order."""
+    stops = stops or {}
+    orders = []
+    for sym in symbols:
+        if sym not in day_data or holds.get(sym, 0) > 0:
+            continue
+        buy_qty, buy_price_frac, sell_all_price_frac, sell_qty = sug[sym]
+        cur_qty        = holdings.get(sym, 0.0)
+        low            = day_data[sym]['low']
+        high           = day_data[sym]['high']
+        close          = day_data[sym]['close']
+        span           = max(high - low, 1e-9)
+        sell_all_price = low + sell_all_price_frac * span
+
+        # Sell qty at market (open price)
+        if sell_qty > 1e-6 and cur_qty > 1e-6:
+            amount = int(min(sell_qty, cur_qty))
+            if amount >= 1:
+                orders.append({'symbol': sym, 'action': 'sell',
+                               'quantity': amount, 'price': close})
+                cur_qty -= amount
+
+        # Sell all at limit price
+        if cur_qty >= 1 and low <= sell_all_price <= high:
+            orders.append({'symbol': sym, 'action': 'sell',
+                           'quantity': int(cur_qty), 'price': sell_all_price})
+            cur_qty = 0.0
+
+        if sell_only and cur_qty >= 1 and sym in stops:
+            orders.append({'symbol': sym, 'action': 'stop_loss',
+                           'quantity': int(cur_qty), 'price': stops[sym]})
+    if sell_only:
+        return orders
+
+    # ── Buys after sells: stop anchored to buy_price ─────────────
+    # allocated_cash is the industry's budget for the WHOLE loop, so it has to be
+    # spent down as orders are queued. Reading it fresh per symbol sized every
+    # position against the full allocation: measured 2026-09-17, tech_hardware
+    # queued ~$12,800 against a $1,666.67 allocation (ON 99%, LRCX 96%, SWKS 96%,
+    # KLAC 94%, NVDA 91% ... each of the full budget). Live, Alpaca would fill those
+    # in arbitrary order until buying power ran out and the resulting book would not
+    # reflect the model's intent. training_lib.step_industry spends its cash down
+    # correctly; this path did not.
+    remaining_cash = allocated_cash
+    # Industry portfolio value for the single-stock cap, on the same basis the model
+    # was fed (allocated_cash + holdings), mirroring training_lib.step_industry.
+    ind_port_value = allocated_cash + sum(
+        holdings.get(s, 0.0) * day_data.get(s, {}).get('close', 0.0)
+        for s in symbols)
+    for sym in symbols:
+        if sym not in day_data or holds.get(sym, 0) > 0:
+            continue
+        buy_qty, buy_price_frac, sell_all_price_frac, sell_qty = sug[sym]
+        low       = day_data[sym]['low']
+        high      = day_data[sym]['high']
+        span      = max(high - low, 1e-9)
+        buy_price    = low + buy_price_frac * span
+        stop_loss_at = buy_price * 0.9   # GTC stop at 10% below entry
+
+        if buy_qty > 1e-6 and buy_price > 0 and low <= buy_price <= high:
+            # Shared with the simulator: size_buy is the ONE place the request /
+            # cash / single-stock-cap arithmetic lives. It used to exist in seven
+            # copies and production's was the one no test reached, so production was
+            # the copy that drifted — no cap, no cash decrement, fractional shares.
+            amount = int(training_lib.size_buy(
+                buy_qty, buy_price, remaining_cash, ind_port_value,
+                holdings.get(sym, 0.0) * buy_price))
+            if amount >= 1:
+                orders.append({'symbol': sym, 'action': 'buy',
+                               'quantity': amount, 'price': buy_price})
+                orders.append({'symbol': sym, 'action': 'stop_loss',
+                               'quantity': amount, 'price': stop_loss_at})
+                remaining_cash -= amount * buy_price * BUY_FILL
+    return orders
+
+
 def main():
     """Run one daily trading cycle: fetch data, infer, submit orders, retrain."""
     parser = argparse.ArgumentParser(description="Run stock trading system v2.")
@@ -714,6 +804,11 @@ def main():
     parser.add_argument('--flat-allocation', action='store_true',
                         help='Allocate capital evenly across all industries, skipping MT1/MT2 '
                              'inference. Use while MT1/MT2 are unconfirmed.')
+    parser.add_argument('--sell-only', default='', metavar='IND[,IND...]',
+                        help='Industries in sell-only mode (the loser zone): StockNN still runs '
+                             'and its sells are placed, but nothing is bought, so the industry '
+                             'drains at the model\'s own sell rate. Not liquidation. Their '
+                             'allocation is not spent.')
     args = parser.parse_args()
 
     subtype   = 'paper' if args.paper else 'prod'
@@ -749,6 +844,11 @@ def main():
         # Load state
         state = load_state(model_dir)
         industries = state['industries']
+        sell_only = {x.strip() for x in args.sell_only.split(',') if x.strip()}
+        unknown = sell_only - set(industries)
+        if unknown:
+            print(f"--sell-only: unknown industries {sorted(unknown)}; known: {sorted(industries)}")
+            return
         histories = state['histories']
         cash = state['cash']
         holdings = state['holdings']
@@ -889,8 +989,6 @@ def main():
         #     not a ramp -- and the old universe hid that, because unlock points ran from $140
         #     to $1,825 and so supplied an accidental ordering. Inside the $30-$90 band every
         #     industry unlocks at roughly the same figure, so the order must now be explicit.
-        from training_lib import size_buy   # shared sizing arithmetic — see its docstring
-
         active_industries = set()
         inactive_log      = []
         total_value       = compute_total_portfolio_value(cash, holdings, day_data, histories)
@@ -946,8 +1044,18 @@ def main():
                 # Freed cash flows back to master pool — reflected in next day's Alpaca sync
                 print(f"[{industry}] Liquidated ${liquidated:.2f} of ${liquidation_target:.2f} requested")
 
+            # Sell-only (the loser zone): no budget to buy with, so the model sees the cash the
+            # real book has. Its holdings still need their sells even when the entry gate
+            # would close the industry, since the gate is about affording a way IN.
+            if industry in sell_only:
+                allocated_cash = 0.0
+                held = any(holdings.get(sym, 0.0) >= 1 for sym in symbols)
+                print(f"[{industry}] SELL-ONLY: sells only, no buys"
+                      + ("" if held else " (nothing held)"))
+                if not held:
+                    continue
             # Step 2: skip trading if industry is below the 1-share capital floor
-            if industry not in active_industries:
+            elif industry not in active_industries:
                 continue
 
             # Step 3: normal industry model inference — 232-feature input, 48 outputs
@@ -1043,90 +1151,32 @@ def main():
                 out  = out.view(12, 4)   # (buy_qty, buy_price, sell_all_price, sell_qty)
                 sug  = {sym: out[j].tolist() for j, sym in enumerate(symbols)}
 
-                # ── Sells first: cancel existing stops, execute sells ────────
+                # Cancel existing GTC stops on held symbols before any sell (Alpaca reserves the
+                # shares an open stop covers). Skipped under --no-orders: cancelling a live stop
+                # while submitting no replacement would strip protection from a real position,
+                # which is the one destructive thing this mode must not do. The prices are kept
+                # so a sell-only industry can re-protect what it still holds.
                 _sym_holds = state.get('new_symbol_holds', {})
-                for j, sym in enumerate(symbols):
-                    if sym not in day_data:
+                stops = {}
+                for sym in symbols:
+                    if sym not in day_data or _sym_holds.get(sym, 0) > 0:
                         continue
-                    if _sym_holds.get(sym, 0) > 0:
-                        continue  # new symbol hold active — no orders this run
-                    buy_qty, buy_price_frac, sell_all_price_frac, sell_qty = sug[sym]
-                    cur_qty        = holdings.get(sym, 0.0)
-                    low            = day_data[sym]['low']
-                    high           = day_data[sym]['high']
-                    close          = day_data[sym]['close']
-                    span           = max(high - low, 1e-9)
-                    sell_all_price = low + sell_all_price_frac * span
-
-                    # Cancel existing GTC stop orders. Skipped under --no-orders: cancelling a
-                    # live stop while submitting no replacement would strip protection from a real
-                    # position, which is the one destructive thing this mode must not do.
-                    if cur_qty > 0 and not args.no_orders:
+                    if holdings.get(sym, 0.0) > 0 and not args.no_orders:
                         try:
                             get_orders_request = GetOrdersRequest(
                                 status=QueryOrderStatus.OPEN, symbols=[sym])
                             existing_orders = trading_client.get_orders(get_orders_request)
                             for o in existing_orders:
                                 if o.order_type == OrderType.STOP:
+                                    if o.stop_price is not None:
+                                        stops[sym] = max(stops.get(sym, 0.0), float(o.stop_price))
                                     trading_client.cancel_order_by_id(o.id)
                         except Exception as e:
                             print(f"Error canceling existing orders for {sym}: {e}")
 
-                    # Sell qty at market (open price)
-                    if sell_qty > 1e-6 and cur_qty > 1e-6:
-                        amount = int(min(sell_qty, cur_qty))
-                        if amount >= 1:
-                            orders.append({'symbol': sym, 'action': 'sell',
-                                           'quantity': amount, 'price': close})
-                            cur_qty -= amount
-
-                    # Sell all at limit price
-                    if cur_qty >= 1 and low <= sell_all_price <= high:
-                        orders.append({'symbol': sym, 'action': 'sell',
-                                       'quantity': int(cur_qty), 'price': sell_all_price})
-                        cur_qty = 0.0
-
-                # ── Buys after sells: stop anchored to buy_price ─────────────
-                # allocated_cash is the industry's budget for the WHOLE loop, so it has to be
-                # spent down as orders are queued. Reading it fresh per symbol sized every
-                # position against the full allocation: measured 2026-09-17, tech_hardware
-                # queued ~$12,800 against a $1,666.67 allocation (ON 99%, LRCX 96%, SWKS 96%,
-                # KLAC 94%, NVDA 91% ... each of the full budget). Live, Alpaca would fill those
-                # in arbitrary order until buying power ran out and the resulting book would not
-                # reflect the model's intent. training_lib.step_industry spends its cash down
-                # correctly; this path did not.
-                remaining_cash = allocated_cash
-                # Industry portfolio value for the single-stock cap, on the same basis the model
-                # was fed (allocated_cash + holdings), mirroring training_lib.step_industry.
-                ind_port_value = allocated_cash + sum(
-                    holdings.get(s, 0.0) * day_data.get(s, {}).get('close', 0.0)
-                    for s in symbols)
-                for j, sym in enumerate(symbols):
-                    if sym not in day_data:
-                        continue
-                    if _sym_holds.get(sym, 0) > 0:
-                        continue  # new symbol hold active — no orders this run
-                    buy_qty, buy_price_frac, sell_all_price_frac, sell_qty = sug[sym]
-                    low       = day_data[sym]['low']
-                    high      = day_data[sym]['high']
-                    span      = max(high - low, 1e-9)
-                    buy_price    = low + buy_price_frac * span
-                    stop_loss_at = buy_price * 0.9   # GTC stop at 10% below entry
-
-                    if buy_qty > 1e-6 and buy_price > 0 and low <= buy_price <= high:
-                        # Shared with the simulator: size_buy is the ONE place the request /
-                        # cash / single-stock-cap arithmetic lives. It used to exist in seven
-                        # copies and production's was the one no test reached, so production was
-                        # the copy that drifted — no cap, no cash decrement, fractional shares.
-                        amount = int(size_buy(
-                            buy_qty, buy_price, remaining_cash, ind_port_value,
-                            holdings.get(sym, 0.0) * buy_price))
-                        if amount >= 1:
-                            orders.append({'symbol': sym, 'action': 'buy',
-                                           'quantity': amount, 'price': buy_price})
-                            orders.append({'symbol': sym, 'action': 'stop_loss',
-                                           'quantity': amount, 'price': stop_loss_at})
-                            remaining_cash -= amount * buy_price * BUY_FILL
+                orders += plan_industry_orders(symbols, sug, holdings, day_data, allocated_cash,
+                                               _sym_holds, sell_only=industry in sell_only,
+                                               stops=stops)
 
             except Exception as e:
                 print(f"Error processing industry {industry}: {e}")

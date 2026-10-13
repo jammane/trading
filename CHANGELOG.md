@@ -23,7 +23,15 @@ entry is in its commit message.
   voting under seven methods (including an online Bayesian vote-pattern tree), beat their best
   member consistently across passes. `--watch` tracks across passes which entries keep becoming
   entrants, which members lift the committees they sit on, which methods do best, and which
-  committees recur near the top.
+  committees recur near the top. `--champions pass_reference.csv` races the committees on the
+  champion composite, each industry taken from its champion pass, which is the mix production
+  deploys and the race that picks the committee to trade.
+  `--losers` runs the same races on the other end of the ranking: committees flag the 4
+  industries expected to do worst, scored on how far below flat they fall and how often they
+  lost money.
+- `production_v2.py --sell-only IND,...` puts industries in sell-only mode: StockNN still runs
+  and its sells are placed, but nothing is bought. Positions it does not sell stay held, and the
+  stop on any partly sold position is re-placed for the remainder.
 
 ### Changed
 - StockNN champions are crowned on slot 0's **recency-weighted mean daily book return** over the

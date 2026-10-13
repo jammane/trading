@@ -373,6 +373,21 @@ uniform positive `tier_map` comes back unequal. The flat path also **clears** `z
 consecutive tier-0 readings liquidate an industry's holdings, so letting it accumulate would sell
 the book off on day 3.
 
+**`--sell-only IND[,IND...]` — the loser zone.** A sell-only industry keeps running StockNN and
+its sells are placed, but nothing is bought, so it drains at the model's own sell rate (measured
+~50% of the invested book per day in v5). It is **not liquidation**: a position the model does not
+sell stays held, and `zero_counts` is not touched. The model is fed zero cash, the cash the real
+book has, and the industry's allocation goes unspent. An industry closed by the prod entry gate
+still gets its sells while it holds anything, because the gate is about affording a way in.
+
+Stops need care. Each run cancels a held symbol's open stops before selling, because Alpaca
+reserves the shares an open stop covers; a buying industry re-protects through the stop placed
+with each new buy. A sell-only industry places no buys, so `plan_industry_orders` re-places the
+cancelled stop, at its old price, for whatever the day's sells leave held. A symbol that had no
+stop gets none invented. `tests/test_sell_only.py` pins all of this. The flag is the manual and
+test interface; the planned allocator (a loser committee flags 4 industries sell-only, a winner
+committee tilts the rest) will supply the set itself.
+
 Training output (`training_v4_cpp`) writes to `models/acct#/training`; after training run
 `python convert_weights.py --account acct0`, then copy `_best.pt` files to `.../prod`.
 
@@ -475,9 +490,12 @@ pytest tests across the files in `tests/`:
   entrant rule and its one-pass form, the 1.1-step weightings on a hand-worked day, a committee
   of copies reproducing its model, independent informative models voting better than their best
   member, pure noise not looking consistent, the Bayesian tree being causal and finding the one
-  member to trust, and `--watch` crediting the informative member over noise.
+  member to trust, `--watch` crediting the informative member over noise, the champion composite taking each
+  industry from its champion pass, and the loser race flagging the worst 4 and crediting a model
+  that knows only the losers.
 - Production safety: `test_allocation_limits.py` (an industry's capital is never over-committed,
-  single-stock cap honoured), `test_whole_shares.py` (the simulator floors to whole shares as
+  single-stock cap honoured), `test_sell_only.py` (the loser zone sells but never buys or
+  liquidates, and re-protects what it still holds), `test_whole_shares.py` (the simulator floors to whole shares as
   production does), `test_bad_bars.py` (non-finite OHLC bars never reach a calculation),
   `test_trading_lock.py` (the lock the trainer pauses on), `test_production_cli.py` (crontab flags
   are a contract), `test_cross_environment_universe.py` (shared `stock_data/` across universes).
@@ -973,7 +991,35 @@ new days. A full v5-sized run takes ~15 s.
 ```bash
 python committee_race.py /root/ht_race_v5/race_daily.csv --out committee_race.csv
 python committee_race.py /root/ht_race_v5/race_daily.csv --watch
+python committee_race.py /root/ht_race_v5/race_daily.csv --champions /root/ht_race_v5/pass_reference.csv
 ```
+
+`--champions` races the committees on the **champion composite**, and this is the race that
+picks the committee to trade. Each industry's column (its realised return and every entry's
+prediction for it) is taken from that industry's champion pass, the mix `convert_weights.py
+--industry-dir champion/` deploys. Entry gaps are recomputed from the composite's own top 4,
+since no pass ever made those picks. Entrants are chosen on the composite (`pass_pool`), and the
+per-pass mean and wins are printed beside each configuration for reference. The composite is one
+252-day sample, ±5.3 bp/day, raced over thousands of configurations, so its maximum is inflated
+by selection. A full run takes ~3 minutes.
+
+The composite was adopted because the per-pass ranking did not carry over to it. On v5 after
+pass 6 the rank correlation between the two was +0.23, and the per-pass leader (`votes_both`, MT1
+evo + MT1C evo + MT1S-sum evo + bayes mean, +7.50 per pass) scored +3.21 on the composite.
+Calibrating each industry's predictions against their own trailing mean and sd, to remove the
+scale difference between passes, was tested and rejected: it cut MT1 evo's per-pass mean from
++7.28 to +3.43. The level of an entry's prediction across industries carries the signal, so the
+raw prediction is the one to vote on.
+
+`--losers` runs any mode as the **loser race**: predictions and returns are negated, so each
+method's "top 4" are the 4 industries the committee expects to do worst, and the gap is flat minus
+their mean return. Leaving those 4 out of an equal book adds half that gap on a 12-industry day.
+The `--champions` report adds the share of flagged industry-days that actually lost money against
+the base rate. On v5 after pass 6 (composite, 7 entrants) the base rate was 43.3% and the best
+committees flagged losers at 44-46%: their +12-14 bp/day comes from flagging industries that fall
+further, not from flagging more down days. The two ends of the ranking are carried by different
+entries -- MT1 evo and MT1C evo, strong at picking the top, score -2.25 and -3.83 at flagging the
+bottom, while TANH32 grad, MT1 grdC and MT1S-stk evo lead both.
 
 `--watch` races each pass separately on that pass's own entrants (every entry that beat flat in
 the pass, plus the 6 best by gap -- the entrant rule read where wins are 0 or 1) and tracks four

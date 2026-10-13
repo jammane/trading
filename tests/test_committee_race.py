@@ -63,7 +63,7 @@ def test_committee_of_copies_reproduces_the_single_model():
     out = cr.run_committee(list("ABCD"), [1.331, 1.21, 1.1, 1.0], P, F)
     single = np.sort(real[np.argsort(pred)[-4:]]).mean() - real.mean()
     for meth in ("votes", "votes_pick", "votes_member", "votes_both", "borda", "zrecord"):
-        assert abs(out[meth] - single) < 1e-9, meth
+        assert abs(out[meth][0] - single) < 1e-9, meth
 
 
 def test_one_point_one_steps_on_a_hand_worked_day():
@@ -75,12 +75,12 @@ def test_one_point_one_steps_on_a_hand_worked_day():
     flat = np.mean(real)
     out = cr.run_committee(["A", "B"], [1.1, 1.0], P, F)
     # member weights: A's four picks outrank B's
-    assert abs(out["votes_member"] - (np.mean([10, 20, 30, 40]) - flat)) < 1e-9
+    assert abs(out["votes_member"][0] - (np.mean([10, 20, 30, 40]) - flat)) < 1e-9
     # pick weights: each member's #1 and #2 (1.331, 1.21) beat any #3 (1.1)
-    assert abs(out["votes_pick"] - (np.mean([10, 20, 1, 2]) - flat)) < 1e-9
+    assert abs(out["votes_pick"][0] - (np.mean([10, 20, 1, 2]) - flat)) < 1e-9
     # both: A#1 1.4641; A#2 and B#1 1.331; then A#3 and B#2 tie at 1.21, and the tie goes to
     # the higher mean z -- B's #2 (z 1.50) over A's #3 (z 1.30)
-    assert abs(out["votes_both"] - (np.mean([10, 20, 1, 2]) - flat)) < 1e-9
+    assert abs(out["votes_both"][0] - (np.mean([10, 20, 1, 2]) - flat)) < 1e-9
 
 
 def test_independent_informative_models_vote_better_than_their_best_member(tmp_path):
@@ -155,3 +155,61 @@ def test_watch_credits_the_informative_member_and_counts_eligibility(tmp_path):
         assert len(p) <= w["eligible"](c)
         assert c == " + ".join(sorted(c.split(" + ")))      # one key per set, across passes
     assert sum(s["won"] for s in w["methods"].values()) == 3
+
+
+def test_champion_composite_takes_each_industry_from_its_champion_pass(tmp_path):
+    path = _write(tmp_path / "rd.csv", {"good": 30.0, "noise": None}, passes=3, days=40)
+    ref = tmp_path / "pass_reference.csv"
+    champ = {i: (k % 3) + 1 for k, i in enumerate(INDS)}
+    ref.write_text("# pass_reference v2\npass,industry,new_champ_pass\n"
+                   + "".join(f"2,{i},1\n" for i in INDS)                 # superseded pass
+                   + "".join(f"3,{i},{p}\n" for i, p in champ.items()))
+    assert cr.read_champions(str(ref)) == champ
+    entries, passes = cr.load(path)
+    C = cr.champion_composite(entries, passes, champ)
+    for j, i in enumerate(INDS):
+        assert np.array_equal(C["real"][:, j], passes[champ[i]]["real"][:, j])
+        assert np.array_equal(C["pred"]["good"][:, j], passes[champ[i]]["pred"]["good"][:, j])
+    # the gap is recomputed from the composite's own top 4, not copied from any pass
+    top = np.argsort(-C["pred"]["good"], axis=1, kind="stable")[:, :4]
+    want = np.take_along_axis(C["real"], top, 1).mean(1) - C["real"].mean(1)
+    assert np.allclose(C["gap"]["good"], want)
+    assert C["gap"]["good"].mean() > C["gap"]["noise"].mean()
+
+
+def test_loser_race_flags_the_worst_four():
+    """Mirrored, a model's "top 4" is its bottom 4: gap = flat - their return, hit = they lost."""
+    real = np.array([-50, -40, -30, -20, 5, 10, 15, 20, 25, 30, 35, 40], float)
+    P = cr.mirror(dict(real=real[None], ok=np.ones((1, 12), bool), flat=real.mean(keepdims=True),
+                       pred={"A": real[None].copy()}, gap={"A": np.zeros(1)}))
+    flat = real.mean()
+    assert np.isclose(P["gap"]["A"][0], flat - np.mean([-50, -40, -30, -20]))
+    F = {"A": (*cr.per_entry(P["pred"]["A"], P["ok"]), np.zeros(1))}
+    gap, hit = cr.run_committee(["A"], [1.0], P, F)["votes"]
+    assert np.isclose(gap, flat - np.mean([-50, -40, -30, -20])) and hit == 1.0
+
+
+def test_loser_race_rewards_a_model_that_knows_only_the_losers(tmp_path):
+    """Informative on the bottom of the ranking only: wins the loser race outright."""
+    path = _write(tmp_path / "rd.csv", {"N1": None, "N2": None})
+    rows = (tmp_path / "rd.csv").read_text().splitlines()
+    rng = np.random.default_rng(3)
+    out = [rows[0]]
+    for line in rows[1:]:
+        f = line.split(",")
+        out.append(line)
+        if f[3] == "REALIZED":
+            r = np.array(f[12:], float)
+            pred = rng.normal(0, 1, 12)
+            pred[np.argsort(r)[:4]] -= 10           # its 4 lowest are today's 4 worst
+            out.append(",".join(f[:3] + ["L", "12", f[5], "", "0", "", "", "", ""]
+                                + [f"{x:.6g}" for x in pred]))
+    (tmp_path / "rd.csv").write_text("\n".join(out) + "\n")
+    lose = cr.standings(*cr.load(path, losers=True))
+    assert lose["L"][0] == 4 and lose["L"][1] > 50
+    assert lose["L"][1] > max(lose["N1"][1], lose["N2"][1])
+    _, passes = cr.load(path)
+    top = np.mean([cr.entry_gap(P["pred"]["L"], P["real"], P["ok"], P["flat"]).mean()
+                   for P in passes.values()])
+    # its top 4 are random among the 8 non-losers: an edge at the top, but only about half
+    assert 0.3 * lose["L"][1] < top < 0.7 * lose["L"][1]

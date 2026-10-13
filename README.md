@@ -298,6 +298,7 @@ ruff check .
 | `--account` | Account id (default `acct0`); selects `models/ACCT/paper|prod` |
 | `--flat-allocation` | Even 1/12 split, skipping MT1/MT2 (paper default for now) |
 | `--no-orders` | Run the full cycle but submit and cancel nothing |
+| `--sell-only IND,...` | Put industries in sell-only mode: the model's sells go in, nothing is bought |
 | `--capital` | Cap total deployed capital regardless of account balance |
 | `--withdraw` | Request a cash withdrawal of this dollar amount |
 
@@ -338,7 +339,7 @@ ruff check .
 | `race_watch.py [LOG] [--all] [--trend]` | Per-pass race table (default: newest `/root/ht_race_v*`) |
 | `race_qualify.py V3_LOG V4_LOG` | Apply the qualifier rule; prints `RACE_SKIP=` |
 | `race_daily_check.py CSV ROWS BAYES` | Consistency gate on `race_daily.csv` |
-| `committee_race.py CSV [--sizes 3,4,5,6] [--pool ...] [--watch]` | Committee voting race; `--watch` for the cross-pass watch list |
+| `committee_race.py CSV [--sizes 3,4,5,6] [--pool ...] [--watch] [--champions REF]` | Committee voting race; `--watch` for the cross-pass watch list, `--champions` to score it on the champion composite |
 | `plot_training.py [--download] [--pass N]` | SVG training charts from the droplet's logs |
 
 ---

@@ -36,8 +36,19 @@ plus the 6 best) and tracks four things across passes: which entries keep becomi
 which members lift the committees they sit on, which methods do best, and which committees
 recur near the top.
 
+--champions pass_reference.csv races the committees on the CHAMPION COMPOSITE: each industry's
+column (its realized return and every entry's prediction for it) taken from that industry's
+champion pass, the mix production deploys. This is the race that picks the committee to trade;
+entrants are chosen on the composite, and the per-pass mean and wins are printed for reference.
+
+--losers runs any of the above as the LOSER RACE: every prediction and return is negated, so a
+committee's "top 4" are the 4 industries it expects to do worst, and gap = flat - their mean
+return (positive = they did worse than flat). The --champions report adds the share of flagged
+industry-days that actually lost money, against the base rate.
+
 usage: committee_race.py race_daily.csv [--sizes 3,4,5,6] [--pool "A,B,..."] [--top 40]
-                         [--out committee_race.csv] [--watch]
+                         [--out committee_race.csv] [--watch] [--champions pass_reference.csv]
+                         [--losers]
 """
 import argparse
 import csv
@@ -59,11 +70,11 @@ METHODS = ("votes", "votes_pick", "votes_member", "votes_both", "borda", "zrecor
 PICK_W = np.array([STEP ** 3, STEP ** 2, STEP, 1.0])
 
 
-def load(path):
+def load(path, losers=False):
     """-> entries, {pass: dict(real[T,12], ok[T,12], flat[T], pred{e: [T,12]}, gap{e: [T]})}
 
     Only days on which every entry has a row are kept, so every configuration in a pass is
-    scored on the same days.
+    scored on the same days. losers=True returns the mirror image (see `mirror`).
     """
     with open(path) as f:
         rows = list(csv.DictReader(f))
@@ -87,11 +98,66 @@ def load(path):
         real = np.array([vec(by[(p, d)]["REALIZED"]) for d in days])
         ok = ~np.isnan(real)
         passes[p] = dict(
-            real=np.nan_to_num(real), ok=ok,
+            days=np.array(days), inds=inds, real=np.nan_to_num(real), ok=ok,
             flat=np.array([real[t][ok[t]].mean() for t in range(len(days))]),
             pred={e: np.array([vec(by[(p, d)][e]) for d in days]) for e in entries},
             gap={e: np.array([float(by[(p, d)][e]["gap_bp"]) for d in days]) for e in entries})
+    if losers:
+        passes = {p: mirror(P) for p, P in passes.items()}
     return entries, passes
+
+
+def entry_gap(pred, real, ok, flat):
+    """[T] one entry's daily gap: its own top 4 of the 12 against flat."""
+    zero = np.zeros(real.shape)
+    return (fund(np.nan_to_num(pred, nan=-np.inf), ok, zero, zero) * real).sum(1) / N_PICK - flat
+
+
+def mirror(P):
+    """The loser race: predictions, returns and flat negated, so every method's "top 4" is the
+    4 industries the committee expects to do WORST, and gap = flat - their mean return (bp/day;
+    positive = the flagged industries did worse than flat). Each entry's gap is recomputed from
+    its own bottom 4. Leaving the 4 flagged industries out of an equal book would add
+    gap x 4/8 to it on a 12-industry day."""
+    real, flat = -P["real"], -P["flat"]
+    pred = {e: -x for e, x in P["pred"].items()}
+    return dict(P, real=real, flat=flat, pred=pred,
+                gap={e: entry_gap(x, real, P["ok"], flat) for e, x in pred.items()})
+
+
+def read_champions(path):
+    """pass_reference.csv -> {industry: champion pass} as of its last judged pass."""
+    with open(path) as f:
+        rows = [r for r in csv.DictReader(line for line in f if not line.startswith("#"))]
+    last = max(int(r["pass"]) for r in rows)
+    return {r["industry"]: int(r["new_champ_pass"]) for r in rows if int(r["pass"]) == last}
+
+
+def champion_composite(entries, passes, champ):
+    """One synthetic pass in which each industry's column -- its realized return and every
+    entry's prediction for it -- comes from that industry's champion pass: the mix that
+    production deploys. Kept to the days every champion pass logged. Entry gaps are recomputed
+    from the composite predictions (each entry's top 4 of the 12), since no trainer pass ever
+    made those picks."""
+    inds = passes[min(passes)]["inds"]
+    src = [champ[i] for i in inds]
+    missing = sorted(set(src) - set(passes))
+    if missing:
+        sys.exit(f"champion passes not in the log: {missing}")
+    days = sorted(set.intersection(*(set(passes[p]["days"].tolist()) for p in set(src))))
+    at = {p: {d: t for t, d in enumerate(passes[p]["days"].tolist())} for p in set(src)}
+
+    def col(key, j, e=None):
+        p = src[j]
+        a = passes[p][key] if e is None else passes[p][key][e]
+        return a[[at[p][d] for d in days], j]
+
+    real = np.stack([col("real", j) for j in range(len(inds))], 1)
+    ok = np.stack([col("ok", j) for j in range(len(inds))], 1)
+    flat = np.array([real[t][ok[t]].mean() for t in range(len(days))])
+    pred = {e: np.stack([col("pred", j, e) for j in range(len(inds))], 1) for e in entries}
+    gap = {e: entry_gap(pred[e], real, ok, flat) for e in entries}
+    return dict(days=np.array(days), inds=inds, real=real, ok=ok, flat=flat, pred=pred, gap=gap)
 
 
 def standings(entries, passes):
@@ -191,19 +257,19 @@ def bayes_tree(pos, real, flat, ok, kappa=TREE_KAPPA, recency=RECENCY):
     return score
 
 
-def run_committee(members, rank_w, P, F):
-    """members: entrant names, strongest first; rank_w: their member weights (1.1 steps).
-    P: one pass; F: {entry: (rank, z, pos, rec)} for that pass. -> {method: gap bp/day}."""
+def committee_scores(members, rank_w, P, F):
+    """Each method's [T,12] daily score for one committee (higher = fund first), plus the vote
+    count and mean z that break its ties. members: entrant names, strongest first; rank_w: their
+    member weights (1.1 steps). P: one pass; F: {entry: (rank, z, pos, rec)} for that pass.
+    -> ({method: score}, votes, zmean)"""
     rk = np.array([F[e][0] for e in members])
     z = np.array([F[e][1] for e in members])
     pos = np.array([F[e][2] for e in members])
     rec = np.array([F[e][3] for e in members])
-    real, ok, flat = P["real"], P["ok"], P["flat"]
     voted = (pos >= 0).astype(float)
     pw = np.where(pos >= 0, PICK_W[np.clip(pos, 0, 3)], 0.0)
     mw = np.asarray(rank_w)[:, None, None]
     votes = voted.sum(0)
-    zmean = z.mean(0)
     rw = np.maximum(rec, 0.0)[:, :, None]
     rw = np.where(rw.sum(0, keepdims=True) <= 0, 1.0, rw)
     scores = {
@@ -213,12 +279,21 @@ def run_committee(members, rank_w, P, F):
         "votes_both": (mw * pw).sum(0),
         "borda": rk.mean(0),
         "zrecord": (rw * z).sum(0) / rw.sum(0),
-        "bayes_tree": bayes_tree(pos, real, flat, ok),
+        "bayes_tree": bayes_tree(pos, P["real"], P["flat"], P["ok"]),
     }
+    return scores, votes, z.mean(0)
+
+
+def run_committee(members, rank_w, P, F):
+    """-> {method: (gap bp/day, hit rate)} for one committee on one pass (see committee_scores);
+    hit = share of funded industry-days with a positive return (in the loser race: a loss)."""
+    scores, votes, zmean = committee_scores(members, rank_w, P, F)
+    real, ok, flat = P["real"], P["ok"], P["flat"]
     out = {}
     for meth, s in scores.items():
         pick = fund(s, ok, votes, zmean)
-        out[meth] = float(((pick * real).sum(1) / N_PICK - flat).mean())
+        out[meth] = (float(((pick * real).sum(1) / N_PICK - flat).mean()),
+                     float((pick & (real > 0)).sum() / max(pick.sum(), 1)))
     return out
 
 
@@ -239,17 +314,18 @@ def configs(passes, stand, pool, sizes):
             per = [run_committee(combo, rank_w, passes[p], feats[p]) for p in ps]
             mem = np.array([stand[e][2] for e in combo])           # [k,P]
             for meth in METHODS:
-                g = np.array([x[meth] for x in per])
+                g = np.array([x[meth][0] for x in per])
                 results.append(dict(committee=" + ".join(combo), k=k, method=meth, gaps=g,
+                                    hits=np.array([x[meth][1] for x in per]),
                                     w_flat=int((g > 0).sum()),
                                     w_best=int((g > mem.max(0)).sum()),
                                     w_mean=int((g > mem.mean(0)).sum())))
     return results
 
 
-def run(path, sizes=(3, 4, 5, 6), pool=None):
+def run(path, sizes=(3, 4, 5, 6), pool=None, losers=False):
     """-> (stand, pool, ps, results[list of dict])"""
-    entries, passes = load(path)
+    entries, passes = load(path, losers)
     stand = standings(entries, passes)
     if pool:
         missing = set(pool) - set(entries)
@@ -269,7 +345,7 @@ def pass_pool(stand, n_mean=N_BY_MEAN):
     return [e for e in by_g if e in pool]
 
 
-def watch(path, sizes=(3, 4, 5, 6), top_frac=TOP_FRAC):
+def watch(path, sizes=(3, 4, 5, 6), top_frac=TOP_FRAC, losers=False):
     """The cross-pass watch list, each pass raced on its own entrants (pass_pool):
       entrants   how often each entry becomes an entrant
       members    member effect: mean gap of committees containing it minus those without,
@@ -280,7 +356,7 @@ def watch(path, sizes=(3, 4, 5, 6), top_frac=TOP_FRAC):
       recurring  committees (and committee+method) in the top `top_frac` of their pass, counted
                  over the passes in which all their members were entrants
     -> dict of the four tables plus `ps`."""
-    entries, passes = load(path)
+    entries, passes = load(path, losers)
     ps = sorted(passes)
     ent = defaultdict(list)                        # entry -> passes it was an entrant
     eff = defaultdict(dict)                        # entry -> {pass: member effect bp}
@@ -332,6 +408,71 @@ def watch(path, sizes=(3, 4, 5, 6), top_frac=TOP_FRAC):
                 top_cm=top_cm, top_c=top_c, eligible=eligible)
 
 
+def champion_check(path, champions, sizes=(3, 4, 5, 6), pool=None, losers=False):
+    """Race the committees on the champion composite -- the selection that decides what trades --
+    with the per-pass race beside it for reference. Entrants are chosen on the composite itself
+    (pass_pool: every entry that beat flat there, plus the 6 best), strongest first, unless `pool`
+    is given. -> dict(champ, pool, stand, cstand, res, cres, ps, ndays); res and cres hold the
+    same configurations in the same order."""
+    entries, passes = load(path, losers)
+    champ = read_champions(champions)
+    stand = standings(entries, passes)
+    C = {0: champion_composite(entries, passes, champ)}
+    cstand = standings(entries, C)
+    P = C[0]
+    up = P["ok"] & (P["real"] > 0)              # a gain, or in the loser race a loss
+    zero = np.zeros(up.shape)
+    hit = {}
+    for e in entries:
+        f = fund(np.nan_to_num(P["pred"][e], nan=-np.inf), P["ok"], zero, zero)
+        hit[e] = float((f & up).sum() / f.sum())
+    base = float(up.sum() / P["ok"].sum())
+    pool = sorted(pool, key=lambda e: -cstand[e][1]) if pool else pass_pool(cstand)
+    return dict(champ=champ, pool=pool, stand=stand, cstand=cstand, ps=sorted(passes),
+                ndays=len(C[0]["days"]), losers=losers, base=base, hit=hit,
+                res=configs(passes, stand, pool, sizes), cres=configs(C, cstand, pool, sizes))
+
+
+def print_champion_check(c, top=15):
+    n = len(c["ps"])
+    lose = c["losers"]
+    hitname = "loss%" if lose else "gain%"
+    print(("LOSER RACE (flags the 4 industries expected to do worst; gap = flat - their return)\n"
+           if lose else "") + "CHAMPION COMPOSITE: each industry from its champion pass, "
+          f"{c['ndays']} days, {n} passes in the log")
+    print("   " + "  ".join(f"{i}=p{p}" for i, p in c["champ"].items()))
+    st, cs = c["stand"], c["cstand"]
+    print(f"\n{hitname} = share of picked industry-days that {'lost' if lose else 'gained'}; "
+          f"base rate over all industry-days {c['base']:.1%}")
+    print(f"\nsingles, gap vs flat bp/day (* = entrant)   {'composite':>10}{hitname:>7}"
+          f"{'per-pass mean':>15}")
+    for e in sorted(st, key=lambda e: -cs[e][1]):
+        print(f"   {('* ' if e in c['pool'] else '  ') + e:40}{cs[e][1]:+10.2f}"
+              f"{c['hit'][e]:>7.1%}{st[e][1]:+15.2f}")
+    res, cres = c["res"], c["cres"]
+    pm = np.array([r["gaps"].mean() for r in res])
+    cg = np.array([r["gaps"][0] for r in cres])
+
+    def rk(x):
+        r = np.empty(len(x))
+        r[np.argsort(x, kind="stable")] = np.arange(len(x))
+        return r
+    rho = float(np.corrcoef(rk(pm), rk(cg))[0, 1])
+    print(f"\n{len(c['pool'])} entrants -> {len(res)} configurations, "
+          f"{int((cg > 0).sum())} beat flat on the composite. "
+          f"Rank correlation with the per-pass mean: {rho:+.2f}")
+    print(f"\nchampion-composite top {top} (sorted: composite gap)")
+    print(f"{'comp':>7}{hitname:>7}{'>best':>6}{'per-pass':>10}{'wins':>6}  {'method':12} committee")
+    for i in np.argsort(-cg, kind="stable")[:top]:
+        r, q = res[i], cres[i]
+        print(f"{cg[i]:+7.2f}{q['hits'][0]:>7.1%}{'yes' if q['w_best'] else 'no':>6}{pm[i]:+10.2f}"
+              f"{r['w_flat']:>4}/{n:<2}  {r['method']:12} {r['committee']}")
+    print("\nby method: configurations beating flat on the composite, and mean composite gap")
+    for meth in METHODS:
+        g = np.array([cg[i] for i, r in enumerate(cres) if r["method"] == meth])
+        print(f"  {meth:12} {int((g > 0).sum()):>5}/{len(g):<5} {g.mean():+7.2f}")
+
+
 def print_watch(w, show=15):
     n = len(w["ps"])
     print(f"WATCH: each pass raced on its own entrants, {n} pass(es)\n")
@@ -373,15 +514,24 @@ def main():
     ap.add_argument("--out", default="")
     ap.add_argument("--watch", action="store_true",
                     help="race each pass on its own entrants and print the cross-pass watch list")
+    ap.add_argument("--champions", default="", metavar="PASS_REFERENCE_CSV",
+                    help="score the committees on the champion composite named by the trainer's "
+                         "pass_reference.csv, beside the per-pass race")
+    ap.add_argument("--losers", action="store_true",
+                    help="the loser race: committees flag the 4 industries expected to do worst")
     a = ap.parse_args()
     sizes = tuple(int(x) for x in a.sizes.split(","))
-    if a.watch:
-        print_watch(watch(a.csv, sizes))
-        return
     pool = [x.strip() for x in a.pool.split(",") if x.strip()] or None
-    stand, pool, ps, res = run(a.csv, sizes, pool)
+    if a.champions:
+        print_champion_check(champion_check(a.csv, a.champions, sizes, pool, a.losers), a.top)
+        return
+    if a.watch:
+        print_watch(watch(a.csv, sizes, losers=a.losers))
+        return
+    stand, pool, ps, res = run(a.csv, sizes, pool, a.losers)
     n = len(ps)
-    print(f"{a.csv}: {len(stand)} entries, {n} passes\n")
+    print(f"{a.csv}: {len(stand)} entries, {n} passes"
+          + (" -- LOSER RACE (gap = flat - flagged 4)" if a.losers else "") + "\n")
     print("singles, gap vs flat bp/day per pass  (* = entrant)")
     print(f"{'entry':24}{'wins':>6}{'mean':>8}  " + " ".join(f"{'p' + str(p):>6}" for p in ps))
     for e in sorted(stand, key=lambda e: (-stand[e][0], -stand[e][1])):
