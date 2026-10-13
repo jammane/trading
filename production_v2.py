@@ -27,6 +27,7 @@ from alpaca.trading.enums import OrderSide, OrderType, QueryOrderStatus, TimeInF
 from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, MarketOrderRequest, StopOrderRequest
 
 import training_lib
+import upkeep_cpp
 from fees import BUY_FILL, SELL_FILL, _sell_net
 from models import MasterNN, StockNN, stock_close_pos, stock_close_vs_wap
 from universe import INDUSTRIES
@@ -790,6 +791,92 @@ def plan_industry_orders(symbols, sug, holdings, day_data, allocated_cash, holds
     return orders
 
 
+# ── Daily training with the C++ trainer (--cpp-upkeep) ───────────────────────────
+# The daily cycle is: download the day's bars -> train one day -> convert the StockNN elites ->
+# run the models -> place tomorrow's orders. Training is training_v4_cpp --upkeep, the same code
+# that trained the race (see upkeep_cpp.py), on the books this run recorded the session before.
+# Its state lives in <model_dir>/cpp; <model_dir>/champion is the seed it starts from.
+UPKEEP_BINARY = os.environ.get('TRAINER_BIN', 'build/training_v4_cpp')
+# The race entries the committees vote with -- the winner committee (TANH32 grad, MT1 grdC,
+# MT1 evo, MT1S-rep evo, MT1S-stk grad) and the loser committee (TANH32 grad, MT1S-stk evo,
+# ALLOC bayes mean), picked on the v5 champion composite. Only these are trained daily; the
+# trainer also always runs MT1C grad and MT1 evo, which it reads by index.
+UPKEEP_RACE_ONLY = ("TANH32 grad", "MT1 grdC", "MT1 evo", "MT1S-rep evo", "MT1S-stk grad",
+                    "MT1S-stk evo", "ALLOC bayes mean")
+
+
+def convert_stocknn(state_dir, model_dir):
+    """The trained StockNN elites, .bin -> .pt, for this run's inference."""
+    from convert_weights import STOCK_LAYER_DEFS, convert_industry
+    for ind in INDUSTRIES:
+        convert_industry(ind, state_dir, model_dir, STOCK_LAYER_DEFS, StockNN, ind)
+
+
+def run_daily_training(model_dir):
+    """Train the day the previous run placed orders on, then convert. -> True if the models
+    changed. A failure leaves the previous models in place: a bad training day must not stop the
+    orders, and the trainer refuses (rc 3) a day it has already trained, so a re-run is safe."""
+    state_dir = os.path.join(model_dir, 'cpp')
+    seed_dir = os.path.join(model_dir, 'champion')
+    book = os.path.join(state_dir, 'book_next.txt')
+    if not os.path.exists(book):
+        print("Daily training: no book recorded by a previous run yet -- nothing to train")
+        return False
+    if not os.path.isdir(seed_dir):
+        print(f"Daily training: ERROR seed directory {seed_dir} is missing -- not training")
+        return False
+    log = os.path.join(LOG_DIR, 'upkeep_cpp.log')
+    print(f"Daily training: training_v4_cpp --upkeep (log {log}) ...")
+    rc = upkeep_cpp.run_upkeep(UPKEEP_BINARY, book, state_dir, seed_dir, UPKEEP_RACE_ONLY, log)
+    if rc == 3:
+        print("Daily training: that day is already trained; models unchanged")
+        return False
+    if rc != 0:
+        print(f"Daily training: ERROR rc={rc} (see {log}); trading on the previous models")
+        return False
+    convert_stocknn(state_dir, model_dir)
+    print("Daily training: done, StockNN elites converted")
+    return True
+
+
+def save_upkeep_book(model_dir, trading_client, industries, allocations, sell_only, orders,
+                     day_data):
+    """Record today's real books -- what each industry holds (Alpaca), the cash it was given and
+    the stops queued -- dated today, for tomorrow's training step. A sell-only industry was given
+    no cash. CN_BOOK's base, each industry's starting book, is fixed on the first write."""
+    state_dir = os.path.join(model_dir, 'cpp')
+    os.makedirs(state_dir, exist_ok=True)
+    try:
+        positions = {p.symbol: float(p.qty) for p in trading_client.get_all_positions()}
+    except Exception as e:
+        print(f"Daily training: ERROR reading positions ({e}); no book recorded for tomorrow")
+        return
+    stops = {}
+    for o in orders:
+        if o['action'] == 'stop_loss':
+            stops[o['symbol']] = max(stops.get(o['symbol'], 0.0), float(o['price']))
+    books, value = {}, {}
+    for ind, syms in industries.items():
+        cash = 0.0 if ind in sell_only else float(allocations.get(ind, 0.0))
+        hold = {s: positions.get(s, 0.0) for s in syms}
+        books[ind] = {'cash': cash, 'holdings': hold,
+                      'stop_prices': {s: stops.get(s, 0.0) for s in syms}}
+        value[ind] = cash + sum(q * day_data.get(s, {}).get('close', 0.0) for s, q in hold.items())
+    base_path = os.path.join(state_dir, 'book_base.json')
+    if os.path.exists(base_path):
+        with open(base_path) as f:
+            base = json.load(f)
+    else:
+        even = sum(value.values()) / max(1, len(value))
+        base = {ind: (v if v > 0 else even) or training_lib.IND_STARTING_CASH
+                for ind, v in value.items()}
+        with open(base_path, 'w') as f:
+            json.dump(base, f, indent=1)
+    upkeep_cpp.write_book(os.path.join(state_dir, 'book_next.txt'),
+                          datetime.today().strftime('%Y-%m-%d'), books, base)
+    print(f"Daily training: today's books recorded for tomorrow ({len(books)} industries)")
+
+
 def main():
     """Run one daily trading cycle: fetch data, infer, submit orders, retrain."""
     parser = argparse.ArgumentParser(description="Run stock trading system v2.")
@@ -809,6 +896,10 @@ def main():
                              'and its sells are placed, but nothing is bought, so the industry '
                              'drains at the model\'s own sell rate. Not liquidation. Their '
                              'allocation is not spent.')
+    parser.add_argument('--cpp-upkeep', action='store_true',
+                        help='Daily training with the C++ trainer: before deciding, train the day '
+                             'the previous run placed orders on (training_v4_cpp --upkeep) and '
+                             'convert the StockNN elites; replaces the Python upkeep step.')
     args = parser.parse_args()
 
     subtype   = 'paper' if args.paper else 'prod'
@@ -915,6 +1006,11 @@ def main():
 
         # Load historical data
         histories = load_stock_data(symbols)
+
+        # Daily training (--cpp-upkeep): today's bars are in stock_data now, so the day the last
+        # run placed orders on can be trained against them before anything is decided today.
+        if args.cpp_upkeep:
+            run_daily_training(model_dir)
 
         # Fetch 1-minute intraday bars for today so the fill simulation uses the
         # actual intraday high/low sequence rather than a random 50/50 coin flip.
@@ -1240,77 +1336,83 @@ def main():
         total_portfolio_value = compute_total_portfolio_value(cash, holdings, day_data, histories)
         update_owners_file(total_portfolio_value, model_dir)
 
-        # Retrain models using real Alpaca state as portfolio seed.
-        # yesterday_data = model-input features (day N); day_data = fill prices (day N+1).
-        # This matches the offline training's day-N-predict / day-N+1-fill pattern.
-        ind_primed, master_primed = build_primed_portfolios(
-            trading_client, industries, allocations, zero_counts)
-        industry_top_scores = {}
-        for industry, symbols in industries.items():
-            if os.path.exists(f"{model_dir}/{industry}_best.pt"):
-                result = train_industry_one_day_prod(
-                    industry, symbols, yesterday_data, ind_primed[industry], model_dir,
-                    today_data=day_data, seq_flags=seq_flags, intraday_bars=intraday_data)
-                if result is not None:
-                    industry_top_scores[industry] = result
-
-        # Compute equal-weight market close-to-close return per industry from today's data.
-        # Uses yesterday_data (prev close) and day_data (today close).
-        mkt_ret: dict = {}
-        for ind, syms in industries.items():
-            total, valid = 0.0, 0
-            for sym in syms:
-                prev = yesterday_data.get(sym, {}).get('close', 0.0)
-                cur  = day_data.get(sym, {}).get('close', 0.0)
-                if prev > 1e-3 and cur > 1e-3:
-                    total += cur / prev - 1.0; valid += 1
-            mkt_ret[ind] = total / valid if valid > 0 else 0.0
-
-        # Update market cumulative index (starts at IND_STARTING_CASH per session)
-        IND_START = 25_000.0
-        for ind in industry_list:
-            hist_v = mkt_val_history.get(ind, [])
-            prev_v = hist_v[-1] if hist_v else IND_START
-            hist_v.append(prev_v * (1.0 + mkt_ret.get(ind, 0.0)))
-            mkt_val_history[ind] = hist_v[-92:]  # cap at IND_HIST_CAP=92
-
-        # Append today's PORTFOLIO index (Part C: compound the deployed slot-0 return so a 10-day
-        # forward ratio is a meaningful cumulative return, matching the C++ ind_val_hist), and record
-        # today's same-day slot-0 delta (the MT2 objective). industry_top_scores[ind] = (baseline, slot0).
-        slot0_deltas = {}
-        for ind in industry_list:
-            if ind in industry_top_scores:
-                baseline, slot0_v = industry_top_scores[ind]
-                slot0_ret = (slot0_v / baseline - 1.0) if baseline > 1e-6 else 0.0
-                slot0_deltas[ind] = slot0_ret
-                hist_v = ind_value_history.get(ind, [])
-                prev_v = hist_v[-1] if hist_v else IND_START
-                hist_v.append(prev_v * (1.0 + slot0_ret))
-                ind_value_history[ind] = hist_v[-92:]  # cap at IND_HIST_CAP=92
-        _save_master_state(model_dir, ind_value_history, mkt_val_history, zero_counts)
-
-        # MT1/MT2 upkeep — gate on ≥15 days of history (MT1 needs features; MT2 needs ≥5 MT1 warmup).
-        min_real_days = min(
-            (len(ind_value_history.get(ind, [])) for ind in industry_list),
-            default=0,
-        )
-        if min_real_days >= 15:
-            print(f"Running MT1/MT2 upkeep ({min_real_days} history days) ...")
-            train_mt_one_day_prod(
-                industries, model_dir, mkt_val_history, ind_value_history,
-                slot0_deltas, mkt_ret)
-        elif os.path.exists(f"{model_dir}/master_best.pt"):
-            # Legacy MasterNN upkeep during transition period (≤15 real days)
-            from training_lib import train_master_one_day
-            try:
-                train_master_one_day(industries, master_primed, model_dir,
-                                     ind_value_history,
-                                     industry_top_scores=industry_top_scores)
-            except Exception as e:
-                print(f"Error in legacy master upkeep: {e}")
-            print(f"MT upkeep deferred: {min_real_days}/15 days of real history")
+        if args.cpp_upkeep:
+            # The C++ step trained before inference (run_daily_training); what is left is to
+            # record today's books, which tomorrow's run trains on.
+            save_upkeep_book(model_dir, trading_client, industries, allocations, sell_only,
+                             orders, day_data)
         else:
-            print(f"MT upkeep deferred: {min_real_days}/15 days of real history")
+            # Retrain models using real Alpaca state as portfolio seed.
+            # yesterday_data = model-input features (day N); day_data = fill prices (day N+1).
+            # This matches the offline training's day-N-predict / day-N+1-fill pattern.
+            ind_primed, master_primed = build_primed_portfolios(
+                trading_client, industries, allocations, zero_counts)
+            industry_top_scores = {}
+            for industry, symbols in industries.items():
+                if os.path.exists(f"{model_dir}/{industry}_best.pt"):
+                    result = train_industry_one_day_prod(
+                        industry, symbols, yesterday_data, ind_primed[industry], model_dir,
+                        today_data=day_data, seq_flags=seq_flags, intraday_bars=intraday_data)
+                    if result is not None:
+                        industry_top_scores[industry] = result
+
+            # Compute equal-weight market close-to-close return per industry from today's data.
+            # Uses yesterday_data (prev close) and day_data (today close).
+            mkt_ret: dict = {}
+            for ind, syms in industries.items():
+                total, valid = 0.0, 0
+                for sym in syms:
+                    prev = yesterday_data.get(sym, {}).get('close', 0.0)
+                    cur  = day_data.get(sym, {}).get('close', 0.0)
+                    if prev > 1e-3 and cur > 1e-3:
+                        total += cur / prev - 1.0; valid += 1
+                mkt_ret[ind] = total / valid if valid > 0 else 0.0
+
+            # Update market cumulative index (starts at IND_STARTING_CASH per session)
+            IND_START = 25_000.0
+            for ind in industry_list:
+                hist_v = mkt_val_history.get(ind, [])
+                prev_v = hist_v[-1] if hist_v else IND_START
+                hist_v.append(prev_v * (1.0 + mkt_ret.get(ind, 0.0)))
+                mkt_val_history[ind] = hist_v[-92:]  # cap at IND_HIST_CAP=92
+
+            # Append today's PORTFOLIO index (Part C: compound the deployed slot-0 return so a 10-day
+            # forward ratio is a meaningful cumulative return, matching the C++ ind_val_hist), and record
+            # today's same-day slot-0 delta (the MT2 objective). industry_top_scores[ind] = (baseline, slot0).
+            slot0_deltas = {}
+            for ind in industry_list:
+                if ind in industry_top_scores:
+                    baseline, slot0_v = industry_top_scores[ind]
+                    slot0_ret = (slot0_v / baseline - 1.0) if baseline > 1e-6 else 0.0
+                    slot0_deltas[ind] = slot0_ret
+                    hist_v = ind_value_history.get(ind, [])
+                    prev_v = hist_v[-1] if hist_v else IND_START
+                    hist_v.append(prev_v * (1.0 + slot0_ret))
+                    ind_value_history[ind] = hist_v[-92:]  # cap at IND_HIST_CAP=92
+            _save_master_state(model_dir, ind_value_history, mkt_val_history, zero_counts)
+
+            # MT1/MT2 upkeep — gate on ≥15 days of history (MT1 needs features; MT2 needs ≥5 MT1 warmup).
+            min_real_days = min(
+                (len(ind_value_history.get(ind, [])) for ind in industry_list),
+                default=0,
+            )
+            if min_real_days >= 15:
+                print(f"Running MT1/MT2 upkeep ({min_real_days} history days) ...")
+                train_mt_one_day_prod(
+                    industries, model_dir, mkt_val_history, ind_value_history,
+                    slot0_deltas, mkt_ret)
+            elif os.path.exists(f"{model_dir}/master_best.pt"):
+                # Legacy MasterNN upkeep during transition period (≤15 real days)
+                from training_lib import train_master_one_day
+                try:
+                    train_master_one_day(industries, master_primed, model_dir,
+                                         ind_value_history,
+                                         industry_top_scores=industry_top_scores)
+                except Exception as e:
+                    print(f"Error in legacy master upkeep: {e}")
+                print(f"MT upkeep deferred: {min_real_days}/15 days of real history")
+            else:
+                print(f"MT upkeep deferred: {min_real_days}/15 days of real history")
 
         # Submit orders to Alpaca (paper or live depending on --paper flag).
         # --no-orders stops here: everything above (allocation, decisions) and the upkeep training
