@@ -77,16 +77,16 @@ class TestWeightedAvgPortfolio:
 class TestWeightedAvgModel:
     """training_lib.compute_weighted_avg_model: zip(slots, weights, strict=True).
 
-    Uses MT1Tail (1,803 params) rather than StockNN (921,625) to keep the fixture cheap.
+    Uses MT1Net (3,501 params) rather than StockNN (928,825) to keep the fixture cheap.
     """
 
     @staticmethod
     def _seed(tmp_path, n):
-        from models import MT1Tail
+        from models import MT1Net
 
         for slot in range(n):
-            save_slot_model("zt", str(tmp_path), slot, MT1Tail())
-        return MT1Tail
+            save_slot_model("zt", str(tmp_path), slot, MT1Net())
+        return MT1Net
 
     def test_equal_lengths_produce_a_model(self, tmp_path):
         cls = self._seed(tmp_path, 3)

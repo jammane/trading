@@ -183,8 +183,96 @@ static void test_regime_labels()
 static void test_constants()
 {
     current_suite = "constants";
-    CHECK(PASS_JUDGE_DAYS == 15);
-    CHECK(PASS_REF_VERSION == 1);
+    CHECK(PASS_JUDGE_MIN_DAYS == 15);
+    CHECK(PASS_REF_VERSION == 2);
+    CHECK(PASS_JUDGE_RECENCY == 0.995);
+    // half-life ~138 days -- the figure CLAUDE.md and the race header quote
+    CHECK(NEAR(std::log(0.5) / std::log(PASS_JUDGE_RECENCY), 138.3, 0.5));
+}
+
+// ── PassJudge: the champion score ─────────────────────────────────────────
+
+static void test_judge_constant_return_scores_that_return()
+{
+    current_suite = "judge/constant";
+    PassJudge j;
+    double book = 25000.0;
+    for (int age = 600; age >= 0; age--) { j.add(book, book * 1.001, age); book *= 1.001; }
+    CHECK(NEAR(j.score(), 0.001, 1e-12));    // any weighting of a constant is that constant
+    CHECK(j.have());
+    CHECK(j.n == 601);
+}
+
+static void test_judge_reset_day_scores_zero_not_a_jump()
+{
+    current_suite = "judge/reset";
+    // The trainer's reset path sets book_prev == slot0_score at $25,000. v1 measured the book's
+    // level, so a reset from $22,400 read as +11.6%. v2 sums returns: the day must be exactly 0.
+    PassJudge a, b;
+    for (int age = 9; age >= 1; age--) { a.add(25000.0, 25025.0, age); b.add(25000.0, 25025.0, age); }
+    a.add(25000.0, 25000.0, 0);              // reset day
+    b.add(22400.0, 25000.0, 0);              // what a level-based metric would have seen
+    CHECK(a.score() < 0.001);                // diluted by one zero, never inflated
+    CHECK(a.score() > 0.0009 * 0.9);
+    CHECK(b.score() > 10.0 * a.score());     // the contamination the fix removes
+}
+
+static void test_judge_recent_days_count_more()
+{
+    current_suite = "judge/recency";
+    // Same returns, opposite order: the pass that did well LATE must outscore the one that did
+    // well early, and by a lot when the gap is ~a year.
+    PassJudge late, early;
+    for (int age = 399; age >= 0; age--) {
+        const bool recent = age < 200;
+        late.add (25000.0, 25000.0 * (recent ? 1.002 : 0.999), age);
+        early.add(25000.0, 25000.0 * (recent ? 0.999 : 1.002), age);
+    }
+    CHECK(late.score() > 0.0);
+    CHECK(early.score() < 0.0);
+    // weight at age 138 is half that at age 0
+    PassJudge h;
+    h.add(25000.0, 25000.0 * 1.01, 0);
+    h.add(25000.0, 25000.0 * 0.99, 138);
+    CHECK(h.score() > 0.0);                  // the newer day dominates
+    CHECK(NEAR(h.score(), (0.01 - 0.01 * std::pow(0.995, 138)) / (1 + std::pow(0.995, 138)), 1e-12));
+}
+
+static void test_judge_effective_days()
+{
+    current_suite = "judge/eff";
+    PassJudge j;
+    for (int age = 1237; age >= 0; age--) j.add(25000.0, 25010.0, age);
+    // (1+g)/(1-g) = 399 for an infinite series at g = 0.995; a 1,238-day pass is near that
+    CHECK(j.eff_days() > 380.0 && j.eff_days() < 400.0);
+    PassJudge one; one.add(25000.0, 25010.0, 0);
+    CHECK(NEAR(one.eff_days(), 1.0, 1e-12));
+}
+
+static void test_judge_ignores_invalid_days()
+{
+    current_suite = "judge/invalid";
+    PassJudge j;
+    CHECK(!j.have());
+    CHECK(j.score() == 0.0);
+    j.add(0.0, 25000.0, 0);                  // no book
+    j.add(25000.0, std::nan(""), 0);         // non-finite outcome
+    CHECK(!j.have());
+    j.add(25000.0, 25250.0, 5);
+    CHECK(j.have());
+    CHECK(NEAR(j.score(), 0.01, 1e-12));
+    // negative age (cannot happen; clamped rather than overweighted)
+    PassJudge k; k.add(25000.0, 25250.0, -3); k.add(25000.0, 24750.0, 0);
+    CHECK(NEAR(k.score(), 0.0, 1e-12));
+}
+
+static void test_judge_share_stays_a_proportion()
+{
+    current_suite = "judge/share";
+    // pass_share_new is fed v2 scores (~1e-3) now; it only uses sign and ratio, so the scale
+    // change must not move it.
+    CHECK(NEAR(pass_share_new(0.0004, 0.0012), pass_share_new(0.04, 0.12), 1e-12));
+    CHECK(NEAR(pass_share_new(-0.0004, -0.0012), pass_share_new(-0.04, -0.12), 1e-12));
 }
 
 int main()
@@ -203,6 +291,12 @@ int main()
     test_interleave_best_of_both_land_early();
     test_interleave_minority_below_resolution_gets_nothing();
     test_regime_labels();
+    test_judge_constant_return_scores_that_return();
+    test_judge_reset_day_scores_zero_not_a_jump();
+    test_judge_recent_days_count_more();
+    test_judge_effective_days();
+    test_judge_ignores_invalid_days();
+    test_judge_share_stays_a_proportion();
 
     printf("\n===========================\n");
     printf("%d passed, %d failed\n", pass_count, fail_count);

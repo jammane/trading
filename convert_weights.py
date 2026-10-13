@@ -25,20 +25,21 @@ correct: StockNN from champion/, master/MT1/MT2 from the run root.
 import argparse
 import os
 
+import struct
+
 import numpy as np
 import torch
 
-from models import MT1NN, MT2NN, MasterNN, MT1DualHead, MT1Tail, StockNN
+from models import MT1NET_LAYER_DEFS, MT1NET_PARAMS, MT1Net, MT2NN, MasterNN, StockNN
 from prepare_models import (
     ELITE_POOL,
-    HEAD_LAYER_DEFS,
-    HT_PARENTS,
     MASTER_LAYER_DEFS,
-    MT1_COMP_SLOTS,
-    MT1_POOL_NAMES,
+    MT1_META_MAGIC,
+    MT1_META_VERSION,
+    MT1_POOL_SLOTS,
+    MT1_SLOT_META_BYTES,
     MT2_LAYOUT,
     STOCK_LAYER_DEFS,
-    TAIL_LAYER_DEFS,
 )
 
 
@@ -131,46 +132,67 @@ def convert_mt2(models_dir, output_dir):
         print('  [mt2] mt2_best.pt written (copy of slot 0)')
 
 
-def _read_bin_sd(models_dir, ind, name, layer_defs):
-    """Load a head/tail .bin into a state_dict, preferring the production _0.bin, else elite_0."""
-    for cand in (f'mt1_{ind}_{name}_0.bin', f'mt1_{ind}_{name}_elite_0.bin'):
-        p = os.path.join(models_dir, cand)
-        if os.path.exists(p):
-            return arr_to_state_dict(np.fromfile(p, dtype=np.float32), layer_defs, None)
-    return None
+def _mt1_meta_path(models_dir, ind):
+    return os.path.join(models_dir, f'mt1_{ind}_meta.bin')
 
 
-def _convert_mt1_best(ind, models_dir, output_dir):
-    """Compose mt1_{ind}_best.pt (production MT1NN) from the head + 4 tail .bin production bests."""
-    head_sd = _read_bin_sd(models_dir, ind, 'head', HEAD_LAYER_DEFS)
-    if head_sd is None:
-        print(f'  [mt1/{ind}] head .bin not found — skipping best compose')
-        return
+def _read_mt1_meta(models_dir, ind):
+    """Read the pool metadata sidecar written by save_mt1_pool.
+
+    Returns (best_slot, n_slots) or (0, MT1_POOL_SLOTS) when the sidecar is missing or rejected.
+    The sidecar is what says WHICH of the 200 individuals is deployed — without it slot 0 is a
+    guess, and the deployed model is the one whose rolling register ranked first, not a fixed slot.
+    """
+    path = _mt1_meta_path(models_dir, ind)
+    if not os.path.exists(path):
+        return 0, MT1_POOL_SLOTS
     try:
-        m = MT1NN()
-        m.head.load_state_dict(head_sd)
-        for c, pool in enumerate(MT1_POOL_NAMES):
-            tail_sd = _read_bin_sd(models_dir, ind, f'tail_{pool}', TAIL_LAYER_DEFS)
-            if tail_sd is None:
-                print(f'  [mt1/{ind}] tail_{pool} .bin not found — skipping best compose')
-                return
-            m.tails[c].load_state_dict(tail_sd)
-        torch.save(m.state_dict(), os.path.join(output_dir, f'mt1_{ind}_best.pt'))
-        print(f'  [mt1/{ind}] mt1_{ind}_best.pt composed from head + 4 tail .bin')
-    except Exception as e:
-        print(f'  [mt1/{ind}] ERROR composing best.pt: {e}')
+        with open(path, 'rb') as f:
+            magic, version, n_slots, hist = struct.unpack('<4I', f.read(16))
+            if magic != MT1_META_MAGIC or version != MT1_META_VERSION:
+                print(f'  [mt1/{ind}] metadata sidecar rejected (magic/version) — assuming slot 0')
+                return 0, MT1_POOL_SLOTS
+            f.seek(16 + n_slots * MT1_SLOT_META_BYTES)
+            best_slot = struct.unpack('<i', f.read(4))[0]
+        if not 0 <= best_slot < n_slots:
+            return 0, n_slots
+        return best_slot, n_slots
+    except (OSError, struct.error) as e:
+        print(f'  [mt1/{ind}] metadata sidecar unreadable ({e}) — assuming slot 0')
+        return 0, MT1_POOL_SLOTS
 
 
-def _convert_mt1_pools(ind, models_dir, output_dir):
-    """Convert head + 4 tail pool elite .bin → .pt so upkeep can keep evolving them."""
-    convert_industry(f'mt1_{ind}_head', models_dir, output_dir, HEAD_LAYER_DEFS, MT1DualHead,
-                     f'mt1_{ind}_head', n_elites=HT_PARENTS)
-    for pool in MT1_POOL_NAMES:
-        # The direction pool holds MT1_COMP_SLOTS persistent individuals rather than HT_PARENTS
-        # elites plus seed-regenerated mutations, so every slot has a real weight file to convert.
-        n = MT1_COMP_SLOTS if pool == 'dir' else HT_PARENTS
-        convert_industry(f'mt1_{ind}_tail_{pool}', models_dir, output_dir, TAIL_LAYER_DEFS, MT1Tail,
-                         f'mt1_{ind}_tail_{pool}', n_elites=n)
+def _convert_mt1_pool(ind, models_dir, output_dir):
+    """Convert one industry's 200-individual MT1 pool .bin → .pt, and write the deployed best.
+
+    Replaces the old head + 4-tail compose. There is no composition step any more: a slot file IS
+    a whole model.
+    """
+    best_slot, n_slots = _read_mt1_meta(models_dir, ind)
+    converted = 0
+    for slot in range(n_slots):
+        src = os.path.join(models_dir, f'mt1_{ind}_slot_{slot}.bin')
+        if not os.path.exists(src):
+            continue
+        try:
+            arr = np.fromfile(src, dtype=np.float32)
+            if len(arr) != MT1NET_PARAMS:
+                print(f'  [mt1/{ind}] slot {slot}: {len(arr)} floats, expected {MT1NET_PARAMS}'
+                      ' — skipped')
+                continue
+            m = MT1Net()
+            m.load_state_dict(arr_to_state_dict(arr, MT1NET_LAYER_DEFS, None))
+            torch.save(m.state_dict(), os.path.join(output_dir, f'mt1_{ind}_model_{slot}.pt'))
+            converted += 1
+            if slot == best_slot:
+                torch.save(m.state_dict(), os.path.join(output_dir, f'mt1_{ind}_best.pt'))
+        except Exception as e:                                   # noqa: BLE001 - report and continue
+            print(f'  [mt1/{ind}] slot {slot}: ERROR — {e}')
+    if converted == 0:
+        print(f'  [mt1/{ind}] no slot .bin found — nothing converted')
+    else:
+        print(f'  [mt1/{ind}] {converted}/{n_slots} slots converted; '
+              f'best = slot {best_slot} → mt1_{ind}_best.pt')
 
 
 def main():
@@ -230,10 +252,9 @@ def main():
     print(f'Converting master elite models from {models_dir} → {output_dir}')
     convert_industry('master', models_dir, output_dir, MASTER_LAYER_DEFS, MasterNN, 'master')
 
-    print(f'Converting MT1 head/tail pools + composing best models from {models_dir} → {output_dir}')
+    print(f'Converting MT1 pools ({MT1_POOL_SLOTS} individuals/industry) from {models_dir} → {output_dir}')
     for ind in industries:
-        _convert_mt1_pools(ind, models_dir, output_dir)
-        _convert_mt1_best(ind, models_dir, output_dir)
+        _convert_mt1_pool(ind, models_dir, output_dir)
 
     print(f'Converting MT2 elite models from {models_dir} → {output_dir}')
     convert_mt2(models_dir, output_dir)

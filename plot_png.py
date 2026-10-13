@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Local helper (untracked): pull the heads/tails training logs from /root/ht_train on the droplet
-and render the plot_training.py charts as PNGs (so they can be viewed inline). Not committed —
-just a monitoring convenience for the mt1-heads-tails 1-pass run.
+Local helper: pull training logs from /root/ht_train on the droplet and render the
+plot_training.py charts as PNGs (so they can be viewed inline). A monitoring convenience written
+for the heads/tails runs (pre-v0.8.0.0); the droplet path is that run's and may need changing.
 
   python plot_png.py            # download + render to plots/pass<N>/*.png
 """

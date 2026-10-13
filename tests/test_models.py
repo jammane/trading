@@ -1,11 +1,11 @@
-"""Tests for StockNN, MasterNN, MT1NN, and MT2NN model architecture."""
+"""Tests for StockNN, MasterNN, and MT2NN model architecture. MT1Net: tests/test_mt1net.py."""
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 import models
-from models import MT1NN, MT2NN, MasterNN, MT1DualHead, MT1Head, MT1Tail, StockNN, stock_close_pos, stock_close_vs_wap
+from models import MT2NN, MasterNN, StockNN, stock_close_pos, stock_close_vs_wap
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
 
@@ -211,116 +211,14 @@ class TestMasterNN:
         assert not torch.isinf(out).any()
 
 
-# ── MT1NN ──────────────────────────────────────────────────────────────────────
-
-@pytest.fixture
-def mt1_inputs():
-    torch.manual_seed(0)
-    return torch.randn(1, 74)   # Part C: [market37 ‖ portfolio37]
-
-
-class TestMT1NN:
-    def test_output_shape(self, mt1_inputs):
-        out = MT1NN()(mt1_inputs)
-        assert out.shape == (1, 4)
-
-    def test_param_count(self):
-        # Composed = dual head (2×998=1996) + 4 specialized tails (1803 each) = 9208
-        assert sum(p.numel() for p in MT1Head().parameters()) == 998
-        assert sum(p.numel() for p in MT1DualHead().parameters()) == 1996
-        assert sum(p.numel() for p in MT1Tail().parameters()) == 1803
-        n = sum(p.numel() for p in MT1NN().parameters())
-        assert n == 9208, f"MT1NN param count: expected 9208, got {n}"
-
-    def test_head_tail_shapes(self, mt1_inputs):
-        h = MT1DualHead()(mt1_inputs)
-        assert h.shape == (1, 56)                 # concat of two (A20+B4+C4) trunks
-        assert MT1Tail()(h).shape == (1, 1)       # single-output tail
-        assert MT1Head()(torch.randn(1, 37)).shape == (1, 28)   # one sub-trunk
-
-    def test_composition(self, mt1_inputs):
-        # Composed forward == dual head then the four tails concatenated.
-        m = MT1NN()
-        h = m.head(mt1_inputs)
-        manual = torch.cat([t(h) for t in m.tails], dim=1)
-        assert torch.allclose(m(mt1_inputs), manual)
-
-    def test_head_tail_roundtrip(self):
-        from convert_weights import arr_to_state_dict
-        from prepare_models import HEAD_LAYER_DEFS, TAIL_LAYER_DEFS, state_dict_to_arr
-        x = torch.randn(1, 74)
-        head = MT1DualHead()
-        arr = state_dict_to_arr(head.state_dict(), HEAD_LAYER_DEFS)
-        assert arr.size == 1996
-        head2 = MT1DualHead(); head2.load_state_dict(arr_to_state_dict(arr, HEAD_LAYER_DEFS, MT1DualHead))
-        assert torch.allclose(head(x), head2(x))
-        tail = MT1Tail(); h = head(x)
-        tarr = state_dict_to_arr(tail.state_dict(), TAIL_LAYER_DEFS)
-        assert tarr.size == 1803
-        tail2 = MT1Tail(); tail2.load_state_dict(arr_to_state_dict(tarr, TAIL_LAYER_DEFS, MT1Tail))
-        assert torch.allclose(tail(h), tail2(h))
-
-    def test_head_tail_compose_to_mt1nn(self):
-        """convert_weights composes a production MT1NN from dual head + 4 tail flat arrays."""
-        from convert_weights import arr_to_state_dict
-        from prepare_models import HEAD_LAYER_DEFS, TAIL_LAYER_DEFS, state_dict_to_arr
-        src = MT1NN()
-        head_arr  = state_dict_to_arr(src.head.state_dict(), HEAD_LAYER_DEFS)
-        tail_arrs = [state_dict_to_arr(src.tails[c].state_dict(), TAIL_LAYER_DEFS) for c in range(4)]
-        m = MT1NN()
-        m.head.load_state_dict(arr_to_state_dict(head_arr, HEAD_LAYER_DEFS, None))
-        for c in range(4):
-            m.tails[c].load_state_dict(arr_to_state_dict(tail_arrs[c], TAIL_LAYER_DEFS, None))
-        x = torch.randn(1, 74)
-        assert torch.allclose(src(x), m(x), atol=1e-6)
-
-    def test_confidence_after_sigmoid(self, mt1_inputs):
-        out = MT1NN()(mt1_inputs)
-        conf = torch.sigmoid(out[:, 0])
-        assert (conf >= 0).all() and (conf <= 1).all()
-
-    def test_calib_confidence_after_sigmoid(self, mt1_inputs):
-        out = MT1NN()(mt1_inputs)
-        conf4 = torch.sigmoid(out[:, 3])
-        assert (conf4 >= 0).all() and (conf4 <= 1).all()
-
-    def test_range_after_softplus(self, mt1_inputs):
-        out = MT1NN()(mt1_inputs)
-        rng = F.softplus(out[:, 2])
-        assert (rng > 0).all()
-
-    def test_deterministic(self, mt1_inputs):
-        model = MT1NN()
-        model.eval()
-        with torch.no_grad():
-            assert torch.equal(model(mt1_inputs), model(mt1_inputs))
-
-    def test_serialization_roundtrip(self, mt1_inputs, tmp_path):
-        model = MT1NN()
-        model.eval()
-        with torch.no_grad():
-            out_before = model(mt1_inputs)
-        path = tmp_path / "mt1.pt"
-        torch.save(model.state_dict(), path)
-        model2 = MT1NN()
-        model2.load_state_dict(torch.load(path, weights_only=True))
-        model2.eval()
-        with torch.no_grad():
-            assert torch.allclose(out_before, model2(mt1_inputs))
-
-    def test_no_nan(self, mt1_inputs):
-        assert not torch.isnan(MT1NN()(mt1_inputs)).any()
-
-    def test_no_inf(self, mt1_inputs):
-        assert not torch.isinf(MT1NN()(mt1_inputs)).any()
-
-
 # ── MT2NN ──────────────────────────────────────────────────────────────────────
 
 @pytest.fixture
 def mt2_inputs():
     torch.manual_seed(0)
-    return torch.randn(1, 48)
+    # One MT1 prediction per industry, in dollars — was 48 (4 channels × 12) before the MT1
+    # rebuild. Scaled like a real prediction so the test exercises the magnitudes MT2 will see.
+    return torch.randn(1, 12) * 500.0
 
 
 class TestMT2NN:
@@ -330,7 +228,7 @@ class TestMT2NN:
 
     def test_param_count(self):
         n = sum(p.numel() for p in MT2NN().parameters())
-        assert n == 34572, f"MT2NN param count: expected 34572, got {n}"
+        assert n == 32844, f"MT2NN param count: expected 32844, got {n}"
 
     def test_output_reshapes_to_12x4(self, mt2_inputs):
         out = MT2NN()(mt2_inputs)
@@ -343,14 +241,41 @@ class TestMT2NN:
 
     def test_fc_branch_dims(self):
         m = MT2NN()
-        assert m.fc1.in_features == 48 and m.fc1.out_features == 36
+        assert m.fc1.in_features == 12 and m.fc1.out_features == 36
         assert m.fc2.in_features == 36 and m.fc2.out_features == 36
 
     def test_lstm_dims(self):
         m = MT2NN()
-        assert m.lstm.input_size  == 4
+        assert m.lstm.input_size  == 1
         assert m.lstm.hidden_size == 36
         assert m.lstm.num_layers  == 2
+
+    def test_lstm_walks_industries_one_at_a_time(self, mt2_inputs):
+        """The LSTM must see 12 steps of 1 feature, not 1 step of 12.
+
+        The reshape is x.view(batch, 12, 1); a view(batch, 1, 12) has the same element count and
+        would run without error, collapsing the sequence into a single step and silently throwing
+        away the recurrence the branch exists for.
+        """
+        m = MT2NN().eval()
+        lstm_in = mt2_inputs.view(mt2_inputs.size(0), 12, 1)
+        assert lstm_in.shape == (1, 12, 1)
+        _, (h_n, _) = m.lstm(lstm_in)
+        assert h_n.shape == (2, 1, 36)
+
+    def test_every_industry_reaches_the_output(self, mt2_inputs):
+        """Perturbing any one industry's prediction must move the logits.
+
+        With a 12-wide input a fencepost in the FC or the reshape would drop an industry entirely,
+        and the shape checks above would all still pass.
+        """
+        m = MT2NN().eval()
+        with torch.no_grad():
+            base = m(mt2_inputs)
+            for i in range(12):
+                x = mt2_inputs.clone()
+                x[0, i] += 1000.0
+                assert not torch.equal(m(x), base), f'industry {i} does not reach the output' 
 
     def test_taper_dims(self):
         m = MT2NN()

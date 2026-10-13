@@ -16,6 +16,8 @@ import os
 import numpy as np
 import torch
 
+from models import MT1NET_LAYER_DEFS, MT1NET_PARAMS
+
 # Shared layer definitions — single source of truth for binary layout.
 # Each entry: (state_dict_key_prefix, out_size, in_size)
 # For inject layers, key_prefix uses the ModuleList index notation.
@@ -40,29 +42,14 @@ MASTER_LAYER_DEFS = [
     ('fc_out',  48, 180),
 ]
 
-# Heads/tails split — layer order defines each flat .bin; must match models.py MT1Head/MT1Tail
-# and the C++ HD_*/TL_* offsets. (prefix, out_size, in_size).
-HEAD_LAYER_DEFS = [          # dual trunk, 1,996 params (matches MT1DualHead: mkt then pf, each MT1Head)
-    ('mkt.a1', 20, 20), ('mkt.a2', 20, 20),
-    ('mkt.b1',  6, 10), ('mkt.b2',  4,  6),
-    ('mkt.c1',  5,  7), ('mkt.c2',  4,  5),
-    ('pf.a1', 20, 20), ('pf.a2', 20, 20),
-    ('pf.b1',  6, 10), ('pf.b2',  4,  6),
-    ('pf.c1',  5,  7), ('pf.c2',  4,  5),
-]
-TAIL_LAYER_DEFS = [          # specialized 1-output tail, 1,803 params (matches MT1Tail, keys d1..d4)
-    ('d1', 22, 56), ('d2', 16, 22),
-    ('d3', 10, 16), ('d4',  1, 10),
-]
-
 # MT2 layout mirrors C++ binary offsets (FC1, FC2, LSTM L1, LSTM L2, taper1-3, fc_out).
 # Stored as (key, shape) rather than (prefix, out, in) because LSTM has bias-only entries.
 MT2_LAYOUT = [
-    ('fc1.weight',         (36, 48)),
+    ('fc1.weight',         (36, 12)),
     ('fc1.bias',           (36,)),
     ('fc2.weight',         (36, 36)),
     ('fc2.bias',           (36,)),
-    ('lstm.weight_ih_l0',  (144, 4)),
+    ('lstm.weight_ih_l0',  (144, 1)),
     ('lstm.weight_hh_l0',  (144, 36)),
     ('lstm.bias_ih_l0',    (144,)),
     ('lstm.bias_hh_l0',    (144,)),
@@ -81,12 +68,17 @@ MT2_LAYOUT = [
 ]
 
 ELITE_POOL       = 20
-MT1_COMP_PARENTS = 25  # 17 direct + 3 wavg + 5 injection per (legacy) component pool
-HT_PARENTS       = 20  # heads/tails pools: 17 direct + 3 wavg (no injection slots)
-# The direction pool left the elites+regenerated-mutations regime in v0.5.0.0: all 200 slots are
-# persistent individuals carrying their own record, so all 200 have weight files on disk.
-MT1_COMP_SLOTS   = 200
-MT1_POOL_NAMES   = ('dir', 'acc', 'rng', 'cfd')
+
+# MT1: one pool of persistent individuals per industry. Every slot carries its own rolling score
+# register, so every slot has a weight file — there are no seed-regenerated mutation slots.
+MT1_POOL_SLOTS      = 200
+# Metadata sidecar written by save_mt1_pool in training_v4.cpp. KEEP IN SYNC with MT1_META_MAGIC /
+# MT1_META_VERSION there and with MT1SlotMeta in mt1_pool.h: the sidecar is a separate file
+# precisely because .bin weight files are headerless and validated by element count alone.
+MT1_META_MAGIC      = 0x4D543150        # "MT1P"
+MT1_META_VERSION    = 1
+MT1_SCORE_HIST      = 16
+MT1_SLOT_META_BYTES = MT1_SCORE_HIST * 4 + 4 + 4   # float score[16] + uint16 n_pred(+pad) + uint32
 
 
 def state_dict_to_arr(state_dict, layer_defs):
@@ -135,6 +127,34 @@ def convert_industry(prefix, load_dir, output_dir, layer_defs, label, n_elites=N
     print(f'  [{label}] {converted}/{n_elites} elite slots converted')
 
 
+def convert_mt1_pool(ind, load_dir, output_dir):
+    """Convert one industry's MT1 pool .pt → the .bin names load_or_init_mt1_pool reads.
+
+    Deliberately not convert_industry: that writes `{prefix}_elite_{slot}.bin`, and the MT1 pool
+    has no elite slots — 200 persistent individuals, read as `mt1_{ind}_slot_{n}.bin`. A name
+    mismatch here is silent, because load_bin treats a missing file as "random-init this slot".
+    """
+    converted = 0
+    for slot in range(MT1_POOL_SLOTS):
+        src = os.path.join(load_dir, f'mt1_{ind}_model_{slot}.pt')
+        if not os.path.exists(src):
+            continue
+        try:
+            sd = torch.load(src, map_location='cpu', weights_only=True)
+            arr = state_dict_to_arr(sd, MT1NET_LAYER_DEFS)
+            if len(arr) != MT1NET_PARAMS:
+                print(f'  [mt1/{ind}] slot {slot}: {len(arr)} floats, expected {MT1NET_PARAMS}'
+                      ' — skipped')
+                continue
+            arr.tofile(os.path.join(output_dir, f'mt1_{ind}_slot_{slot}.bin'))
+            converted += 1
+        except Exception as e:                                   # noqa: BLE001 - report and continue
+            print(f'  [mt1/{ind}] slot {slot}: ERROR — {e}')
+    print(f'  [mt1/{ind}] {converted}/{MT1_POOL_SLOTS} slots converted')
+    # No metadata sidecar is written: seeding from .pt gives weights but no score history, so the
+    # pool starts every register empty. load_or_init_mt1_pool handles a missing sidecar by design.
+
+
 def convert_mt2(load_dir, output_dir):
     """Convert MT2NN .pt elite slots to C++ .bin files."""
     converted = 0
@@ -177,14 +197,9 @@ def main():
     print(f'Converting master elite models from {load_dir} → {output_dir}')
     convert_industry('master', load_dir, output_dir, MASTER_LAYER_DEFS, 'master')
 
-    print(f'Converting MT1 head/tail pool models from {load_dir} → {output_dir}')
+    print(f'Converting MT1 pools from {load_dir} → {output_dir}')
     for ind in industries:
-        convert_industry(f'mt1_{ind}_head', load_dir, output_dir, HEAD_LAYER_DEFS,
-                         f'mt1_{ind}_head', n_elites=HT_PARENTS)
-        for pool in MT1_POOL_NAMES:
-            n = MT1_COMP_SLOTS if pool == 'dir' else HT_PARENTS
-            convert_industry(f'mt1_{ind}_tail_{pool}', load_dir, output_dir, TAIL_LAYER_DEFS,
-                             f'mt1_{ind}_tail_{pool}', n_elites=n)
+        convert_mt1_pool(ind, load_dir, output_dir)
 
     print(f'Converting MT2 elite models from {load_dir} → {output_dir}')
     convert_mt2(load_dir, output_dir)

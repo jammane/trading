@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo \"$CLAUDE_TOOL_INPUT\" | grep -qE 'git (commit|push)' && bash .claude/run_tests.sh || true"
+            "command": "jq -r '.tool_input.command // empty' | grep -qE 'git (commit|push)' && bash .claude/run_tests.sh || true"
           }
         ]
       }

@@ -1,6 +1,20 @@
+> # Still planned, but the destination changed (v0.8.0.0)
+>
+> This was staged as an input to MT1's **volatility channel**. That channel no longer exists — the
+> four-tail MT1 was deleted and replaced by a single-output `MT1Net`.
+>
+> The feature itself is still wanted, and a slot is already held open for it: `MT1Net`'s `d2` layer
+> takes **23** inputs — 22 from `d1` plus one RESERVED slot fed `0.0`, reserved for exactly this.
+> It is inert by construction (`0 × w = 0`), so filling it changes no dimension, no offset, no file
+> format and not `MT1NET_PARAMS` — the same trick that let `close_vs_wap` land in v0.6.1.0 without
+> breaking binary compatibility. See `MT1NET_D2_RESERVED` in `mt1_pool.h` and
+> `MT1Net.RESERVED_D2_INPUT` in `models.py`.
+>
+> The blocker recorded below — that no portfolio-vol validation had been run — is unchanged.
+
 # Staged: add `(H−L)/A` as an MT1 input
 
-**Status: STAGED — do not implement yet.**
+**Status: staged — not to be implemented yet.**
 Two gates must clear first:
 
 1. Paper trading is running (the v0.6.2.1 five-pass run finishes, models deploy, cron enabled).
@@ -39,7 +53,7 @@ R²  trailing vol + (H−L)/A   = 0.4760     delta +0.0338   (+7.6% relative)
 
 `close_pos` alone is weak (0.212). The ratio is what carries the signal.
 
-## Why NOT the direction/delta channel
+## Why not the direction/delta channel
 
 Against MT1's direction target — 10-day forward industry return vs the cross-sectional median,
 sampled every 10th day so windows never overlap (n=123):
@@ -56,7 +70,7 @@ cross-industry level over 10 days, nothing here predicts relative returns. This 
 with direction scoring negative OOS skill in all 12 industries on every run to date, and it
 means adding inputs will not fix that channel. Scope this change to the vol channel only.
 
-## BLOCKING prerequisite — validate against *portfolio* vol
+## Blocking prerequisite — validate against *portfolio* vol
 
 The measurement above used the **industry index's** forward vol. MT1's actual target is the
 forward vol of the **deployed slot-0 portfolio**.
