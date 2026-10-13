@@ -6,6 +6,7 @@ holdings without any error. The bayes seed must apply the trainer's exact update
 starts from a posterior the race never had.
 """
 import math
+from pathlib import Path
 
 import pytest
 
@@ -150,3 +151,46 @@ def test_production_records_the_real_book_for_tomorrow(tmp_path, monkeypatch):
     pv.save_upkeep_book(str(tmp_path), _Client({}), UNI, {"ind_a": 1.0, "ind_b": 1.0}, set(),
                         [], day)
     assert json.loads((tmp_path / "cpp" / "book_base.json").read_text()) == base
+
+
+def test_catch_up_chains_the_simulated_books_and_stops_at_the_newest_session(tmp_path, monkeypatch):
+    """rc 0 -> train and move to the book that day left; rc 2 -> no later session, stop."""
+    rcs = iter([0, 0, 2])
+    books_seen = []
+
+    def fake_run(binary, book, state_dir, seed_dir, race_only, log_path, **kw):
+        books_seen.append(Path(book).read_text())
+        rc = next(rcs)
+        if rc == 0:
+            (tmp_path / u.SIM_BOOK).write_text(f"day after {len(books_seen)}\n")
+        return rc
+    monkeypatch.setattr(u, "run_upkeep", fake_run)
+    first = tmp_path / "first.txt"
+    first.write_text("first\n")
+    assert u.catch_up("bin", str(tmp_path), "seed", ["x"], str(first), "log") == 2
+    assert books_seen == ["first\n", "day after 1\n", "day after 2\n"]
+
+
+def test_catch_up_raises_on_a_failed_day(tmp_path, monkeypatch):
+    monkeypatch.setattr(u, "run_upkeep", lambda *a, **k: 4)
+    (tmp_path / "b").write_text("b\n")
+    with pytest.raises(RuntimeError):
+        u.catch_up("bin", str(tmp_path), "seed", ["x"], str(tmp_path / "b"), "log")
+
+
+def test_race_book_reads_the_champion_pass_row_for_the_day(tmp_path, monkeypatch):
+    (tmp_path / "pass_reference.csv").write_text(
+        "pass,industry,new_champ_pass\n2,ind_a,1\n2,ind_b,2\n")
+    (tmp_path / "race_daily.csv").write_text(
+        "pass,day,date,entry\n1,9,2026-10-05,REALIZED\n2,9,2026-10-05,REALIZED\n")
+    (tmp_path / "holdings_log.csv").write_text(
+        "pass,day,industry,cash,q0,q1,q2\n"
+        "1,9,ind_a,100,1,2,3\n2,9,ind_a,999,9,9,9\n"
+        "1,9,ind_b,999,9,9,9\n2,9,ind_b,200,4,5,6\n")
+    date = u.race_book(str(tmp_path), str(tmp_path / "book.txt"), universe=UNI)
+    assert date == "2026-10-05"
+    lines = (tmp_path / "book.txt").read_text().splitlines()
+    a, b = lines[2].split(), lines[3].split()
+    assert a[5] == "100.000000" and [float(x) for x in a[7:10]] == [1, 2, 3]
+    assert b[5] == "200.000000" and [float(x) for x in b[7:10]] == [4, 5, 6]
+    assert a[3] == "25000.000000"

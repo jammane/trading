@@ -1116,6 +1116,22 @@ mirrors it. Dollar targets and predictions are not rescaled, so a paper book muc
 $25k gives the race entries smaller numbers than they were trained on; ranking across industries
 is unaffected because every industry shares the scale.
 
+**Catching up a gap.** Every `--upkeep` also writes `book_sim_next.txt`: slot 0's simulated book
+after the day, dated the session it filled on. When there are no real books to hand over -- the
+sessions between the race's end and the first paper run -- each day trains on the book the day
+before left. `race_book()` reads the starting book from the race's `holdings_log.csv` (row d is
+the book carried INTO day d, each industry from its champion pass), and `catch_up()` chains
+`--upkeep` through the newest session in `stock_data`:
+
+```bash
+python upkeep_cpp.py seed --state models/acct0/paper/cpp --run-dir /root/ht_race_v5
+python upkeep_cpp.py catch-up --state models/acct0/paper/cpp --seed-dir models/acct0/paper/champion \
+    --run-dir /root/ht_race_v5 --race-only "TANH32 grad,MT1 grdC,..." --log logs/acct0/paper/upkeep_cpp.log
+```
+
+The race's last logged decision day is trained again: v5 stopped with no session after its last
+day in `stock_data`, so that day never had a real fill.
+
 `upkeep_cpp.py` holds the Python side (book and state formats, the seed, the subprocess call);
 `tests/test_upkeep_cpp.py` pins the formats, the symbol order, the posterior update and the book
 production records.
