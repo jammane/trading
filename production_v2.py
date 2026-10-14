@@ -936,7 +936,9 @@ def plan_industry_orders(symbols, sug, holdings, day_data, allocated_cash, holds
                     holdings.get(sym, 0.0) * buy_price))
                 if amount >= 1:
                     orders.append({'symbol': sym, 'action': 'buy', 'quantity': amount,
-                                   'price': buy_price, 'stop': to_cents(buy_price * 0.9, 'near')})
+                                   'price': buy_price,
+                                   'stop': to_cents(training_lib.buy_stop_price(
+                                       buy_price, day_data[sym]['close']), 'near')})
                     remaining_cash -= amount * buy_price * BUY_FILL
                     bought.add(sym)
 
