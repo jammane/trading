@@ -46,7 +46,13 @@ entry is in its commit message.
   trainer's own logs for every training day accumulate under `logs/<account>/<mode>/training/`,
   so paper and training can be compared with the same tools.
 
+- **Per-symbol suspension.** A universe symbol whose data stops arriving (its newest bar is
+  behind the universe's newest session) gets no orders until its data returns; its shares stay
+  held and the rest of the universe trades as usual. Logged to `suspended.log`.
+
 ### Fixed
+- Production saved the bar it fetched under today's date even when the feed returned an older
+  one, which made a halted symbol look current. Bars are saved under their own date.
 - Production read its cash and positions from `state.json`, which defaults to $20,000 and nothing
   held, instead of from the Alpaca account. Both now come from Alpaca on every run.
 

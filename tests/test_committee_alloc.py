@@ -137,3 +137,9 @@ def test_settled_rows_are_race_daily_rows(tmp_path):
     assert by["TANH32 grad"]["pick1"] == "a" and float(by["TANH32 grad"]["top4_bp"]) == \
         pytest.approx(flat)
     assert set(ca.ENTRIES) <= set(by)
+
+
+def test_a_suspended_holding_is_held_at_its_decision_close_not_zero():
+    closes = {"A1": 50.0, "A2": 20.0, "B1": 10.0}          # C1 suspended: no close today
+    r = ca.industry_returns(_pending(), closes, {"A1": 2, "C1": 10}, [])
+    assert r[2] == pytest.approx(0.0) and r[0] == pytest.approx(0.0)

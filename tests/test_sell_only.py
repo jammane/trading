@@ -69,3 +69,25 @@ def test_new_symbol_hold_still_applies():
 def test_buys_still_spend_down_the_budget():
     o = pv.plan_industry_orders(SYMS, SUG, HOLD, DAY, 260.0, {})
     assert sum(x["quantity"] * x["price"] for x in o if x["action"] == "buy") <= 260.0
+
+
+# ── Suspended symbols: data stopped arriving, so that symbol alone stops trading ─────────────
+
+def test_a_symbol_whose_data_stopped_is_suspended_and_the_rest_are_not():
+    pv = pytest.importorskip("production_v2")
+    last = {"A": "2026-10-13", "B": "2026-10-13", "C": "2026-10-09"}
+    session, sus = pv.suspended_symbols(["A", "B", "C", "D"], last)
+    assert session == "2026-10-13"
+    assert sus == {"C": "2026-10-09", "D": None}          # D: no data at all
+
+
+def test_a_suspended_symbol_gets_no_orders_while_its_industry_trades():
+    """Suspension removes the symbol's bar, and plan_industry_orders places nothing on a symbol
+    without one -- no sell, no buy, no stop -- while its holdings stay as they are."""
+    pv = pytest.importorskip("production_v2")
+    syms = ["A", "B"]
+    bar = {"open": 50.0, "high": 52.0, "low": 48.0, "close": 50.0}
+    day = {"A": bar}                                       # B suspended: its bar was removed
+    sug = {"A": (5, 0.5, 2.0, 0), "B": (5, 0.5, 0.0, 9)}
+    orders = pv.plan_industry_orders(syms, sug, {"B": 10.0}, day, 1000.0, {})
+    assert orders and all(o["symbol"] == "A" for o in orders)

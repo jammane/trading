@@ -402,8 +402,9 @@ def load_stock_data(symbols):
             histories[sym] = []
     return histories
 
-def save_stock_data(symbol, day_data):
-    """Append today's OHLCV to stock_data/<symbol>.json without truncating.
+def save_stock_data(symbol, day_data, date=None):
+    """Append one session's OHLCV to stock_data/<symbol>.json without truncating, under the
+    session's own date (`date`; today if not given).
 
     Full history is preserved so the C++ trainer and download_daily.py can
     use the same files. download_daily.py trims to MAX_HISTORY_DAYS on each run.
@@ -414,7 +415,7 @@ def save_stock_data(symbol, day_data):
         if os.path.exists(file_path):
             with open(file_path) as f:
                 existing_data = json.load(f).get('days', [])
-        today_str = datetime.today().strftime('%Y-%m-%d')
+        today_str = date or datetime.today().strftime('%Y-%m-%d')
         new_data_point = {
             'date': today_str,
             'open': day_data['open'],
@@ -430,6 +431,34 @@ def save_stock_data(symbol, day_data):
             json.dump({'days': existing_data}, f)
     except Exception as e:
         print(f"Error saving stock data for {symbol}: {e}")
+
+def last_bar_dates(symbols):
+    """{sym: date of its newest bar in stock_data}; a symbol with no file or no bars is absent."""
+    out = {}
+    for sym in symbols:
+        try:
+            with open(f"{STOCK_DATA_DIR}/{sym}.json") as f:
+                days = json.load(f).get('days', [])
+            if days:
+                out[sym] = days[-1]['date']
+        except Exception:
+            pass
+    return out
+
+
+def suspended_symbols(symbols, last_dates):
+    """Symbols that stopped arriving: newest bar older than the universe's newest session, or no
+    data at all. -> (session, {sym: its last bar date or None}).
+
+    A symbol that stops downloading is the first sign it is no longer tradable (halted,
+    delisted, renamed). Its trades are suspended -- no buys, sells or stops are placed for it,
+    and its held shares stay held -- while every other symbol trades as usual. It resumes by
+    itself the first session its data arrives again. One missed session is enough: an order on
+    a bar that is not today's would be priced off a stale day."""
+    session = max(last_dates.values(), default=None)
+    return session, {s: last_dates.get(s) for s in symbols
+                     if session is None or last_dates.get(s, '') < session}
+
 
 LOG_DIR = 'logs'  # overridden in main() via --account/--paper: logs/ACCOUNT/paper|prod
 
@@ -1075,13 +1104,20 @@ def settle_pending(model_dir, trading_client, day_data):
           f"{acct_bp:+.1f} bp) -> {log}")
 
 
-def record_decision(model_dir, industries, decision, holdings, day_data, cash, no_orders):
+def record_decision(model_dir, industries, decision, holdings, day_data, histories, cash,
+                    equity, suspended, no_orders):
     """Today's decision, for the next run to settle. Written before any order is submitted, so
-    every fill after `time` belongs to it."""
+    every fill after `time` belongs to it. equity: the account's, as Alpaca reports it, so the
+    next run's PORTFOLIO return compares like with like. A suspended symbol's close is its last
+    bar's."""
     inds = list(industries)
-    closes = {s: day_data[s]['close'] for syms in industries.values() for s in syms
-              if s in day_data}
-    equity = cash + sum(q * closes.get(s, 0.0) for s, q in holdings.items())
+    closes = {}
+    for syms in industries.values():
+        for s in syms:
+            if s in day_data:
+                closes[s] = day_data[s]['close']
+            elif histories.get(s):
+                closes[s] = histories[s][-1][1]
     pending = dict(date=datetime.today().strftime('%Y-%m-%d'),
                    time=datetime.now().astimezone().isoformat(),
                    industries=inds, symbols={i: list(industries[i]) for i in inds},
@@ -1090,7 +1126,7 @@ def record_decision(model_dir, industries, decision, holdings, day_data, cash, n
                    preds={e: [None if not math.isfinite(x) else float(x) for x in v]
                           for e, v in decision['preds'].items()},
                    holdings={s: q for s, q in holdings.items() if q}, closes=closes,
-                   cash=cash, equity=equity, no_orders=no_orders)
+                   cash=cash, equity=equity, suspended=sorted(suspended), no_orders=no_orders)
     path = os.path.join(model_dir, 'cpp', PENDING_DECISION)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path + '.tmp', 'w') as f:
@@ -1224,6 +1260,9 @@ def main():
                     ticker = tickers.tickers[sym]
                     hist = ticker.history(period='1d', interval='1d')
                     if not hist.empty:
+                        # Saved under the bar's own date: a halted symbol returns its LAST bar,
+                        # and stamping that with today's date would hide that it stopped.
+                        bar_date = hist.index[-1].date().isoformat()
                         day_data[sym] = {
                             'open': float(hist['Open'].iloc[0]),
                             'close': float(hist['Close'].iloc[0]),
@@ -1231,7 +1270,7 @@ def main():
                             'low': float(hist['Low'].iloc[0]),
                             'volume': float(hist['Volume'].iloc[0])
                         }
-                        save_stock_data(sym, day_data[sym])
+                        save_stock_data(sym, day_data[sym], date=bar_date)
                     else:
                         log_data_failure(sym, 'empty response', mode)
                 except Exception as e:
@@ -1241,6 +1280,19 @@ def main():
 
         # Load historical data
         histories = load_stock_data(symbols)
+
+        # Suspend the symbols whose data stopped arriving; everything else trades as usual.
+        session, suspended = suspended_symbols(symbols, last_bar_dates(symbols))
+        for sym in suspended:
+            day_data.pop(sym, None)
+        state['suspended'] = suspended
+        if suspended:
+            print(f"SUSPENDED (no bar for {session}; no orders, holdings kept): "
+                  + ", ".join(f"{s} (last {d or 'never'})" for s, d in sorted(suspended.items())))
+            os.makedirs(LOG_DIR, exist_ok=True)
+            with open(os.path.join(LOG_DIR, 'suspended.log'), 'a') as f:
+                f.write(f"{session} " + " ".join(f"{s}:{d or 'never'}"
+                                                 for s, d in sorted(suspended.items())) + "\n")
 
         # Daily training (--cpp-upkeep): today's bars are in stock_data now, so the day the last
         # run placed orders on can be trained against them before anything is decided today.
@@ -1586,7 +1638,13 @@ def main():
         # --no-orders stops here: everything above (allocation, decisions) and the upkeep training
         # step below still run, so the models advance a day without anything reaching the market.
         if decision is not None and not args.no_orders:
-            record_decision(model_dir, industries, decision, holdings, day_data, cash, False)
+            try:
+                equity = float(trading_client.get_account().equity)
+            except Exception as e:
+                print(f"Committee log: ERROR reading equity ({e}); estimating it")
+                equity = compute_total_portfolio_value(cash, holdings, day_data, histories)
+            record_decision(model_dir, industries, decision, holdings, day_data, histories, cash,
+                            equity, suspended, False)
         mode = 'paper' if args.paper else 'live'
         if args.no_orders:
             print(f"--no-orders: {len(orders)} order(s) computed, NONE submitted")
