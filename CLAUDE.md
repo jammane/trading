@@ -325,7 +325,7 @@ require a droplet upgrade.
 30 16 * * 1-5 cd /root/trading && mkdir -p logs/data && source .venv/bin/activate && python download_daily.py >> logs/data/download_daily.log 2>&1
 0  0  * * 0   cd /root/trading && mkdir -p logs/data && source .venv/bin/activate && python cleanup_stock_data.py >> logs/data/cleanup_stock_data.log 2>&1
 # acct0 paper trading: 5:05 PM ET; prod: 5:35 PM ET
-#5 17 * * 1-5 cd /root/trading && mkdir -p logs/acct0 && export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d) && export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d) && source .venv/bin/activate && python production_v2.py --paper --account acct0 --flat-allocation >> logs/acct0/paper.log 2>&1
+#5 17 * * 1-5 cd /root/trading && mkdir -p logs/acct0 && export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d) && export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d) && source .venv/bin/activate && python production_v2.py --paper --account acct0 --cpp-upkeep --committee >> logs/acct0/paper.log 2>&1
 #35 17 * * 1-5 cd /root/trading && mkdir -p logs/acct0 && export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d) && export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d) && source .venv/bin/activate && python production_v2.py --account acct0 >> logs/acct0/prod.log 2>&1
 # acct1 (future): 30 16 download_daily if diff universe; 5 18 paper, 35 18 prod
 # acct2 (future): 5 19 paper, 35 19 prod
@@ -357,6 +357,8 @@ export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n t
 python production_v2.py --account acct0
 ```
 
+**`--committee`** replaces `--flat-allocation` on paper; see **Committee allocation** below.
+
 **`--flat-allocation` (paper only, v0.6.2.0).** Splits deployed capital evenly across all 12
 industries and skips MT1/MT2 inference entirely. In force for paper while MT1/MT2 have no
 demonstrated out-of-sample skill, so paper results measure the StockNN layer rather than an
@@ -385,8 +387,8 @@ reserves the shares an open stop covers; a buying industry re-protects through t
 with each new buy. A sell-only industry places no buys, so `plan_industry_orders` re-places the
 cancelled stop, at its old price, for whatever the day's sells leave held. A symbol that had no
 stop gets none invented. `tests/test_sell_only.py` pins all of this. The flag is the manual and
-test interface; the planned allocator (a loser committee flags 4 industries sell-only, a winner
-committee tilts the rest) will supply the set itself.
+test interface; under `--committee` the loser committee supplies the set (see **Committee
+allocation**), and any industries named here are added to it.
 
 Training output (`training_v4_cpp`) writes to `models/acct#/training`; after training run
 `python convert_weights.py --account acct0`, then copy `_best.pt` files to `.../prod`.
@@ -495,7 +497,12 @@ pytest tests across the files in `tests/`:
   that knows only the losers.
 - `test_upkeep_cpp.py` -- the daily C++ training glue: book and state formats shared with the
   trainer (symbols in universe order), the bayes seed replaying the trainer's exact update, the
-  committee and race settings passed to the binary, and the real books production records.
+  committee and race settings passed to the binary, the real books production records, and the
+  log archive keeping every training day.
+- `test_committee_alloc.py` -- the committee allocation: the vote is `committee_race`'s on one
+  day, member order breaks a split vote, the 4 flagged get nothing and the rest are tilted
+  exactly, an industry without predictions sits out, models load from the daily state first, and
+  the settled record's real returns and `race_daily` rows.
 - Production safety: `test_allocation_limits.py` (an industry's capital is never over-committed,
   single-stock cap honoured), `test_sell_only.py` (the loser zone sells but never buys or
   liquidates, and re-protects what it still holds), `test_whole_shares.py` (the simulator floors to whole shares as
@@ -1067,13 +1074,14 @@ second implementation is how production's buy loop once drifted ~8× over budget
 upkeep step (below) does not run in this mode.
 
 ```
-production_v2.py --paper --account acct0 --flat-allocation --cpp-upkeep
+production_v2.py --paper --account acct0 --cpp-upkeep --committee
   fetch today's bars (written to stock_data)
   run_daily_training:  training_v4_cpp --upkeep <model_dir>/cpp/book_next.txt
                          --output <model_dir>/cpp --load-dir <model_dir>/champion
                          --race-only "<the committee members>" --sigma 0.008 --master-sigma 0.006
                        then convert_industry(): <model_dir>/cpp/*_elite_*.bin -> <model_dir>/*.pt
-  decide and queue orders with the updated models
+  settle yesterday's decision (--committee): committee_daily.csv
+  decide and queue orders with the updated models (--committee: the committees allocate)
   save_upkeep_book:    today's real books -> <model_dir>/cpp/book_next.txt, for tomorrow's run
 ```
 
@@ -1136,6 +1144,65 @@ day in `stock_data`, so that day never had a real fill.
 `tests/test_upkeep_cpp.py` pins the formats, the symbol order, the posterior update and the book
 production records.
 
+### Committee allocation (`--committee`, `committee_alloc.py`)
+
+Paper allocates with two committees of race entries, both voting `votes_member`, chosen on the v5
+champion composite:
+
+| committee | members, strongest first | role |
+|---|---|---|
+| L1 | TANH32 grad, ALLOC bayes mean, MT1S-stk evo | flags the 4 industries it expects to do worst: **sell-only** |
+| W1 | TANH32 grad, MT1 grdC, MT1 evo, MT1S-rep evo, MT1S-stk grad | picks 4 of the other 8 to tilt toward |
+
+The member order is each entry's composite mean gap (the mirrored loser race for L1), because
+`votes_member` weights each member 1.1x the one below it; it is fixed in `committee_alloc.py`.
+Today's cash is split over the 8 unflagged industries at `(1 − t)/8` each plus `t/4` to each W1
+pick, `t = 0.5`; the flagged 4 get none and only sell (never liquidated). Replayed on v5 with
+StockNN's measured sell rate this scored +10.53 bp/day against flat on the composite and beat flat
+in 8 of 10 passes. `committee_alloc.vote` is checked against that replay on every one of the 252
+composite days (0 mismatches) and against `committee_race` in `tests/test_committee_alloc.py`.
+
+**Inputs.** Each run, after the daily training step:
+
+- the race models are `<model_dir>/cpp/race_<entry>_<ind>.bin`, as the trainer left them (an
+  evolutionary entry's deployed slot, a gradient entry's weights), else the champion's;
+- MT1's 74 features are built from the value curves in `upkeep_state.txt` with
+  `training_lib.build_master_features`, the trainer's own twin;
+- the bayes line is the posterior mean in `upkeep_state.txt`;
+- the order-intent inputs (cfeat146, the MT1S-stk slices) come from the deployed StockNN run on
+  each industry's real holdings with an **even share of the cash**. The allocation is what is being
+  decided, so it cannot also be an input; the trainer's twin of the same day, trained the next
+  session, sees the cash each industry was actually given, so its logged predictions differ from
+  the decision's in the cash features only.
+- `CN_BOOK`'s base is `cpp/book_base.json`, fixed on the first run as each industry's even cash
+  share plus its holdings.
+
+A failure anywhere in the decision (no state, a missing model) falls back to flat allocation with
+nothing sell-only, and says so.
+
+**Account size.** Cash and positions are read from Alpaca on every run (they used to come from
+`state.json`, whose defaults are $20,000 and nothing held). The race trained on $25k books per
+industry; paper trades what the account has. Ranking is scale-free through `CN_BOOK`, but dollar
+targets are not rescaled, so the gradient entries train on smaller numbers than they were raised on.
+
+**The daily record — the same files as training.** Two records, written so paper and the race can
+be read with the same tools:
+
+- `logs/<account>/<mode>/training/` accumulates the trainer's own logs for every training day
+  (`upkeep_cpp.archive_logs`; the trainer rewrites its log directory every run). `race_daily.csv`,
+  `holdings_log.csv`, `training_log.csv` and `bayes_online.csv` gain a row set per day with a
+  `date` column (an upkeep pass's `day` is an index into that run's 1255-day window, so it
+  repeats); `days/<date>/` keeps every file as written, including the binary logs. This is the
+  **simulated** record: the real book, filled by the trainer's fill model.
+- `logs/<account>/<mode>/committee_daily.csv` is the **real** record, in `race_daily.csv`'s
+  format. Each run writes its decision to `cpp/pending_decision.json` before submitting anything;
+  the next run settles it against the account and appends: `REALIZED` (each industry's real book
+  return, bp: holdings at the decision close plus the cash it was given, against the same holdings
+  a session later plus the cash its fills raised or spent), a row per committee member (its
+  predictions and its own top 4), `W1 committee`, `L1 committee` (its picks are the 4 it flagged,
+  so a negative gap means they lagged), and `PORTFOLIO` (the account's equity return; its 12
+  columns are the dollars each industry was given). `--no-orders` records nothing.
+
 ### Daily upkeep (production_v2.py + upkeep.py)
 
 `upkeep.py` handles single-step evolution in production (one day per run):
@@ -1178,7 +1245,7 @@ When an elite holds ≥50% cash (industry) or ≥80% cash (master), an `UNDER_IN
 
 ### Production cycle
 
-`production_v2.py` runs once per trading day: fetch data from yfinance → run MT1×12 + MT2 (or MasterNN fallback) to rebalance capital → run StockNN per active industry → submit limit/stop orders to Alpaca → perform one upkeep evolution step on yesterday's data (via `upkeep.py`). Under `--cpp-upkeep` the training step moves to the front and runs in C++ (see **Daily training with the C++ trainer** above). Alpaca credentials are read from `keyring` or environment variables (`ALPACA_API_KEY` / `ALPACA_SECRET_KEY`). All per-account state files (`state.json`, `owners.json`, `master_state.json`, `mt1_rolling_state.json`, `mt_prev_session.json`) live under `--model-dir`, enabling multiple accounts to run independently with different `--model-dir` paths and credentials.
+`production_v2.py` runs once per trading day: fetch data from yfinance → run MT1×12 + MT2 (or MasterNN fallback) to rebalance capital → run StockNN per active industry → submit limit/stop orders to Alpaca → perform one upkeep evolution step on yesterday's data (via `upkeep.py`). Under `--cpp-upkeep` the training step moves to the front and runs in C++ (see **Daily training with the C++ trainer** above), and under `--committee` the committees replace MT1/MT2 in the allocation (see **Committee allocation**). Cash and positions are read from the Alpaca account at the start of every run. Alpaca credentials are read from `keyring` or environment variables (`ALPACA_API_KEY` / `ALPACA_SECRET_KEY`). All per-account state files (`state.json`, `owners.json`, `master_state.json`, `mt1_rolling_state.json`, `mt_prev_session.json`) live under `--model-dir`, enabling multiple accounts to run independently with different `--model-dir` paths and credentials.
 
 `--paper` routes all API calls to Alpaca's paper trading endpoint — orders are submitted and portfolio state is read from the paper account, giving real paper trading history without risking real money. Omit `--paper` for live trading.
 
