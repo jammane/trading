@@ -43,7 +43,15 @@ training pass on Fridays.
   each invocation's logs in their own `continue_p<N>/`; `--crown` crowns named industries outright.
 - `committee_race.py` takes several `race_daily.csv` files and matches passes by date.
 
+- **Simulated vs real fills.** Each paper session's training day writes slot 0's simulated
+  execution (`orders_sim.csv`), and `fill_check.py` compares it with what the broker did, at the
+  level of the model's outputs, the orders and the fills, into `fill_check.csv`.
+
 ### Fixed
+- **StockNN's inputs in production.** Its 15-day history ended on the decision day instead of the
+  day before, zeroing every day-over-day input; on the v5 champions only 27 of 144 symbols matched
+  the trainer's outputs for the same day and book (144 of 144 after the fix). Found by the first
+  fill check; the first paper session had traded on the wrong inputs.
 - **Orders Alpaca accepts.** The first real paper session was rejected order by order: prices were
   sent with sub-penny digits, and a buy's stop-loss was sent as a separate sell stop, which Alpaca
   refuses beside an open buy. Prices are rounded to whole cents in the order's favour, each buy

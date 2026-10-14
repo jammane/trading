@@ -535,6 +535,12 @@ pytest tests across the files in `tests/`:
   rejected symbol, swaps happen only for stopped data or drift, the replacement is the first that
   rechecks and keeps the band, the book forgets exactly the swapped slot, and promotion clears
   exactly one industry's state even where industry names share words.
+- `test_fill_check.py` -- the simulated-vs-real comparison: a matching day agrees at every level,
+  each way a fill can disagree is counted on its own side, a different intent is flagged as the
+  first cause, and sells and stops compare the quantities that left the book.
+- `test_stocknn_history.py` -- production's StockNN history ends the session before the decision
+  day, invalid bars are dropped before the last 15 are taken (as the trainer's ring does), and
+  both call sites use it.
 - `test_committee_alloc.py` -- the committee allocation: the vote is `committee_race`'s on one
   day, member order breaks a split vote, the 4 flagged get nothing and the rest are tilted
   exactly, an industry without predictions sits out, models load from the daily state first, and
@@ -1240,6 +1246,36 @@ be read with the same tools:
   predictions and its own top 4), `W1 committee`, `L1 committee` (its picks are the 4 it flagged,
   so a negative gap means they lagged), and `PORTFOLIO` (the account's equity return; its 12
   columns are the dollars each industry was given). `--no-orders` records nothing.
+
+### Does the trainer predict what the broker does? (`fill_check.py`)
+
+StockNN is selected on **simulated** fills, so the simulator is the training signal. Every paper
+session checks it against reality. The day's `--upkeep` trains the previous decision day on the
+account's real book, and its slot 0 is the model production traded with, so it re-makes
+production's orders and the fill model plays them against the bar that has since arrived. The
+trainer writes that, order by order, to `orders_sim.csv` (slot 0's raw outputs, limits, the fill
+bar, and what fired: open sell, sell-all, stop, buy, with quantities and prices). Production
+records its own raw outputs and orders with each decision, and when it settles the decision the
+next session it sets the two side by side (`fill_check.compare`) at three levels:
+
+- **intent**: StockNN's raw outputs, Python/torch against C++. These must agree; a difference
+  means the two sides built different inputs from the same day, and explains everything below it.
+- **orders**: the limits and quantities each side derived.
+- **fills**: for every order, did the simulator fill it and did the market, at what price; and
+  each symbol's holding after the session, simulated against real.
+
+Rows go to `logs/<account>/<mode>/fill_check.csv`; the summary is printed in the session log.
+Known, deliberate differences are named rather than counted: the trainer sells `sell_qty` at the
+next open where production sends a limit at today's close, production does not buy a symbol it
+sells the same day, and production sizes a buy at decision time against its limit where the
+trainer sizes at the fill price.
+
+**The first check found a real defect.** Production's StockNN history ended *on* the decision
+day, so every day-over-day delta in the `today` input read zero; the trainer's ring ends the day
+before. Run on the v5 champions over the same day and book, only 27 of 144 symbols got the
+trainer's outputs; with the history cut at the day before (`load_stock_data(before=session)`),
+144 of 144 to float precision. The first paper session (2026-10-13) traded on the wrong inputs.
+`tests/test_stocknn_history.py` pins the cut.
 
 ### The weekly pass (`weekly_pass.py`, Fridays)
 
