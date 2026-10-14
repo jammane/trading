@@ -6,6 +6,8 @@ independent noisy-but-informative models beating their best member (the reason t
 noise not looking consistent, and the Bayesian tree being causal and learning which member to
 trust.
 """
+import datetime
+
 import numpy as np
 
 import committee_race as cr
@@ -13,22 +15,28 @@ import committee_race as cr
 INDS = [f"i{k}" for k in range(12)]
 
 
-def _write(path, models, passes=4, days=150, seed=0):
-    """models: {name: noise sd, or None for pure noise}; returns are N(0, 100) bp per industry."""
+def _date(d):
+    return (datetime.date(2025, 1, 1) + datetime.timedelta(days=d)).isoformat()
+
+
+def _write(path, models, passes=4, days=150, seed=0, first_pass=1, shift=0):
+    """models: {name: noise sd, or None for pure noise}; returns are N(0, 100) bp per industry.
+    shift moves the dates against the day index, as a later invocation's window does."""
     rng = np.random.default_rng(seed)
     hdr = "pass,day,date,entry,ok_n,flat_bp,top4_bp,gap_bp,pick1,pick2,pick3,pick4," + ",".join(INDS)
     lines = [hdr]
-    for p in range(1, passes + 1):
+    for p in range(first_pass, first_pass + passes):
         for d in range(400, 400 + days):
             r = rng.normal(0, 100, 12)
             flat = r.mean()
-            lines.append(f"{p},{d},2025-01-01,REALIZED,12,{flat:.6f},,,,,,,"
+            lines.append(f"{p},{d},{_date(d + shift)},REALIZED,12,{flat:.6f},,,,,,,"
                          + ",".join(f"{x:.10g}" for x in r))
             for name, sd in models.items():
                 pred = rng.normal(0, 100, 12) if sd is None else r + rng.normal(0, sd, 12)
                 top = np.argsort(-pred, kind="stable")[:4]
                 t4 = r[top].mean()
-                lines.append(f"{p},{d},2025-01-01,{name},12,{flat:.6f},{t4:.6f},{t4 - flat:.6f},"
+                lines.append(f"{p},{d},{_date(d + shift)},{name},12,{flat:.6f},{t4:.6f},"
+                             f"{t4 - flat:.6f},"
                              + ",".join(INDS[k] for k in top) + ","
                              + ",".join(f"{x:.10g}" for x in pred))
     path.write_text("\n".join(lines) + "\n")
@@ -213,3 +221,17 @@ def test_loser_race_rewards_a_model_that_knows_only_the_losers(tmp_path):
                    for P in passes.values()])
     # its top 4 are random among the 8 non-losers: an edge at the top, but only about half
     assert 0.3 * lose["L"][1] < top < 0.7 * lose["L"][1]
+
+
+def test_continued_runs_load_together_and_match_passes_by_date(tmp_path):
+    """A continued run logs its new pass in a second file whose day indices point at later dates;
+    the passes load together, and the composite lines them up by date, not by index."""
+    a = _write(tmp_path / "a.csv", {"A": 50.0, "B": None}, passes=2, days=40)
+    b = _write(tmp_path / "b.csv", {"A": 50.0, "B": None}, passes=1, days=40, first_pass=3,
+               shift=5, seed=1)
+    entries, passes = cr.load([a, b])
+    assert sorted(passes) == [1, 2, 3]
+    assert passes[3]["days"][0] == _date(405) and passes[1]["days"][0] == _date(400)
+    comp = cr.champion_composite(entries, passes, {i: (3 if k < 6 else 1)
+                                                    for k, i in enumerate(INDS)})
+    assert len(comp["days"]) == 35                       # the dates both passes logged
