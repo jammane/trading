@@ -23,8 +23,14 @@ import keyring
 import torch
 import yfinance as yf
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, OrderType, QueryOrderStatus, TimeInForce
-from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, MarketOrderRequest, StopOrderRequest
+from alpaca.trading.enums import OrderClass, OrderSide, OrderType, QueryOrderStatus, TimeInForce
+from alpaca.trading.requests import (
+    GetOrdersRequest,
+    LimitOrderRequest,
+    MarketOrderRequest,
+    StopLossRequest,
+    StopOrderRequest,
+)
 
 import committee_alloc
 import training_lib
@@ -822,23 +828,43 @@ def stocknn_outputs(model, symbols, histories, day_data, holdings, cash):
     return out.tolist()
 
 
+def to_cents(price, how):
+    """A price Alpaca accepts: whole cents at $1 and over, 1/100 cent below. 'down' for a buy
+    limit and 'up' for a sell limit, so rounding never makes an order worse than the model's price;
+    'near' for a stop. Alpaca rejects every other increment ("sub-penny increment does not fulfill
+    minimum pricing criteria") -- which is what every order of the first paper session did."""
+    step = 0.01 if price >= 1.0 else 0.0001
+    n = price / step
+    k = math.floor(n + 1e-6) if how == 'down' else math.ceil(n - 1e-6) if how == 'up' else round(n)
+    return round(k * step, 4)
+
+
 def plan_industry_orders(symbols, sug, holdings, day_data, allocated_cash, holds,
                          sell_only=False, stops=None):
-    """One industry's orders from StockNN's suggestions. Sells first, then buys.
+    """One industry's orders from StockNN's suggestions: sells, then buys, then stops.
 
     sug:   {sym: (buy_qty, buy_price_frac, sell_all_price_frac, sell_qty)}, the model's output
     holds: {sym: runs left} -- symbols under the new-symbol hold get no orders
-    stops: {sym: stop price} of the open stops the caller cancelled for held symbols
+    stops: {sym: stop price} protecting held shares -- the open stops the caller cancelled, or the
+           stop recorded for a position whose stop expired
+
+    Every price is rounded to an increment Alpaca accepts (to_cents). A buy carries its stop-loss
+    in the same order (`stop`, submitted as one OTO order: the stop goes live when the buy fills),
+    because Alpaca rejects a separate sell stop while a buy for the same symbol is open ("potential
+    wash trade"). For the same reason a symbol the model sells today is not also bought today.
+
+    Held shares keep their protection: the caller cancels a held symbol's stops before selling
+    (Alpaca reserves the shares a stop covers), so a GTC stop is re-placed, at its old price, for
+    whatever the day's sells leave held -- unless the symbol is being bought today, when the open
+    buy would make it a wash trade and the held shares go unprotected for that session. A symbol
+    with no recorded stop gets none invented.
 
     sell_only=True is the loser zone: StockNN runs as usual and its sells go in, but nothing is
-    bought, so the industry drains at the model's own sell rate. It is NOT liquidation. The
-    caller cancels each held symbol's stops before any sell (Alpaca reserves the shares an open
-    stop covers), so here the stop is re-placed, at its old price, for whatever the day's sells
-    leave held. A buy-side day re-protects through the stop placed with each new buy instead.
+    bought, so the industry drains at the model's own sell rate. It is NOT liquidation.
 
     -> list of order dicts in submission order."""
     stops = stops or {}
-    orders = []
+    orders, left, sold, bought = [], {}, set(), set()
     for sym in symbols:
         if sym not in day_data or holds.get(sym, 0) > 0:
             continue
@@ -855,60 +881,58 @@ def plan_industry_orders(symbols, sug, holdings, day_data, allocated_cash, holds
             amount = int(min(sell_qty, cur_qty))
             if amount >= 1:
                 orders.append({'symbol': sym, 'action': 'sell',
-                               'quantity': amount, 'price': close})
+                               'quantity': amount, 'price': to_cents(close, 'up')})
                 cur_qty -= amount
+                sold.add(sym)
 
         # Sell all at limit price
         if cur_qty >= 1 and low <= sell_all_price <= high:
             orders.append({'symbol': sym, 'action': 'sell',
-                           'quantity': int(cur_qty), 'price': sell_all_price})
+                           'quantity': int(cur_qty), 'price': to_cents(sell_all_price, 'up')})
             cur_qty = 0.0
+            sold.add(sym)
+        left[sym] = cur_qty
 
-        if sell_only and cur_qty >= 1 and sym in stops:
-            orders.append({'symbol': sym, 'action': 'stop_loss',
-                           'quantity': int(cur_qty), 'price': stops[sym]})
-    if sell_only:
-        return orders
+    if not sell_only:
+        # ── Buys after sells: stop anchored to buy_price ─────────────
+        # allocated_cash is the industry's budget for the WHOLE loop, so it has to be
+        # spent down as orders are queued. Reading it fresh per symbol sized every
+        # position against the full allocation: measured 2026-09-17, tech_hardware
+        # queued ~$12,800 against a $1,666.67 allocation (ON 99%, LRCX 96%, SWKS 96%,
+        # KLAC 94%, NVDA 91% ... each of the full budget). training_lib.step_industry
+        # spends its cash down correctly; this path did not.
+        remaining_cash = allocated_cash
+        # Industry portfolio value for the single-stock cap, on the same basis the model
+        # was fed (allocated_cash + holdings), mirroring training_lib.step_industry.
+        ind_port_value = allocated_cash + sum(
+            holdings.get(s, 0.0) * day_data.get(s, {}).get('close', 0.0)
+            for s in symbols)
+        for sym in symbols:
+            if sym not in day_data or holds.get(sym, 0) > 0 or sym in sold:
+                continue
+            buy_qty, buy_price_frac, sell_all_price_frac, sell_qty = sug[sym]
+            low       = day_data[sym]['low']
+            high      = day_data[sym]['high']
+            span      = max(high - low, 1e-9)
+            raw_price = low + buy_price_frac * span
 
-    # ── Buys after sells: stop anchored to buy_price ─────────────
-    # allocated_cash is the industry's budget for the WHOLE loop, so it has to be
-    # spent down as orders are queued. Reading it fresh per symbol sized every
-    # position against the full allocation: measured 2026-09-17, tech_hardware
-    # queued ~$12,800 against a $1,666.67 allocation (ON 99%, LRCX 96%, SWKS 96%,
-    # KLAC 94%, NVDA 91% ... each of the full budget). Live, Alpaca would fill those
-    # in arbitrary order until buying power ran out and the resulting book would not
-    # reflect the model's intent. training_lib.step_industry spends its cash down
-    # correctly; this path did not.
-    remaining_cash = allocated_cash
-    # Industry portfolio value for the single-stock cap, on the same basis the model
-    # was fed (allocated_cash + holdings), mirroring training_lib.step_industry.
-    ind_port_value = allocated_cash + sum(
-        holdings.get(s, 0.0) * day_data.get(s, {}).get('close', 0.0)
-        for s in symbols)
+            if buy_qty > 1e-6 and raw_price > 0 and low <= raw_price <= high:
+                buy_price = to_cents(raw_price, 'down')
+                # Shared with the simulator: size_buy is the ONE place the request /
+                # cash / single-stock-cap arithmetic lives.
+                amount = int(training_lib.size_buy(
+                    buy_qty, buy_price, remaining_cash, ind_port_value,
+                    holdings.get(sym, 0.0) * buy_price))
+                if amount >= 1:
+                    orders.append({'symbol': sym, 'action': 'buy', 'quantity': amount,
+                                   'price': buy_price, 'stop': to_cents(buy_price * 0.9, 'near')})
+                    remaining_cash -= amount * buy_price * BUY_FILL
+                    bought.add(sym)
+
     for sym in symbols:
-        if sym not in day_data or holds.get(sym, 0) > 0:
-            continue
-        buy_qty, buy_price_frac, sell_all_price_frac, sell_qty = sug[sym]
-        low       = day_data[sym]['low']
-        high      = day_data[sym]['high']
-        span      = max(high - low, 1e-9)
-        buy_price    = low + buy_price_frac * span
-        stop_loss_at = buy_price * 0.9   # GTC stop at 10% below entry
-
-        if buy_qty > 1e-6 and buy_price > 0 and low <= buy_price <= high:
-            # Shared with the simulator: size_buy is the ONE place the request /
-            # cash / single-stock-cap arithmetic lives. It used to exist in seven
-            # copies and production's was the one no test reached, so production was
-            # the copy that drifted — no cap, no cash decrement, fractional shares.
-            amount = int(training_lib.size_buy(
-                buy_qty, buy_price, remaining_cash, ind_port_value,
-                holdings.get(sym, 0.0) * buy_price))
-            if amount >= 1:
-                orders.append({'symbol': sym, 'action': 'buy',
-                               'quantity': amount, 'price': buy_price})
-                orders.append({'symbol': sym, 'action': 'stop_loss',
-                               'quantity': amount, 'price': stop_loss_at})
-                remaining_cash -= amount * buy_price * BUY_FILL
+        if left.get(sym, 0.0) >= 1 and sym in stops and sym not in bought:
+            orders.append({'symbol': sym, 'action': 'stop_loss',
+                           'quantity': int(left[sym]), 'price': to_cents(stops[sym], 'near')})
     return orders
 
 
@@ -978,8 +1002,9 @@ def save_upkeep_book(model_dir, trading_client, industries, allocations, sell_on
         return
     stops = {}
     for o in orders:
-        if o['action'] == 'stop_loss':
-            stops[o['symbol']] = max(stops.get(o['symbol'], 0.0), float(o['price']))
+        p = o['price'] if o['action'] == 'stop_loss' else o.get('stop')
+        if p:
+            stops[o['symbol']] = max(stops.get(o['symbol'], 0.0), float(p))
     books, value = {}, {}
     for ind, syms in industries.items():
         cash = 0.0 if ind in sell_only else float(allocations.get(ind, 0.0))
@@ -1489,6 +1514,12 @@ def main():
                                     trading_client.cancel_order_by_id(o.id)
                         except Exception as e:
                             print(f"Error canceling existing orders for {sym}: {e}")
+                    # A buy's stop is an OTO leg that expires with the day order, so a position
+                    # bought yesterday has no open stop today: fall back to the stop recorded
+                    # for it, so it is re-placed as a GTC stop.
+                    if holdings.get(sym, 0.0) >= 1 and sym not in stops \
+                            and sym in state.get('stops', {}):
+                        stops[sym] = state['stops'][sym]
 
                 orders += plan_industry_orders(symbols, sug, holdings, day_data, allocated_cash,
                                                _sym_holds, sell_only=industry in sell_only,
@@ -1547,6 +1578,18 @@ def main():
             holdings.pop(sym, None)
         if _orphaned:
             print(f"Cleared orphaned holdings from state: {list(_orphaned.keys())}")
+
+        # Remember each held or bought symbol's stop for the next run (see the fallback above).
+        # A held position left without a stop today (a new buy for it is open) keeps the one it
+        # had. A --no-orders run placed nothing, so it records nothing new.
+        remembered = {sym: p for sym, p in state.get('stops', {}).items()
+                      if holdings.get(sym, 0.0) >= 1}
+        for o in ([] if args.no_orders else orders):
+            if o['action'] == 'stop_loss':
+                remembered[o['symbol']] = o['price']
+            elif o['action'] == 'buy' and o.get('stop'):
+                remembered[o['symbol']] = o['stop']
+        state['stops'] = remembered
 
         # Save updated state
         state['histories'] = histories
@@ -1657,13 +1700,18 @@ def main():
         for order in orders:
             try:
                 if order['action'] == 'buy':
+                    # One OTO order: the stop-loss goes live only when the buy fills. A separate
+                    # sell stop beside an open buy is rejected by Alpaca as a wash trade.
+                    stop = order.get('stop')
                     order_req = LimitOrderRequest(
                         symbol=order['symbol'],
                         qty=order['quantity'],
                         side=OrderSide.BUY,
                         type=OrderType.LIMIT,
                         time_in_force=TimeInForce.DAY,
-                        limit_price=order['price']
+                        limit_price=order['price'],
+                        **({'order_class': OrderClass.OTO,
+                            'stop_loss': StopLossRequest(stop_price=stop)} if stop else {})
                     )
                     result = trading_client.submit_order(order_req)
                     log_request_id(str(result.id), f"{mode} buy {order['symbol']} qty={order['quantity']}")

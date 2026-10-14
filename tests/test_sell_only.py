@@ -32,8 +32,33 @@ def of(orders, action):
 def test_normal_mode_buys_and_sells():
     o = plan()
     assert of(o, "sell") == {("AAA", 4), ("BBB", 8)}
-    assert {s for s, _ in of(o, "buy")} == {"AAA", "BBB", "DDD"}
-    assert of(o, "stop_loss") == {(s, q) for s, q in of(o, "buy")}     # one stop per buy
+    # AAA and BBB are sold today, so they are not also bought (Alpaca: wash trade)
+    assert {s for s, _ in of(o, "buy")} == {"DDD"}
+    assert all(x["stop"] for x in o if x["action"] == "buy")           # the stop rides the buy
+    assert not of(o, "stop_loss")                                      # no prior stops to re-place
+
+
+def test_every_price_is_a_whole_cent_and_rounds_in_the_orders_favour():
+    day = {s: {"open": 50.0, "high": 52.003, "low": 48.0071, "close": 50.0049} for s in SYMS}
+    o = pv.plan_industry_orders(SYMS, SUG, HOLD, day, 10_000.0, {}, stops={"CCC": 45.4449})
+    for x in o:
+        for k in ("price", "stop"):
+            if k in x:
+                assert round(x[k] * 100, 6) == int(round(x[k] * 100)), (x, k)
+    buy = next(x for x in o if x["action"] == "buy")
+    raw = 48.0071 + 0.5 * (52.003 - 48.0071)
+    assert raw - 0.01 < buy["price"] <= raw                            # a buy never pays more
+    assert all(x["price"] >= 50.0049 for x in o if x["action"] == "sell" and x["symbol"] == "AAA")
+    assert pv.to_cents(45.4449, "near") == 45.44 and pv.to_cents(0.123456, "down") == 0.1234
+
+
+def test_held_shares_are_re_protected_in_every_industry_unless_bought_today():
+    o = plan(stops={"AAA": 45.0, "CCC": 40.0, "DDD": 41.0})
+    st = {(x["symbol"], x["quantity"], x["price"]) for x in o if x["action"] == "stop_loss"}
+    assert st == {("AAA", 6, 45.0), ("CCC", 5, 40.0)}                 # DDD is not held
+    o = pv.plan_industry_orders(SYMS, {**SUG, "CCC": (2.0, 0.5, 2.0, 0.0)}, HOLD, DAY,
+                                10_000.0, {}, stops={"CCC": 40.0})
+    assert not of(o, "stop_loss") and ("CCC", 2) in of(o, "buy")      # open buy: no stop beside it
 
 
 def test_sell_only_places_exactly_the_same_sells_and_no_buys():
@@ -52,7 +77,7 @@ def test_sell_only_re_protects_the_remainder_at_the_old_stop_price():
     o = plan(sell_only=True, stops={"AAA": 45.0, "BBB": 44.0})
     stops = [x for x in o if x["action"] == "stop_loss"]
     assert [(x["symbol"], x["quantity"], x["price"]) for x in stops] == [("AAA", 6, 45.0)]
-    # BBB was sold in full, so nothing is left to protect; CCC's stop was never cancelled
+    # BBB was sold in full, so nothing is left to protect
     sells = [i for i, x in enumerate(o) if x["symbol"] == "AAA" and x["action"] == "sell"]
     assert sells[0] < o.index(stops[0])                              # sell submitted first
 
