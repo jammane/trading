@@ -25,6 +25,7 @@
 #include <mutex>
 #include <numeric>
 #include <random>
+#include <set>
 #include <semaphore>
 #include <sstream>
 #include <string>
@@ -582,6 +583,14 @@ static bool g_no_save = false;
 // off: the hard-floor recapitalisation (the book is real money, not a $25k simulation), the
 // pass-start reset of the StockNN history ring, and the pass-start re-init of gradient entries.
 static bool  g_upkeep = false;
+// --continue-run: add passes to an existing run. Passes are numbered after the last one in its
+// pass_reference.csv, so per-pass files and champion records never collide with earlier passes.
+static bool  g_continue  = false;
+static int   g_pass_base = 0;      // passes already in the run (0 for a new run)
+// --crown IND,...: these industries' pass is crowned champion outright at its boundary, whatever
+// the standing champion scored. For an industry whose universe changed (a symbol swap): its
+// champion was raised on a symbol it no longer trades, so its score is no longer comparable.
+static std::set<std::string> g_force_crown;
 // CN_BOOK's denominator per industry: the book's starting capital. IND_STARTING_CASH in training;
 // production passes each industry's own, since a paper book is not $25k. race_models.py's
 // build_cfeat146(book_base=) mirrors it.
@@ -3434,6 +3443,83 @@ static bool copy_elites(const std::string& from, const std::string& to, const ch
     return true;
 }
 
+// The highest pass number recorded in pass_reference.csv (0 if none).
+static int last_pass_in_ref(const std::string& path) {
+    int last = 0;
+    FILE* f = fopen(path.c_str(), "r");
+    if (!f) return 0;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        int p;
+        if (line[0] != '#' && sscanf(line, "%d,", &p) == 1 && p > last) last = p;
+    }
+    fclose(f);
+    return last;
+}
+
+// Marker written when a boundary has blended the next pass's seed into the run directory. A run
+// that ended normally has not (its final pass is crowned but not blended), so --continue-run
+// blends first, with the share that boundary recorded.
+static const char* SEEDED_MARKER = "/seeded_next";
+
+static void write_seeded_marker(const std::string& out_dir, int pass_num) {
+    if (FILE* f = fopen((out_dir + SEEDED_MARKER).c_str(), "w")) {
+        fprintf(f, "%d\n", pass_num);
+        fclose(f);
+    }
+}
+
+// --continue-run start: if the last boundary did not blend a seed, blend now -- the champion and
+// that pass's elites (still in the run directory) interleaved at the recorded share_new, exactly
+// what the boundary would have written with seed_next. An industry crowned outright ("seed"
+// regime) keeps the run directory as it is, as the boundary does.
+static void reseed_for_continue(const std::string& out_dir, int last_pass) {
+    int marked = -1;
+    if (FILE* f = fopen((out_dir + SEEDED_MARKER).c_str(), "r")) {
+        if (fscanf(f, "%d", &marked) != 1) marked = -1;
+        fclose(f);
+    }
+    if (marked == last_pass) {
+        log_msg("continue: pass " + std::to_string(last_pass) + " already seeded the next pass");
+        return;
+    }
+    const std::string champ_dir = out_dir + "/champion", stage_dir = out_dir + "/stage";
+    std::error_code ec;
+    fs::create_directories(stage_dir, ec);
+    FILE* f = fopen((out_dir + "/pass_reference.csv").c_str(), "r");
+    if (!f) return;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        char ind_buf[64], regime[32];
+        int p, ds, de, cp, chp, slots, ncp;
+        float cpct, chpct, share, npct;
+        if (sscanf(line, "%d,%63[^,],%d,%d,%d,%f,%d,%f,%31[^,],%f,%d,%d,%f",
+                   &p, ind_buf, &ds, &de, &cp, &cpct, &chp, &chpct,
+                   regime, &share, &slots, &ncp, &npct) != 13 || p != last_pass) continue;
+        if (std::string(regime) == "seed" || std::string(regime) == "crown") continue;
+        int src[ELITE_POOL], idx[ELITE_POOL];
+        pass_interleave(share, ELITE_POOL, src, idx);
+        bool ok = true;
+        for (int k = 0; k < ELITE_POOL && ok; k++) {
+            fs::copy_file(elite_path(out_dir, ind_buf, k), elite_path(stage_dir, ind_buf, k),
+                          fs::copy_options::overwrite_existing, ec);
+            ok = !ec;
+        }
+        if (!ok) { log_msg(std::string("continue: cannot stage ") + ind_buf + " -- seed unchanged"); continue; }
+        for (int k = 0; k < ELITE_POOL; k++)
+            fs::copy_file(src[k] == 0 ? elite_path(champ_dir, ind_buf, idx[k])
+                                      : elite_path(stage_dir, ind_buf, idx[k]),
+                          elite_path(out_dir, ind_buf, k), fs::copy_options::overwrite_existing, ec);
+        char msg[200];
+        snprintf(msg, sizeof(msg), "continue: %s seeded from champion p%d + p%d (share_new %.2f)",
+                 ind_buf, ncp, last_pass, share);
+        log_msg(msg);
+    }
+    fclose(f);
+    fs::remove_all(stage_dir, ec);
+    write_seeded_marker(out_dir, last_pass);
+}
+
 // seed_next=false on the final pass: crown and record, but skip the blend. Otherwise the run
 // would end with out_dir holding a seed built for a pass that never runs — neither the champion
 // nor the final pass's models. The deliverable is champion/ either way.
@@ -3501,15 +3587,17 @@ static void pass_boundary(const std::string& out_dir, int pass_num,
             log_msg(std::string("[") + IND_SHORT[i] +
                     "]   pass-seed: champion weights MISSING — falling back to 100% from this pass");
 
-        if (!champ_ok || !have) {
-            // First boundary, missing champion, or no usable metric: this pass becomes the
-            // champion outright and the seed is left as-is — the pre-v0.6.3.0 behaviour.
+        const bool forced = g_force_crown.count(g_ind_names[i]) > 0;
+        if (!champ_ok || !have || forced) {
+            // First boundary, missing champion, no usable metric, or --crown: this pass becomes
+            // the champion outright and the seed is left as-is — the pre-v0.6.3.0 behaviour.
             copy_elites(stage_dir, champ_dir, ind);
             fprintf(csv, "%d,%s,%d,%d,%d,%+.8f,%d,%+.8f,%s,%.4f,%d,%d,%+.8f\n",
                     pass_num, ind, day_start + 1, day_end, pass_num, chal_pct, 0, 0.f,
-                    "seed", 1.0, ELITE_POOL, pass_num, chal_pct);
-            snprintf(msg, sizeof(msg), "   pass-seed: champion = pass %d (%+.2f bp/day, eff %.0f days), "
-                     "seed unchanged", pass_num, chal_pct * 1e4f, judge[i].eff_days());
+                    forced ? "crown" : "seed", 1.0, ELITE_POOL, pass_num, chal_pct);
+            snprintf(msg, sizeof(msg), "   pass-seed: champion = pass %d (%+.2f bp/day, eff %.0f days)%s, "
+                     "seed unchanged", pass_num, chal_pct * 1e4f, judge[i].eff_days(),
+                     forced ? " [--crown]" : "");
             log_msg(std::string("[") + IND_SHORT[i] + "]" + msg);
             continue;
         }
@@ -3549,6 +3637,7 @@ static void pass_boundary(const std::string& out_dir, int pass_num,
     }
     fclose(csv);
     fs::remove_all(stage_dir, ec);
+    if (seed_next) write_seeded_marker(out_dir, pass_num);
 }
 
 // save_master_elites() removed in v0.8.1.10: unreferenced (-Wunused-function).
@@ -4253,8 +4342,11 @@ static void print_usage(const char* prog) {
         "       %s --output DIR [--load-dir DIR] ...  (diagnostic/override)\n"
         "       %s --drift-study --load-dir SEED --drift-scratch DIR  (phase-3 calibration)\n"
         "       %s --upkeep BOOK --output STATE --load-dir SEED [--race-only ...]  (production's\n"
-        "          daily step: one day on the real book, state carried in STATE)\n",
-        prog, prog, prog, prog);
+        "          daily step: one day on the real book, state carried in STATE)\n"
+        "       %s --continue-run --output RUN --passes N ...  add N passes to an existing run,\n"
+        "          numbered after its pass_reference.csv; logs in RUN/continue_p<first pass>\n"
+        "          [--crown IND,...]  crown these industries' pass outright (after a symbol swap)\n",
+        prog, prog, prog, prog, prog);
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -4777,6 +4869,17 @@ int main(int argc, char* argv[]) {
         }
         else if (arg == "--upkeep" && a+1<argc) { g_upkeep = true; upkeep_book_path = argv[++a]; }
         else if (arg == "--race-only" && a+1<argc) { race_only = argv[++a]; }
+        else if (arg == "--continue-run") g_continue = true;
+        else if (arg == "--crown" && a+1<argc) {
+            std::string list = argv[++a];
+            size_t pos = 0;
+            while (pos <= list.size()) {
+                size_t comma = list.find(',', pos);
+                if (comma == std::string::npos) comma = list.size();
+                if (comma > pos) g_force_crown.insert(list.substr(pos, comma - pos));
+                pos = comma + 1;
+            }
+        }
         else if (arg == "--no-save") g_no_save = true;
         else if (arg == "--control-untrained") g_control_untrained = true;
         else if (arg == "--control-random") g_control_random = true;
@@ -4826,6 +4929,20 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
+    if (g_continue) {
+        if (output_dir.empty() || !account.empty() || g_upkeep || g_no_save || g_control_untrained
+            || g_control_random || master_only || drift_study) {
+            fprintf(stderr, "ERROR: --continue-run needs --output RUN (and no --account, --upkeep "
+                            "or diagnostic mode)\n");
+            return 1;
+        }
+        g_pass_base = last_pass_in_ref(output_dir + "/pass_reference.csv");
+        if (g_pass_base == 0) {
+            fprintf(stderr, "ERROR: --continue-run: %s/pass_reference.csv has no passes\n",
+                    output_dir.c_str());
+            return 1;
+        }
+    }
     // --account derives model and log dirs; --output/--load-dir are diagnostic overrides
     std::string log_dir;
     if (!account.empty()) {
@@ -4834,7 +4951,11 @@ int main(int argc, char* argv[]) {
         if (load_dir.empty())   load_dir   = acct_dir;
         log_dir = "logs/" + account + "/training";
     } else {
-        log_dir = g_upkeep ? output_dir + "/log" : output_dir;  // diagnostic: co-locate logs with models
+        // An upkeep day logs into its state's log/; a continued run gives each invocation its own
+        // log directory, so the earlier passes' race_daily.csv and binary logs are kept.
+        log_dir = g_upkeep   ? output_dir + "/log"
+                : g_continue ? output_dir + "/continue_p" + std::to_string(g_pass_base + 1)
+                : output_dir;  // diagnostic: co-locate logs with models
     }
     if (output_dir.empty()) { print_usage(argv[0]); return 1; }
     if (master_sigma  < 0.f) master_sigma  = sigma;
@@ -4860,6 +4981,12 @@ int main(int argc, char* argv[]) {
     }
 
     if (!load_universe_json("universe.json")) return 1;
+    for (const std::string& c : g_force_crown) {
+        bool known = false;
+        for (int i = 0; i < N_IND; i++) known |= (g_ind_names[i] == c);
+        if (!known) { fprintf(stderr, "ERROR: --crown: no industry named \"%s\"\n", c.c_str()); return 1; }
+        log_msg("--crown: " + c + "'s pass is crowned outright at its boundary");
+    }
 
     // --no-save: train into a scratch directory and drop it at exit. Writing is REQUIRED for
     // training to work at all — elite_buf and hist_buf are reloaded from disk every day — so the
@@ -5209,8 +5336,15 @@ int main(int argc, char* argv[]) {
 
     bool upkeep_failed = false;
     // ── Multi-pass loop ─────────────────────────────────────────────────────
-    for (int pass = 0; pass < passes; pass++) {
-        float decay         = powf(sigma_decay, (float)pass);
+    if (g_continue) {
+        log_msg("continue: run has " + std::to_string(g_pass_base) + " pass(es); this invocation "
+                "trains pass " + std::to_string(g_pass_base + 1) +
+                (passes > 1 ? ".." + std::to_string(g_pass_base + passes) : std::string()) +
+                ", logs in " + log_dir);
+        reseed_for_continue(output_dir, g_pass_base);
+    }
+    for (int pass = g_pass_base; pass < g_pass_base + passes; pass++) {
+        float decay         = powf(sigma_decay, (float)(pass - g_pass_base));
         float cur_sigma     = sigma        * decay;
         float cur_mst_sigma = master_sigma * decay;  // composite blends
         float cur_mt1_sigma = mt1_sigma    * decay;
@@ -5223,7 +5357,7 @@ int main(int argc, char* argv[]) {
             : (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
         log_msg("  pass seed: " + std::to_string(g_run_seed));
 
-        log_msg("===== PASS " + std::to_string(pass+1) + "/" + std::to_string(passes) +
+        log_msg("===== PASS " + std::to_string(pass+1) + "/" + std::to_string(g_pass_base + passes) +
                 " | sigma=" + std::to_string(cur_sigma).substr(0,6) +
                 " | mst=" + std::to_string(cur_mst_sigma).substr(0,6) +
                 " | mt1=" + std::to_string(cur_mt1_sigma).substr(0,6) +
@@ -5268,7 +5402,25 @@ int main(int argc, char* argv[]) {
                                           RACE[v].tag, race_init(RACE[v].arch), r.salt);
                     continue;
                 }
-                if (RACE[v].carry && pass > 0) continue;   // keep weights, Adam moments AND lr
+                if (RACE[v].carry && pass > g_pass_base) continue;   // keep weights, Adam moments AND lr
+                // A continued run's first pass has nothing in memory to carry: a carry entry
+                // resumes from the previous pass's saved weights (Adam restarts, lr at base).
+                if (RACE[v].carry && g_continue) {
+                    r.lr[i] = BP_LR_BASE;
+                    std::vector<float>* W = &r.w[i];
+                    if (RACE[v].arch == ARCH_TANH32) {
+                        r.tanh32[i].init({MT1C_IN, 32, 8, 1}, mix_seed(sd));
+                        W = &r.tanh32[i].W;
+                    } else {
+                        std::fill(r.m[i].begin(), r.m[i].end(), 0.f);
+                        std::fill(r.v[i].begin(), r.v[i].end(), 0.f);
+                        std::fill(r.g[i].begin(), r.g[i].end(), 0.f);
+                    }
+                    if (load_bin(race_weight_path(output_dir, v, i, g_pass_base), W->data(), (int)W->size()))
+                        continue;
+                    log_msg(std::string("continue: WARNING no p") + std::to_string(g_pass_base) +
+                            " weights for " + race_slug(v) + " " + g_ind_names[i] + " -- fresh init");
+                }
                 r.lr[i] = BP_LR_BASE;
                 if (RACE[v].arch == ARCH_TANH32) {         // its own Xavier init, as in v0.8.1.27
                     r.tanh32[i].init({MT1C_IN, 32, 8, 1}, mix_seed(sd));
@@ -6641,7 +6793,7 @@ int main(int argc, char* argv[]) {
             // weights into champion/, where the NEXT real run would seed from them.
             if (!master_only && !g_control_untrained && (day_end - day_start) > PASS_JUDGE_MIN_DAYS)
                 pass_boundary(output_dir, pass + 1, day_start, day_end,
-                              judge, /*seed_next=*/pass + 1 < passes);
+                              judge, /*seed_next=*/g_continue || pass + 1 < g_pass_base + passes);
 
             // ── how well did the gradient MT1 predict the TRADING OUTCOME? ──────────────
             //

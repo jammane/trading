@@ -433,6 +433,8 @@ floor it never goes stale (`universe_acct0.py` docstring; thresholds in `univers
   there is a swap under the rules above. Production's own bar fetch is saved under the **bar's
   date**, not today's: a halted symbol's feed returns its last bar, and stamping that with today's
   date made a stopped symbol look current.
+- **Automatic swaps.** The Friday weekly pass performs swaps itself, from the ready-replacement
+  list (see **The weekly pass**); `swap_symbols.sh` remains for a swap made by hand.
 - **5-day new-symbol hold** — after any swap, `production_v2.py` automatically detects the new symbol (compares universe to `state['known_symbols']`) and applies a 5-run hold: paper/prod orders are suppressed for that symbol for 5 trading days. Training (regular C++ and daily upkeep) still runs on the new symbol immediately so the model starts adapting.
 
 ## Shared modules
@@ -511,6 +513,11 @@ pytest tests across the files in `tests/`:
   trainer (symbols in universe order), the bayes seed replaying the trainer's exact update, the
   committee and race settings passed to the binary, the real books production records, and the
   log archive keeping every training day.
+- `test_weekly.py` -- the weekly pass and its replacement list: each vetting check rejects on
+  its own, the refresh keeps three ranked candidates and never offers a member, a removed or a
+  rejected symbol, swaps happen only for stopped data or drift, the replacement is the first that
+  rechecks and keeps the band, the book forgets exactly the swapped slot, and promotion clears
+  exactly one industry's state even where industry names share words.
 - `test_committee_alloc.py` -- the committee allocation: the vote is `committee_race`'s on one
   day, member order breaks a split vote, the 4 flagged get nothing and the rest are tilted
   exactly, an industry without predictions sits out, models load from the daily state first, and
@@ -1014,6 +1021,8 @@ new days. A full v5-sized run takes ~15 s.
 python committee_race.py /root/ht_race_v5/race_daily.csv --out committee_race.csv
 python committee_race.py /root/ht_race_v5/race_daily.csv --watch
 python committee_race.py /root/ht_race_v5/race_daily.csv --champions /root/ht_race_v5/pass_reference.csv
+python committee_race.py /root/ht_race_v5/race_daily.csv /root/ht_race_v5/continue_p*/race_daily.csv \
+    --champions /root/ht_race_v5/pass_reference.csv     # with the weekly passes
 ```
 
 `--champions` races the committees on the **champion composite**, and this is the race that
@@ -1214,6 +1223,71 @@ be read with the same tools:
   predictions and its own top 4), `W1 committee`, `L1 committee` (its picks are the 4 it flagged,
   so a negative gap means they lagged), and `PORTFOLIO` (the account's equity return; its 12
   columns are the dollars each industry was given). `--no-orders` records nothing.
+
+### The weekly pass (`weekly_pass.py`, Fridays)
+
+Every Friday, once paper and prod have placed their orders, the dev worktree adds **one full pass**
+to the standing race run (`/root/ht_race_v5`, whose `champion/` paper seeds from). The new pass
+competes with the champions paper trades, industry by industry, on the champion rule
+(pass_reference v2), and over the weeks it adds passes to the record the committees are chosen on.
+One pass takes ~17 hours on the droplet, so a Friday-evening start finishes Saturday.
+
+1. **Wait** for production's trading lock to clear.
+2. **Swap.** A symbol whose newest bar is behind the universe's newest session (its data stopped
+   arriving; `download_daily.py` is re-run first so a one-day feed gap does not count), or the
+   outlier of an industry whose mean/median price ratio is past a swap threshold (the dearest if
+   high, the cheapest if low), is replaced by the first of its industry's **ready replacements**
+   that still passes its checks and keeps the ratio inside the watch band (0.96–1.20). The
+   universe change is committed to dev and **cherry-picked** onto paper (a swap releases nothing
+   else from dev), and paper's recorded book zeroes the old symbol's slot, because the book is
+   positional and that slot now belongs to the new symbol. No ready replacement passing means no
+   swap: the symbol stays suspended and the report says so.
+3. **Train** one pass: `training_v4_cpp --continue-run --output RUN --passes 1` with the canonical
+   settings and the v5 `--race-skip` (`RUN/race_skip.txt`), so every entry a committee could use
+   keeps running. A swapped industry is crowned outright (`--crown`): its champion was raised on a
+   symbol it no longer trades.
+4. **Promote.** Every industry the pass took goes to paper automatically: its daily-training state
+   in `cpp/` is deleted (elites, history ring, race models, Adam moments, evolutionary pools, its
+   learning rates and step counts in `upkeep_state.txt`), so the next session re-seeds it from
+   the new champion exactly as the first paper run seeded from v5; and its StockNN is converted to
+   `.pt` now, for inference before the next training day. Both sides are trained through the same
+   decision day (Thursday's, filled Friday), so the swap is aligned in time. **Prod** is promoted
+   only for swapped industries, whose old models no longer match the universe.
+5. **Report** to `RUN/weekly/<date>.md` (and `latest.md`): swaps, champions taken, and the
+   committee races re-run on the new champion composite. W1 and L1 are scored as traded (fixed
+   members and order) beside the five best configurations of each race, with how many raced
+   configurations beat them. **Committees are never changed automatically**; that decision is
+   made from this report.
+
+**Continuing a run.** `--continue-run` numbers the new passes after the last one in
+`pass_reference.csv`, so `race_p<N>_*` snapshots and champion records never collide, and writes
+the invocation's logs (`race_daily.csv`, `holdings_log.csv`, the binary logs) to
+`RUN/continue_p<N>/` rather than overwriting the run's. A run's final pass is crowned but not
+blended into a seed, so the first continuation blends one from the recorded `share_new` before it
+trains (logged `continue: <ind> seeded from champion pN + pM`); every continued pass then seeds the
+next (`seeded_next` marker). Carry entries (`grdC`) resume from the previous pass's saved weights
+with fresh Adam moments. `committee_race.py` reads all the `race_daily.csv` files together and
+matches passes by **date**: the trainer's `day` is an index into a window that moves forward
+with the data, so the same index is a different session a week later.
+
+**Ready replacements (`replacements.py`).** Three vetted replacement symbols per industry, kept in
+`universe_watchlist.json` under `replacements` and refreshed every **Monday** after trading
+(`replacements.py refresh --commit` pulls dev, rewrites the list, commits and pushes it), so a
+concern can be raised before Friday can choose a candidate. Candidates are screened from the
+Yahoo industries the industry's members belong to and must pass every check the hand-made swaps
+were researched on: a major US exchange (no OTC), a price inside $30–$90, 1230 clean sessions in five years
+(a long-listed stock's 5-year download returns ~1253), annualised volatility within 0.8× the quietest and 1.2× the most volatile member, 60-day
+dollar volume at least half the least-traded member's, and an active, tradable Alpaca asset. They
+are ranked by resemblance (distance from the members' median volatility and median price, as log
+ratios) and each symbol is offered to one industry only. **To veto a candidate**, add it to
+`rejected` (`{"SYM": "reason"}`) in `universe_watchlist.json` on dev; it is never offered again.
+Earlier swaps' removed symbols (`completed`) are never offered either.
+
+```
+# dev worktree: Monday replacement list, Friday pass (crontab, ET)
+15 18 * * 1 cd /root/trading-ht && export ALPACA_API_KEY=... ALPACA_SECRET_KEY=... (paper keys, read-only use) && source /root/trading/.venv/bin/activate && python replacements.py refresh --commit >> logs/data/replacements.log 2>&1
+30 18 * * 5 tmux new -d -s weekly "cd /root/trading-ht && export ALPACA_API_KEY=... && source /root/trading/.venv/bin/activate && python weekly_pass.py >> logs/weekly.log 2>&1"
+```
 
 ### Daily upkeep (production_v2.py + upkeep.py)
 

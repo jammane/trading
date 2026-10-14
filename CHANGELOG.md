@@ -50,6 +50,17 @@ entry is in its commit message.
   behind the universe's newest session) gets no orders until its data returns; its shares stay
   held and the rest of the universe trades as usual. Logged to `suspended.log`.
 
+- **The weekly pass.** Every Friday after trading, `weekly_pass.py` adds one full pass to the
+  standing race run (`training_v4_cpp --continue-run`), promotes every champion it takes to paper,
+  and re-runs the committee races as a report. Symbols that stopped arriving, or that pushed their
+  industry's prices out of band, are swapped first.
+- **Ready replacements.** `replacements.py` keeps three vetted replacement symbols per industry in
+  `universe_watchlist.json`, screened from the industry's own Yahoo industries and refreshed every
+  Monday so concerns can be raised before Friday.
+- `training_v4_cpp --continue-run` adds passes to an existing run, numbered after its last, with
+  each invocation's logs in their own `continue_p<N>/`; `--crown` crowns named industries outright.
+- `committee_race.py` takes several `race_daily.csv` files and matches passes by date.
+
 ### Fixed
 - Production saved the bar it fetched under today's date even when the feed returned an older
   one, which made a halted symbol look current. Bars are saved under their own date.

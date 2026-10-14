@@ -71,19 +71,28 @@ PICK_W = np.array([STEP ** 3, STEP ** 2, STEP, 1.0])
 
 
 def load(path, losers=False):
-    """-> entries, {pass: dict(real[T,12], ok[T,12], flat[T], pred{e: [T,12]}, gap{e: [T]})}
+    """-> entries, {pass: dict(days[T] (dates), real[T,12], ok[T,12], flat[T], pred{e: [T,12]},
+    gap{e: [T]})}
+
+    path: one race_daily.csv or a list of them -- a run continued with --continue-run logs each
+    invocation's passes in its own continue_p<N>/race_daily.csv. Days are keyed by DATE: the
+    trainer's `day` is an index into its 1255-session window, which moves forward with the data,
+    so the same index is a different session in a later invocation.
 
     Only days on which every entry has a row are kept, so every configuration in a pass is
     scored on the same days. losers=True returns the mirror image (see `mirror`).
     """
-    with open(path) as f:
-        rows = list(csv.DictReader(f))
+    paths = [path] if isinstance(path, str) else list(path)
+    rows = []
+    for pth in paths:
+        with open(pth) as f:
+            rows += list(csv.DictReader(f))
     if not rows:
-        sys.exit(f"{path}: empty")
+        sys.exit(f"{', '.join(paths)}: empty")
     inds = list(rows[0].keys())[12:]
     by = defaultdict(dict)
     for r in rows:
-        by[(int(r["pass"]), int(r["day"]))][r["entry"]] = r
+        by[(int(r["pass"]), r["date"])][r["entry"]] = r
     entries = sorted({r["entry"] for r in rows} - {"REALIZED"})
 
     def vec(r):
@@ -507,7 +516,8 @@ def print_watch(w, show=15):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("csv")
+    ap.add_argument("csv", nargs="+", help="race_daily.csv file(s); a continued run has one per "
+                                           "invocation")
     ap.add_argument("--sizes", default="3,4,5,6")
     ap.add_argument("--pool", default="", help="override the entrant list (comma separated)")
     ap.add_argument("--top", type=int, default=40)
@@ -530,7 +540,7 @@ def main():
         return
     stand, pool, ps, res = run(a.csv, sizes, pool, a.losers)
     n = len(ps)
-    print(f"{a.csv}: {len(stand)} entries, {n} passes"
+    print(f"{', '.join(a.csv)}: {len(stand)} entries, {n} passes"
           + (" -- LOSER RACE (gap = flat - flagged 4)" if a.losers else "") + "\n")
     print("singles, gap vs flat bp/day per pass  (* = entrant)")
     print(f"{'entry':24}{'wins':>6}{'mean':>8}  " + " ".join(f"{'p' + str(p):>6}" for p in ps))
