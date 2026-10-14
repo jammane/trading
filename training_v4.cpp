@@ -1538,6 +1538,16 @@ struct IndResult {
     float hold[IND_SYMS];
     float hold_cash;
     float book_base;   // CN_BOOK denominator: g_book_base[industry] (see --upkeep)
+    // Slot 0's SIMULATED EXECUTION, per symbol: the limits the deployed model set on today's bar
+    // and what the fill model did with each against the next bar (quantity and price; 0 = did not
+    // fire). Written to orders_sim.csv under --upkeep, where the day's book is the real one, so
+    // fill_check.py can compare it order by order with what the broker actually did.
+    struct SimExec {
+        float buy_lim, sell_all_lim, stop_before, stop_after;
+        float sold_open_q, sold_open_px, sold_all_q, sold_all_px;
+        float stopped_q, stopped_px, bought_q, bought_px;
+        int   low_first;
+    } sim[IND_SYMS];
 };
 
 struct MasterResult {
@@ -1777,6 +1787,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     double oi_ba = 0.0, oi_sa = 0.0, oi_bv = 0.0, oi_sv = 0.0;
     double oi_bf = 0.0, oi_bf2 = 0.0;
 
+    IndResult::SimExec s0[IND_SYMS] = {};
     float out48[48];
     for (int slot = 0; slot < N_SLOTS; slot++) {
         Portfolio& port = state.portfolios[slot];
@@ -1867,6 +1878,11 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             float nd_high = fill_sym[j].valid ? fill_sym[j].high  : day_sym[j].high;
 
             bool low_first = seq_flags[ind_i * IND_SYMS + j];
+            IndResult::SimExec& ex = s0[j];        // written on slot 0 only
+            if (slot == 0) {
+                ex.buy_lim = buy_price; ex.sell_all_lim = sell_all_price;
+                ex.stop_before = port.stop_prices[j]; ex.low_first = low_first ? 1 : 0;
+            }
 
             // Partial sell at open
             if (sell_qty > 1e-6f && port.holdings[j] > 1e-6f) {
@@ -1875,6 +1891,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                 port.cash        += sell_net(amt, nd_open);
                 sym_cash[j]        += sell_net(amt, nd_open);
                 local_sell       += amt;
+                if (slot == 0) { ex.sold_open_q = amt; ex.sold_open_px = nd_open; }
             }
 
             // Gap-up sell_all at open
@@ -1884,6 +1901,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                 port.cash        += sell_net(amt, nd_open);
                 sym_cash[j]        += sell_net(amt, nd_open);
                 local_sell       += amt;
+                if (slot == 0) { ex.sold_all_q = amt; ex.sold_all_px = nd_open; }
             }
 
             // High-first: intraday sell_all fires before buy
@@ -1895,6 +1913,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                 port.cash        += sell_net(amt, slipped);
                 sym_cash[j]        += sell_net(amt, slipped);
                 local_sell       += amt;
+                if (slot == 0) { ex.sold_all_q = amt; ex.sold_all_px = slipped; }
             }
 
             // Stop loss
@@ -1906,6 +1925,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                     port.cash        += sell_net(amt, nd_open);
                     sym_cash[j]        += sell_net(amt, nd_open);
                     local_sell       += amt;
+                    if (slot == 0) { ex.stopped_q = amt; ex.stopped_px = nd_open; }
                 } else if (nd_low <= stop_p) {
                     float slipped = stop_p * (1.f - SLIPPAGE_RATE);
                     float amt = port.holdings[j];
@@ -1913,6 +1933,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                     port.cash        += sell_net(amt, slipped);
                     sym_cash[j]        += sell_net(amt, slipped);
                     local_sell       += amt;
+                    if (slot == 0) { ex.stopped_q = amt; ex.stopped_px = slipped; }
                 }
             }
 
@@ -1946,6 +1967,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                         sym_cash[j]           -= buy_amount * fill_price;
                         port.stop_prices[j]  = stop_loss;
                         local_buy           += buy_amount;
+                        if (slot == 0) { ex.bought_q = buy_amount; ex.bought_px = fill_price; }
                     }
                 }
             }
@@ -1970,8 +1992,11 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                 port.cash        += sell_net(amt, slipped);
                 sym_cash[j]        += sell_net(amt, slipped);
                 local_sell       += amt;
+                if (slot == 0) { s0[j].sold_all_q = amt; s0[j].sold_all_px = slipped; }
             }
         }
+        if (slot == 0)
+            for (int j = 0; j < IND_SYMS; j++) s0[j].stop_after = port.stop_prices[j];
 
         slot_scores[slot] = compute_value_ind(port, day_sym, fill_sym);
         // book P&L for symbol j = what the position is worth now, minus what it was worth at
@@ -2494,6 +2519,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     res.ctl_mean      = ctl_mean;
     for (int j = 0; j < IND_SYMS; j++) res.hold[j] = slot0_own.holdings[j];
     res.hold_cash     = slot0_own.cash;
+    memcpy(res.sim, s0, sizeof(s0));
     res.ctl_n         = ctl_n;
     state.streak      = new_streak;
     return res;
@@ -6748,6 +6774,40 @@ int main(int argc, char* argv[]) {
                 upk_state.mu[i] = balloc.mu[i]; upk_state.m2[i] = balloc.m2[i]; upk_state.w[i] = balloc.w[i];
             }
             upk_state.have_bayes = !g_bayes_off;
+            // Slot 0's simulated execution, order by order, for fill_check.py to set beside the
+            // broker's: the decision day's raw outputs and limits, the fill bar, and what fired.
+            {
+                FILE* of = fopen((log_dir + "/orders_sim.csv").c_str(), "w");
+                if (of) {
+                    fprintf(of, "date,fill_date,industry,symbol,hold_before,cash_before,bqty,bfrac,"
+                                "sfrac,sqty,buy_lim,sell_all_lim,stop_before,low_first,fill_open,"
+                                "fill_high,fill_low,fill_close,sold_open_q,sold_open_px,sold_all_q,"
+                                "sold_all_px,stopped_q,stopped_px,bought_q,bought_px,stop_after,"
+                                "hold_after,cash_after\n");
+                    const DayData& fd = all_days[day_start + 1];
+                    for (int i = 0; i < N_IND; i++) {
+                        const IndResult& R = results[i];
+                        for (int j = 0; j < IND_SYMS; j++) {
+                            const IndResult::SimExec& e = R.sim[j];
+                            const OHLCV& b = fd.sym[i][j];
+                            fprintf(of, "%s,%s,%s,%s,%.6f,%.4f,%.6g,%.6g,%.6g,%.6g,%.4f,%.4f,%.4f,%d,"
+                                        "%.4f,%.4f,%.4f,%.4f,%.6f,%.4f,%.6f,%.4f,%.6f,%.4f,%.6f,%.4f,"
+                                        "%.4f,%.6f,%.4f\n",
+                                    dates[day_start].c_str(), dates[day_start + 1].c_str(),
+                                    g_ind_names[i].c_str(), g_syms[i][j].c_str(), R.ref_hold[j],
+                                    R.ref_cash_v, R.slot_bqty[0][j], R.slot_bfrac[0][j],
+                                    R.slot_sfrac[0][j], R.slot_sqty[0][j], e.buy_lim,
+                                    e.sell_all_lim, e.stop_before, e.low_first,
+                                    b.valid ? b.open : 0.f, b.valid ? b.high : 0.f,
+                                    b.valid ? b.low : 0.f, b.valid ? b.close : 0.f,
+                                    e.sold_open_q, e.sold_open_px, e.sold_all_q, e.sold_all_px,
+                                    e.stopped_q, e.stopped_px, e.bought_q, e.bought_px,
+                                    e.stop_after, R.hold[j], R.hold_cash);
+                        }
+                    }
+                    ok &= fclose(of) == 0;
+                }
+            }
             // The book slot 0 ends the day with, dated the session it filled on, in the BOOK
             // format: the next run's book when there are no real books to hand over, as when
             // catching up on sessions production did not trade.

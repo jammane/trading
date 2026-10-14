@@ -33,6 +33,7 @@ from alpaca.trading.requests import (
 )
 
 import committee_alloc
+import fill_check
 import training_lib
 import upkeep_cpp
 from fees import BUY_FILL, SELL_FILL, _sell_net
@@ -383,8 +384,15 @@ def build_primed_portfolios(trading_client, industries, allocations, zero_counts
 
     return ind_primed, master_primed
 
-def load_stock_data(symbols):
-    """Load rolling 15-day OHLCV histories from stock_data/ for each symbol."""
+def load_stock_data(symbols, before=None):
+    """Load rolling 15-day OHLCV histories from stock_data/ for each symbol.
+
+    before='YYYY-MM-DD' keeps only sessions strictly before that date: StockNN's history input.
+    The trainer's history ring on decision day t holds the 15 valid bars BEFORE t, and today's
+    bar arrives separately as the `today` input. Fed a history that already ends with today -- as
+    production was until 2026-10-13 -- every day-over-day delta in `today` reads zero, and on the
+    v5 champions only 27 of 144 symbols got the outputs the trainer's slot 0 computes for the same
+    day and book (with the history cut at the day before: 144 of 144, to float precision)."""
     histories = {}
     for sym in symbols:
         try:
@@ -396,11 +404,14 @@ def load_stock_data(symbols):
                 # writes NaN for a missing session; one such bar (SCCO 2026-08-11) reached
                 # the trainer's valuation and surfaced as prod=$-2147483648. download_daily
                 # now purges them at the source, but this path reads whatever is on disk.
+                # Filtered BEFORE the last 15 are taken, like the trainer's ring, which skips
+                # an invalid bar rather than holding a gap.
                 histories[sym] = [
                     [d['open'], d['close'], d['high'], d['low'], d['volume']]
-                    for d in data.get('days', [])[-15:]
-                    if all(isinstance(d.get(k), (int, float)) and math.isfinite(d[k])
-                           and d[k] > 0 for k in ('open', 'high', 'low', 'close'))]
+                    for d in data.get('days', [])
+                    if (before is None or d.get('date', '') < before)
+                    and all(isinstance(d.get(k), (int, float)) and math.isfinite(d[k])
+                            and d[k] > 0 for k in ('open', 'high', 'low', 'close'))][-15:]
             else:
                 histories[sym] = []
         except Exception as e:
@@ -1124,13 +1135,32 @@ def settle_pending(model_dir, trading_client, day_data):
             n = sum(1 for line in f if ',REALIZED,' in line)
     committee_alloc.append_rows(log, pending['industries'],
                                 committee_alloc.settle_rows(pending, real, acct_bp, n))
+    run_fill_check(pending, trading_client, positions)
     os.replace(path, path + '.settled')
     print(f"Committee log: {pending['date']} settled ({len(fills)} fills, account "
           f"{acct_bp:+.1f} bp) -> {log}")
 
 
+def run_fill_check(pending, trading_client, positions):
+    """Set the trainer's simulation of the settled decision day beside what the broker did
+    (fill_check.py): rows to fill_check.csv, a summary to the log. Never stops the session."""
+    sim_path = os.path.join(LOG_DIR, 'training', 'days', pending['date'], 'orders_sim.csv')
+    if not os.path.exists(sim_path):
+        print(f"Fill check: no simulation of {pending['date']} (the trainer did not train it)")
+        return
+    try:
+        req = GetOrdersRequest(status=QueryOrderStatus.ALL, limit=500, nested=True,
+                               after=datetime.fromisoformat(pending['time']))
+        orders = [fill_check.broker_order_dict(o) for o in trading_client.get_orders(req)]
+        rows, summ = fill_check.compare(pending, fill_check.load_sim(sim_path), orders, positions)
+        fill_check.append_rows(os.path.join(LOG_DIR, 'fill_check.csv'), rows)
+        print("\n".join(fill_check.summary_lines(summ, pending['date'])))
+    except Exception as e:
+        print(f"Fill check: ERROR {e}")
+
+
 def record_decision(model_dir, industries, decision, holdings, day_data, histories, cash,
-                    equity, suspended, no_orders):
+                    equity, suspended, no_orders, intents=None, orders=None):
     """Today's decision, for the next run to settle. Written before any order is submitted, so
     every fill after `time` belongs to it. equity: the account's, as Alpaca reports it, so the
     next run's PORTFOLIO return compares like with like. A suspended symbol's close is its last
@@ -1151,7 +1181,9 @@ def record_decision(model_dir, industries, decision, holdings, day_data, histori
                    preds={e: [None if not math.isfinite(x) else float(x) for x in v]
                           for e, v in decision['preds'].items()},
                    holdings={s: q for s, q in holdings.items() if q}, closes=closes,
-                   cash=cash, equity=equity, suspended=sorted(suspended), no_orders=no_orders)
+                   cash=cash, equity=equity, suspended=sorted(suspended), no_orders=no_orders,
+                   intents={k: [float(x) for x in v] for k, v in (intents or {}).items()},
+                   orders=list(orders or []))
     path = os.path.join(model_dir, 'cpp', PENDING_DECISION)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path + '.tmp', 'w') as f:
@@ -1311,6 +1343,8 @@ def main():
         for sym in suspended:
             day_data.pop(sym, None)
         state['suspended'] = suspended
+        # StockNN's history ends the session BEFORE the decision day (see load_stock_data).
+        model_hist = load_stock_data(symbols, before=session)
         if suspended:
             print(f"SUSPENDED (no bar for {session}; no orders, holdings kept): "
                   + ", ".join(f"{s} (last {d or 'never'})" for s, d in sorted(suspended.items())))
@@ -1341,7 +1375,7 @@ def main():
         decision = None
         if args.committee:
             try:
-                decision = committee_decision(model_dir, industries, histories, day_data,
+                decision = committee_decision(model_dir, industries, model_hist, day_data,
                                               holdings, cash)
             except Exception as e:
                 print(f"Committee: ERROR ({e}); allocating flat today, nothing sell-only")
@@ -1372,6 +1406,7 @@ def main():
             print(f"Master liquidation orders (3x tier-0): {liq_str}")
 
         orders = []
+        intents = {}       # {sym: StockNN's raw (buy_qty, buy_frac, sell_all_frac, sell_qty)}
 
         # Liquidate any positions in symbols that have been removed from the universe.
         # Queued as market orders so they fill regardless of intraday price.
@@ -1488,9 +1523,10 @@ def main():
                 print(f"Model for {industry} not found.")
                 continue
             try:
-                out = stocknn_outputs(model, symbols, histories, day_data, holdings,
+                out = stocknn_outputs(model, symbols, model_hist, day_data, holdings,
                                       allocated_cash)
                 sug = {sym: out[j] for j, sym in enumerate(symbols)}
+                intents.update(sug)            # recorded with the decision, for fill_check
 
                 # Cancel existing GTC stops on held symbols before any sell (Alpaca reserves the
                 # shares an open stop covers). Skipped under --no-orders: cancelling a live stop
@@ -1687,7 +1723,7 @@ def main():
                 print(f"Committee log: ERROR reading equity ({e}); estimating it")
                 equity = compute_total_portfolio_value(cash, holdings, day_data, histories)
             record_decision(model_dir, industries, decision, holdings, day_data, histories, cash,
-                            equity, suspended, False)
+                            equity, suspended, False, intents, orders)
         mode = 'paper' if args.paper else 'live'
         if args.no_orders:
             print(f"--no-orders: {len(orders)} order(s) computed, NONE submitted")

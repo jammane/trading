@@ -203,7 +203,8 @@ def race_book(run_dir, path, day=None, universe=None):
 # The trainer's CSV logs, accumulated across days by archive_logs. Each upkeep run is a one-day
 # pass, so its `day` column is an index into that run's 1255-day window and repeats from day to
 # day; the accumulated copy adds the trained date to every row.
-ARCHIVE_CSV = ("race_daily.csv", "holdings_log.csv", "training_log.csv", "bayes_online.csv")
+ARCHIVE_CSV = ("race_daily.csv", "holdings_log.csv", "training_log.csv", "bayes_online.csv",
+               "orders_sim.csv")
 
 
 def archive_logs(log_dir, dest, date):
