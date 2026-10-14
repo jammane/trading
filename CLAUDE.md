@@ -1294,8 +1294,10 @@ ratios) and each symbol is offered to one industry only. **To veto a candidate**
 Earlier swaps' removed symbols (`completed`) are never offered either.
 
 ```
-# dev worktree: Monday replacement list, Friday pass (crontab, ET)
-15 18 * * 1 cd /root/trading-ht && export ALPACA_API_KEY=... ALPACA_SECRET_KEY=... (paper keys, read-only use) && source /root/trading/.venv/bin/activate && python replacements.py refresh --commit >> logs/data/replacements.log 2>&1
+# dev worktree (crontab, ET). The Monday refresh is installed; it uses the paper keys only to
+# ask Alpaca whether a candidate is tradable.
+15 18 * * 1 cd /root/trading-ht && mkdir -p logs/data && export ALPACA_API_KEY=... ALPACA_SECRET_KEY=... && source /root/trading/.venv/bin/activate && python replacements.py refresh --commit >> logs/data/replacements.log 2>&1
+# Friday pass: run by hand (in tmux) until its first run has been watched, then scheduled as
 30 18 * * 5 tmux new -d -s weekly "cd /root/trading-ht && export ALPACA_API_KEY=... && source /root/trading/.venv/bin/activate && python weekly_pass.py >> logs/weekly.log 2>&1"
 ```
 
