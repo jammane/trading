@@ -144,6 +144,15 @@ static inline float whole_shares(float q) {
     float w = std::floor(q + 1e-4f);
     return w > 0.f ? w : 0.f;
 }
+// The stop-loss placed with a buy: STOP_LOSS_FRAC below the lower of the limit and the decision
+// day's close. Mirrored by training_lib.buy_stop_price -- keep the two in sync. A limit above the
+// close fills near the next open, not at the limit, so a stop taken from the limit can sit at the
+// market: on paper SSRM's $35.50 limit filled at $32.31 and its $31.95 stop was cancelled by
+// Alpaca, already crossed, the moment it went live.
+static constexpr float STOP_LOSS_FRAC = 0.90f;
+static inline float buy_stop_price(float buy_price, float close) {
+    return std::min(buy_price, close) * STOP_LOSS_FRAC;
+}
 static constexpr float SEC_FEE_RATE        = 0.0000278f;
 static constexpr float FINRA_TAF_PER_SHARE = 0.000166f;
 static constexpr float FINRA_TAF_MAX       = 8.30f;
@@ -1825,7 +1834,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             float span_t = std::max(high_t - low_t, 1e-9f);
             float sell_all_price = low_t + sell_all_price_frac * span_t;
             float buy_price      = low_t + buy_price_frac * span_t;
-            float stop_loss      = buy_price * 0.9f;
+            float stop_loss      = buy_stop_price(buy_price, day_sym[j].close);
 
             // Record the deployed model's INTENT before anything is matched against next-day
             // prices. Deliberately placed here, above the fill logic, so it cannot pick up
@@ -2062,7 +2071,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             float span_t = std::max(high_t - low_t, 1e-9f);
             float sell_all_price = low_t + sell_all_price_frac * span_t;
             float buy_price      = low_t + buy_price_frac * span_t;
-            float stop_loss      = buy_price * 0.9f;
+            float stop_loss      = buy_stop_price(buy_price, day_sym[j].close);
             float nd_open = fill_sym[j].valid ? fill_sym[j].open  : day_sym[j].close;
             float nd_low  = fill_sym[j].valid ? fill_sym[j].low   : day_sym[j].low;
             float nd_high = fill_sym[j].valid ? fill_sym[j].high  : day_sym[j].high;

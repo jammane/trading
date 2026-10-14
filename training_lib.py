@@ -43,6 +43,18 @@ IND_STARTING_CASH     = 25_000.0    # per-industry portfolio starting capital
 MST_STARTING_CASH     = 300_000.0   # master starting capital (12 × IND_STARTING_CASH)
 IND_UNIT_PRICE        = 25_000.0    # fixed price per industry "unit" in master's portfolio
 MAX_SINGLE_STOCK_PCT  = 0.60        # no single stock may exceed 60% of portfolio value
+STOP_LOSS_FRAC        = 0.90        # a buy's stop sits this fraction below its expected entry
+
+
+def buy_stop_price(buy_price, close):
+    """The stop-loss placed with a buy: STOP_LOSS_FRAC below the lower of the limit and the
+    decision day's close. Mirrored by buy_stop_price() in training_v4.cpp -- keep the two in sync.
+
+    A limit set above the close fills near the next open, not at the limit, so a stop taken from
+    the limit can sit at the market: on paper (2026-10-14) SSRM's $35.50 limit filled at $32.31,
+    its $31.95 stop was already crossed when it went live, and Alpaca cancelled it.
+    """
+    return min(buy_price, close) * STOP_LOSS_FRAC
 
 
 def portfolio_value(port, symbols, day_data, fill_data):
@@ -356,7 +368,7 @@ def _simulate_one_model(model, ref_cash, ref_hold, ref_stop, symbols,
         span_t         = max(high_t - low_t, 1e-9)
         sell_all_price = low_t + sell_all_price_frac * span_t
         buy_price      = low_t + buy_price_frac * span_t
-        stop_loss      = buy_price * 0.9
+        stop_loss      = buy_stop_price(buy_price, day_data[sym]['close'])
         low_first      = seq_flags.get(sym, True) if seq_flags else True
         nd             = fill_data.get(sym, day_data.get(sym, {}))
         nd_open        = nd.get('open',  day_data[sym]['close'])
@@ -1264,7 +1276,7 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
             span_t         = max(high_t - low_t, 1e-9)
             sell_all_price = low_t + sell_all_price_frac * span_t
             buy_price      = low_t + buy_price_frac * span_t
-            stop_loss      = buy_price * 0.9
+            stop_loss      = buy_stop_price(buy_price, day_data[sym]['close'])
             low_first      = seq_flags.get(sym, True) if seq_flags else True
 
             nd      = fill_data.get(sym, day_data.get(sym, {}))
