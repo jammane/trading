@@ -62,6 +62,11 @@ entry is in its commit message.
 - `committee_race.py` takes several `race_daily.csv` files and matches passes by date.
 
 ### Fixed
+- **Orders Alpaca accepts.** The first real paper session was rejected order by order: prices were
+  sent with sub-penny digits, and a buy's stop-loss was sent as a separate sell stop, which Alpaca
+  refuses beside an open buy. Prices are rounded to whole cents in the order's favour, each buy
+  carries its stop in one OTO order, held positions have their stops re-placed every run in every
+  industry, and a symbol sold today is not also bought.
 - Production saved the bar it fetched under today's date even when the feed returned an older
   one, which made a halted symbol look current. Bars are saved under their own date.
 - Production read its cash and positions from `state.json`, which defaults to $20,000 and nothing

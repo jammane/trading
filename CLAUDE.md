@@ -383,10 +383,17 @@ book has, and the industry's allocation goes unspent. An industry closed by the 
 still gets its sells while it holds anything, because the gate is about affording a way in.
 
 Stops need care. Each run cancels a held symbol's open stops before selling, because Alpaca
-reserves the shares an open stop covers; a buying industry re-protects through the stop placed
-with each new buy. A sell-only industry places no buys, so `plan_industry_orders` re-places the
-cancelled stop, at its old price, for whatever the day's sells leave held. A symbol that had no
-stop gets none invented. `tests/test_sell_only.py` pins all of this. The flag is the manual and
+reserves the shares an open stop covers, and `plan_industry_orders` re-places a GTC stop, at its
+old price, for whatever the day's sells leave held, in every industry. A symbol that had no stop
+gets none invented. A new buy carries its own stop in the same **OTO** order (the stop goes live
+when the buy fills): the first paper session showed that Alpaca rejects a separate sell stop while
+a buy for the same symbol is open ("potential wash trade"). For the same reason, a held symbol
+being bought today gets no re-placed stop that session, and a symbol sold today is not also bought
+(a divergence from the trainer, which can do both). An OTO stop expires with its day order, so
+each run records every position's stop in `state.json` (`stops`) and re-places it as a GTC stop
+next run. Every price is rounded to an increment Alpaca accepts (`to_cents`: buy limits down, sell
+limits up, stops to the nearest cent); unrounded prices were rejected on every order of that first
+session. `tests/test_sell_only.py` pins all of this. The flag is the manual and
 test interface; under `--committee` the loser committee supplies the set (see **Committee
 allocation**), and any industries named here are added to it.
 
