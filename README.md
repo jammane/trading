@@ -132,7 +132,8 @@ At every pass boundary each industry's StockNN elites are judged against the sta
 slot 0's **recency-weighted mean daily book return** (the same 0.995/day weighting the race uses).
 The winner is copied into `champion/` together with every race model trained in that same pass, so
 an industry's StockNN and its allocators stay paired. `champion/` is what gets converted and
-promoted to paper.
+promoted to paper. Each Friday one more pass is added to the run (`weekly_pass.py`), and any
+industry it takes is promoted to paper automatically.
 
 ### Evolutionary training
 
@@ -283,6 +284,10 @@ ruff check .
 | `--no-save` | off | Train into `<output>.nosave` and delete it at exit |
 | `--no-nn-race` | off | Skip every neural allocator (StockNN and the online models only) |
 | `--race-skip "A,B"` | none | Switch race entries off at runtime (`ALLOC bayes` for the allocator) |
+| `--race-only "A,B"` | all | Run only these race entries (production's daily training) |
+| `--upkeep BOOK` | off | Train one day on a real book, state carried in `--output` (production's daily step) |
+| `--continue-run` | off | Add `--passes` passes to the run in `--output`, numbered after its last; logs in `continue_p<N>/` |
+| `--crown IND,...` | none | Crown these industries' pass outright (after a symbol swap) |
 | `--seed N` | clock | Reproducible run; default draws from the clock, re-seeded every pass |
 | `--trade-lock PATH` / `--no-trade-lock` | `/run/trading/trading_active.lock` | Pause between days while production holds the lock |
 | `--control-untrained` | off | No-learning control: re-randomise StockNN daily |
@@ -341,7 +346,9 @@ ruff check .
 | `race_watch.py [LOG] [--all] [--trend]` | Per-pass race table (default: newest `/root/ht_race_v*`) |
 | `race_qualify.py V3_LOG V4_LOG` | Apply the qualifier rule; prints `RACE_SKIP=` |
 | `race_daily_check.py CSV ROWS BAYES` | Consistency gate on `race_daily.csv` |
-| `committee_race.py CSV [--sizes 3,4,5,6] [--pool ...] [--watch] [--champions REF]` | Committee voting race; `--watch` for the cross-pass watch list, `--champions` to score it on the champion composite |
+| `committee_race.py CSV... [--sizes 3,4,5,6] [--pool ...] [--watch] [--champions REF] [--losers]` | Committee voting race over one or more `race_daily.csv` files; `--watch` for the cross-pass watch list, `--champions` to score it on the champion composite, `--losers` for the loser race |
+| `weekly_pass.py [--dry-run]` | The Friday pass: swaps, one continued training pass, champion promotion, committee report |
+| `replacements.py refresh\|show` | Keep three vetted replacement symbols ready per industry |
 | `plot_training.py [--download] [--pass N]` | SVG training charts from the droplet's logs |
 
 ---
@@ -399,7 +406,8 @@ One-shot analyses kept because each carries a control or correction that was exp
 | `download_daily.py` | Daily incremental update, trims to 1255 days |
 | `cleanup_stock_data.py` | Weekly purge of symbols no longer in any universe or position |
 | `inspect_trades.py` | Audit elite trade decisions for a day and industry |
-| `swap_symbols.sh`, `swap_symbols.py` | Guided ticker replacement |
+| `swap_symbols.sh`, `swap_symbols.py` | Guided ticker replacement (the weekly pass swaps automatically) |
+| `replacements.py` | The ready-replacement list in `universe_watchlist.json`, refreshed every Monday |
 
 ### Production and setup
 
