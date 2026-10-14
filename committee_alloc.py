@@ -142,7 +142,8 @@ def industry_returns(pending, closes, positions, fills):
 
     Book at the decision = shares held x that day's close + the cash it was given. Book a session
     later = shares now x today's close + that cash - what its buys cost + what its sells raised.
-    fills: [(symbol, side 'buy'|'sell', qty, avg price)]."""
+    fills: [(symbol, side 'buy'|'sell', qty, avg price)]. A symbol with no close today
+    (suspended) is held at its decision close."""
     flow = {}
     for sym, side, qty, px in fills:
         flow[sym] = flow.get(sym, 0.0) + (qty * px if side == "sell" else -qty * px)
@@ -152,8 +153,9 @@ def industry_returns(pending, closes, positions, fills):
         cash = pending["allocations"][ind] if ind not in pending["sell_only"] else 0.0
         v0 = cash + sum(pending["holdings"].get(s, 0.0) * pending["closes"].get(s, 0.0)
                         for s in syms)
-        v1 = cash + sum(positions.get(s, 0.0) * closes.get(s, 0.0) + flow.get(s, 0.0)
-                        for s in syms)
+        # A suspended symbol has no close today: it is held at its decision close, not at 0.
+        v1 = cash + sum(positions.get(s, 0.0) * closes.get(s, pending["closes"].get(s, 0.0))
+                        + flow.get(s, 0.0) for s in syms)
         out.append((v1 / v0 - 1.0) * 1e4 if v0 > 1.0 else np.nan)
     return np.array(out)
 

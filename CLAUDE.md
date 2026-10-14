@@ -421,6 +421,18 @@ floor it never goes stale (`universe_acct0.py` docstring; thresholds in `univers
   liquidated by market order on the next `production_v2.py` run (orphaned-position logic).
 - The thresholds are asymmetric because a price can rise without bound but only fall to zero.
 - The old absolute rule ($15 watch, $10 swap) applied to the pre-band universe and is retired.
+- **Suspension — a symbol whose data stops arriving.** The first sign a symbol is no longer
+  tradable (halted, delisted, renamed) is that its bars stop downloading. Each production run
+  compares every universe symbol's newest bar in `stock_data` with the universe's newest session;
+  a symbol behind it, even by one session, is **suspended** for that run: its bar is dropped, so
+  no buy, sell or stop is placed on it and its open stops are left alone, while every other symbol
+  and industry trades as usual. Its shares stay held. The models see it as the trainer sees any
+  missing bar (no data, no trades), the settled record holds it at its last close, and it resumes
+  by itself the first session its data arrives again. Each run prints the suspended set, stores it
+  in `state.json`, and appends it to `logs/<account>/<mode>/suspended.log`; a symbol that stays
+  there is a swap under the rules above. Production's own bar fetch is saved under the **bar's
+  date**, not today's: a halted symbol's feed returns its last bar, and stamping that with today's
+  date made a stopped symbol look current.
 - **5-day new-symbol hold** — after any swap, `production_v2.py` automatically detects the new symbol (compares universe to `state['known_symbols']`) and applies a 5-run hold: paper/prod orders are suppressed for that symbol for 5 trading days. Training (regular C++ and daily upkeep) still runs on the new symbol immediately so the model starts adapting.
 
 ## Shared modules
