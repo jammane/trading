@@ -37,6 +37,18 @@ entry is in its commit message.
   the champion store. `production_v2.py --cpp-upkeep` runs it each session before deciding, then
   converts the StockNN elites, so the cycle is download → train → convert → decide → order.
   `--race-only` trains just the committee members.
+- **Committee allocation.** `production_v2.py --committee` allocates with the race committees:
+  the loser committee puts 4 industries in sell-only and the winner committee tilts the other 8
+  (half the cash spread evenly, half to its 4 picks). Predictions come from the daily-trained race
+  models (`committee_alloc.py`); the vote reproduces `committee_race.py` on every v5 day.
+- **Paper's daily record.** Each committee decision is settled the next session against the
+  account's real fills and appended to `committee_daily.csv` in `race_daily.csv`'s format, and the
+  trainer's own logs for every training day accumulate under `logs/<account>/<mode>/training/`,
+  so paper and training can be compared with the same tools.
+
+### Fixed
+- Production read its cash and positions from `state.json`, which defaults to $20,000 and nothing
+  held, instead of from the Alpaca account. Both now come from Alpaca on every run.
 
 ### Changed
 - StockNN champions are crowned on slot 0's **recency-weighted mean daily book return** over the

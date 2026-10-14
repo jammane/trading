@@ -194,3 +194,22 @@ def test_race_book_reads_the_champion_pass_row_for_the_day(tmp_path, monkeypatch
     assert a[5] == "100.000000" and [float(x) for x in a[7:10]] == [1, 2, 3]
     assert b[5] == "200.000000" and [float(x) for x in b[7:10]] == [4, 5, 6]
     assert a[3] == "25000.000000"
+
+
+def test_archive_keeps_every_day_and_dates_the_rows(tmp_path):
+    """The trainer rewrites its log directory on every run; the archive must keep each day."""
+    log, dest = tmp_path / "log", tmp_path / "training"
+    log.mkdir()
+    for date, v in (("2026-10-12", "1"), ("2026-10-13", "2")):
+        (log / "holdings_log.csv").write_text(f"pass,day,industry,cash\n1,1254,a,{v}\n")
+        (log / "training_log.csv").write_text(f"pass,day,x\npass,day,x\n1,1254,{v}\n")
+        (log / "race_daily.csv").write_text(f"pass,day,date,entry\n1,1253,{date},MT1 evo\n")
+        (log / "mt_training_log.bin").write_bytes(b"\x01" * 4)
+        u.archive_logs(str(log), str(dest), date)
+    rows = (dest / "holdings_log.csv").read_text().splitlines()
+    assert rows == ["pass,day,industry,cash,date", "1,1254,a,1,2026-10-12", "1,1254,a,2,2026-10-13"]
+    assert (dest / "training_log.csv").read_text().splitlines() == [
+        "pass,day,x,date", "1,1254,1,2026-10-12", "1,1254,2,2026-10-13"]
+    assert (dest / "race_daily.csv").read_text().splitlines()[0] == "pass,day,date,entry"
+    assert len((dest / "race_daily.csv").read_text().splitlines()) == 3
+    assert (dest / "days" / "2026-10-12" / "mt_training_log.bin").exists()

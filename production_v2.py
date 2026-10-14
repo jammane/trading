@@ -26,6 +26,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, OrderType, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, MarketOrderRequest, StopOrderRequest
 
+import committee_alloc
 import training_lib
 import upkeep_cpp
 from fees import BUY_FILL, SELL_FILL, _sell_net
@@ -701,6 +702,97 @@ def generate_liquidation_sells(industry, symbols, liquidation_target,
     return liquidated
 
 
+def stocknn_outputs(model, symbols, histories, day_data, holdings, cash):
+    """The industry model's (12, 4) output at today's close for a book holding `holdings` with
+    `cash` to spend: per symbol buy_qty, buy_price_frac, sell_all_price_frac, sell_qty."""
+    # Rolling stats for new input features
+    sym_stats = {}
+    for sym in symbols:
+        h = histories.get(sym, [])
+        if len(h) >= 2:
+            closes = [r[1] for r in h]
+            vols   = [r[4] for r in h]
+            hi15   = max(r[2] for r in h)
+            lo15   = min(r[3] for r in h)
+            avg_c  = sum(closes)/len(closes)
+            avg_v  = sum(vols)/len(vols) if sum(vols) > 0 else 1.0
+            dvols  = [r[0]*r[4] for r in h]
+            avg_dv = sum(dvols)/len(dvols) if sum(dvols) > 0 else 1.0
+            std_c  = (sum((c-avg_c)**2 for c in closes)/len(closes))**0.5
+            sym_stats[sym] = {'hi15': hi15, 'lo15': lo15,
+                              'avg_c': avg_c if avg_c > 0 else 1.0,
+                              'avg_v': avg_v, 'avg_dv': avg_dv,
+                              'volatility': std_c/avg_c if avg_c > 0 else 0.0}
+        else:
+            sym_stats[sym] = {'hi15': 1.0, 'lo15': 0.0, 'avg_c': 1.0,
+                              'avg_v': 1.0, 'avg_dv': 1.0, 'volatility': 0.0}
+
+    # Industry aggregates for cross-correlation (15 values per timestep)
+    num_past = min(len(histories.get(sym, [])) for sym in symbols)
+    ind_agg_per_t = []
+    for t in range(15):
+        if t >= num_past:
+            ind_agg_per_t.append([0.0]*15)
+        else:
+            dl = [histories[sym][-(t+1)][5:] for sym in symbols
+                  if len(histories.get(sym,[])) > t]
+            if dl:
+                tr   = list(zip(*dl, strict=True))
+                aggs = []
+                for tp in tr:
+                    aggs += [max(tp), min(tp), sum(tp)/len(tp)]
+                ind_agg_per_t.append(aggs[:15])
+            else:
+                ind_agg_per_t.append([0.0]*15)
+
+    # history_t: (1,15,60) — OHLCV only, oldest first
+    history_rows = []
+    for t in range(14, -1, -1):
+        row = []
+        for sym in symbols:
+            h = histories.get(sym, [])
+            row += list(h[-(t+1)][:5]) if len(h) > t else [0.0] * 5
+        history_rows.append(row)
+    history_t = torch.tensor(history_rows, dtype=torch.float32).unsqueeze(0)  # (1,15,60)
+
+    # today_t: (1,232) — full features for current day
+    state_vec = [cash] + [holdings.get(sym, 0.0) for sym in symbols]
+    today_row = []
+    today_dl  = []
+    for sym in symbols:
+        st    = sym_stats[sym]
+        d     = day_data.get(sym, {})
+        raw_t = [d.get('open', 0), d.get('close', 0), d.get('high', 0),
+                 d.get('low', 0), d.get('volume', 0)]
+        h     = histories.get(sym, [])
+        prev  = h[-1][:5] if h else None
+        dlt_t = [raw_t[i] - prev[i] for i in range(5)] if prev else [0.0] * 5
+        rng   = max(st['hi15'] - st['lo15'], 1e-9)
+        today_row += (raw_t + dlt_t +
+                      [(raw_t[1] - st['lo15']) / rng,
+                       raw_t[1] / st['avg_c'],
+                       st['volatility'],
+                       raw_t[4] / st['avg_v'],
+                       (raw_t[0] * raw_t[4]) / st['avg_dv'],
+                       stock_close_pos(raw_t[0], raw_t[2],
+                                       raw_t[3], raw_t[1]),
+                       stock_close_vs_wap(raw_t[0], raw_t[2],
+                                          raw_t[3], raw_t[1])])
+        today_dl.append(dlt_t)
+    if today_dl:
+        tr = list(zip(*today_dl, strict=True))
+        for tp in tr: today_row += [max(tp), min(tp), sum(tp)/len(tp)]
+    else:
+        today_row += [0.0] * 15
+    today_row += state_vec
+    today_t = torch.tensor(today_row, dtype=torch.float32).unsqueeze(0)  # (1,232)
+
+    with torch.no_grad():
+        out = model(history_t, today_t)
+    out  = out.view(12, 4)   # (buy_qty, buy_price, sell_all_price, sell_qty)
+    return out.tolist()
+
+
 def plan_industry_orders(symbols, sug, holdings, day_data, allocated_cash, holds,
                          sell_only=False, stops=None):
     """One industry's orders from StockNN's suggestions. Sells first, then buys.
@@ -834,8 +926,12 @@ def run_daily_training(model_dir):
     if rc != 0:
         print(f"Daily training: ERROR rc={rc} (see {log}); trading on the previous models")
         return False
+    st = upkeep_cpp.read_state(state_dir)
+    upkeep_cpp.archive_logs(os.path.join(state_dir, 'log'), os.path.join(LOG_DIR, 'training'),
+                            st['date'])
     convert_stocknn(state_dir, model_dir)
-    print("Daily training: done, StockNN elites converted")
+    print(f"Daily training: {st['date']} trained, StockNN elites converted, logs in "
+          f"{os.path.join(LOG_DIR, 'training')}")
     return True
 
 
@@ -877,6 +973,131 @@ def save_upkeep_book(model_dir, trading_client, industries, allocations, sell_on
     print(f"Daily training: today's books recorded for tomorrow ({len(books)} industries)")
 
 
+PENDING_DECISION = 'pending_decision.json'
+COMMITTEE_LOG = 'committee_daily.csv'
+
+
+def ensure_book_base(state_dir, industries, holdings, day_data, cash):
+    """{ind: starting book}, the base CN_BOOK is read against, fixed the first time it is needed.
+    Under --committee each industry starts from an even share of the account's cash plus what
+    it holds, so every industry begins at the same scale whatever the first day's vote was."""
+    path = os.path.join(state_dir, 'book_base.json')
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    share = cash / max(1, len(industries))
+    base = {ind: share + sum(holdings.get(s, 0.0) * day_data.get(s, {}).get('close', 0.0)
+                             for s in syms)
+            for ind, syms in industries.items()}
+    base = {ind: v if v > 0 else training_lib.IND_STARTING_CASH for ind, v in base.items()}
+    os.makedirs(state_dir, exist_ok=True)
+    with open(path, 'w') as f:
+        json.dump(base, f, indent=1)
+    return base
+
+
+def committee_decision(model_dir, industries, histories, day_data, holdings, cash):
+    """The committees' allocation for today (committee_alloc). Each industry's race inputs are
+    built from its real holdings, an even share of the cash (the allocation is what is being
+    decided, so it cannot be an input), and its deployed StockNN's output on that book.
+    -> dict(sell_only, winners, allocations, preds)"""
+    state_dir = os.path.join(model_dir, 'cpp')
+    seed_dir = os.path.join(model_dir, 'champion')
+    st = upkeep_cpp.read_state(state_dir)
+    if st is None:
+        raise RuntimeError(f"no daily-training state in {state_dir}")
+    inds = list(industries)
+    share = cash / len(inds)
+    base = ensure_book_base(state_dir, industries, holdings, day_data, cash)
+    inputs = {}
+    for ind, syms in industries.items():
+        model = load_weighted_model(StockNN, model_dir, ind)
+        if model is None:
+            print(f"Committee: no StockNN for {ind}; it sits out the vote")
+            continue
+        intent = stocknn_outputs(model, syms, histories, day_data, holdings, share)
+        bars = []
+        for sym in syms:
+            d = day_data.get(sym)
+            okb = d is not None and all(math.isfinite(d.get(k, float('nan'))) and d[k] > 0
+                                        for k in ('open', 'high', 'low', 'close'))
+            bars.append((d['open'], d['high'], d['low'], d['close']) if okb else None)
+        inputs[ind] = committee_alloc.industry_inputs(
+            bars, [holdings.get(sym, 0.0) for sym in syms], share, intent, base[ind])
+    feats = training_lib.build_master_features(st['mkt'], st['pf'], inds)[0].numpy()
+    in74 = {ind: feats[i * 74:(i + 1) * 74] for i, ind in enumerate(inds)}
+    bayes_mu = {ind: v[0] for ind, v in st['bayes'].items()}
+    preds = committee_alloc.predict(inds, inputs, in74, bayes_mu, state_dir, seed_dir)
+    d = committee_alloc.decide(inds, preds, cash)
+    d['preds'] = preds
+    print(f"Committee (models through {st['date']}): sell-only {', '.join(d['sell_only'])}; "
+          f"tilt toward {', '.join(d['winners'])}")
+    for ind in inds:
+        tag = 'SELL-ONLY' if ind in d['sell_only'] else 'winner' if ind in d['winners'] else ''
+        print(f"  {ind:24} ${d['allocations'][ind]:>10.2f}  {tag}")
+    return d
+
+
+def settle_pending(model_dir, trading_client, day_data):
+    """Settle the previous run's decision against what the account did since, appending its rows
+    to committee_daily.csv. A decision from today (a re-run) is left for tomorrow."""
+    path = os.path.join(model_dir, 'cpp', PENDING_DECISION)
+    if not os.path.exists(path):
+        return
+    with open(path) as f:
+        pending = json.load(f)
+    if pending['date'] >= datetime.today().strftime('%Y-%m-%d'):
+        return
+    try:
+        positions = {p.symbol: float(p.qty) for p in trading_client.get_all_positions()}
+        equity = float(trading_client.get_account().equity)
+        req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=500,
+                               after=datetime.fromisoformat(pending['time']))
+        fills = [(o.symbol, 'buy' if o.side == OrderSide.BUY else 'sell', float(o.filled_qty),
+                  float(o.filled_avg_price))
+                 for o in trading_client.get_orders(req)
+                 if o.filled_qty and float(o.filled_qty) > 0 and o.filled_avg_price]
+    except Exception as e:
+        print(f"Committee log: ERROR reading the account ({e}); {pending['date']} left unsettled")
+        return
+    closes = {s: d['close'] for s, d in day_data.items()}
+    real = committee_alloc.industry_returns(pending, closes, positions, fills)
+    acct_bp = (equity / pending['equity'] - 1.0) * 1e4 if pending['equity'] > 0 else float('nan')
+    log = os.path.join(LOG_DIR, COMMITTEE_LOG)
+    n = 0
+    if os.path.exists(log):
+        with open(log) as f:
+            n = sum(1 for line in f if ',REALIZED,' in line)
+    committee_alloc.append_rows(log, pending['industries'],
+                                committee_alloc.settle_rows(pending, real, acct_bp, n))
+    os.replace(path, path + '.settled')
+    print(f"Committee log: {pending['date']} settled ({len(fills)} fills, account "
+          f"{acct_bp:+.1f} bp) -> {log}")
+
+
+def record_decision(model_dir, industries, decision, holdings, day_data, cash, no_orders):
+    """Today's decision, for the next run to settle. Written before any order is submitted, so
+    every fill after `time` belongs to it."""
+    inds = list(industries)
+    closes = {s: day_data[s]['close'] for syms in industries.values() for s in syms
+              if s in day_data}
+    equity = cash + sum(q * closes.get(s, 0.0) for s, q in holdings.items())
+    pending = dict(date=datetime.today().strftime('%Y-%m-%d'),
+                   time=datetime.now().astimezone().isoformat(),
+                   industries=inds, symbols={i: list(industries[i]) for i in inds},
+                   allocations=decision['allocations'], sell_only=decision['sell_only'],
+                   winners=decision['winners'],
+                   preds={e: [None if not math.isfinite(x) else float(x) for x in v]
+                          for e, v in decision['preds'].items()},
+                   holdings={s: q for s, q in holdings.items() if q}, closes=closes,
+                   cash=cash, equity=equity, no_orders=no_orders)
+    path = os.path.join(model_dir, 'cpp', PENDING_DECISION)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + '.tmp', 'w') as f:
+        json.dump(pending, f, indent=1)
+    os.replace(path + '.tmp', path)
+
+
 def main():
     """Run one daily trading cycle: fetch data, infer, submit orders, retrain."""
     parser = argparse.ArgumentParser(description="Run stock trading system v2.")
@@ -896,11 +1117,17 @@ def main():
                              'and its sells are placed, but nothing is bought, so the industry '
                              'drains at the model\'s own sell rate. Not liquidation. Their '
                              'allocation is not spent.')
+    parser.add_argument('--committee', action='store_true',
+                        help='Allocate with the race committees: the loser committee puts 4 '
+                             'industries in sell-only, the winner committee tilts the other 8 '
+                             '(t = 0.5). Requires --cpp-upkeep, whose state it reads.')
     parser.add_argument('--cpp-upkeep', action='store_true',
                         help='Daily training with the C++ trainer: before deciding, train the day '
                              'the previous run placed orders on (training_v4_cpp --upkeep) and '
                              'convert the StockNN elites; replaces the Python upkeep step.')
     args = parser.parse_args()
+    if args.committee and (args.flat_allocation or not args.cpp_upkeep):
+        parser.error('--committee needs --cpp-upkeep and excludes --flat-allocation')
 
     subtype   = 'paper' if args.paper else 'prod'
     model_dir = os.path.join('models', args.account, subtype)
@@ -941,8 +1168,16 @@ def main():
             print(f"--sell-only: unknown industries {sorted(unknown)}; known: {sorted(industries)}")
             return
         histories = state['histories']
-        cash = state['cash']
-        holdings = state['holdings']
+        # The account is the book: cash and positions come from Alpaca, never from state.json,
+        # whose defaults ($20,000, nothing held) describe no real account.
+        try:
+            cash = float(trading_client.get_account().cash)
+            holdings = {p.symbol: float(p.qty) for p in trading_client.get_all_positions()}
+        except Exception as e:
+            print(f"ERROR reading the Alpaca account ({e}); not trading on an unknown book")
+            return
+        state['cash'], state['holdings'] = cash, holdings
+        print(f"Account: ${cash:,.2f} cash, {len(holdings)} position(s)")
 
         # Detect symbols new to the universe since last run → 5-day order hold.
         # The hold suppresses paper/prod order submission only; training still runs normally.
@@ -1011,6 +1246,8 @@ def main():
         # run placed orders on can be trained against them before anything is decided today.
         if args.cpp_upkeep:
             run_daily_training(model_dir)
+        if args.committee:
+            settle_pending(model_dir, trading_client, day_data)
 
         # Fetch 1-minute intraday bars for today so the fill simulation uses the
         # actual intraday high/low sequence rather than a random 50/50 coin flip.
@@ -1024,11 +1261,25 @@ def main():
 
         # ── Master: predict tier allocations (MT2 preferred, MasterNN fallback) ──
         industry_list     = list(industries.keys())
-        ind_value_history, mkt_val_history, zero_counts = _load_master_state(model_dir, industry_list)
-        master = load_weighted_model(MasterNN, model_dir, 'master')
-        allocations, tier_map, _mt1_inf_outputs = run_master_allocation(
-            master, industries, mkt_val_history, ind_value_history, zero_counts, cash,
-            model_dir=model_dir, flat=args.flat_allocation)
+        decision = None
+        if args.committee:
+            try:
+                decision = committee_decision(model_dir, industries, histories, day_data,
+                                              holdings, cash)
+            except Exception as e:
+                print(f"Committee: ERROR ({e}); allocating flat today, nothing sell-only")
+        if decision is not None:
+            allocations = decision['allocations']
+            sell_only |= set(decision['sell_only'])
+            zero_counts = {ind: 0 for ind in industry_list}      # never liquidate
+        else:
+            ind_value_history, mkt_val_history, zero_counts = _load_master_state(model_dir,
+                                                                                 industry_list)
+            master = None if args.flat_allocation or args.committee else \
+                load_weighted_model(MasterNN, model_dir, 'master')
+            allocations, tier_map, _mt1_inf_outputs = run_master_allocation(
+                master, industries, mkt_val_history, ind_value_history, zero_counts, cash,
+                model_dir=model_dir, flat=args.flat_allocation or args.committee)
 
         # Liquidate industries with 3+ consecutive tier-0 predictions
         ind_current_values = compute_industry_current_values(industries, holdings, histories)
@@ -1160,92 +1411,9 @@ def main():
                 print(f"Model for {industry} not found.")
                 continue
             try:
-                # Rolling stats for new input features
-                sym_stats = {}
-                for sym in symbols:
-                    h = histories.get(sym, [])
-                    if len(h) >= 2:
-                        closes = [r[1] for r in h]
-                        vols   = [r[4] for r in h]
-                        hi15   = max(r[2] for r in h)
-                        lo15   = min(r[3] for r in h)
-                        avg_c  = sum(closes)/len(closes)
-                        avg_v  = sum(vols)/len(vols) if sum(vols) > 0 else 1.0
-                        dvols  = [r[0]*r[4] for r in h]
-                        avg_dv = sum(dvols)/len(dvols) if sum(dvols) > 0 else 1.0
-                        std_c  = (sum((c-avg_c)**2 for c in closes)/len(closes))**0.5
-                        sym_stats[sym] = {'hi15': hi15, 'lo15': lo15,
-                                          'avg_c': avg_c if avg_c > 0 else 1.0,
-                                          'avg_v': avg_v, 'avg_dv': avg_dv,
-                                          'volatility': std_c/avg_c if avg_c > 0 else 0.0}
-                    else:
-                        sym_stats[sym] = {'hi15': 1.0, 'lo15': 0.0, 'avg_c': 1.0,
-                                          'avg_v': 1.0, 'avg_dv': 1.0, 'volatility': 0.0}
-
-                # Industry aggregates for cross-correlation (15 values per timestep)
-                num_past = min(len(histories.get(sym, [])) for sym in symbols)
-                ind_agg_per_t = []
-                for t in range(15):
-                    if t >= num_past:
-                        ind_agg_per_t.append([0.0]*15)
-                    else:
-                        dl = [histories[sym][-(t+1)][5:] for sym in symbols
-                              if len(histories.get(sym,[])) > t]
-                        if dl:
-                            tr   = list(zip(*dl, strict=True))
-                            aggs = []
-                            for tp in tr:
-                                aggs += [max(tp), min(tp), sum(tp)/len(tp)]
-                            ind_agg_per_t.append(aggs[:15])
-                        else:
-                            ind_agg_per_t.append([0.0]*15)
-
-                # history_t: (1,15,60) — OHLCV only, oldest first
-                history_rows = []
-                for t in range(14, -1, -1):
-                    row = []
-                    for sym in symbols:
-                        h = histories.get(sym, [])
-                        row += list(h[-(t+1)][:5]) if len(h) > t else [0.0] * 5
-                    history_rows.append(row)
-                history_t = torch.tensor(history_rows, dtype=torch.float32).unsqueeze(0)  # (1,15,60)
-
-                # today_t: (1,232) — full features for current day
-                state_vec = [allocated_cash] + [holdings.get(sym, 0.0) for sym in symbols]
-                today_row = []
-                today_dl  = []
-                for sym in symbols:
-                    st    = sym_stats[sym]
-                    d     = day_data.get(sym, {})
-                    raw_t = [d.get('open', 0), d.get('close', 0), d.get('high', 0),
-                             d.get('low', 0), d.get('volume', 0)]
-                    h     = histories.get(sym, [])
-                    prev  = h[-1][:5] if h else None
-                    dlt_t = [raw_t[i] - prev[i] for i in range(5)] if prev else [0.0] * 5
-                    rng   = max(st['hi15'] - st['lo15'], 1e-9)
-                    today_row += (raw_t + dlt_t +
-                                  [(raw_t[1] - st['lo15']) / rng,
-                                   raw_t[1] / st['avg_c'],
-                                   st['volatility'],
-                                   raw_t[4] / st['avg_v'],
-                                   (raw_t[0] * raw_t[4]) / st['avg_dv'],
-                                   stock_close_pos(raw_t[0], raw_t[2],
-                                                   raw_t[3], raw_t[1]),
-                                   stock_close_vs_wap(raw_t[0], raw_t[2],
-                                                      raw_t[3], raw_t[1])])
-                    today_dl.append(dlt_t)
-                if today_dl:
-                    tr = list(zip(*today_dl, strict=True))
-                    for tp in tr: today_row += [max(tp), min(tp), sum(tp)/len(tp)]
-                else:
-                    today_row += [0.0] * 15
-                today_row += state_vec
-                today_t = torch.tensor(today_row, dtype=torch.float32).unsqueeze(0)  # (1,232)
-
-                with torch.no_grad():
-                    out = model(history_t, today_t)
-                out  = out.view(12, 4)   # (buy_qty, buy_price, sell_all_price, sell_qty)
-                sug  = {sym: out[j].tolist() for j, sym in enumerate(symbols)}
+                out = stocknn_outputs(model, symbols, histories, day_data, holdings,
+                                      allocated_cash)
+                sug = {sym: out[j] for j, sym in enumerate(symbols)}
 
                 # Cancel existing GTC stops on held symbols before any sell (Alpaca reserves the
                 # shares an open stop covers). Skipped under --no-orders: cancelling a live stop
@@ -1417,6 +1585,8 @@ def main():
         # Submit orders to Alpaca (paper or live depending on --paper flag).
         # --no-orders stops here: everything above (allocation, decisions) and the upkeep training
         # step below still run, so the models advance a day without anything reaching the market.
+        if decision is not None and not args.no_orders:
+            record_decision(model_dir, industries, decision, holdings, day_data, cash, False)
         mode = 'paper' if args.paper else 'live'
         if args.no_orders:
             print(f"--no-orders: {len(orders)} order(s) computed, NONE submitted")
