@@ -9,6 +9,7 @@ never holds.
 import re
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -36,7 +37,7 @@ def test_production_buy_carries_the_shared_stop():
 
 def test_no_copy_of_the_old_rule_survives():
     for path in ("training_lib.py", "production_v2.py", "inspect_trades.py", "training_v4.cpp"):
-        src = open(path).read()
+        src = Path(path).read_text()
         assert not re.search(r"buy_price\s*\*\s*0\.9", src), path
 
 
@@ -44,7 +45,7 @@ def test_cpp_twin_matches(tmp_path):
     cxx = shutil.which("g++")
     if not cxx:
         pytest.skip("g++ not available")
-    src = open("training_v4.cpp").read()
+    src = Path("training_v4.cpp").read_text()
     frac = re.search(r"static constexpr float STOP_LOSS_FRAC = [^;]+;", src).group(0)
     fn = re.search(r"static inline float buy_stop_price\(.*?\n}\n", src, re.S).group(0)
     cases = [(35.50, 32.30), (30.00, 32.30), (50.0, 50.0), (61.5, 61.31)]
