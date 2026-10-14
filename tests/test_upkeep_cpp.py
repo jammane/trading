@@ -134,7 +134,7 @@ def test_production_records_the_real_book_for_tomorrow(tmp_path, monkeypatch):
     monkeypatch.setattr(u, "universe_order", lambda path="universe.json": UNI)
     orders = [{"symbol": "A1", "action": "stop_loss", "quantity": 1, "price": 9.0},
               {"symbol": "A1", "action": "stop_loss", "quantity": 1, "price": 9.5},
-              {"symbol": "B1", "action": "buy", "quantity": 1, "price": 20.0}]
+              {"symbol": "B1", "action": "buy", "quantity": 1, "price": 20.0, "stop": 18.0}]
     day = {s: {"close": 10.0} for syms in UNI.values() for s in syms}
     pv.save_upkeep_book(str(tmp_path), _Client({"A1": 3, "B2": 4}), UNI,
                         {"ind_a": 500.0, "ind_b": 700.0}, {"ind_b"}, orders, day)
@@ -144,6 +144,7 @@ def test_production_records_the_real_book_for_tomorrow(tmp_path, monkeypatch):
     assert float(a[11]) == 9.5                                    # the higher of two stops
     assert b[5] == "0.000000"                                     # sell-only: no cash to buy
     assert [float(x) for x in b[7:10]] == [0.0, 4.0, 0.0]
+    assert float(b[11]) == 18.0                                   # a buy's stop is recorded too
     # base is fixed on the first write: 500 + 3x10 for ind_a, 0 + 4x10 for ind_b
     import json
     base = json.loads((tmp_path / "cpp" / "book_base.json").read_text())
