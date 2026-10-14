@@ -397,7 +397,12 @@ reserves the shares an open stop covers, and `plan_industry_orders` re-places a 
 old price, for whatever the day's sells leave held, in every industry. A symbol that had no stop
 gets none invented. A new buy carries its own stop in the same **OTO** order (the stop goes live
 when the buy fills): the first paper session showed that Alpaca rejects a separate sell stop while
-a buy for the same symbol is open ("potential wash trade"). For the same reason, a held symbol
+a buy for the same symbol is open ("potential wash trade"). The stop is 10% below the **lower of
+the limit and the decision close** (`buy_stop_price`, in `training_lib` and `training_v4.cpp`, used
+by production and both fill simulators). It was 10% below the limit, but a limit above the close
+fills near the next open, so the stop could sit at the market: on 2026-10-14 SSRM's $35.50 limit
+filled at $32.31 and Alpaca cancelled its $31.95 stop, already crossed, the moment it went live.
+For the same reason as the OTO order, a held symbol
 being bought today gets no re-placed stop that session, and a symbol sold today is not also bought
 (a divergence from the trainer, which can do both). An OTO stop expires with its day order, so
 each run records every position's stop in `state.json` (`stops`) and re-places it as a GTC stop

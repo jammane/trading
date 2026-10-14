@@ -48,6 +48,7 @@ import yfinance as yf
 
 from fees import BUY_FILL, SLIPPAGE_RATE, _sell_net
 from models import StockNN, stock_close_pos, stock_close_vs_wap
+from training_lib import buy_stop_price
 from universe import INDUSTRIES
 
 
@@ -394,7 +395,7 @@ def simulate_trades(symbols, out_tensor, day_data, next_day_data, cash, holdings
         high_t = day_data[sym]['high']
         span_t = max(high_t - low_t, 1e-9)
         buy_price = low_t + buy_price_frac * span_t
-        stop_loss = buy_price * 0.9
+        stop_loss = buy_stop_price(buy_price, day_data[sym]['close'])
 
         nd_sym  = nd.get(sym, day_data[sym])
         nd_open = nd_sym.get('open',  day_data[sym]['close'])
