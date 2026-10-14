@@ -365,6 +365,8 @@ def main(argv=None):
         if crown and os.path.isdir(prod_dir):
             promote(prod_dir, champ, crown, reset_state=False)
             rep.append(f"- prod: promoted the swapped {', '.join(crown)}")
+        elif crown:
+            rep.append(f"- prod: {prod_dir} does not exist (prod not set up); nothing promoted")
         # 5. committees
         rep += ["", "## Committees (report only)"]
         try:
