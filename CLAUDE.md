@@ -6,6 +6,13 @@ file records how each part works, the constants that govern it, and — where a 
 the measurement that changed it. Findings that turned out to be wrong are kept and marked as such,
 because the reason a design was abandoned is as useful as the design that replaced it.
 
+**Status (October 2026).** Paper trading has been live since 2026-10-13: each weekday at 5:05 PM
+ET `production_v2.py --paper --cpp-upkeep --committee` trains one day with the C++ trainer on the
+account's real book, allocates with the race committees (4 industries sell-only, the other 8
+tilted), and places the next session's orders. Every Friday `weekly_pass.py` adds one training
+pass that competes with the deployed champions (run by hand until its first run has been watched;
+the Monday replacement refresh is scheduled). Prod (live trading) has not run.
+
 ## Development commands
 
 **Setup (Linux/Fedora):**
@@ -352,7 +359,7 @@ few catch-up sessions, an argument against a long one.
 # Manual run (paper)
 export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d)
 export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d)
-python production_v2.py --paper --account acct0 --flat-allocation
+python production_v2.py --paper --account acct0 --cpp-upkeep --committee
 
 # Manual run (live, future)
 export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d)
@@ -363,12 +370,12 @@ python production_v2.py --account acct0
 **`--committee`** replaces `--flat-allocation` on paper; see **Committee allocation** below.
 
 **`--flat-allocation` (paper only, v0.6.2.0).** Splits deployed capital evenly across all 12
-industries and skips MT1/MT2 inference entirely. In force for paper while MT1/MT2 have no
-demonstrated out-of-sample skill, so paper results measure the StockNN layer rather than an
-unvalidated allocator. The pre-rebuild MT1 measured 52–53% direction OOS against 81–84% in-sample,
-with negative per-channel skill in all 12 industries; the v0.8.0.0 rebuild has **no measurement
-yet**, and the flag stays until it has one. **Remove the flag from the paper crontab line once MT1/MT2 are confirmed.**
-Prod does not pass it and keeps the MT1/MT2 path.
+industries and skips MT1/MT2 inference entirely. It was paper's allocation until the committees
+replaced it on 2026-10-13, so paper results measured the StockNN layer rather than an unvalidated
+allocator, and it is still what `--committee` falls back to when its decision fails. The
+pre-rebuild MT1 measured 52–53% direction OOS against 81–84% in-sample, with negative
+per-channel skill in all 12 industries; the v0.8.0.0 rebuild has no out-of-sample measurement.
+Prod passes neither flag and keeps the MT1/MT2 path.
 
 It is a deliberate override, not a fallback — the "equal allocation" fallback in
 `run_master_allocation`'s docstring allocates **$0.00** to every industry, because with no MT2 and
@@ -1398,8 +1405,9 @@ Version string is defined in `version.py` (`VERSION`) and mirrored as `TRAINER_V
 - `FEATURE` — increment for any new capability or significant improvement; resets `BUILD` to 0.
 - `BUILD` — increment for bug fixes and minor changes within a `FEATURE`.
 
-Current version: see `version.py` (0.8.1.45 at the time of writing). The CI bot bumps
-`BUILD` on every push to `dev`, so don't hand-edit it for a build bump.
+Current version: see `version.py` (0.8.1.5x as paper went live in October 2026). The CI bot bumps
+`BUILD` on every push to any branch, so don't hand-edit it for a build bump; merging dev into
+paper conflicts only on the two version lines, resolved to dev's.
 
 To bump the version, edit `VERSION` in `version.py` and `TRAINER_VERSION` in `training_v4.cpp`, then rebuild the C++ binary.
 

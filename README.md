@@ -9,11 +9,13 @@ paper first, live later.
 
 > **Development Status**
 >
-> This project is under active development and is not yet production-ready. Core training is
-> operational; paper trading runs with **flat allocation** (an even 1/12 per industry) while the
-> allocators are still being qualified, and live trading has not run. Breaking changes to model
-> architecture, file formats and CLI flags happen between versions. Use in live trading
-> environments is at your own risk.
+> This project is under active development and is not yet production-ready. **Paper trading has
+> been live since 2026-10-13**: every weekday after the close the system trains one day on the
+> paper account's real book, lets two committees of allocators decide where capital goes, and
+> places the next session's orders. Each Friday one more full training pass competes with the
+> deployed models. Live trading has not run. Breaking changes to model architecture, file
+> formats and CLI flags happen between versions. Use in live trading environments is at your own
+> risk.
 
 ---
 
@@ -30,9 +32,14 @@ paper first, live later.
   on every analysis, block-bootstrap error bars for overlapping samples, and pre-registered
   out-of-sample tests. Several early "results" in this project were overturned by exactly these,
   and the write-ups are kept.
-- **Production discipline.** Per-account isolation for paper and live trading, whole-share fill
-  semantics matching the broker, position limits, a lock that pauses training during the trading
-  cycle, and Kubernetes deployment with secrets kept out of the repository.
+- **One trainer, research to production.** The daily paper session trains with the same C++ code
+  that ran the race, on the account's real book, so nothing is reimplemented on the way to
+  trading; and paper writes its results in the race's own log format, so live results can be read
+  with the tools that judged the models.
+- **Production discipline.** Per-account isolation for paper and live trading, the broker as the
+  source of truth for cash and positions, whole-share and whole-cent order semantics, stop-losses
+  carried with every buy, per-symbol suspension when a ticker's data stops, a lock that pauses
+  training during the trading cycle, and Kubernetes secrets kept out of the repository.
 
 Built with C++20 (OpenBLAS, CMake), Python 3 (PyTorch, NumPy, pytest, ruff), the Alpaca API,
 and k3s on a DigitalOcean droplet.
@@ -100,6 +107,20 @@ pass, each entry's 12 predictions, the 4 industries it funded and the result, pl
 industry's actual return. `committee_race.py` replays it to test whether a **committee** of entries
 voting on the 4 industries beats any single one.
 
+**What trades.** The 10-pass v5 race ended 2026-10-12, and the committees were chosen on its
+**champion composite** (each industry's results taken from the pass that produced its deployed
+model). Two committees of entries vote, each member weighted 1.1x the one ranked below it:
+
+| Committee | Members | Role |
+|---|---|---|
+| Loser (L1) | TANH32 grad, ALLOC bayes mean, MT1S-stk evo | flags the 4 industries it expects to do worst: they go **sell-only** (never liquidated) |
+| Winner (W1) | TANH32 grad, MT1 grdC, MT1 evo, MT1S-rep evo, MT1S-stk grad | picks 4 of the other 8; half the cash is spread evenly over the 8, half goes to its 4 |
+
+Replayed on v5 with StockNN's measured sell rate, the pair scored **+10.53 bp/day over a flat
+1/12 book** on the composite and beat flat in 8 of 10 passes. The composite is one 252-day
+sample chosen from thousands of configurations, so that figure is optimistic; paper trading is
+the out-of-sample test.
+
 ### MT1Net and MT2NN (production allocator path)
 
 **MT1Net** (per-industry predictor, one 200-slot pool per sector, 3,501 params):
@@ -123,8 +144,9 @@ voting on the 4 industries beats any single one.
 
 **MasterNN** (legacy fallback, 599,028 params) is used only when `mt2_best.pt` is absent.
 
-> **Status.** No allocator has yet shown out-of-sample skill, so paper trading runs
-> `--flat-allocation` (even 1/12). The race above is how one earns the right to replace it.
+> **Status.** MT1Net/MT2NN are the allocator path production falls back to without
+> `--committee`. Paper allocates with the race committees above; MT1/MT2 have not shown
+> out-of-sample skill.
 
 ### Champions
 
@@ -132,8 +154,28 @@ At every pass boundary each industry's StockNN elites are judged against the sta
 slot 0's **recency-weighted mean daily book return** (the same 0.995/day weighting the race uses).
 The winner is copied into `champion/` together with every race model trained in that same pass, so
 an industry's StockNN and its allocators stay paired. `champion/` is what gets converted and
-promoted to paper. Each Friday one more pass is added to the run (`weekly_pass.py`), and any
-industry it takes is promoted to paper automatically.
+promoted to paper.
+
+### Production cycle
+
+**Daily** (paper, 5:05 PM ET): the bars are downloaded at 4:30 → the C++ trainer trains the
+previous decision day on the account's real book (`--upkeep`: StockNN, the committee members and
+the Bayesian allocator, state carried between days in files) → the StockNN elites are converted →
+the committees decide the allocation → StockNN plans each industry's orders → limit buys go to
+Alpaca with their stop-loss attached (one OTO order each). Cash and positions always come from
+the broker. A symbol whose data stops arriving is suspended on its own: no orders, its shares
+held, everything else trading as usual.
+
+**Weekly** (Fridays, `weekly_pass.py`): symbols that stopped arriving, or that pushed their
+industry's prices out of band, are swapped for the first of three replacements the program keeps
+vetted for each industry (`replacements.py`, refreshed and committed every Monday so a concern
+can be raised before Friday). Then one full training pass is added to the race run; every
+industry it wins is promoted to paper automatically, and the committee races are re-run as a
+report — committees are only changed by hand.
+
+**Records.** Paper writes two sets of results in the race's formats: the trainer's own logs for
+every training day (the real book through the simulator), and `committee_daily.csv`, each
+decision settled the next session against the account's actual fills.
 
 ### Evolutionary training
 
@@ -234,8 +276,11 @@ python inspect_trades.py --industry energy --date 2024-01-10 --account acct0
 ### 5. Paper trading
 
 ```bash
-python production_v2.py --paper --account acct0 --flat-allocation
+python production_v2.py --paper --account acct0 --cpp-upkeep --committee
 ```
+
+The first run needs the daily-training state seeded from a race run's champions
+(`upkeep_cpp.py seed`, then `catch-up` for the sessions since the race ended) — see CLAUDE.md.
 
 ### 6. Live trading
 
@@ -250,7 +295,7 @@ On the droplet they come from per-account Kubernetes secrets — see CLAUDE.md.
 
 ## Testing
 
-28 pytest modules and 6 C++ test binaries (`ctest`), covering model shapes and serialization,
+33 pytest modules and 6 C++ test binaries (`ctest`), covering model shapes and serialization,
 Python/C++ parity, gradient correctness, the fill simulator, production safety limits, log
 formats, and the analysis tooling. Analysis code is tested against synthetic data with a known
 answer: a planted signal must be found, and noise must not look like one.
@@ -301,7 +346,7 @@ ruff check .
 |------|-------------|
 | `--paper` | Use Alpaca's paper endpoint (real paper orders, real paper portfolio) |
 | `--account` | Account id (default `acct0`); selects `models/ACCT/paper|prod` |
-| `--flat-allocation` | Even 1/12 split, skipping MT1/MT2 (paper default for now) |
+| `--flat-allocation` | Even 1/12 split, skipping MT1/MT2 (paper's allocation before `--committee`) |
 | `--no-orders` | Run the full cycle but submit and cancel nothing |
 | `--sell-only IND,...` | Put industries in sell-only mode: the model's sells go in, nothing is bought |
 | `--cpp-upkeep` | Train one day with the C++ trainer before deciding, then convert; replaces the Python upkeep |
@@ -364,7 +409,9 @@ ruff check .
 | `universe.py` | Aggregator over all `universe_acct*.py` |
 | `fees.py` | Broker fee constants and `_sell_net()` |
 | `training_lib.py` | Shared evolutionary functions used by `upkeep.py` and `production_v2.py` |
-| `upkeep.py` | Single-day evolution run by production after each session |
+| `upkeep.py` | Python single-day evolution (production without `--cpp-upkeep`) |
+| `race_models.py` | Numpy forwards of every race architecture, held to the C++ by parity tests |
+| `committee_alloc.py` | The traded committees: predictions, the vote, the allocation, the daily record |
 | `version.py` | Project version (mirrored as `TRAINER_VERSION` in the C++) |
 
 ### Training (C++)
@@ -413,7 +460,9 @@ One-shot analyses kept because each carries a control or correction that was exp
 
 | File | Purpose |
 |------|---------|
-| `production_v2.py` | Daily cycle: fetch → allocate → StockNN orders → Alpaca → upkeep |
+| `production_v2.py` | Daily cycle: fetch → train (C++) → allocate → StockNN orders → Alpaca |
+| `upkeep_cpp.py` | The daily C++ training step: book and state formats, seeding, catching up a gap |
+| `weekly_pass.py` | The Friday pass: swaps, one training pass, champion promotion, committee report |
 | `install_python.sh` | Create `.venv` and install packages (Fedora/Linux) |
 | `k8s/setup.sh` | First-time Kubernetes setup |
 

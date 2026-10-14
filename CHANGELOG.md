@@ -6,6 +6,54 @@ entry is in its commit message.
 
 ---
 
+## 0.8.1.46 – 0.8.1.57 — Paper trading goes live (2026-10-05 to 2026-10-13)
+
+The v5 race finished, its committees were wired into production, and paper trading started on
+2026-10-13 with the daily cycle download → train (C++) → convert → decide → order, and a weekly
+training pass on Fridays.
+
+### Added
+- `production_v2.py --sell-only IND,...` puts industries in sell-only mode: StockNN still runs
+  and its sells are placed, but nothing is bought. Positions it does not sell stay held, and the
+  stop on any partly sold position is re-placed for the remainder.
+- **Daily training with the C++ trainer.** `training_v4_cpp --upkeep` trains one day on
+  production's real books and carries everything a pass keeps in memory in files, starting from
+  the champion store. `production_v2.py --cpp-upkeep` runs it each session before deciding, then
+  converts the StockNN elites, so the cycle is download → train → convert → decide → order.
+  `--race-only` trains just the committee members.
+- **Committee allocation.** `production_v2.py --committee` allocates with the race committees:
+  the loser committee puts 4 industries in sell-only and the winner committee tilts the other 8
+  (half the cash spread evenly, half to its 4 picks). Predictions come from the daily-trained race
+  models (`committee_alloc.py`); the vote reproduces `committee_race.py` on every v5 day.
+- **Paper's daily record.** Each committee decision is settled the next session against the
+  account's real fills and appended to `committee_daily.csv` in `race_daily.csv`'s format, and the
+  trainer's own logs for every training day accumulate under `logs/<account>/<mode>/training/`,
+  so paper and training can be compared with the same tools.
+- **Per-symbol suspension.** A universe symbol whose data stops arriving (its newest bar is
+  behind the universe's newest session) gets no orders until its data returns; its shares stay
+  held and the rest of the universe trades as usual. Logged to `suspended.log`.
+- **The weekly pass.** Every Friday after trading, `weekly_pass.py` adds one full pass to the
+  standing race run (`training_v4_cpp --continue-run`), promotes every champion it takes to paper,
+  and re-runs the committee races as a report. Symbols that stopped arriving, or that pushed their
+  industry's prices out of band, are swapped first.
+- **Ready replacements.** `replacements.py` keeps three vetted replacement symbols per industry in
+  `universe_watchlist.json`, screened from the industry's own Yahoo industries and refreshed every
+  Monday so concerns can be raised before Friday.
+- `training_v4_cpp --continue-run` adds passes to an existing run, numbered after its last, with
+  each invocation's logs in their own `continue_p<N>/`; `--crown` crowns named industries outright.
+- `committee_race.py` takes several `race_daily.csv` files and matches passes by date.
+
+### Fixed
+- **Orders Alpaca accepts.** The first real paper session was rejected order by order: prices were
+  sent with sub-penny digits, and a buy's stop-loss was sent as a separate sell stop, which Alpaca
+  refuses beside an open buy. Prices are rounded to whole cents in the order's favour, each buy
+  carries its stop in one OTO order, held positions have their stops re-placed every run in every
+  industry, and a symbol sold today is not also bought.
+- Production saved the bar it fetched under today's date even when the feed returned an older
+  one, which made a halted symbol look current. Bars are saved under their own date.
+- Production read its cash and positions from `state.json`, which defaults to $20,000 and nothing
+  held, instead of from the Alpaca account. Both now come from Alpaca on every run.
+
 ## 0.8.1.39 – 0.8.1.45 — Qualifier races and committee voting (2026-10-03 to 2026-10-04)
 
 ### Added
@@ -29,48 +77,6 @@ entry is in its commit message.
   `--losers` runs the same races on the other end of the ranking: committees flag the 4
   industries expected to do worst, scored on how far below flat they fall and how often they
   lost money.
-- `production_v2.py --sell-only IND,...` puts industries in sell-only mode: StockNN still runs
-  and its sells are placed, but nothing is bought. Positions it does not sell stay held, and the
-  stop on any partly sold position is re-placed for the remainder.
-- **Daily training with the C++ trainer.** `training_v4_cpp --upkeep` trains one day on
-  production's real books and carries everything a pass keeps in memory in files, starting from
-  the champion store. `production_v2.py --cpp-upkeep` runs it each session before deciding, then
-  converts the StockNN elites, so the cycle is download → train → convert → decide → order.
-  `--race-only` trains just the committee members.
-- **Committee allocation.** `production_v2.py --committee` allocates with the race committees:
-  the loser committee puts 4 industries in sell-only and the winner committee tilts the other 8
-  (half the cash spread evenly, half to its 4 picks). Predictions come from the daily-trained race
-  models (`committee_alloc.py`); the vote reproduces `committee_race.py` on every v5 day.
-- **Paper's daily record.** Each committee decision is settled the next session against the
-  account's real fills and appended to `committee_daily.csv` in `race_daily.csv`'s format, and the
-  trainer's own logs for every training day accumulate under `logs/<account>/<mode>/training/`,
-  so paper and training can be compared with the same tools.
-
-- **Per-symbol suspension.** A universe symbol whose data stops arriving (its newest bar is
-  behind the universe's newest session) gets no orders until its data returns; its shares stay
-  held and the rest of the universe trades as usual. Logged to `suspended.log`.
-
-- **The weekly pass.** Every Friday after trading, `weekly_pass.py` adds one full pass to the
-  standing race run (`training_v4_cpp --continue-run`), promotes every champion it takes to paper,
-  and re-runs the committee races as a report. Symbols that stopped arriving, or that pushed their
-  industry's prices out of band, are swapped first.
-- **Ready replacements.** `replacements.py` keeps three vetted replacement symbols per industry in
-  `universe_watchlist.json`, screened from the industry's own Yahoo industries and refreshed every
-  Monday so concerns can be raised before Friday.
-- `training_v4_cpp --continue-run` adds passes to an existing run, numbered after its last, with
-  each invocation's logs in their own `continue_p<N>/`; `--crown` crowns named industries outright.
-- `committee_race.py` takes several `race_daily.csv` files and matches passes by date.
-
-### Fixed
-- **Orders Alpaca accepts.** The first real paper session was rejected order by order: prices were
-  sent with sub-penny digits, and a buy's stop-loss was sent as a separate sell stop, which Alpaca
-  refuses beside an open buy. Prices are rounded to whole cents in the order's favour, each buy
-  carries its stop in one OTO order, held positions have their stops re-placed every run in every
-  industry, and a symbol sold today is not also bought.
-- Production saved the bar it fetched under today's date even when the feed returned an older
-  one, which made a halted symbol look current. Bars are saved under their own date.
-- Production read its cash and positions from `state.json`, which defaults to $20,000 and nothing
-  held, instead of from the Alpaca account. Both now come from Alpaca on every run.
 
 ### Changed
 - StockNN champions are crowned on slot 0's **recency-weighted mean daily book return** over the
