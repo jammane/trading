@@ -24,7 +24,7 @@ def help_text():
 
 @pytest.mark.parametrize('flag', ['--paper', '--account', '--capital', '--withdraw',
                                   '--no-orders', '--flat-allocation', '--sell-only',
-                                  '--cpp-upkeep'])
+                                  '--cpp-upkeep', '--committee'])
 def test_flag_present(help_text, flag):
     assert flag in help_text
 
@@ -46,3 +46,9 @@ def test_source_guards_both_mutating_paths():
     assert 'if args.no_orders:' in src, 'submission path not guarded'
     assert 'not args.no_orders' in src, 'stop-cancellation path not guarded'
     assert src.count('args.no_orders') >= 2
+
+
+def test_committee_requires_the_daily_training_state():
+    r = subprocess.run([sys.executable, 'production_v2.py', '--paper', '--committee'],
+                       cwd=ROOT, capture_output=True, text=True, timeout=180)
+    assert r.returncode == 2 and '--committee needs --cpp-upkeep' in r.stderr

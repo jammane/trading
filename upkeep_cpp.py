@@ -11,6 +11,7 @@ race training: a second implementation is how production's buy loop once drifted
   seed_state()   the first state: the bayes posterior replayed from the race's champion composite
   race_book()    the champions' simulated books where the race stopped, to start a catch-up from
   catch_up()     train every session from a book to the newest bars, chaining the simulated books
+  archive_logs() keep each training day's logs; the trainer rewrites its log directory every run
 
 State lives in one directory (the trainer's --output): StockNN elites and history ring, the
 evolutionary pools, race_<entry>_<ind>.bin (+ .adam.bin) for every entry in use, and
@@ -199,7 +200,41 @@ def race_book(run_dir, path, day=None, universe=None):
     return date
 
 
-def catch_up(binary, state_dir, seed_dir, race_only, book, log_path, max_days=250):
+# The trainer's CSV logs, accumulated across days by archive_logs. Each upkeep run is a one-day
+# pass, so its `day` column is an index into that run's 1255-day window and repeats from day to
+# day; the accumulated copy adds the trained date to every row.
+ARCHIVE_CSV = ("race_daily.csv", "holdings_log.csv", "training_log.csv", "bayes_online.csv")
+
+
+def archive_logs(log_dir, dest, date):
+    """Keep one training day's logs: every file, as written, under dest/days/<date>/, and each
+    CSV's rows appended to dest/<name> with a `date` column. The trainer truncates its log
+    directory on every run, so without this each day's record is gone the next day."""
+    if not os.path.isdir(log_dir):
+        return
+    day_dir = os.path.join(dest, "days", date)
+    shutil.copytree(log_dir, day_dir, dirs_exist_ok=True)
+    for name in ARCHIVE_CSV:
+        src = os.path.join(log_dir, name)
+        if not os.path.exists(src):
+            continue
+        with open(src, newline="") as f:
+            rows = list(csv.reader(f))
+        if not rows:
+            continue
+        head = rows[0]
+        data = [r for r in rows[1:] if r and r != head]      # training_log.csv repeats its header
+        dated = "date" in head
+        out = os.path.join(dest, name)
+        new = not os.path.exists(out)
+        with open(out, "a", newline="") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(head if dated else head + ["date"])
+            w.writerows(data if dated else [r + [date] for r in data])
+
+
+def catch_up(binary, state_dir, seed_dir, race_only, book, log_path, max_days=250, archive=None):
     """Train from `book` through the newest session in stock_data, one --upkeep per day, each
     day's book being the simulated book the day before ended with. -> days trained.
     Stops cleanly at rc 2 (no later session yet); a day already in the state (rc 3) is skipped by
@@ -218,6 +253,8 @@ def catch_up(binary, state_dir, seed_dir, race_only, book, log_path, max_days=25
         if rc == 3 and not os.path.exists(nxt):
             break
         trained += rc == 0
+        if rc == 0 and archive:
+            archive_logs(os.path.join(state_dir, "log"), archive, read_state(state_dir)["date"])
         shutil.copy2(nxt, cur)
     return trained
 
@@ -235,6 +272,7 @@ def main(argv=None):
     b.add_argument("--binary", default="build/training_v4_cpp")
     b.add_argument("--race-only", required=True, help="comma-separated race entries")
     b.add_argument("--log", required=True)
+    b.add_argument("--archive", default=None, help="accumulate each day's training logs here")
     a = ap.parse_args(argv)
     if a.cmd == "seed":
         mu = seed_state(a.state, os.path.join(a.run_dir, "race_daily.csv"),
@@ -245,7 +283,8 @@ def main(argv=None):
     book = os.path.join(a.state, "book_race_end.txt")
     date = race_book(a.run_dir, book)
     print(f"catch-up from {date}, the race's last decision day, on its champions' books")
-    n = catch_up(a.binary, a.state, a.seed_dir, a.race_only.split(","), book, a.log)
+    n = catch_up(a.binary, a.state, a.seed_dir, a.race_only.split(","), book, a.log,
+                 archive=a.archive)
     st = read_state(a.state)
     print(f"trained {n} day(s); state now through {st['date'] if st else '(none)'}")
     return 0

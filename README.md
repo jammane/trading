@@ -300,6 +300,7 @@ ruff check .
 | `--no-orders` | Run the full cycle but submit and cancel nothing |
 | `--sell-only IND,...` | Put industries in sell-only mode: the model's sells go in, nothing is bought |
 | `--cpp-upkeep` | Train one day with the C++ trainer before deciding, then convert; replaces the Python upkeep |
+| `--committee` | Allocate with the race committees: 4 industries sell-only, the other 8 tilted toward the winner committee's picks (needs `--cpp-upkeep`) |
 | `--capital` | Cap total deployed capital regardless of account balance |
 | `--withdraw` | Request a cash withdrawal of this dollar amount |
 
