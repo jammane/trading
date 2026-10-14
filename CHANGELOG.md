@@ -6,6 +6,17 @@ entry is in its commit message.
 
 ---
 
+## Unreleased
+
+### Changed
+- **A buy's stop-loss is 10% below the lower of its limit and the decision close**, not 10% below
+  the limit. A limit above the close fills near the next open, so the old stop could sit at the
+  market; on paper, Alpaca cancelled SSRM's stop the moment its buy filled. The rule is one helper
+  (`buy_stop_price`) shared by production, the C++ trainer and the Python simulator, so the models
+  train on the stops the broker holds. `tests/test_buy_stop.py` pins the C++ twin.
+
+---
+
 ## 0.8.1.46 – 0.8.1.57 — Paper trading goes live (2026-10-05 to 2026-10-13)
 
 The v5 race finished, its committees were wired into production, and paper trading started on
