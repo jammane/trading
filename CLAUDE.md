@@ -321,11 +321,14 @@ require a droplet upgrade.
 
 ```
 # crontab on droplet (times in Eastern Time — DST handled automatically by system timezone)
+# cron's default PATH lacks /usr/local/bin, where kubectl lives: without this line every
+# credentialed job finds no API keys and exits without trading
+PATH=/usr/local/bin:/usr/bin:/bin
 # Stock data: shared across all accounts; download once daily, cleanup weekly
 30 16 * * 1-5 cd /root/trading && mkdir -p logs/data && source .venv/bin/activate && python download_daily.py >> logs/data/download_daily.log 2>&1
 0  0  * * 0   cd /root/trading && mkdir -p logs/data && source .venv/bin/activate && python cleanup_stock_data.py >> logs/data/cleanup_stock_data.log 2>&1
-# acct0 paper trading: 5:05 PM ET; prod: 5:35 PM ET
-#5 17 * * 1-5 cd /root/trading && mkdir -p logs/acct0 && export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d) && export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d) && source .venv/bin/activate && python production_v2.py --paper --account acct0 --cpp-upkeep --committee >> logs/acct0/paper.log 2>&1
+# acct0 paper trading: 5:05 PM ET (live since 2026-10-13); prod: 5:35 PM ET (not yet enabled)
+5 17 * * 1-5 cd /root/trading && mkdir -p logs/acct0 && export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d) && export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-paper -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d) && source .venv/bin/activate && python production_v2.py --paper --account acct0 --cpp-upkeep --committee >> logs/acct0/paper.log 2>&1
 #35 17 * * 1-5 cd /root/trading && mkdir -p logs/acct0 && export ALPACA_API_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_API_KEY}' | base64 -d) && export ALPACA_SECRET_KEY=$(kubectl get secret alpaca-credentials-acct0-prod -n trading -o jsonpath='{.data.ALPACA_SECRET_KEY}' | base64 -d) && source .venv/bin/activate && python production_v2.py --account acct0 >> logs/acct0/prod.log 2>&1
 # acct1 (future): 30 16 download_daily if diff universe; 5 18 paper, 35 18 prod
 # acct2 (future): 5 19 paper, 35 19 prod
