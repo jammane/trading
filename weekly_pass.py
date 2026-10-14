@@ -353,9 +353,10 @@ def main(argv=None):
         rep.append("- **CONCERN: the pass failed; nothing promoted**")
     else:
         won = crowned(ref, pass_num)
-        rep.append("- champions taken: " + (", ".join(f"{i} ({r}, {s:+.2f} bp/day, was p{p})"
-                                                     for i, (r, s, p) in sorted(won.items()))
-                                            or "none"))
+        rep.append("- champions taken: " + (", ".join(
+            f"{i} ({s:+.2f} bp/day, " + ("crowned after its swap)" if r == "crown"
+                                         else f"replaces p{p})")
+            for i, (r, s, p) in sorted(won.items())) or "none"))
         # 4. promote
         champ = os.path.join(a.run_dir, "champion")
         if won:
