@@ -9,6 +9,18 @@ entry is in its commit message.
 ## Unreleased
 
 ### Changed
+- **Training trades under production's limits.** The fill simulators used to re-buy what they had
+  just sold, spend the same morning's sale proceeds, size buys at the fill price and sell a
+  position back the day it was bought, none of which production can do (on paper, 16 of 26
+  holdings matched the simulation on 2026-10-14). Production's order rules now live once, in
+  `training_lib.plan_orders`: production queues the plan and every simulator fills exactly it,
+  including the C++ trainer through a twin pinned by `tests/test_order_plan.py`.
+- **New order rules replace every model at the next weekly pass.** `training_lib.ORDER_RULES`
+  (now 2) is recorded in the race run as `order_rules.txt`; when the two differ, the Friday pass
+  crowns every industry outright and promotes all 12 to paper, because models raised under the old
+  rules learned on trades the broker does not make.
+- **`sell_qty` is a market order at the next open** in production, as the trainer fills it. It
+  was a limit at the decision close; on 2026-10-15 AR stayed held while the trainer sold it.
 - **A buy's stop-loss is 10% below the lower of its limit and the decision close**, not 10% below
   the limit. A limit above the close fills near the next open, so the old stop could sit at the
   market; on paper, Alpaca cancelled SSRM's stop the moment its buy filled. The rule is one helper

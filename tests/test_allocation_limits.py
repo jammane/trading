@@ -102,20 +102,22 @@ class TestProductionSourceGuards:
     """The three trading implementations drift; guard the one that isn't otherwise exercised."""
 
     def test_buy_loop_decrements_remaining_cash(self):
-        """Cash bookkeeping stays production's own job; only the arithmetic is shared."""
-        src = open('production_v2.py').read()
-        assert 'remaining_cash = allocated_cash' in src
+        """The buy plan (training_lib.plan_orders, which production queues) spends its budget down."""
+        src = open('training_lib.py').read()
+        assert 'remaining_cash = cash' in src
         assert re.search(r'remaining_cash\s*-=\s*amount \* buy_price', src), \
             'buy loop no longer spends its budget down'
         assert re.search(r'size_buy\(\s*\n?\s*buy_qty, buy_price, remaining_cash', src), \
             'sizing must be fed remaining_cash, not the full allocation'
+        assert 'training_lib.plan_orders(' in open('production_v2.py').read(), \
+            'production must queue the shared plan'
 
     def test_cap_is_applied_via_the_shared_function(self):
-        """The cap moved into size_buy; production must pass the portfolio value to it."""
-        src = open('production_v2.py').read()
-        assert 'ind_port_value' in src, 'production computes no portfolio value for the cap'
+        """The cap moved into size_buy; the plan must pass the portfolio value to it."""
+        src = open('training_lib.py').read()
+        assert 'ind_port_value' in src, 'the plan computes no portfolio value for the cap'
         assert re.search(r'size_buy\([^)]*ind_port_value', src, re.S), \
-            'production must pass ind_port_value so the cap is enforced'
+            'the plan must pass ind_port_value so the cap is enforced'
         lib = open('training_lib.py').read()
         assert 'MAX_SINGLE_STOCK_PCT * port_value' in lib, 'the cap left size_buy'
 
@@ -233,11 +235,12 @@ class TestSizingIsSharedNotCopied:
         assert n == 1, f'cap arithmetic duplicated {n} times; it belongs only in size_buy()'
 
     def test_all_python_sizing_goes_through_size_buy(self):
+        """Sizing happens once, in plan_orders, at the close; the simulators fill its quantities."""
         lib = open('training_lib.py').read()
-        assert lib.count('buy_amount = size_buy(') == 4, 'a simulator site stopped sharing'
+        assert lib.count('size_buy(') == 2, 'sizing must live only in plan_orders (+ its definition)'
         assert "affordable = port['cash']" not in lib, 'an inlined sizing copy came back'
         prod = open('production_v2.py').read()
-        assert 'size_buy(' in prod, 'production must use the shared sizing'
+        assert 'training_lib.size_buy(' not in prod, 'production must size through the shared plan'
         assert 'affordable = remaining_cash' not in prod, 'production re-inlined the arithmetic'
 
     def test_production_no_longer_defines_its_own_cap_constant(self):

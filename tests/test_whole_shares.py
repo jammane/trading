@@ -62,8 +62,9 @@ class TestBothSidesFloored:
     def test_cpp_has_the_twin(self):
         src = open('training_v4.cpp').read()
         assert 'static inline float whole_shares(float q)' in src
-        assert src.count('buy_amount = whole_shares(buy_amount);') >= 2, \
-            'a C++ buy site lost its floor'
+        assert 'const double w = std::floor(amount + 1e-4);' in src, \
+            'the C++ buy plan (size_buy_d) lost its floor'
+        assert 'std::floor(std::min(sell_qty, cur))' in src, 'the C++ planned sell is fractional'
         assert 'std::min(sell_qty, port.holdings[j])' not in src.replace(
             'whole_shares(std::min(sell_qty, port.holdings[j]))', ''), \
             'a C++ partial-sell site is still fractional'

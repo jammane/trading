@@ -10,11 +10,14 @@ champions paper trades:
               replacements (replacements.py) that still passes its checks. The universe change
               is committed to dev and to paper, and paper's recorded book forgets the old symbol.
   3. train    one pass on the whole race roster; a swapped industry's pass is crowned outright
-              (--crown), since its champion was raised on a symbol it no longer trades
+              (--crown), since its champion was raised on a symbol it no longer trades. When the
+              order rules (training_lib.ORDER_RULES) differ from those the run's champions were
+              trained under (<run>/order_rules.txt), EVERY industry is crowned: the old models
+              learned on trades the broker does not make
   4. promote  every industry whose champion changed is promoted to paper: its daily-training
               state is cleared, so the next session re-seeds it from the new champion, and its
-              StockNN is converted for inference now. Prod is promoted only for swapped industries,
-              whose old models no longer match the universe.
+              StockNN is converted for inference now. Prod is promoted only for crowned industries
+              (a swap or new order rules), whose old models no longer match what is traded.
   5. report   the champions, the swaps, and the committee races re-run on the new champion
               composite beside the committees paper trades. Committees are reported, never
               changed automatically.
@@ -44,6 +47,34 @@ LOCK = os.environ.get("TRADING_LOCK_PATH", "/run/trading/trading_active.lock")
 WATCHLIST = "universe_watchlist.json"
 TRAIN_ARGS = ["--passes", "1", "--sigma", "0.008", "--master-sigma", "0.006",
               "--sigma-decay", "1.0", "--start-day", "17", "--stop-day", "1255"]
+
+
+RULES_FILE = "order_rules.txt"
+
+
+def recorded_order_rules(run_dir):
+    """The order-rules version the run's champions were trained under; 1 if never recorded (every
+    run before training_lib.plan_orders)."""
+    try:
+        return int(Path(run_dir, RULES_FILE).read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 1
+
+
+def rules_crown(run_dir, industries, crown, current):
+    """-> (crown, report lines). If the champions were trained under other order rules, every
+    industry's pass is crowned outright, whatever it scores against them."""
+    was = recorded_order_rules(run_dir)
+    if was == current:
+        return list(crown), []
+    return sorted(set(crown) | set(industries)), [
+        "", "## Order rules",
+        f"- the champions were trained under order rules v{was}; training now uses v{current}, "
+        "so every industry's pass is crowned outright and replaces its model"]
+
+
+def record_order_rules(run_dir, current):
+    Path(run_dir, RULES_FILE).write_text(f"{current}\n")
 
 
 # ── 2. Which symbols must go ─────────────────────────────────────────────────────────────────────
@@ -331,6 +362,10 @@ def main(argv=None):
                        "universe until it is merged by hand**")
 
     # 3. train
+    from training_lib import ORDER_RULES
+    swapped = set(crown)
+    crown, note = rules_crown(a.run_dir, universe, crown, ORDER_RULES)
+    rep += note
     rep += ["", "## Pass"]
     if a.dry_run:
         rep.append("- dry run: no pass trained")
@@ -352,10 +387,13 @@ def main(argv=None):
     if rc != 0:
         rep.append("- **CONCERN: the pass failed; nothing promoted**")
     else:
+        if note:
+            record_order_rules(a.run_dir, ORDER_RULES)
         won = crowned(ref, pass_num)
         rep.append("- champions taken: " + (", ".join(
-            f"{i} ({s:+.2f} bp/day, " + ("crowned after its swap)" if r == "crown"
-                                         else f"replaces p{p})")
+            f"{i} ({s:+.2f} bp/day, "
+            + (("crowned after its swap)" if i in swapped else "crowned: new order rules)")
+               if r == "crown" else f"replaces p{p})")
             for i, (r, s, p) in sorted(won.items())) or "none"))
         # 4. promote
         champ = os.path.join(a.run_dir, "champion")
@@ -365,7 +403,7 @@ def main(argv=None):
             rep.append(f"- paper: promoted {', '.join(sorted(won))} ({n} state files reset)")
         if crown and os.path.isdir(prod_dir):
             promote(prod_dir, champ, crown, reset_state=False)
-            rep.append(f"- prod: promoted the swapped {', '.join(crown)}")
+            rep.append(f"- prod: promoted the crowned {', '.join(crown)}")
         elif crown:
             rep.append(f"- prod: {prod_dir} does not exist (prod not set up); nothing promoted")
         # 5. committees

@@ -147,3 +147,16 @@ def test_screener_names_take_the_em_dash():
     assert rp.screener_name("Software - Application", vocab) == "Software\u2014Application"
     assert rp.screener_name("Semiconductors", vocab) == "Semiconductors"
     assert rp.screener_name("Shell Companies", vocab) is None
+
+
+def test_new_order_rules_crown_every_industry(tmp_path):
+    inds = ["energy", "materials", "utilities"]
+    # never recorded: the run predates the rules, so everything is crowned
+    crown, note = wp.rules_crown(tmp_path, inds, [], 2)
+    assert crown == sorted(inds) and any("v1" in n for n in note)
+    # recorded at the current version: only the swaps are crowned
+    wp.record_order_rules(tmp_path, 2)
+    assert wp.rules_crown(tmp_path, inds, ["energy"], 2) == (["energy"], [])
+    # the rules move on again
+    crown, _ = wp.rules_crown(tmp_path, inds, ["energy"], 3)
+    assert crown == sorted(inds)
