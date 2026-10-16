@@ -36,7 +36,7 @@ import committee_alloc
 import fill_check
 import training_lib
 import upkeep_cpp
-from fees import BUY_FILL, SELL_FILL, _sell_net
+from fees import SELL_FILL, _sell_net
 from models import MasterNN, StockNN, stock_close_pos, stock_close_vs_wap
 from universe import INDUSTRIES
 from upkeep import (
@@ -839,15 +839,8 @@ def stocknn_outputs(model, symbols, histories, day_data, holdings, cash):
     return out.tolist()
 
 
-def to_cents(price, how):
-    """A price Alpaca accepts: whole cents at $1 and over, 1/100 cent below. 'down' for a buy
-    limit and 'up' for a sell limit, so rounding never makes an order worse than the model's price;
-    'near' for a stop. Alpaca rejects every other increment ("sub-penny increment does not fulfill
-    minimum pricing criteria") -- which is what every order of the first paper session did."""
-    step = 0.01 if price >= 1.0 else 0.0001
-    n = price / step
-    k = math.floor(n + 1e-6) if how == 'down' else math.ceil(n - 1e-6) if how == 'up' else round(n)
-    return round(k * step, 4)
+# Shared with the fill simulators: see training_lib.to_cents.
+to_cents = training_lib.to_cents
 
 
 def plan_industry_orders(symbols, sug, holdings, day_data, allocated_cash, holds,
@@ -875,75 +868,41 @@ def plan_industry_orders(symbols, sug, holdings, day_data, allocated_cash, holds
 
     -> list of order dicts in submission order."""
     stops = stops or {}
-    orders, left, sold, bought = [], {}, set(), set()
+    # training_lib.plan_orders is the ONE place the order rules live; the fill simulators (and
+    # training_v4.cpp's twin) fill exactly what it plans. A sell-only industry is planned with no
+    # cash, so it gets its sells and no buys.
+    plan = training_lib.plan_orders(
+        symbols, sug, holdings, day_data, 0.0 if sell_only else allocated_cash,
+        skip={s for s in symbols if holds.get(s, 0) > 0})
+    orders, left = [], {}
     for sym in symbols:
         if sym not in day_data or holds.get(sym, 0) > 0:
             continue
-        buy_qty, buy_price_frac, sell_all_price_frac, sell_qty = sug[sym]
-        cur_qty        = holdings.get(sym, 0.0)
-        low            = day_data[sym]['low']
-        high           = day_data[sym]['high']
-        close          = day_data[sym]['close']
-        span           = max(high - low, 1e-9)
-        sell_all_price = low + sell_all_price_frac * span
-
-        # Sell qty at market (open price)
-        if sell_qty > 1e-6 and cur_qty > 1e-6:
-            amount = int(min(sell_qty, cur_qty))
-            if amount >= 1:
-                orders.append({'symbol': sym, 'action': 'sell',
-                               'quantity': amount, 'price': to_cents(close, 'up')})
-                cur_qty -= amount
-                sold.add(sym)
-
-        # Sell all at limit price
-        if cur_qty >= 1 and low <= sell_all_price <= high:
-            orders.append({'symbol': sym, 'action': 'sell',
-                           'quantity': int(cur_qty), 'price': to_cents(sell_all_price, 'up')})
+        cur_qty = holdings.get(sym, 0.0)
+        # Sell qty at the next open: a market order, as the trainer fills it (at nd_open,
+        # unconditionally). It was a limit at today's close, which the trainer never models: on
+        # 2026-10-15 AR opened at 36.83, traded above its 36.64 limit only in the first minute,
+        # and stayed held while the trainer sold it.
+        if sym in plan['sell_open']:
+            orders.append({'symbol': sym, 'action': 'sell', 'quantity': plan['sell_open'][sym],
+                           'at_open': True})
+            cur_qty -= plan['sell_open'][sym]
+        if sym in plan['sell_all']:
+            qty, limit = plan['sell_all'][sym]
+            orders.append({'symbol': sym, 'action': 'sell', 'quantity': qty, 'price': limit})
             cur_qty = 0.0
-            sold.add(sym)
         left[sym] = cur_qty
 
-    if not sell_only:
-        # ── Buys after sells: stop anchored to buy_price ─────────────
-        # allocated_cash is the industry's budget for the WHOLE loop, so it has to be
-        # spent down as orders are queued. Reading it fresh per symbol sized every
-        # position against the full allocation: measured 2026-09-17, tech_hardware
-        # queued ~$12,800 against a $1,666.67 allocation (ON 99%, LRCX 96%, SWKS 96%,
-        # KLAC 94%, NVDA 91% ... each of the full budget). training_lib.step_industry
-        # spends its cash down correctly; this path did not.
-        remaining_cash = allocated_cash
-        # Industry portfolio value for the single-stock cap, on the same basis the model
-        # was fed (allocated_cash + holdings), mirroring training_lib.step_industry.
-        ind_port_value = allocated_cash + sum(
-            holdings.get(s, 0.0) * day_data.get(s, {}).get('close', 0.0)
-            for s in symbols)
-        for sym in symbols:
-            if sym not in day_data or holds.get(sym, 0) > 0 or sym in sold:
-                continue
-            buy_qty, buy_price_frac, sell_all_price_frac, sell_qty = sug[sym]
-            low       = day_data[sym]['low']
-            high      = day_data[sym]['high']
-            span      = max(high - low, 1e-9)
-            raw_price = low + buy_price_frac * span
-
-            if buy_qty > 1e-6 and raw_price > 0 and low <= raw_price <= high:
-                buy_price = to_cents(raw_price, 'down')
-                # Shared with the simulator: size_buy is the ONE place the request /
-                # cash / single-stock-cap arithmetic lives.
-                amount = int(training_lib.size_buy(
-                    buy_qty, buy_price, remaining_cash, ind_port_value,
-                    holdings.get(sym, 0.0) * buy_price))
-                if amount >= 1:
-                    orders.append({'symbol': sym, 'action': 'buy', 'quantity': amount,
-                                   'price': buy_price,
-                                   'stop': to_cents(training_lib.buy_stop_price(
-                                       buy_price, day_data[sym]['close']), 'near')})
-                    remaining_cash -= amount * buy_price * BUY_FILL
-                    bought.add(sym)
+    # Buys after sells. The budget is spent down as orders are queued: reading it fresh per
+    # symbol once queued ~$12,800 against a $1,666.67 allocation (2026-09-17).
+    for sym in symbols:
+        if sym in plan['buys']:
+            qty, limit, stop = plan['buys'][sym]
+            orders.append({'symbol': sym, 'action': 'buy', 'quantity': qty, 'price': limit,
+                           'stop': stop})
 
     for sym in symbols:
-        if left.get(sym, 0.0) >= 1 and sym in stops and sym not in bought:
+        if left.get(sym, 0.0) >= 1 and sym in stops and sym not in plan['buys']:
             orders.append({'symbol': sym, 'action': 'stop_loss',
                            'quantity': int(left[sym]), 'price': to_cents(stops[sym], 'near')})
     return orders
@@ -1753,6 +1712,16 @@ def main():
                     )
                     result = trading_client.submit_order(order_req)
                     log_request_id(str(result.id), f"{mode} buy {order['symbol']} qty={order['quantity']}")
+                elif order['action'] == 'sell' and order.get('at_open'):
+                    # Queued tonight, executed at the next open (DAY market order).
+                    order_req = MarketOrderRequest(
+                        symbol=order['symbol'],
+                        qty=order['quantity'],
+                        side=OrderSide.SELL,
+                        time_in_force=TimeInForce.DAY
+                    )
+                    result = trading_client.submit_order(order_req)
+                    log_request_id(str(result.id), f"{mode} sell@open {order['symbol']} qty={order['quantity']}")
                 elif order['action'] == 'sell':
                     order_req = LimitOrderRequest(
                         symbol=order['symbol'],

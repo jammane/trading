@@ -7,6 +7,7 @@ import contextlib
 import copy
 import gc
 import json
+import math
 import os
 import random
 import shutil
@@ -87,6 +88,85 @@ def size_buy(buy_qty, price, cash, port_value, cur_sym_value, buy_fill=None):
         return 0.0
     max_spend = max(0.0, MAX_SINGLE_STOCK_PCT * port_value - cur_sym_value)
     return whole_shares(min(amount, max_spend / (price * bf)))
+
+
+def to_cents(price, how):
+    """A price Alpaca accepts: whole cents at $1 and over, 1/100 cent below. 'down' for a buy
+    limit and 'up' for a sell limit, so rounding never makes an order worse than the model's price;
+    'near' for a stop. Alpaca rejects every other increment ("sub-penny increment does not fulfill
+    minimum pricing criteria") -- which is what every order of the first paper session did.
+    Mirrored by to_cents() in training_v4.cpp."""
+    step = 0.01 if price >= 1.0 else 0.0001
+    n = price / step
+    k = math.floor(n + 1e-6) if how == 'down' else math.ceil(n - 1e-6) if how == 'up' else round(n)
+    return round(k * step, 4)
+
+
+# The version of the order rules below. Models raised under other rules learned on trades the
+# broker does not make, so a change here makes the weekly pass crown every industry outright
+# (weekly_pass.rules_crown). 1: before plan_orders (re-buying sold symbols, spending same-day
+# proceeds, sizing at the fill price, sell_qty as a limit at the close). 2: plan_orders.
+ORDER_RULES = 2
+
+
+def plan_orders(symbols, sug, holdings, day_data, cash, skip=()):
+    """The orders production places for one industry, decided at the close and before any fill.
+    THE one place the order rules live: production queues these, and every fill simulator
+    (training_lib's and its twin plan_orders() in training_v4.cpp) fills exactly these.
+
+    sug: {sym: (buy_qty, buy_price_frac, sell_all_price_frac, sell_qty)}, the model's output.
+    cash: the industry's cash at the close. skip: symbols that get no orders (new-symbol hold).
+
+    Production's limits, which the simulators must share or they train on trades the broker
+    never makes (measured on paper 2026-10-14/15):
+      - a symbol sold today is not bought today (Alpaca rejects the buy as a wash trade), and
+        every held symbol gets a sell-all limit, so a held symbol is never added to;
+      - buys are sized at the close, against the cash the industry HAS: proceeds of tomorrow's
+        sells are not in it, and an order that does not fill still used its share of the budget;
+      - the quantity is fixed at the close, sized at the limit, not at the fill price;
+      - every price is rounded to an increment Alpaca accepts.
+
+    -> dict(sell_open={sym: qty}, sell_all={sym: (qty, limit)}, buys={sym: (qty, limit, stop)},
+            sold=set). sell_open is a market order at the next open; sell_all a limit.
+    """
+    sell_open, sell_all, buys, sold = {}, {}, {}, set()
+    for sym in symbols:
+        if sym not in day_data or sym in skip:
+            continue
+        _, _, sell_all_price_frac, sell_qty = sug[sym]
+        cur_qty = holdings.get(sym, 0.0)
+        low, high = day_data[sym]['low'], day_data[sym]['high']
+        sell_all_price = low + sell_all_price_frac * max(high - low, 1e-9)
+        if sell_qty > 1e-6 and cur_qty > 1e-6:
+            amount = int(min(sell_qty, cur_qty))
+            if amount >= 1:
+                sell_open[sym] = amount
+                cur_qty -= amount
+                sold.add(sym)
+        if cur_qty >= 1 and low <= sell_all_price <= high:
+            sell_all[sym] = (int(cur_qty), to_cents(sell_all_price, 'up'))
+            sold.add(sym)
+
+    remaining_cash = cash
+    # The single-stock cap's portfolio value, on the basis the model was fed: cash + holdings at
+    # the close.
+    ind_port_value = cash + sum(holdings.get(s, 0.0) * day_data.get(s, {}).get('close', 0.0)
+                                for s in symbols)
+    for sym in symbols:
+        if sym not in day_data or sym in skip or sym in sold:
+            continue
+        buy_qty, buy_price_frac, _, _ = sug[sym]
+        low, high = day_data[sym]['low'], day_data[sym]['high']
+        raw_price = low + buy_price_frac * max(high - low, 1e-9)
+        if buy_qty > 1e-6 and raw_price > 0 and low <= raw_price <= high:
+            buy_price = to_cents(raw_price, 'down')
+            amount = int(size_buy(buy_qty, buy_price, remaining_cash, ind_port_value,
+                                  holdings.get(sym, 0.0) * buy_price))
+            if amount >= 1:
+                stop = to_cents(buy_stop_price(buy_price, day_data[sym]['close']), 'near')
+                buys[sym] = (amount, buy_price, stop)
+                remaining_cash -= amount * buy_price * BUY_FILL
+    return dict(sell_open=sell_open, sell_all=sell_all, buys=buys, sold=sold)
 
 
 def whole_shares(q):
@@ -257,91 +337,148 @@ def _build_models_section(
 
 # ── Daily burst helpers ────────────────────────────────────────────────────────
 
-def _fill_sym_from_bars(sym, port, bars, buy_qty, buy_price, sell_all_price,
-                        sell_qty, stop_loss, symbols, fill_data, day_data):
+# The fill rules, shared by every Python simulator. Each fills the orders plan_orders() planned at
+# the close -- nothing more -- so training never makes a trade production cannot: a stop exists
+# only where production holds one (a buy's own stop, or held shares nothing is selling), a
+# sell-all only where production placed it (shares held at the close), and a buy only as planned,
+# in the planned quantity, at the planned limit.
+
+def _fill_sym_open_low(sym, port, plan, day_data, fill_data, low_first):
+    """Open and low phase for one symbol, on the daily bar: sell at open, gap sell-all, the
+    high-first intraday sell-all, stop, limit buy. Modifies port in place. -> (buys, sells)."""
+    buys = sells = 0.0
+    nd      = fill_data.get(sym, day_data.get(sym, {}))
+    nd_open = nd.get('open', day_data[sym]['close'])
+    nd_low  = nd.get('low',  day_data[sym]['low'])
+    nd_high = nd.get('high', day_data[sym]['high'])
+    hold    = port['holdings']
+
+    qty = min(plan['sell_open'].get(sym, 0), hold.get(sym, 0.0))
+    if qty > 1e-6:
+        hold[sym] -= qty
+        port['cash'] += _sell_net(qty, nd_open)
+        sells += qty
+
+    if sym in plan['sell_all']:
+        limit = plan['sell_all'][sym][1]
+        cur = hold.get(sym, 0.0)
+        if cur > 1e-6 and nd_open >= limit:
+            hold[sym] = 0.0
+            port['cash'] += _sell_net(cur, nd_open)
+            sells += cur
+        cur = hold.get(sym, 0.0)
+        if not low_first and cur > 1e-6 and nd_low < limit < nd_high:
+            hold[sym] = 0.0
+            port['cash'] += _sell_net(cur, limit * (1.0 - SLIPPAGE_RATE))
+            sells += cur
+
+    stop_p = port['stop_prices'].get(sym, 0.0)
+    remaining = hold.get(sym, 0.0)
+    if sym not in plan['sold'] and stop_p > 0 and remaining > 1e-6:
+        if nd_open <= stop_p:
+            hold[sym] = 0.0
+            port['cash'] += _sell_net(remaining, nd_open)
+            sells += remaining
+        elif nd_low <= stop_p:
+            hold[sym] = 0.0
+            port['cash'] += _sell_net(remaining, stop_p * (1.0 - SLIPPAGE_RATE))
+            sells += remaining
+
+    if sym in plan['buys']:
+        qty, limit, stop = plan['buys'][sym]
+        if nd_open <= limit:
+            fill_price = nd_open
+        elif nd_low < limit < nd_high:   # strict: not right at the day's extreme
+            fill_price = limit * (1.0 + SLIPPAGE_RATE)
+        else:
+            fill_price = 0.0
+        if fill_price > 0:
+            hold[sym] = hold.get(sym, 0.0) + qty
+            port['cash'] -= qty * fill_price * BUY_FILL
+            port['stop_prices'][sym] = stop
+            buys += qty
+    return buys, sells
+
+
+def _fill_sell_all_intraday(sym, port, plan, day_data, fill_data):
+    """High phase for a low-first symbol: the planned sell-all, if the day reaches it. -> sells."""
+    if sym not in plan['sell_all']:
+        return 0.0
+    limit = plan['sell_all'][sym][1]
+    nd      = fill_data.get(sym, day_data.get(sym, {}))
+    nd_low  = nd.get('low',  day_data[sym]['low'])
+    nd_high = nd.get('high', day_data[sym]['high'])
+    cur = port['holdings'].get(sym, 0.0)
+    if cur > 1e-6 and nd_low < limit < nd_high:   # strict: not at the day's extreme
+        port['holdings'][sym] = 0.0
+        port['cash'] += _sell_net(cur, limit * (1.0 - SLIPPAGE_RATE))
+        return cur
+    return 0.0
+
+
+def _fill_sym_from_bars(sym, port, bars, plan):
     """
     Walk 1-minute intraday bars for one symbol's fill simulation.
     Replaces the OHLC + seq_flags approximation with chronological bar ordering.
     Within each bar: low-based events (stop, limit buy) checked before high-based (sell_all).
+    A buy's stop is live from its fill, as Alpaca's OTO stop is.
     Modifies port in place. Returns (buys, sells).
     """
     buys = sells = 0.0
     if not bars:
         return buys, sells
-
+    hold = port['holdings']
     nd_open = bars[0]['open']
+    sell_all = plan['sell_all'][sym][1] if sym in plan['sell_all'] else None
+    buy = plan['buys'].get(sym)
 
-    # Open: partial sell
-    cur_qty = port['holdings'].get(sym, 0.0)
-    if sell_qty > 1e-6 and cur_qty > 1e-6:
-        sell_amount = whole_shares(min(sell_qty, cur_qty))
-        port['holdings'][sym] -= sell_amount
-        port['cash'] += _sell_net(sell_amount, nd_open)
-        sells += sell_amount
-
-    # Open: gap sell_all
-    cur_qty = port['holdings'].get(sym, 0.0)
-    if cur_qty > 1e-6 and nd_open >= sell_all_price:
-        port['holdings'][sym] = 0.0
-        port['cash'] += _sell_net(cur_qty, nd_open)
-        sells += cur_qty
-
-    # Open: gap stop
+    # Open: sell at open, gap sell-all, gap stop, gap buy
+    qty = min(plan['sell_open'].get(sym, 0), hold.get(sym, 0.0))
+    if qty > 1e-6:
+        hold[sym] -= qty
+        port['cash'] += _sell_net(qty, nd_open)
+        sells += qty
+    cur = hold.get(sym, 0.0)
+    if sell_all is not None and cur > 1e-6 and nd_open >= sell_all:
+        hold[sym] = 0.0
+        port['cash'] += _sell_net(cur, nd_open)
+        sells += cur
     stop_p = port['stop_prices'].get(sym, 0.0)
-    remaining = port['holdings'].get(sym, 0.0)
-    if stop_p > 0 and remaining > 1e-6 and nd_open <= stop_p:
-        port['holdings'][sym] = 0.0
+    remaining = hold.get(sym, 0.0)
+    if sym not in plan['sold'] and stop_p > 0 and remaining > 1e-6 and nd_open <= stop_p:
+        hold[sym] = 0.0
         port['cash'] += _sell_net(remaining, nd_open)
         sells += remaining
+    bought = False
+    if buy and nd_open <= buy[1]:
+        hold[sym] = hold.get(sym, 0.0) + buy[0]
+        port['cash'] -= buy[0] * nd_open * BUY_FILL
+        port['stop_prices'][sym] = buy[2]
+        buys += buy[0]
+        bought = True
 
-    # Open: gap buy
-    already_bought = False
-    if buy_qty > 1e-6 and buy_price > 0 and nd_open <= buy_price:
-        fill_price = nd_open
-        buy_amount = size_buy(
-            buy_qty, fill_price, port['cash'],
-            portfolio_value(port, symbols, day_data, fill_data),
-            port['holdings'].get(sym, 0.0) * fill_price)
-        if buy_amount > 1e-6:
-            port['holdings'][sym] = port['holdings'].get(sym, 0.0) + buy_amount
-            port['cash'] -= buy_amount * fill_price * BUY_FILL
-            port['stop_prices'][sym] = stop_loss
-            buys += buy_amount
-            already_bought = True
-
-    # Intraday: walk remaining bars chronologically
-    # Within each bar: check low (stop, buy) before high (sell_all)
+    # Intraday: walk remaining bars chronologically, low (stop, buy) before high (sell-all)
     for bar in bars[1:]:
-        bar_low  = bar['low']
-        bar_high = bar['high']
-
-        stop_p    = port['stop_prices'].get(sym, 0.0)
-        remaining = port['holdings'].get(sym, 0.0)
-        if stop_p > 0 and remaining > 1e-6 and bar_low <= stop_p:
-            port['holdings'][sym] = 0.0
+        stop_p = port['stop_prices'].get(sym, 0.0)
+        remaining = hold.get(sym, 0.0)
+        if (sym not in plan['sold'] and stop_p > 0 and remaining > 1e-6
+                and bar['low'] <= stop_p):
+            hold[sym] = 0.0
             port['cash'] += _sell_net(remaining, stop_p * (1.0 - SLIPPAGE_RATE))
             sells += remaining
             break
-
-        if not already_bought and buy_qty > 1e-6 and buy_price > 0 and bar_low <= buy_price:
-            fill_price = buy_price * (1.0 + SLIPPAGE_RATE)
-            buy_amount = size_buy(
-                buy_qty, fill_price, port['cash'],
-                portfolio_value(port, symbols, day_data, fill_data),
-                port['holdings'].get(sym, 0.0) * fill_price)
-            if buy_amount > 1e-6:
-                port['holdings'][sym] = port['holdings'].get(sym, 0.0) + buy_amount
-                port['cash'] -= buy_amount * fill_price * BUY_FILL
-                port['stop_prices'][sym] = stop_loss
-                buys += buy_amount
-                already_bought = True
-
-        cur_qty = port['holdings'].get(sym, 0.0)
-        if cur_qty > 1e-6 and bar_high >= sell_all_price:
-            slipped = sell_all_price * (1.0 - SLIPPAGE_RATE)
-            port['holdings'][sym] = 0.0
-            port['cash'] += _sell_net(cur_qty, slipped)
-            sells += cur_qty
+        if buy and not bought and bar['low'] <= buy[1]:
+            fill_price = buy[1] * (1.0 + SLIPPAGE_RATE)
+            hold[sym] = hold.get(sym, 0.0) + buy[0]
+            port['cash'] -= buy[0] * fill_price * BUY_FILL
+            port['stop_prices'][sym] = buy[2]
+            buys += buy[0]
+            bought = True
+        cur = hold.get(sym, 0.0)
+        if sell_all is not None and cur > 1e-6 and bar['high'] >= sell_all:
+            hold[sym] = 0.0
+            port['cash'] += _sell_net(cur, sell_all * (1.0 - SLIPPAGE_RATE))
+            sells += cur
             break
 
     return buys, sells
@@ -355,103 +492,29 @@ def _simulate_one_model(model, ref_cash, ref_hold, ref_stop, symbols,
     with torch.inference_mode():
         out = model(history_t, today_t)
     out = out.view(len(symbols), 4)
+    plan = plan_orders(symbols, {s: out[j].tolist() for j, s in enumerate(symbols)},
+                       port['holdings'], day_data, port['cash'])
 
     # ── Phase 1: open + low phase ────────────────────────────────────────────
-    # Partial sells at open, gap sell_all, high-first intraday sell_all, stops, limit buys.
-    for j, sym in enumerate(symbols):
+    # Fills production's planned orders: sells at open, gap sell_all, high-first intraday
+    # sell_all, stops, limit buys.
+    for sym in symbols:
         if sym not in day_data:
             continue
-        buy_qty, buy_price_frac, sell_all_price_frac, sell_qty = out[j].tolist()
-        cur_qty        = port['holdings'].get(sym, 0.0)
-        low_t          = day_data[sym]['low']
-        high_t         = day_data[sym]['high']
-        span_t         = max(high_t - low_t, 1e-9)
-        sell_all_price = low_t + sell_all_price_frac * span_t
-        buy_price      = low_t + buy_price_frac * span_t
-        stop_loss      = buy_stop_price(buy_price, day_data[sym]['close'])
-        low_first      = seq_flags.get(sym, True) if seq_flags else True
-        nd             = fill_data.get(sym, day_data.get(sym, {}))
-        nd_open        = nd.get('open',  day_data[sym]['close'])
-        nd_low         = nd.get('low',   day_data[sym]['low'])
-        nd_high        = nd.get('high',  day_data[sym]['high'])
-
+        low_first = seq_flags.get(sym, True) if seq_flags else True
         sym_bars = (intraday_bars or {}).get(sym)
         if sym_bars:
-            b, s = _fill_sym_from_bars(sym, port, sym_bars, buy_qty, buy_price,
-                                       sell_all_price, sell_qty, stop_loss,
-                                       symbols, fill_data, day_data)
+            _fill_sym_from_bars(sym, port, sym_bars, plan)
             continue
-
-        # Partial sell at open
-        if sell_qty > 1e-6 and cur_qty > 1e-6:
-            sell_amount            = whole_shares(min(sell_qty, cur_qty))
-            port['holdings'][sym] -= sell_amount
-            port['cash']          += _sell_net(sell_amount, nd_open)
-
-        # Gap-up sell_all at open (both sequences)
-        cur_qty_after = port['holdings'].get(sym, 0.0)
-        if cur_qty_after > 1e-6 and nd_open >= sell_all_price:
-            port['holdings'][sym] = 0.0
-            port['cash']         += _sell_net(cur_qty_after, nd_open)
-
-        # High-first: intraday sell_all fires before the buy
-        if not low_first:
-            intraday_qty = port['holdings'].get(sym, 0.0)
-            if intraday_qty > 1e-6 and nd_low < sell_all_price < nd_high:
-                slipped = sell_all_price * (1.0 - SLIPPAGE_RATE)
-                port['holdings'][sym] = 0.0
-                port['cash']         += _sell_net(intraday_qty, slipped)
-
-        # Stop loss
-        stop_p    = port['stop_prices'].get(sym, 0.0)
-        remaining = port['holdings'].get(sym, 0.0)
-        if stop_p > 0 and remaining > 1e-6:
-            if nd_open <= stop_p:
-                port['holdings'][sym] = 0.0
-                port['cash']         += _sell_net(remaining, nd_open)
-            elif nd_low <= stop_p:
-                port['holdings'][sym] = 0.0
-                port['cash']         += _sell_net(remaining, stop_p * (1.0 - SLIPPAGE_RATE))
-
-        # Limit buy
-        if buy_qty > 1e-6 and buy_price > 0:
-            if nd_open <= buy_price:
-                fill_price = nd_open
-            elif nd_low < buy_price < nd_high:
-                fill_price = buy_price * (1.0 + SLIPPAGE_RATE)
-            else:
-                fill_price = 0.0
-            if fill_price > 0:
-                buy_amount = size_buy(
-                    buy_qty, fill_price, port['cash'],
-                    portfolio_value(port, symbols, day_data, fill_data),
-                    port['holdings'].get(sym, 0.0) * fill_price)
-                if buy_amount > 1e-6:
-                    port['holdings'][sym]     = port['holdings'].get(sym, 0.0) + buy_amount
-                    port['cash']             -= buy_amount * fill_price * BUY_FILL
-                    port['stop_prices'][sym]  = stop_loss
+        _fill_sym_open_low(sym, port, plan, day_data, fill_data, low_first)
 
     # ── Phase 2: high phase — low-first intraday sell_all ───────────────────
-    for j, sym in enumerate(symbols):
-        if sym not in day_data:
-            continue
-        if (intraday_bars or {}).get(sym):
+    for sym in symbols:
+        if sym not in day_data or (intraday_bars or {}).get(sym):
             continue  # bar-walk already handled this symbol
         if seq_flags and not seq_flags.get(sym, True):
             continue  # high-first: sell_all already handled in phase 1
-        _, _, sell_all_price_frac, _ = out[j].tolist()
-        low_t          = day_data[sym]['low']
-        high_t         = day_data[sym]['high']
-        span_t         = max(high_t - low_t, 1e-9)
-        sell_all_price = low_t + sell_all_price_frac * span_t
-        nd      = fill_data.get(sym, day_data.get(sym, {}))
-        nd_low  = nd.get('low',  day_data[sym]['low'])
-        nd_high = nd.get('high', day_data[sym]['high'])
-        cur_qty = port['holdings'].get(sym, 0.0)
-        if cur_qty > 1e-6 and nd_low < sell_all_price < nd_high:
-            slipped = sell_all_price * (1.0 - SLIPPAGE_RATE)
-            port['holdings'][sym] = 0.0
-            port['cash']         += _sell_net(cur_qty, slipped)
+        _fill_sell_all_intraday(sym, port, plan, day_data, fill_data)
 
     return compute_value(port, fill_data, symbols), port
 
@@ -1255,7 +1318,6 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
 
     for slot in range(pool_size):
         port        = portfolios[slot]
-        stop_prices = port['stop_prices']
         model       = load_slot_model(industry, output_dir, slot, StockNN)
 
         with torch.inference_mode():
@@ -1264,115 +1326,29 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
 
         out = out.view(12, 4)
         local_buys = local_sells = 0
+        plan = plan_orders(symbols, {s: out[j].tolist() for j, s in enumerate(symbols)},
+                           port['holdings'], day_data, port['cash'])
 
-        # ── Open + low phase: partial sells, gap sell_all, stops, limit buys ───
-        for j, sym in enumerate(symbols):
+        # ── Open + low phase: fills production's planned orders ──────────────
+        for sym in symbols:
             if sym not in day_data:
                 continue
-            buy_qty, buy_price_frac, sell_all_price_frac, sell_qty = out[j].tolist()
-            cur_qty        = port['holdings'][sym]
-            low_t          = day_data[sym]['low']
-            high_t         = day_data[sym]['high']
-            span_t         = max(high_t - low_t, 1e-9)
-            sell_all_price = low_t + sell_all_price_frac * span_t
-            buy_price      = low_t + buy_price_frac * span_t
-            stop_loss      = buy_stop_price(buy_price, day_data[sym]['close'])
-            low_first      = seq_flags.get(sym, True) if seq_flags else True
-
-            nd      = fill_data.get(sym, day_data.get(sym, {}))
-            nd_open = nd.get('open',  day_data[sym]['close'])
-            nd_low  = nd.get('low',   day_data[sym]['low'])
-            nd_high = nd.get('high',  day_data[sym]['high'])
-
+            low_first = seq_flags.get(sym, True) if seq_flags else True
             sym_bars = (intraday_bars or {}).get(sym)
             if sym_bars:
-                b, s = _fill_sym_from_bars(sym, port, sym_bars, buy_qty, buy_price,
-                                           sell_all_price, sell_qty, stop_loss,
-                                           symbols, fill_data, day_data)
-                local_buys  += b
-                local_sells += s
-                continue
-
-            # Partial sell at open
-            if sell_qty > 1e-6 and cur_qty > 1e-6:
-                sell_amount               = whole_shares(min(sell_qty, cur_qty))
-                port['holdings'][sym]    -= sell_amount
-                port['cash']             += _sell_net(sell_amount, nd_open)
-                local_sells              += sell_amount
-
-            # Gap-up sell_all at open (both sequences)
-            cur_qty_after = port['holdings'][sym]
-            if cur_qty_after > 1e-6 and nd_open >= sell_all_price:
-                port['holdings'][sym]  = 0.0
-                port['cash']          += _sell_net(cur_qty_after, nd_open)
-                local_sells           += cur_qty_after
-
-            # High-first: intraday sell_all fires at the high before the low
-            if not low_first:
-                intraday_qty = port['holdings'][sym]
-                if intraday_qty > 1e-6 and nd_low < sell_all_price < nd_high:
-                    slipped = sell_all_price * (1.0 - SLIPPAGE_RATE)
-                    port['holdings'][sym]  = 0.0
-                    port['cash']          += _sell_net(intraday_qty, slipped)
-                    local_sells           += intraday_qty
-
-            # Stop loss: gap-down at open, or intraday low
-            stop_p    = stop_prices.get(sym, 0.0)
-            remaining = port['holdings'][sym]
-            if stop_p > 0 and remaining > 1e-6:
-                if nd_open <= stop_p:
-                    port['holdings'][sym]  = 0.0
-                    port['cash']          += _sell_net(remaining, nd_open)
-                    local_sells           += remaining
-                elif nd_low <= stop_p:
-                    port['holdings'][sym]  = 0.0
-                    port['cash']          += _sell_net(remaining, stop_p * (1.0 - SLIPPAGE_RATE))
-                    local_sells           += remaining
-
-            # Buy at open (gap-down) or intraday low
-            if buy_qty > 1e-6 and buy_price > 0:
-                if nd_open <= buy_price:
-                    fill_price = nd_open
-                elif nd_low < buy_price < nd_high:   # strict: not right at day extreme
-                    fill_price = buy_price * (1.0 + SLIPPAGE_RATE)
-                else:
-                    fill_price = 0.0
-
-                if fill_price > 0:
-                    buy_amount = size_buy(
-                        buy_qty, fill_price, port['cash'],
-                        portfolio_value(port, symbols, day_data, fill_data),
-                        port['holdings'].get(sym, 0.0) * fill_price)
-                    if buy_amount > 1e-6:
-                        port['holdings'][sym]  += buy_amount
-                        port['cash']           -= buy_amount * fill_price * BUY_FILL
-                        stop_prices[sym]        = stop_loss
-                        local_buys             += buy_amount
+                b, s = _fill_sym_from_bars(sym, port, sym_bars, plan)
+            else:
+                b, s = _fill_sym_open_low(sym, port, plan, day_data, fill_data, low_first)
+            local_buys  += b
+            local_sells += s
 
         # ── High phase: intraday sell_all for low-first symbols only ─────────
-        for j, sym in enumerate(symbols):
-            if sym not in day_data:
-                continue
-            if (intraday_bars or {}).get(sym):
+        for sym in symbols:
+            if sym not in day_data or (intraday_bars or {}).get(sym):
                 continue  # bar-walk already handled this symbol
             if seq_flags and not seq_flags.get(sym, True):
                 continue  # high-first: sell_all already fired before the low
-            _, _, sell_all_price_frac, _ = out[j].tolist()
-            low_t          = day_data[sym]['low']
-            high_t         = day_data[sym]['high']
-            span_t         = max(high_t - low_t, 1e-9)
-            sell_all_price = low_t + sell_all_price_frac * span_t
-
-            nd      = fill_data.get(sym, day_data.get(sym, {}))
-            nd_low  = nd.get('low',  day_data[sym]['low'])
-            nd_high = nd.get('high', day_data[sym]['high'])
-
-            cur_qty = port['holdings'][sym]
-            if cur_qty > 1e-6 and nd_low < sell_all_price < nd_high:   # strict: not at day extreme
-                slipped = sell_all_price * (1.0 - SLIPPAGE_RATE)
-                port['holdings'][sym]  = 0.0
-                port['cash']          += _sell_net(cur_qty, slipped)
-                local_sells           += cur_qty
+            local_sells += _fill_sell_all_intraday(sym, port, plan, day_data, fill_data)
 
         slot_trade_count[slot] = local_buys + local_sells
         buy_exec_count        += local_buys
