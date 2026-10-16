@@ -17,10 +17,9 @@ A mismatch at a level is reported with the first level it shows up at, since a d
 explains every difference below it. The rows go to fill_check.csv (one per symbol with anything
 to compare) and a summary is printed; nothing here touches the broker except to read.
 
-Known, deliberate differences, which the report names rather than counts as failures:
-  - the trainer sells `sell_qty` at the next OPEN; production sends a limit at today's close
-  - production does not buy a symbol it sells the same day (Alpaca rejects it as a wash trade)
-  - production sizes a buy at decision time against its limit; the trainer at the fill price
+There are no deliberate differences left at the order level: both sides take their orders from
+training_lib.plan_orders (the trainer from its C++ twin), so a difference in orders means a
+difference in intent. The fill level is where the simulator and the broker can still disagree.
 """
 import csv
 import os

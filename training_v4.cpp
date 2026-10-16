@@ -153,6 +153,83 @@ static constexpr float STOP_LOSS_FRAC = 0.90f;
 static inline float buy_stop_price(float buy_price, float close) {
     return std::min(buy_price, close) * STOP_LOSS_FRAC;
 }
+// ── Production's order plan ─────────────────────────────────────────────────────────────────
+// Twin of training_lib.to_cents / size_buy / plan_orders -- keep the three in sync;
+// tests/test_order_plan.py compiles this block and compares it with the Python on random books.
+// Production decides its orders at the close, before anything fills, and the fill simulation
+// fills exactly those: a symbol sold today is not bought (Alpaca: wash trade) and every held
+// symbol gets a sell-all limit, so a held symbol is never added to; buys are sized at the close
+// against the cash the industry HAS (tomorrow's sale proceeds are not in it, and an order that
+// does not fill still used its share of the budget), at the limit, in whole shares; every price
+// is rounded to an increment Alpaca accepts. Before this the simulator re-bought what it had
+// just sold with the proceeds, sized at the fill price -- trades production cannot make
+// (measured on paper 2026-10-14: 16 of 26 holdings matched).
+// Arithmetic in double so the Python twin matches it to the cent.
+static inline double to_cents(double price, int how) {      // how: -1 down, +1 up, 0 nearest
+    const double step = price >= 1.0 ? 0.01 : 0.0001;
+    const double n = price / step;
+    const double k = how < 0 ? std::floor(n + 1e-6) : how > 0 ? std::ceil(n - 1e-6)
+                             : std::nearbyint(n);
+    return std::round(k * step * 10000.0) / 10000.0;
+}
+static inline double size_buy_d(double buy_qty, double price, double cash, double port_value,
+                                double cur_sym_value) {
+    if (buy_qty <= 1e-6 || price <= 0.0) return 0.0;
+    double amount = std::min(buy_qty, cash / price);
+    if (amount <= 1e-6) return 0.0;
+    const double max_spend = std::max(0.0, (double)MAX_SINGLE_STOCK_PCT * port_value - cur_sym_value);
+    amount = std::min(amount, max_spend / price);
+    const double w = std::floor(amount + 1e-4);
+    return w > 0.0 ? w : 0.0;
+}
+struct OrderPlan {
+    float sell_open[IND_SYMS];   // shares sold by market order at the next open
+    float sell_lim[IND_SYMS];    // sell-all limit; 0 = none placed
+    float buy_q[IND_SYMS];       // planned buy, whole shares; 0 = none
+    float buy_lim[IND_SYMS];
+    float buy_stop[IND_SYMS];
+    bool  sold[IND_SYMS];        // a sell was placed: no buy, and no stop beside it
+};
+static void plan_orders(const float* out48, const float* low, const float* high,
+                        const float* close, const unsigned char* valid, const float* hold,
+                        float cash, OrderPlan& p) {
+    double port_value = cash;
+    for (int j = 0; j < IND_SYMS; j++) {
+        p.sell_open[j] = p.sell_lim[j] = p.buy_q[j] = p.buy_lim[j] = p.buy_stop[j] = 0.f;
+        p.sold[j] = false;
+        if (!valid[j]) continue;
+        port_value += (double)hold[j] * close[j];
+        const double lo = low[j], hi = high[j], span = std::max(hi - lo, 1e-9);
+        const double sell_all = lo + (double)out48[4*j+2] * span;
+        const double sell_qty = out48[4*j+3];
+        double cur = hold[j];
+        if (sell_qty > 1e-6 && cur > 1e-6) {
+            const double amount = std::floor(std::min(sell_qty, cur));
+            if (amount >= 1.0) { p.sell_open[j] = (float)amount; cur -= amount; p.sold[j] = true; }
+        }
+        if (cur >= 1.0 && lo <= sell_all && sell_all <= hi) {
+            p.sell_lim[j] = (float)to_cents(sell_all, +1);
+            p.sold[j] = true;
+        }
+    }
+    double remaining = cash;
+    for (int j = 0; j < IND_SYMS; j++) {
+        if (!valid[j] || p.sold[j]) continue;
+        const double lo = low[j], hi = high[j], span = std::max(hi - lo, 1e-9);
+        const double raw = lo + (double)out48[4*j+1] * span;
+        const double buy_qty = out48[4*j+0];
+        if (!(buy_qty > 1e-6 && raw > 0.0 && lo <= raw && raw <= hi)) continue;
+        const double price = to_cents(raw, -1);
+        const double amount = size_buy_d(buy_qty, price, remaining, port_value,
+                                         (double)hold[j] * price);
+        if (amount >= 1.0) {
+            p.buy_q[j]    = (float)amount;
+            p.buy_lim[j]  = (float)price;
+            p.buy_stop[j] = (float)to_cents(buy_stop_price((float)price, close[j]), 0);
+            remaining    -= amount * price;
+        }
+    }
+}
 static constexpr float SEC_FEE_RATE        = 0.0000278f;
 static constexpr float FINRA_TAF_PER_SHARE = 0.000166f;
 static constexpr float FINRA_TAF_MAX       = 8.30f;
@@ -1798,6 +1875,15 @@ static IndResult step_industry(int ind_i, IndustryState& state,
 
     IndResult::SimExec s0[IND_SYMS] = {};
     float out48[48];
+    // The decision day's bar, as plan_orders() reads it: every slot (and every history model)
+    // plans its orders from the same close, the same reference book and the same cash.
+    float d_low[IND_SYMS], d_high[IND_SYMS], d_close[IND_SYMS];
+    unsigned char d_valid[IND_SYMS];
+    for (int j = 0; j < IND_SYMS; j++) {
+        d_valid[j] = day_sym[j].valid ? 1 : 0;
+        d_low[j] = day_sym[j].low; d_high[j] = day_sym[j].high; d_close[j] = day_sym[j].close;
+    }
+    OrderPlan plan;
     for (int slot = 0; slot < N_SLOTS; slot++) {
         Portfolio& port = state.portfolios[slot];
 
@@ -1820,6 +1906,8 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         // its sell returned some. Every cash mutation below happens inside the per-symbol loop, so
         // the attribution is exact rather than apportioned.
         float sym_cash[IND_SYMS] = {};
+        // Production's orders for this slot, decided at the close; the fills below fill these.
+        plan_orders(out48, d_low, d_high, d_close, d_valid, ref_hold, ref_cash, plan);
 
         // ── Phase 1: partial sells, gap sell_all, high-first sell_all, stops, buys ─
         for (int j = 0; j < IND_SYMS; j++) {
@@ -1834,7 +1922,6 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             float span_t = std::max(high_t - low_t, 1e-9f);
             float sell_all_price = low_t + sell_all_price_frac * span_t;
             float buy_price      = low_t + buy_price_frac * span_t;
-            float stop_loss      = buy_stop_price(buy_price, day_sym[j].close);
 
             // Record the deployed model's INTENT before anything is matched against next-day
             // prices. Deliberately placed here, above the fill logic, so it cannot pick up
@@ -1888,14 +1975,18 @@ static IndResult step_industry(int ind_i, IndustryState& state,
 
             bool low_first = seq_flags[ind_i * IND_SYMS + j];
             IndResult::SimExec& ex = s0[j];        // written on slot 0 only
+            // What is filled is the PLAN (production's orders), not the raw outputs above.
+            const float sell_lim = plan.sell_lim[j];
+            const float buy_lim  = plan.buy_lim[j];
             if (slot == 0) {
-                ex.buy_lim = buy_price; ex.sell_all_lim = sell_all_price;
+                ex.buy_lim = buy_lim > 0.f ? buy_lim : buy_price;
+                ex.sell_all_lim = sell_lim > 0.f ? sell_lim : sell_all_price;
                 ex.stop_before = port.stop_prices[j]; ex.low_first = low_first ? 1 : 0;
             }
 
-            // Partial sell at open
-            if (sell_qty > 1e-6f && port.holdings[j] > 1e-6f) {
-                float amt = whole_shares(std::min(sell_qty, port.holdings[j]));
+            // Sell at the next open (production: a market order)
+            if (plan.sell_open[j] > 0.f && port.holdings[j] > 1e-6f) {
+                float amt = std::min(plan.sell_open[j], port.holdings[j]);
                 port.holdings[j] -= amt;
                 port.cash        += sell_net(amt, nd_open);
                 sym_cash[j]        += sell_net(amt, nd_open);
@@ -1904,7 +1995,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             }
 
             // Gap-up sell_all at open
-            if (port.holdings[j] > 1e-6f && nd_open >= sell_all_price) {
+            if (sell_lim > 0.f && port.holdings[j] > 1e-6f && nd_open >= sell_lim) {
                 float amt = port.holdings[j];
                 port.holdings[j] = 0.f;
                 port.cash        += sell_net(amt, nd_open);
@@ -1914,9 +2005,9 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             }
 
             // High-first: intraday sell_all fires before buy
-            if (!low_first && port.holdings[j] > 1e-6f &&
-                nd_low < sell_all_price && sell_all_price < nd_high) {
-                float slipped = sell_all_price * (1.f - SLIPPAGE_RATE);
+            if (sell_lim > 0.f && !low_first && port.holdings[j] > 1e-6f &&
+                nd_low < sell_lim && sell_lim < nd_high) {
+                float slipped = sell_lim * (1.f - SLIPPAGE_RATE);
                 float amt = port.holdings[j];
                 port.holdings[j] = 0.f;
                 port.cash        += sell_net(amt, slipped);
@@ -1925,8 +2016,9 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                 if (slot == 0) { ex.sold_all_q = amt; ex.sold_all_px = slipped; }
             }
 
-            // Stop loss
-            float stop_p = port.stop_prices[j];
+            // Stop loss -- only where production holds one: Alpaca reserves the shares a stop
+            // covers, so a symbol with a sell placed today has its stop cancelled, not re-placed.
+            float stop_p = plan.sold[j] ? 0.f : port.stop_prices[j];
             if (stop_p > 0.f && port.holdings[j] > 1e-6f) {
                 if (nd_open <= stop_p) {
                     float amt = port.holdings[j];
@@ -1946,38 +2038,21 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                 }
             }
 
-            // Limit buy
-            if (buy_qty > 1e-6f && buy_price > 0.f) {
+            // Limit buy: the planned quantity at the planned limit, sized at the close
+            if (plan.buy_q[j] > 0.f) {
                 float fill_price = 0.f;
-                if (nd_open <= buy_price)
+                if (nd_open <= buy_lim)
                     fill_price = nd_open;
-                else if (nd_low < buy_price && buy_price < nd_high)
-                    fill_price = buy_price * (1.f + SLIPPAGE_RATE);
-
+                else if (nd_low < buy_lim && buy_lim < nd_high)
+                    fill_price = buy_lim * (1.f + SLIPPAGE_RATE);
                 if (fill_price > 0.f) {
-                    float affordable = port.cash / fill_price;
-                    float buy_amount = std::min(buy_qty, affordable);
-                    if (buy_amount > 1e-6f) {
-                        // 60% concentration cap
-                        float port_value = port.cash;
-                        for (int k = 0; k < IND_SYMS; k++) {
-                            float cp = fill_sym[k].valid ? fill_sym[k].close :
-                                       day_sym[k].valid  ? day_sym[k].close  : 0.f;
-                            port_value += port.holdings[k] * cp;
-                        }
-                        float cur_sym_val = port.holdings[j] * fill_price;
-                        float max_spend   = std::max(0.f, MAX_SINGLE_STOCK_PCT * port_value - cur_sym_val);
-                        buy_amount = std::min(buy_amount, max_spend / fill_price);
-                    }
-                    buy_amount = whole_shares(buy_amount);
-                    if (buy_amount > 1e-6f) {
-                        port.holdings[j]    += buy_amount;
-                        port.cash           -= buy_amount * fill_price;
-                        sym_cash[j]           -= buy_amount * fill_price;
-                        port.stop_prices[j]  = stop_loss;
-                        local_buy           += buy_amount;
-                        if (slot == 0) { ex.bought_q = buy_amount; ex.bought_px = fill_price; }
-                    }
+                    const float buy_amount = plan.buy_q[j];
+                    port.holdings[j]    += buy_amount;
+                    port.cash           -= buy_amount * fill_price;
+                    sym_cash[j]           -= buy_amount * fill_price;
+                    port.stop_prices[j]  = plan.buy_stop[j];
+                    local_buy           += buy_amount;
+                    if (slot == 0) { ex.bought_q = buy_amount; ex.bought_px = fill_price; }
                 }
             }
         }
@@ -1987,15 +2062,16 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             if (!day_sym[j].valid) continue;
             if (!seq_flags[ind_i * IND_SYMS + j]) continue;  // high-first: skip
 
-            float sell_all_price_frac = out48[4*j+2];
-            float span_t = std::max(day_sym[j].high - day_sym[j].low, 1e-9f);
-            float sell_all_price = day_sym[j].low + sell_all_price_frac * span_t;
+            // Only a sell-all production placed: shares held at the close. A position bought
+            // today has no sell order beside it, so it is not sold back the same day.
+            const float sell_lim = plan.sell_lim[j];
+            if (sell_lim <= 0.f) continue;
 
             float nd_low  = fill_sym[j].valid ? fill_sym[j].low  : day_sym[j].low;
             float nd_high = fill_sym[j].valid ? fill_sym[j].high : day_sym[j].high;
 
-            if (port.holdings[j] > 1e-6f && nd_low < sell_all_price && sell_all_price < nd_high) {
-                float slipped = sell_all_price * (1.f - SLIPPAGE_RATE);
+            if (port.holdings[j] > 1e-6f && nd_low < sell_lim && sell_lim < nd_high) {
+                float slipped = sell_lim * (1.f - SLIPPAGE_RATE);
                 float amt = port.holdings[j];
                 port.holdings[j] = 0.f;
                 port.cash        += sell_net(amt, slipped);
@@ -2058,45 +2134,39 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             port.stop_prices[j] = ref_stop[j];
         }
         stock_forward(W, history_arr, today_arr, out48);
+        OrderPlan hp;
+        plan_orders(out48, d_low, d_high, d_close, d_valid, ref_hold, ref_cash, hp);
         float local_buy = 0.f, local_sell = 0.f;
-        // ── Phase 1: partial sells, gap sell_all, high-first sell_all, stops, buys ─
+        // ── Phase 1: sells at open, gap sell_all, high-first sell_all, stops, buys ─
+        // The same rules as the slot loop above, filling the same plan.
         for (int j = 0; j < IND_SYMS; j++) {
             if (!day_sym[j].valid) continue;
-            float buy_qty             = out48[4*j+0];
-            float buy_price_frac      = out48[4*j+1];
-            float sell_all_price_frac = out48[4*j+2];
-            float sell_qty            = out48[4*j+3];
-            float low_t  = day_sym[j].low;
-            float high_t = day_sym[j].high;
-            float span_t = std::max(high_t - low_t, 1e-9f);
-            float sell_all_price = low_t + sell_all_price_frac * span_t;
-            float buy_price      = low_t + buy_price_frac * span_t;
-            float stop_loss      = buy_stop_price(buy_price, day_sym[j].close);
+            const float sell_lim = hp.sell_lim[j], buy_lim = hp.buy_lim[j];
             float nd_open = fill_sym[j].valid ? fill_sym[j].open  : day_sym[j].close;
             float nd_low  = fill_sym[j].valid ? fill_sym[j].low   : day_sym[j].low;
             float nd_high = fill_sym[j].valid ? fill_sym[j].high  : day_sym[j].high;
             bool low_first = seq_flags[ind_i * IND_SYMS + j];
-            if (sell_qty > 1e-6f && port.holdings[j] > 1e-6f) {
-                float amt = whole_shares(std::min(sell_qty, port.holdings[j]));
+            if (hp.sell_open[j] > 0.f && port.holdings[j] > 1e-6f) {
+                float amt = std::min(hp.sell_open[j], port.holdings[j]);
                 port.holdings[j] -= amt;
                 port.cash        += sell_net(amt, nd_open);
                 local_sell       += amt;
             }
-            if (port.holdings[j] > 1e-6f && nd_open >= sell_all_price) {
+            if (sell_lim > 0.f && port.holdings[j] > 1e-6f && nd_open >= sell_lim) {
                 float amt = port.holdings[j];
                 port.holdings[j] = 0.f;
                 port.cash        += sell_net(amt, nd_open);
                 local_sell       += amt;
             }
-            if (!low_first && port.holdings[j] > 1e-6f &&
-                nd_low < sell_all_price && sell_all_price < nd_high) {
-                float slipped = sell_all_price * (1.f - SLIPPAGE_RATE);
+            if (sell_lim > 0.f && !low_first && port.holdings[j] > 1e-6f &&
+                nd_low < sell_lim && sell_lim < nd_high) {
+                float slipped = sell_lim * (1.f - SLIPPAGE_RATE);
                 float amt = port.holdings[j];
                 port.holdings[j] = 0.f;
                 port.cash        += sell_net(amt, slipped);
                 local_sell       += amt;
             }
-            float stop_p = port.stop_prices[j];
+            float stop_p = hp.sold[j] ? 0.f : port.stop_prices[j];
             if (stop_p > 0.f && port.holdings[j] > 1e-6f) {
                 if (nd_open <= stop_p) {
                     float amt = port.holdings[j];
@@ -2111,33 +2181,17 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                     local_sell       += amt;
                 }
             }
-            if (buy_qty > 1e-6f && buy_price > 0.f) {
+            if (hp.buy_q[j] > 0.f) {
                 float fill_price = 0.f;
-                if (nd_open <= buy_price)
+                if (nd_open <= buy_lim)
                     fill_price = nd_open;
-                else if (nd_low < buy_price && buy_price < nd_high)
-                    fill_price = buy_price * (1.f + SLIPPAGE_RATE);
+                else if (nd_low < buy_lim && buy_lim < nd_high)
+                    fill_price = buy_lim * (1.f + SLIPPAGE_RATE);
                 if (fill_price > 0.f) {
-                    float affordable = port.cash / fill_price;
-                    float buy_amount = std::min(buy_qty, affordable);
-                    if (buy_amount > 1e-6f) {
-                        float port_value = port.cash;
-                        for (int k = 0; k < IND_SYMS; k++) {
-                            float cp = fill_sym[k].valid ? fill_sym[k].close :
-                                       day_sym[k].valid  ? day_sym[k].close  : 0.f;
-                            port_value += port.holdings[k] * cp;
-                        }
-                        float cur_sym_val = port.holdings[j] * fill_price;
-                        float max_spend   = std::max(0.f, MAX_SINGLE_STOCK_PCT * port_value - cur_sym_val);
-                        buy_amount = std::min(buy_amount, max_spend / fill_price);
-                    }
-                    buy_amount = whole_shares(buy_amount);
-                    if (buy_amount > 1e-6f) {
-                        port.holdings[j]    += buy_amount;
-                        port.cash           -= buy_amount * fill_price;
-                        port.stop_prices[j]  = stop_loss;
-                        local_buy           += buy_amount;
-                    }
+                    port.holdings[j]    += hp.buy_q[j];
+                    port.cash           -= hp.buy_q[j] * fill_price;
+                    port.stop_prices[j]  = hp.buy_stop[j];
+                    local_buy           += hp.buy_q[j];
                 }
             }
         }
@@ -2145,13 +2199,12 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         for (int j = 0; j < IND_SYMS; j++) {
             if (!day_sym[j].valid) continue;
             if (!seq_flags[ind_i * IND_SYMS + j]) continue;
-            float sell_all_price_frac = out48[4*j+2];
-            float span_t = std::max(day_sym[j].high - day_sym[j].low, 1e-9f);
-            float sell_all_price = day_sym[j].low + sell_all_price_frac * span_t;
+            const float sell_lim = hp.sell_lim[j];
+            if (sell_lim <= 0.f) continue;
             float nd_low  = fill_sym[j].valid ? fill_sym[j].low  : day_sym[j].low;
             float nd_high = fill_sym[j].valid ? fill_sym[j].high : day_sym[j].high;
-            if (port.holdings[j] > 1e-6f && nd_low < sell_all_price && sell_all_price < nd_high) {
-                float slipped = sell_all_price * (1.f - SLIPPAGE_RATE);
+            if (port.holdings[j] > 1e-6f && nd_low < sell_lim && sell_lim < nd_high) {
+                float slipped = sell_lim * (1.f - SLIPPAGE_RATE);
                 float amt = port.holdings[j];
                 port.holdings[j] = 0.f;
                 port.cash        += sell_net(amt, slipped);

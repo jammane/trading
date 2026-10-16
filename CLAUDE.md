@@ -1270,10 +1270,27 @@ next session it sets the two side by side (`fill_check.compare`) at three levels
   each symbol's holding after the session, simulated against real.
 
 Rows go to `logs/<account>/<mode>/fill_check.csv`; the summary is printed in the session log.
-Known, deliberate differences are named rather than counted: the trainer sells `sell_qty` at the
-next open where production sends a limit at today's close, production does not buy a symbol it
-sells the same day, and production sizes a buy at decision time against its limit where the
-trainer sizes at the fill price.
+**Training trades under production's limits (2026-10-15).** The first two sessions showed the
+simulator making trades production cannot: it re-bought what it had just sold, paid for buys with
+the same morning's sale proceeds, sized at the fill price, and sold positions back the day it
+bought them (16 of 26 holdings matched on 10-14). Production's order rules now live in one place,
+`training_lib.plan_orders`, decided at the close before anything fills:
+
+- a symbol with a sell placed is not bought (Alpaca rejects the buy as a wash trade), and every
+  held symbol gets a sell-all limit, so a held symbol is never added to;
+- buys are sized against the cash the industry has at the close, at the limit, in whole shares,
+  and an order that does not fill still used its share of the budget;
+- a sell-all limit exists only for shares held at the close, so a position bought today is not
+  sold back the same day; a stop exists only where production keeps one (a buy's own stop, or
+  held shares nothing is selling);
+- every price is rounded to an increment Alpaca accepts (`to_cents`);
+- `sell_qty` is a market order at the next open, as the trainer has always filled it (it was a
+  limit at the decision close, so AR stayed held on 10-15 while the trainer sold it).
+
+Production queues the plan; the Python simulators (`step_industry`, `_simulate_one_model`, the
+1-minute bar walker, `inspect_trades.py`) fill it; `plan_orders()` in `training_v4.cpp` is its
+twin, used by the slot loop and the history scorer, and `tests/test_order_plan.py` compiles it and
+compares it with the Python on 300 random books.
 
 **The first check found a real defect.** Production's StockNN history ended *on* the decision
 day, so every day-over-day delta in the `today` input read zero; the trainer's ring ends the day
@@ -1303,14 +1320,18 @@ One pass takes ~17 hours on the droplet, so a Friday-evening start finishes Satu
 3. **Train** one pass: `training_v4_cpp --continue-run --output RUN --passes 1` with the canonical
    settings and the v5 `--race-skip` (`RUN/race_skip.txt`), so every entry a committee could use
    keeps running. A swapped industry is crowned outright (`--crown`): its champion was raised on a
-   symbol it no longer trades.
+   symbol it no longer trades. So is **every** industry when the order rules have changed:
+   `training_lib.ORDER_RULES` is compared with `RUN/order_rules.txt` (missing = v1, before
+   `plan_orders`), and a mismatch crowns all 12, since the old models learned on trades the broker
+   does not make. The file is updated only after the pass succeeds, so a failed pass retries.
 4. **Promote.** Every industry the pass took goes to paper automatically: its daily-training state
    in `cpp/` is deleted (elites, history ring, race models, Adam moments, evolutionary pools, its
    learning rates and step counts in `upkeep_state.txt`), so the next session re-seeds it from
    the new champion exactly as the first paper run seeded from v5; and its StockNN is converted to
    `.pt` now, for inference before the next training day. Both sides are trained through the same
    decision day (Thursday's, filled Friday), so the swap is aligned in time. **Prod** is promoted
-   only for swapped industries, whose old models no longer match the universe.
+   only for crowned industries (a swap, or new order rules), whose old models no longer match
+   what is traded.
 5. **Report** to `RUN/weekly/<date>.md` (and `latest.md`): swaps, champions taken, and the
    committee races re-run on the new champion composite. W1 and L1 are scored as traded (fixed
    members and order) beside the five best configurations of each race, with how many raced
@@ -1383,7 +1404,9 @@ History files per industry:
 
 ### Fill simulation
 
-Orders are placed end-of-day N and filled against next-day OHLCV with `SLIPPAGE_RATE = 0.001` (v2 only). Strict boundary: a buy limit at exactly `nd_low` does not fill.
+Orders are planned end-of-day N by `training_lib.plan_orders` (production's own order rules; see
+**Training trades under production's limits**) and filled against next-day OHLCV with
+`SLIPPAGE_RATE = 0.001`. Strict boundary: a buy limit at exactly `nd_low` does not fill.
 
 ### Diagnostics and data dump
 

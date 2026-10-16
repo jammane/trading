@@ -48,7 +48,7 @@ import yfinance as yf
 
 from fees import BUY_FILL, SLIPPAGE_RATE, _sell_net
 from models import StockNN, stock_close_pos, stock_close_vs_wap
-from training_lib import buy_stop_price
+from training_lib import plan_orders
 from universe import INDUSTRIES
 
 
@@ -268,7 +268,8 @@ def build_input(symbols, histories, day_data, cash, holdings):
 # ── Trade simulation ───────────────────────────────────────────────────────────
 def simulate_trades(symbols, out_tensor, day_data, next_day_data, cash, holdings):
     """
-    Replay the exact trade logic from step_industry.
+    Replay the exact trade logic from step_industry: the orders training_lib.plan_orders plans at
+    the close (production's orders), filled against the next day.
     Returns (trade_records, final_cash, final_holdings, portfolio_value).
 
     portfolio_value uses next_day_data close (fill_data), matching how training_v2
@@ -283,6 +284,8 @@ def simulate_trades(symbols, out_tensor, day_data, next_day_data, cash, holdings
     stop_prices  = {s: 0.0 for s in symbols}
 
     sell_records = {}
+    plan = plan_orders(symbols, {s: out[j].tolist() for j, s in enumerate(symbols)},
+                       cur_holdings, day_data, cash)
 
     # ── SELLS ──────────────────────────────────────────────────────────────
     for j, sym in enumerate(symbols):
@@ -295,7 +298,8 @@ def simulate_trades(symbols, out_tensor, day_data, next_day_data, cash, holdings
         low_t  = day_data[sym]['low']
         high_t = day_data[sym]['high']
         span_t = max(high_t - low_t, 1e-9)
-        sell_all_price = low_t + sell_all_price_frac * span_t
+        sell_all_price = (plan['sell_all'][sym][1] if sym in plan['sell_all']
+                          else low_t + sell_all_price_frac * span_t)
 
         nd_sym  = nd.get(sym, day_data[sym])
         nd_open = nd_sym.get('open',  day_data[sym]['close'])
@@ -321,8 +325,8 @@ def simulate_trades(symbols, out_tensor, day_data, next_day_data, cash, holdings
         }
 
         # Partial sell (sell_qty)
-        if sell_qty > 1e-6 and cur_qty > 1e-6:
-            sell_amount = min(sell_qty, cur_qty)
+        if sym in plan['sell_open']:
+            sell_amount = plan['sell_open'][sym]
             net = _sell_net(sell_amount, nd_open)
             cur_holdings[sym] -= sell_amount
             cur_cash          += net
@@ -395,7 +399,6 @@ def simulate_trades(symbols, out_tensor, day_data, next_day_data, cash, holdings
         high_t = day_data[sym]['high']
         span_t = max(high_t - low_t, 1e-9)
         buy_price = low_t + buy_price_frac * span_t
-        stop_loss = buy_stop_price(buy_price, day_data[sym]['close'])
 
         nd_sym  = nd.get(sym, day_data[sym])
         nd_open = nd_sym.get('open',  day_data[sym]['close'])
@@ -418,6 +421,21 @@ def simulate_trades(symbols, out_tensor, day_data, next_day_data, cash, holdings
             }
             continue
 
+        if sym in plan['sold']:
+            rec['buy_action'] = {
+                'type':   'NO_BUY',
+                'reason': "Sold today, so not bought (production: Alpaca rejects it as a wash trade).",
+            }
+            continue
+
+        if sym not in plan['buys']:
+            rec['buy_action'] = {
+                'type':   'NO_BUY',
+                'reason': "No whole share fits the cash left at the close, or the single-stock cap.",
+            }
+            continue
+        buy_amount, buy_price, stop_loss = plan['buys'][sym]
+
         if nd_open <= buy_price:
             fill_price  = nd_open
             fill_reason = f"Next-day open ${nd_open:.2f} ≤ buy limit ${buy_price:.2f} → gapped below, filled at open."
@@ -436,19 +454,6 @@ def simulate_trades(symbols, out_tensor, day_data, next_day_data, cash, holdings
             }
             continue
 
-        affordable = cur_cash / (fill_price * BUY_FILL)
-        buy_amount = min(buy_qty, affordable)
-
-        if buy_amount <= 1e-6:
-            rec['buy_action'] = {
-                'type':      'BUY_NO_EXEC',
-                'buy_limit': buy_price,
-                'buy_qty':   buy_qty,
-                'reason':    (f"Fill condition met (${fill_price:.2f}) but cash "
-                              f"${cur_cash:.2f} insufficient for even 1 share."),
-            }
-            continue
-
         cost = buy_amount * fill_price * BUY_FILL
         cur_holdings[sym] += buy_amount
         cur_cash          -= cost
@@ -464,7 +469,7 @@ def simulate_trades(symbols, out_tensor, day_data, next_day_data, cash, holdings
             'stop_loss':    stop_loss,
             'reason':       (fill_reason +
                              f" Requested {buy_qty:.4f} sh, "
-                             f"affordable {affordable:.4f} sh → bought {buy_amount:.4f} sh for ${cost:.2f}. "
+                             f"planned at the close {buy_amount:.0f} sh → bought for ${cost:.2f}. "
                              f"Stop-loss set at ${stop_loss:.2f}."),
         }
 

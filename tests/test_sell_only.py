@@ -48,7 +48,6 @@ def test_every_price_is_a_whole_cent_and_rounds_in_the_orders_favour():
     buy = next(x for x in o if x["action"] == "buy")
     raw = 48.0071 + 0.5 * (52.003 - 48.0071)
     assert raw - 0.01 < buy["price"] <= raw                            # a buy never pays more
-    assert all(x["price"] >= 50.0049 for x in o if x["action"] == "sell" and x["symbol"] == "AAA")
     assert pv.to_cents(45.4449, "near") == 45.44 and pv.to_cents(0.123456, "down") == 0.1234
 
 
@@ -116,3 +115,13 @@ def test_a_suspended_symbol_gets_no_orders_while_its_industry_trades():
     sug = {"A": (5, 0.5, 2.0, 0), "B": (5, 0.5, 0.0, 9)}
     orders = pv.plan_industry_orders(syms, sug, {"B": 10.0}, day, 1000.0, {})
     assert orders and all(o["symbol"] == "A" for o in orders)
+
+
+def test_sell_qty_is_a_market_order_at_the_open():
+    # The trainer sells sell_qty at the next open whatever the price; a limit at the decision
+    # close is an order the trainer never models (AR, 2026-10-15: held while the trainer sold).
+    o = plan()
+    aaa = [x for x in o if x["action"] == "sell" and x["symbol"] == "AAA"]
+    assert aaa == [{"symbol": "AAA", "action": "sell", "quantity": 4, "at_open": True}]
+    bbb = [x for x in o if x["action"] == "sell" and x["symbol"] == "BBB"]
+    assert len(bbb) == 1 and not bbb[0].get("at_open") and bbb[0]["price"] == 50.0  # sell-all limit
