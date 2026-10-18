@@ -34,7 +34,7 @@ INDUSTRIES: dict[str, list[str]] = {
     # EVs, autos, travel — already volatile
     'consumer_discretionary': ['PII'  ,'ASO'  ,'OLLI' ,'PVH'  ,'SAH'  ,'SHOO' ,'DAN'  ,'THO'  ,'APTV' ,'WYNN' ,'BKE'  ,'GM'],
     # Streaming, social, gig economy
-    'consumer_services':      ['RBLX' ,'CBRL' ,'SHAK' ,'ZG'   ,'PLNT' ,'CHDN' ,'WH'   ,'GOLF' ,'TNL'  ,'MTCH' ,'NFLX' ,'BYD'],
+    'consumer_services':      ['RBLX' ,'CBRL' ,'SHAK' ,'JOYY'   ,'PLNT' ,'CHDN' ,'WH'   ,'GOLF' ,'TNL'  ,'MTCH' ,'NFLX' ,'BYD'],
     # Biotech / genomics
     'health_care':            ['TMDX' ,'ARWR' ,'CRSP' ,'CDNA' ,'IMVT' ,'CLDX' ,'ATRC' ,'VCEL' ,'CYTK' ,'PTCT' ,'ALKS' ,'LIVN'],
     # Airlines + industrials
