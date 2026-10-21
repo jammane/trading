@@ -1229,6 +1229,12 @@ composite days (0 mismatches) and against `committee_race` in `tests/test_commit
 A failure anywhere in the decision (no state, a missing model) falls back to flat allocation with
 nothing sell-only, and says so.
 
+**The universe is read from `universe_acct0.py` on every run** (`current_industries`), never from
+the copy in `state.json`. Until 2026-10-21 production took its industries from `state.json`, which
+is written on the first run, so the 2026-10-18 swap ZG -> JOYY reached the trainer but not
+production: consumer_services fed ZG's bars in JOYY's place (the 7 intent mismatches of 10-19),
+and the new-symbol hold and the orphaned-position sale could never fire.
+
 **Account size.** Cash and positions are read from Alpaca on every run (they used to come from
 `state.json`, whose defaults are $20,000 and nothing held). The race trained on $25k books per
 industry; paper trades what the account has. Ranking is scale-free through `CN_BOOK`, but dollar
@@ -1324,6 +1330,11 @@ One pass takes ~17 hours on the droplet, so a Friday-evening start finishes Satu
    `training_lib.ORDER_RULES` is compared with `RUN/order_rules.txt` (missing = v1, before
    `plan_orders`), and a mismatch crowns all 12, since the old models learned on trades the broker
    does not make. The file is updated only after the pass succeeds, so a failed pass retries.
+   **When every industry is crowned, three passes are trained instead of one** (~51 hours, so a
+   Friday start finishes Monday evening; the trainer pauses for Monday's paper session). `--crown`
+   applies only to an invocation's **first** pass; the second and third compete with it on the
+   champion rule, so the replacements are the best of three. (Crowning every pass would hand the
+   title to the last one whatever it scored.)
 4. **Promote.** Every industry the pass took goes to paper automatically: its daily-training state
    in `cpp/` is deleted (elites, history ring, race models, Adam moments, evolutionary pools, its
    learning rates and step counts in `upkeep_state.txt`), so the next session re-seeds it from
