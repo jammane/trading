@@ -673,9 +673,11 @@ static bool  g_upkeep = false;
 // pass_reference.csv, so per-pass files and champion records never collide with earlier passes.
 static bool  g_continue  = false;
 static int   g_pass_base = 0;      // passes already in the run (0 for a new run)
-// --crown IND,...: these industries' pass is crowned champion outright at its boundary, whatever
-// the standing champion scored. For an industry whose universe changed (a symbol swap): its
-// champion was raised on a symbol it no longer trades, so its score is no longer comparable.
+// --crown IND,...: these industries' FIRST pass of this invocation is crowned champion outright at
+// its boundary, whatever the standing champion scored. For an industry whose universe changed (a
+// symbol swap) or whose order rules did: its champion was raised on what is no longer traded, so
+// its score is no longer comparable. Later passes of the invocation compete with the crowned one
+// on the ordinary rule -- crowning every pass would hand the title to the last, whatever it scored.
 static std::set<std::string> g_force_crown;
 // CN_BOOK's denominator per industry: the book's starting capital. IND_STARTING_CASH in training;
 // production passes each industry's own, since a paper book is not $25k. race_models.py's
@@ -3675,7 +3677,8 @@ static void pass_boundary(const std::string& out_dir, int pass_num,
             log_msg(std::string("[") + IND_SHORT[i] +
                     "]   pass-seed: champion weights MISSING — falling back to 100% from this pass");
 
-        const bool forced = g_force_crown.count(g_ind_names[i]) > 0;
+        const bool forced = pass_num == g_pass_base + 1 &&
+                            g_force_crown.count(g_ind_names[i]) > 0;
         if (!champ_ok || !have || forced) {
             // First boundary, missing champion, no usable metric, or --crown: this pass becomes
             // the champion outright and the seed is left as-is — the pre-v0.6.3.0 behaviour.
@@ -4433,7 +4436,7 @@ static void print_usage(const char* prog) {
         "          daily step: one day on the real book, state carried in STATE)\n"
         "       %s --continue-run --output RUN --passes N ...  add N passes to an existing run,\n"
         "          numbered after its pass_reference.csv; logs in RUN/continue_p<first pass>\n"
-        "          [--crown IND,...]  crown these industries' pass outright (after a symbol swap)\n",
+        "          [--crown IND,...]  crown these industries' first pass outright (after a symbol swap)\n",
         prog, prog, prog, prog, prog);
 }
 
@@ -5073,7 +5076,7 @@ int main(int argc, char* argv[]) {
         bool known = false;
         for (int i = 0; i < N_IND; i++) known |= (g_ind_names[i] == c);
         if (!known) { fprintf(stderr, "ERROR: --crown: no industry named \"%s\"\n", c.c_str()); return 1; }
-        log_msg("--crown: " + c + "'s pass is crowned outright at its boundary");
+        log_msg("--crown: " + c + "'s first pass is crowned outright at its boundary");
     }
 
     // --no-save: train into a scratch directory and drop it at exit. Writing is REQUIRED for
