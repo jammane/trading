@@ -1364,7 +1364,7 @@ the new state in (paper's real book, book base and pending decision carried over
 kept as `cpp.prev-<date>`), re-points `models/acct0/paper/champion` at `RUN/champion` and converts
 the caught-up StockNN. The next paper run then trains its own last decision day on the real book.
 It also re-runs the committee races, winners and losers, on the run's champion composite
-(`RUN/committee_race_{champions,losers}.{csv,txt}`) and scores W1 and L1 against them in
+(`RUN/committee_race_{champions,losers}.txt`) and scores W1 and L1 against them in
 `RUN/weekly/promote_<date>.md`; committees are never changed automatically. The
 weekly pass refuses to start while any non-upkeep trainer is running, and its run directory
 (`WEEKLY_RUN`) is now `/root/ht_race_v6`.

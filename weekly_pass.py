@@ -394,14 +394,13 @@ def committee_races(run_dir):
     rep = []
     files = race_daily_files(run_dir)
     ref = os.path.join(run_dir, "pass_reference.csv")
-    for flag, out in (([], "committee_race_champions.csv"),
-                      (["--losers"], "committee_race_losers.csv")):
+    for flag, out in (([], "committee_race_champions.txt"),
+                      (["--losers"], "committee_race_losers.txt")):
         dest = os.path.join(run_dir, out)
-        with open(dest.replace(".csv", ".txt"), "w") as f:
+        with open(dest, "w") as f:
             r = sh([sys.executable, "committee_race.py", *files, "--champions", ref, *flag,
-                    "--out", dest], check=False, stdout=f, stderr=subprocess.STDOUT)
-        rep.append(f"- {'loser' if flag else 'winner'} race: rc {r.returncode}, {dest} "
-                   f"(printout {dest.replace('.csv', '.txt')})")
+                    "--top", "40"], check=False, stdout=f, stderr=subprocess.STDOUT)
+        rep.append(f"- {'loser' if flag else 'winner'} race: rc {r.returncode}, {dest}")
     return rep
 
 
