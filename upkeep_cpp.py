@@ -163,9 +163,9 @@ def reseed_bayes(state_dir, race_daily, pass_reference):
     set of champions: the old posterior described the returns of models that no longer trade."""
     bayes, inds = composite_bayes(race_daily, pass_reference)
     p = os.path.join(state_dir, STATE_FILE)
-    lines = [ln for ln in open(p).read().splitlines() if not ln.startswith("bayes ")]
-    lines += [f"bayes {ind} {mu!r} {m2!r} {w!r}" for ind, (mu, m2, w) in
-              ((i, bayes[i]) for i in inds)]
+    with open(p) as f:
+        lines = [ln for ln in f.read().splitlines() if not ln.startswith("bayes ")]
+    lines += ["bayes {} {!r} {!r} {!r}".format(ind, *bayes[ind]) for ind in inds]
     with open(p + ".tmp", "w") as f:
         f.write("\n".join(lines) + "\n")
     os.replace(p + ".tmp", p)
