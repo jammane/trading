@@ -1349,6 +1349,9 @@ One pass takes ~17 hours on the droplet, so a Friday-evening start finishes Satu
    configurations beat them. **Committees are never changed automatically**; that decision is
    made from this report.
 
+`weekly_pass.py --swap-only` runs step 2 alone (swap, commit to dev and paper, no pass), for a
+delisting mid-week or to fix the universe before a fresh run.
+
 **Continuing a run.** `--continue-run` numbers the new passes after the last one in
 `pass_reference.csv`, so `race_p<N>_*` snapshots and champion records never collide, and writes
 the invocation's logs (`race_daily.csv`, `holdings_log.csv`, the binary logs) to

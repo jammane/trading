@@ -27,6 +27,7 @@ champions paper trades:
 The report goes to <run>/weekly/<date>.md and stdout.
 
     python weekly_pass.py [--dry-run]     # from the dev worktree
+    python weekly_pass.py --swap-only     # step 2 alone: before a fresh run, or a mid-week delisting
 """
 import argparse
 import datetime as dt
@@ -325,6 +326,8 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true",
                     help="report what would be swapped and promoted; train, commit and change nothing")
     ap.add_argument("--run-dir", default=RUN_DIR)
+    ap.add_argument("--swap-only", action="store_true",
+                    help="make the swaps due now (commit to dev and paper) and stop: no pass")
     a = ap.parse_args(argv)
     today = dt.date.today().isoformat()
     rep = [f"# Weekly pass {today}", ""]
@@ -388,6 +391,10 @@ def main(argv=None):
         if not ok:
             rep.append("- **CONCERN: the swap commit did not apply to paper; paper keeps the old "
                        "universe until it is merged by hand**")
+
+    if a.swap_only:
+        print("\n".join(rep + ["", "- swap only: no pass trained"]))
+        return 0
 
     # 3. train
     from training_lib import ORDER_RULES
