@@ -46,7 +46,7 @@ INDUSTRIES: dict[str, list[str]] = {
     # Clean energy / renewables
     'utilities':              ['SEDG' ,'ENPH' ,'CWEN' ,'HASI' ,'CWT'  ,'NWE'  ,'UGI'  ,'SR'   ,'OGS'  ,'NJR'  ,'SWX'  ,'POR'],
     # Homebuilders + proptech
-    'real_estate':            ['LGIH' ,'Z'    ,'TREX' ,'SKY'  ,'PATK' ,'BCC'  ,'BZH'  ,'HNI'  ,'LEN'  ,'KBH'  ,'UFPI' ,'MAS'],
+    'real_estate':            ['LGIH' ,'Z'    ,'TREX' ,'SKY'  ,'PATK' ,'BCC'  ,'CARR'  ,'HNI'  ,'LEN'  ,'KBH'  ,'UFPI' ,'MAS'],
     # Volatile precious-metal miners
     'materials':              ['MP'   ,'SSRM' ,'AA'   ,'PAAS' ,'AGI'  ,'GFI'  ,'MEOH' ,'SQM'  ,'FCX'  ,'NGVT' ,'TECK' ,'ASH'],
 }
