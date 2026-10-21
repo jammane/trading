@@ -26,6 +26,18 @@ entry is in its commit message.
   market; on paper, Alpaca cancelled SSRM's stop the moment its buy filled. The rule is one helper
   (`buy_stop_price`) shared by production, the C++ trainer and the Python simulator, so the models
   train on the stops the broker holds. `tests/test_buy_stop.py` pins the C++ twin.
+- **Replacing every model trains three passes, not one.** When the weekly pass crowns all 12
+  industries (new order rules), it trains three passes: `--crown` now applies only to an
+  invocation's first pass, and the other two compete with it on the champion rule, so the new
+  models are the best of three rather than whatever a single pass produced.
+
+### Fixed
+- **Production now trades the current universe.** `production_v2` read its industries from
+  `state.json`, written on the first run and never refreshed, so a symbol swap reached the trainer
+  but not production. After the 2026-10-18 swap ZG -> JOYY, production kept feeding ZG's bars in
+  JOYY's place: all 7 of the session's intent mismatches were in consumer_services, and neither the
+  new-symbol hold nor the orphaned-position sale could fire. `tests/test_production_universe.py`
+  pins it.
 
 ---
 

@@ -142,6 +142,32 @@ def test_crowned_reads_the_pass_rows(tmp_path):
     assert got["energy"][1] == pytest.approx(20.0)
 
 
+def test_crowned_over_three_passes_reads_the_final_champion(tmp_path):
+    # pass 11 crowns both; 12 beats energy's p11; materials keeps p11 through 13
+    p = tmp_path / "pass_reference.csv"
+    p.write_text("# pass_reference v2\npass,industry,day_start,day_end,champ_pass,champ_pct,"
+                 "chal_pass,chal_pct,regime,share_new,slots_new,new_champ_pass,new_champ_pct\n"
+                 "10,energy,18,1255,4,+0.001,10,+0.0005,x,0.4,8,4,+0.00100000\n"
+                 "11,energy,18,1255,11,+0.001,0,+0.0,crown,1.0,20,11,+0.00100000\n"
+                 "11,materials,18,1255,11,+0.002,0,+0.0,crown,1.0,20,11,+0.00200000\n"
+                 "12,energy,18,1255,11,+0.001,12,+0.003,both+,0.7,14,12,+0.00300000\n"
+                 "12,materials,18,1255,11,+0.002,12,+0.001,both+,0.4,8,11,+0.00200000\n"
+                 "13,energy,18,1255,12,+0.003,13,+0.002,both+,0.4,8,12,+0.00300000\n"
+                 "13,materials,18,1255,11,+0.002,13,+0.001,both+,0.4,8,11,+0.00200000\n")
+    got = wp.crowned(str(p), 11, 13)
+    assert got["energy"][3] == 12 and got["energy"][1] == pytest.approx(30.0)
+    assert got["materials"][3] == 11 and got["materials"][0] == "crown"
+    assert wp.last_pass(str(p)) == 13 and wp.last_pass(str(tmp_path / "none.csv")) == 0
+
+
+def test_three_passes_only_when_every_industry_is_replaced():
+    inds = {"energy": [], "materials": [], "utilities": []}
+    assert wp.passes_for(inds, []) == 1
+    assert wp.passes_for(inds, ["energy"]) == 1                  # a swap: one pass
+    assert wp.passes_for(inds, ["energy", "materials"]) == 1
+    assert wp.passes_for(inds, sorted(inds)) == 3                # new order rules: all of them
+
+
 def test_screener_names_take_the_em_dash():
     vocab = {"Software\u2014Application", "Semiconductors"}
     assert rp.screener_name("Software - Application", vocab) == "Software\u2014Application"
