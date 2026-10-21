@@ -1352,6 +1352,15 @@ One pass takes ~17 hours on the droplet, so a Friday-evening start finishes Satu
 `weekly_pass.py --swap-only` runs step 2 alone (swap, commit to dev and paper, no pass), for a
 delisting mid-week or to fix the universe before a fresh run.
 
+**A fresh run replaces the champions** (v6, from random weights, after the order-rules change).
+`weekly_pass.py --promote-run RUN` promotes all 12 of a finished run's champions to paper: it
+re-points `models/acct0/paper/champion` at `RUN/champion`, clears every industry's daily-training
+state and converts its StockNN (the weekly promotion, for all 12), and replays the bayes posterior
+from the run's champion composite (`upkeep_cpp.reseed_bayes`; the value curves and dates are
+kept). It waits out the trading lock and the 16:45-17:50 ET window around the paper run. The
+weekly pass refuses to start while any non-upkeep trainer is running, and its run directory
+(`WEEKLY_RUN`) is now `/root/ht_race_v6`.
+
 **Continuing a run.** `--continue-run` numbers the new passes after the last one in
 `pass_reference.csv`, so `race_p<N>_*` snapshots and champion records never collide, and writes
 the invocation's logs (`race_daily.csv`, `holdings_log.csv`, the binary logs) to

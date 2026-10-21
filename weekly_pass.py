@@ -28,6 +28,7 @@ The report goes to <run>/weekly/<date>.md and stdout.
 
     python weekly_pass.py [--dry-run]     # from the dev worktree
     python weekly_pass.py --swap-only     # step 2 alone: before a fresh run, or a mid-week delisting
+    python weekly_pass.py --promote-run RUN   # a fresh run's champions replace all 12 on paper
 """
 import argparse
 import datetime as dt
@@ -43,7 +44,7 @@ from pathlib import Path
 
 import numpy as np
 
-RUN_DIR = os.environ.get("WEEKLY_RUN", "/root/ht_race_v5")
+RUN_DIR = os.environ.get("WEEKLY_RUN", "/root/ht_race_v6")
 PAPER_REPO = os.environ.get("PAPER_REPO", "/root/trading")
 ACCOUNT = "acct0"
 LOCK = os.environ.get("TRADING_LOCK_PATH", "/run/trading/trading_active.lock")
@@ -294,6 +295,61 @@ def wait_for_trading(lock=LOCK, poll=60, limit=4 * 3600):
         time.sleep(poll)
 
 
+def in_trading_window(now=None):
+    """Weekdays 16:45-17:50 ET, around the 17:05 paper run: a promotion started here could still
+    be clearing state when production reads it, before production has taken its lock."""
+    now = now or dt.datetime.now()
+    return now.weekday() < 5 and dt.time(16, 45) <= now.time() < dt.time(17, 50)
+
+
+def wait_for_quiet(poll=60):
+    while in_trading_window():
+        time.sleep(poll)
+    wait_for_trading()
+
+
+def trainer_running():
+    """Is any training_v4_cpp (other than a production --upkeep day) running?"""
+    r = subprocess.run(["pgrep", "-af", "training_v4_cpp"], capture_output=True, text=True)
+    return [ln for ln in r.stdout.splitlines() if "--upkeep" not in ln and "pgrep" not in ln]
+
+
+def promote_run(run_dir, paper_dir, prod_dir):
+    """A fresh run's champions replace every industry on paper: paper's champion/ seed points at
+    the run's, every industry's daily-training state is cleared and its StockNN converted (as the
+    weekly pass does for the industries it takes), and the bayes posterior is replayed from the
+    run's champion composite. -> report lines."""
+    import upkeep_cpp
+    champ = os.path.join(run_dir, "champion")
+    ref = os.path.join(run_dir, "pass_reference.csv")
+    inds = list(json.loads(Path("universe.json").read_text()))
+    missing = [i for i in inds if not os.path.exists(os.path.join(champ, f"{i}_elite_0.bin"))]
+    if missing:
+        raise RuntimeError(f"{champ} has no champion for {', '.join(missing)}; nothing promoted")
+    link = os.path.join(paper_dir, "champion")
+    if os.path.islink(link):
+        os.remove(link)
+    elif os.path.exists(link):
+        os.rename(link, link + ".old")
+    os.symlink(champ, link)
+    n = promote(paper_dir, champ, inds)
+    rep = [f"- paper: champion/ -> {champ}; promoted all {len(inds)} ({n} state files reset)"]
+    state = os.path.join(paper_dir, "cpp")
+    if os.path.exists(os.path.join(state, upkeep_cpp.STATE_FILE)):
+        mu = upkeep_cpp.reseed_bayes(state, race_daily_files(run_dir), ref)
+        rep.append("- bayes posterior replayed from the run's champion composite: " + ", ".join(
+            f"{i} {m * 1e4:+.1f}" for i, m in mu.items()) + " bp/day")
+    if os.path.isdir(prod_dir):
+        promote(prod_dir, champ, inds, reset_state=False)
+        rep.append(f"- prod: promoted all {len(inds)}")
+    else:
+        rep.append(f"- prod: {prod_dir} does not exist (prod not set up); nothing promoted")
+    won = crowned(ref, 1, last_pass(ref))
+    rep.append("- champions: " + ", ".join(f"{i} p{c} ({s:+.2f} bp/day)"
+                                            for i, (_, s, _, c) in sorted(won.items())))
+    return rep
+
+
 def last_bar_dates_and_closes(symbols, data_dir="stock_data"):
     dates, closes = {}, {}
     for s in symbols:
@@ -328,11 +384,26 @@ def main(argv=None):
     ap.add_argument("--run-dir", default=RUN_DIR)
     ap.add_argument("--swap-only", action="store_true",
                     help="make the swaps due now (commit to dev and paper) and stop: no pass")
+    ap.add_argument("--promote-run", metavar="RUN",
+                    help="promote a finished fresh run's champions to every industry and stop")
     a = ap.parse_args(argv)
     today = dt.date.today().isoformat()
     rep = [f"# Weekly pass {today}", ""]
     paper_dir = os.path.join(PAPER_REPO, "models", ACCOUNT, "paper")
     prod_dir = os.path.join(PAPER_REPO, "models", ACCOUNT, "prod")
+
+    if a.promote_run:
+        wait_for_quiet()
+        rep = [f"# Promotion of {a.promote_run} {today}", ""] + promote_run(
+            a.promote_run, paper_dir, prod_dir)
+        os.makedirs(os.path.join(a.promote_run, "weekly"), exist_ok=True)
+        Path(a.promote_run, "weekly", f"promote_{today}.md").write_text("\n".join(rep) + "\n")
+        print("\n".join(rep))
+        return 0
+    busy = trainer_running()
+    if busy and not a.dry_run:
+        print("a trainer is running; the weekly pass waits for it to finish:\n  " + "\n  ".join(busy))
+        return 1
 
     wait_for_trading()
     if not a.dry_run:

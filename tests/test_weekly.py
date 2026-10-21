@@ -186,3 +186,28 @@ def test_new_order_rules_crown_every_industry(tmp_path):
     # the rules move on again
     crown, _ = wp.rules_crown(tmp_path, inds, ["energy"], 3)
     assert crown == sorted(inds)
+
+
+def test_trading_window_is_weekday_around_the_paper_run():
+    import datetime as dt
+    wed = dt.date(2026, 10, 21)
+
+    def at(h, m, d=wed):
+        return dt.datetime.combine(d, dt.time(h, m))
+
+    assert wp.in_trading_window(at(16, 45)) and wp.in_trading_window(at(17, 49))
+    assert not wp.in_trading_window(at(16, 44)) and not wp.in_trading_window(at(17, 50))
+    assert not wp.in_trading_window(at(17, 5, dt.date(2026, 10, 24)))      # Saturday
+
+
+def test_promote_run_refuses_a_run_missing_a_champion(tmp_path, monkeypatch):
+    run = tmp_path / "run"
+    (run / "champion").mkdir(parents=True)
+    (run / "champion" / "energy_elite_0.bin").write_bytes(b"")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "universe.json").write_text('{"energy": [], "materials": []}')
+    paper = tmp_path / "paper"
+    paper.mkdir()
+    with pytest.raises(RuntimeError, match="materials"):
+        wp.promote_run(str(run), str(paper), str(tmp_path / "prod"))
+    assert not (paper / "champion").exists()        # nothing touched

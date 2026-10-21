@@ -139,16 +139,37 @@ def seed_state(state_dir, race_daily, pass_reference):
     industry's slot-0 return from its champion pass -- so the allocator starts where the race
     left it rather than abstaining for its warm-up. The value curves stay empty; the trainer
     rebuilds them from the bars on its first day. Refuses to overwrite an existing state."""
-    import committee_race as cr
     if read_state(state_dir) is not None:
         raise FileExistsError(f"{state_dir}/{STATE_FILE} exists; not overwriting a live state")
+    bayes, inds = composite_bayes(race_daily, pass_reference)
+    write_state(state_dir, dict(bayes=bayes), inds)
+    return {ind: bayes[ind][0] for ind in inds}
+
+
+def composite_bayes(race_daily, pass_reference):
+    """-> ({industry: (mu, m2, w)}, industries): the bayes posterior after replaying a run's
+    champion composite through the trainer's update."""
+    import committee_race as cr
     entries, passes = cr.load(race_daily)
     comp = cr.champion_composite(entries, passes, cr.read_champions(pass_reference))
     mu, m2, w = bayes_replay((comp["real"] / 1e4).tolist(), comp["ok"].tolist())
     inds = comp["inds"]
-    write_state(state_dir, dict(bayes={ind: (mu[i], m2[i], w[i]) for i, ind in enumerate(inds)}),
-                inds)
-    return {ind: mu[i] for i, ind in enumerate(inds)}
+    return {ind: (mu[i], m2[i], w[i]) for i, ind in enumerate(inds)}, inds
+
+
+def reseed_bayes(state_dir, race_daily, pass_reference):
+    """Replace a live state's bayes posterior with one replayed from a new run's champion
+    composite, leaving every other line (date, value curves, learning rates) as it is. For a new
+    set of champions: the old posterior described the returns of models that no longer trade."""
+    bayes, inds = composite_bayes(race_daily, pass_reference)
+    p = os.path.join(state_dir, STATE_FILE)
+    lines = [ln for ln in open(p).read().splitlines() if not ln.startswith("bayes ")]
+    lines += [f"bayes {ind} {mu!r} {m2!r} {w!r}" for ind, (mu, m2, w) in
+              ((i, bayes[i]) for i in inds)]
+    with open(p + ".tmp", "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(p + ".tmp", p)
+    return {ind: bayes[ind][0] for ind in inds}
 
 
 def run_upkeep(binary, book_path, state_dir, seed_dir, race_only, log_path,

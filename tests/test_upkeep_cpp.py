@@ -63,6 +63,22 @@ def test_state_round_trip(tmp_path):
         assert back[k] == st[k], k
 
 
+def test_reseed_bayes_replaces_only_the_posterior(tmp_path, monkeypatch):
+    st = dict(date="2026-10-09", hist_count=2,
+              mkt={"ind_a": [1.0, 2.0], "ind_b": [3.0, 4.0]},
+              pf={"ind_a": [5.0, 6.0], "ind_b": [7.0, 8.0]},
+              bayes={"ind_a": (0.001, 0.02, 49.5), "ind_b": (-0.002, 0.01, 30.0)},
+              kv={"lr TANH32___grad ind_a": 0.003, "adam_step MT1______grdC": 1234.0})
+    u.write_state(str(tmp_path), st, list(UNI))
+    new = {"ind_a": (0.004, 0.03, 60.0), "ind_b": (0.0005, 0.02, 60.0)}
+    monkeypatch.setattr(u, "composite_bayes", lambda rd, pr: (new, ["ind_a", "ind_b"]))
+    mu = u.reseed_bayes(str(tmp_path), "unused.csv", "unused.csv")
+    back = u.read_state(str(tmp_path))
+    assert back["bayes"] == new and mu == {"ind_a": 0.004, "ind_b": 0.0005}
+    for k in ("date", "hist_count", "mkt", "pf", "kv"):
+        assert back[k] == st[k], k
+
+
 def test_absent_state_reads_as_none(tmp_path):
     assert u.read_state(str(tmp_path)) is None
 
