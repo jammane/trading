@@ -6,6 +6,8 @@ promoting a champion clears exactly its own industry's daily-training state -- n
 industry's, whose names can share words with it.
 """
 import math
+import os
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -211,3 +213,61 @@ def test_promote_run_refuses_a_run_missing_a_champion(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="materials"):
         wp.promote_run(str(run), str(paper), str(tmp_path / "prod"))
     assert not (paper / "champion").exists()        # nothing touched
+
+
+def test_promote_run_catches_up_then_swaps_in_the_new_state(tmp_path, monkeypatch):
+    import production_v2
+    import upkeep_cpp
+    run, paper = tmp_path / "ht_race_v9", tmp_path / "paper"
+    (run / "champion").mkdir(parents=True)
+    for ind in ("energy", "materials"):
+        (run / "champion" / f"{ind}_elite_0.bin").write_bytes(b"x")
+    (run / "pass_reference.csv").write_text(
+        "# pass_reference v2\npass,industry,day_start,day_end,champ_pass,champ_pct,chal_pass,"
+        "chal_pct,regime,share_new,slots_new,new_champ_pass,new_champ_pct\n"
+        "1,energy,18,1255,1,+0.001,0,+0.0,seed,1.0,20,1,+0.00100000\n"
+        "1,materials,18,1255,1,+0.002,0,+0.0,seed,1.0,20,1,+0.00200000\n")
+    live = paper / "cpp"
+    live.mkdir(parents=True)
+    for f in wp.LIVE_STATE_FILES + ("upkeep_state.txt", "energy_elite_0.bin"):
+        (live / f).write_text("old " + f)
+    (paper / "champion").symlink_to(tmp_path)              # the previous run's
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "universe.json").write_text('{"energy": [], "materials": []}')
+    monkeypatch.setattr(wp, "PAPER_REPO", str(tmp_path))
+    calls = []
+
+    def seed(state, files, ref):
+        os.makedirs(state)
+        Path(state, "upkeep_state.txt").write_text("new")
+
+    def catch(binary, state, seed_dir, race_only, book, log, archive=None):
+        calls.append((state, seed_dir, book))
+        Path(state, "book_catchup.txt").write_text("b")
+        Path(state, "energy_elite_0.bin").write_text("new elite")
+        return 3 if len(calls) == 1 else 1
+
+    monkeypatch.setattr(upkeep_cpp, "seed_state", seed)
+    monkeypatch.setattr(upkeep_cpp, "race_book", lambda run_dir, path: "2026-10-21")
+    monkeypatch.setattr(upkeep_cpp, "catch_up", catch)
+    monkeypatch.setattr(upkeep_cpp, "read_state", lambda d: {"date": "2026-10-28"})
+    monkeypatch.setattr(wp, "wait_for_quiet", lambda: calls.append("quiet"))
+    converted = []
+    monkeypatch.setattr(production_v2, "convert_stocknn", lambda s, m: converted.append(s))
+    rep = wp.promote_run(str(run), str(paper), str(tmp_path / "prod"))
+
+    # caught up before the quiet wait, topped up after it, both from the run's champions
+    assert calls[1] == "quiet" and calls[0][1] == calls[2][1] == str(run / "champion")
+    assert calls[0][0] == str(paper / "cpp.ht_race_v9")
+    # the new state is live, carrying paper's own files; the old one is kept
+    assert (live / "energy_elite_0.bin").read_text() == "new elite"
+    assert (live / "upkeep_state.txt").read_text() == "new"
+    for f in wp.LIVE_STATE_FILES:
+        assert (live / f).read_text() == "old " + f
+    prev = [p for p in paper.iterdir() if p.name.startswith("cpp.prev-")]
+    assert len(prev) == 1 and (prev[0] / "energy_elite_0.bin").read_text() == "old energy_elite_0.bin"
+    assert not (paper / "cpp.ht_race_v9").exists()
+    assert os.readlink(paper / "champion") == str(run / "champion")
+    assert converted == [str(live)]
+    assert any("2026-10-21" in r and "2026-10-28" in r and "4 session" in r for r in rep)
+

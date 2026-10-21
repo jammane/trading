@@ -314,11 +314,22 @@ def trainer_running():
     return [ln for ln in r.stdout.splitlines() if "--upkeep" not in ln and "pgrep" not in ln]
 
 
-def promote_run(run_dir, paper_dir, prod_dir):
-    """A fresh run's champions replace every industry on paper: paper's champion/ seed points at
-    the run's, every industry's daily-training state is cleared and its StockNN converted (as the
-    weekly pass does for the industries it takes), and the bayes posterior is replayed from the
-    run's champion composite. -> report lines."""
+LIVE_STATE_FILES = ("book_next.txt", "book_base.json", "pending_decision.json",
+                    "pending_decision.json.settled")     # paper's own, not the models'
+
+
+def promote_run(run_dir, paper_dir, prod_dir, binary="build/training_v4_cpp"):
+    """A fresh run's champions replace every industry on paper, caught up to the present first.
+
+    The run's data ends the day it started, so its champions are days behind. A new daily-training
+    state is built beside the live one (cpp.<run>): seeded from the run (bayes posterior replayed
+    from its champion composite), then trained one --upkeep per session from the run's last
+    decision day on its champions' simulated books, through the newest session in stock_data --
+    as paper's first state was built from v5. Only then, outside the paper run, is it swapped in
+    with paper's own files (real book, book base, pending decision) carried over, paper's
+    champion/ re-pointed at the run's, and the caught-up StockNN converted. The old state is kept
+    as cpp.prev-<date>. -> report lines."""
+    import production_v2
     import upkeep_cpp
     champ = os.path.join(run_dir, "champion")
     ref = os.path.join(run_dir, "pass_reference.csv")
@@ -326,19 +337,41 @@ def promote_run(run_dir, paper_dir, prod_dir):
     missing = [i for i in inds if not os.path.exists(os.path.join(champ, f"{i}_elite_0.bin"))]
     if missing:
         raise RuntimeError(f"{champ} has no champion for {', '.join(missing)}; nothing promoted")
+    name = os.path.basename(os.path.normpath(run_dir))
+    live = os.path.join(paper_dir, "cpp")
+    stage = os.path.join(paper_dir, f"cpp.{name}")
+    logs = os.path.join(PAPER_REPO, "logs", ACCOUNT, "paper")
+    log = os.path.join(logs, f"upkeep_cpp_catchup_{name}.log")
+    archive = os.path.join(logs, f"training_catchup_{name}")
+    if os.path.exists(stage):
+        shutil.rmtree(stage)
+    upkeep_cpp.seed_state(stage, race_daily_files(run_dir), ref)
+    book = os.path.join(stage, "book_race_end.txt")
+    start = upkeep_cpp.race_book(run_dir, book)
+    race_only = list(production_v2.UPKEEP_RACE_ONLY)
+    n = upkeep_cpp.catch_up(binary, stage, champ, race_only, book, log, archive=archive)
+    wait_for_quiet()
+    # a session may have arrived while waiting; catch_up skips the days it already trained
+    n += upkeep_cpp.catch_up(binary, stage, champ, race_only,
+                             os.path.join(stage, "book_catchup.txt"), log, archive=archive)
+    through = upkeep_cpp.read_state(stage)["date"]
+    for f in LIVE_STATE_FILES:
+        if os.path.exists(os.path.join(live, f)):
+            shutil.copy2(os.path.join(live, f), os.path.join(stage, f))
+    if os.path.exists(live):
+        os.rename(live, os.path.join(paper_dir, f"cpp.prev-{dt.date.today().isoformat()}"))
+    os.rename(stage, live)
     link = os.path.join(paper_dir, "champion")
     if os.path.islink(link):
         os.remove(link)
     elif os.path.exists(link):
         os.rename(link, link + ".old")
     os.symlink(champ, link)
-    n = promote(paper_dir, champ, inds)
-    rep = [f"- paper: champion/ -> {champ}; promoted all {len(inds)} ({n} state files reset)"]
-    state = os.path.join(paper_dir, "cpp")
-    if os.path.exists(os.path.join(state, upkeep_cpp.STATE_FILE)):
-        mu = upkeep_cpp.reseed_bayes(state, race_daily_files(run_dir), ref)
-        rep.append("- bayes posterior replayed from the run's champion composite: " + ", ".join(
-            f"{i} {m * 1e4:+.1f}" for i, m in mu.items()) + " bp/day")
+    production_v2.convert_stocknn(live, paper_dir)
+    rep = [f"- paper: champion/ -> {champ}; all {len(inds)} industries on a new daily state",
+           f"- caught up from {start} (the run's last decision day) through {through}: {n} "
+           f"session(s) trained on simulated books (log {log})",
+           "- bayes posterior replayed from the run's champion composite"]
     if os.path.isdir(prod_dir):
         promote(prod_dir, champ, inds, reset_state=False)
         rep.append(f"- prod: promoted all {len(inds)}")
@@ -347,6 +380,23 @@ def promote_run(run_dir, paper_dir, prod_dir):
     won = crowned(ref, 1, last_pass(ref))
     rep.append("- champions: " + ", ".join(f"{i} p{c} ({s:+.2f} bp/day)"
                                             for i, (_, s, _, c) in sorted(won.items())))
+    return rep
+
+
+def committee_races(run_dir):
+    """The full committee races, winners and losers, on a run's champion composite, written beside
+    it. Report only: the committees paper trades are never changed automatically."""
+    rep = []
+    files = race_daily_files(run_dir)
+    ref = os.path.join(run_dir, "pass_reference.csv")
+    for flag, out in (([], "committee_race_champions.csv"),
+                      (["--losers"], "committee_race_losers.csv")):
+        dest = os.path.join(run_dir, out)
+        with open(dest.replace(".csv", ".txt"), "w") as f:
+            r = sh([sys.executable, "committee_race.py", *files, "--champions", ref, *flag,
+                    "--out", dest], check=False, stdout=f, stderr=subprocess.STDOUT)
+        rep.append(f"- {'loser' if flag else 'winner'} race: rc {r.returncode}, {dest} "
+                   f"(printout {dest.replace('.csv', '.txt')})")
     return rep
 
 
@@ -393,9 +443,14 @@ def main(argv=None):
     prod_dir = os.path.join(PAPER_REPO, "models", ACCOUNT, "prod")
 
     if a.promote_run:
-        wait_for_quiet()
         rep = [f"# Promotion of {a.promote_run} {today}", ""] + promote_run(
             a.promote_run, paper_dir, prod_dir)
+        rep += ["", "## Committees (report only)"]
+        for f in (committee_races, committee_report):
+            try:
+                rep += f(a.promote_run)
+            except Exception as e:
+                rep.append(f"- {f.__name__} failed: {e}")
         os.makedirs(os.path.join(a.promote_run, "weekly"), exist_ok=True)
         Path(a.promote_run, "weekly", f"promote_{today}.md").write_text("\n".join(rep) + "\n")
         print("\n".join(rep))

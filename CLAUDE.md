@@ -1353,11 +1353,19 @@ One pass takes ~17 hours on the droplet, so a Friday-evening start finishes Satu
 delisting mid-week or to fix the universe before a fresh run.
 
 **A fresh run replaces the champions** (v6, from random weights, after the order-rules change).
-`weekly_pass.py --promote-run RUN` promotes all 12 of a finished run's champions to paper: it
-re-points `models/acct0/paper/champion` at `RUN/champion`, clears every industry's daily-training
-state and converts its StockNN (the weekly promotion, for all 12), and replays the bayes posterior
-from the run's champion composite (`upkeep_cpp.reseed_bayes`; the value curves and dates are
-kept). It waits out the trading lock and the 16:45-17:50 ET window around the paper run. The
+`weekly_pass.py --promote-run RUN` promotes all 12 of a finished run's champions to paper,
+**caught up to the present first**: the run's data ends the day it started, a week before it
+finishes. It builds a new daily-training state beside the live one (`cpp.<run>`), seeded from the
+run (bayes posterior replayed from its champion composite), and trains it one `--upkeep` per
+session from the run's last decision day on its champions' simulated books through the newest
+session in `stock_data` -- as paper's first state was built from v5 (`upkeep_cpp seed` +
+`catch-up`). Outside the 16:45-17:50 ET window and the trading lock it tops the catch-up up, swaps
+the new state in (paper's real book, book base and pending decision carried over; the old state
+kept as `cpp.prev-<date>`), re-points `models/acct0/paper/champion` at `RUN/champion` and converts
+the caught-up StockNN. The next paper run then trains its own last decision day on the real book.
+It also re-runs the committee races, winners and losers, on the run's champion composite
+(`RUN/committee_race_{champions,losers}.{csv,txt}`) and scores W1 and L1 against them in
+`RUN/weekly/promote_<date>.md`; committees are never changed automatically. The
 weekly pass refuses to start while any non-upkeep trainer is running, and its run directory
 (`WEEKLY_RUN`) is now `/root/ht_race_v6`.
 
