@@ -13,7 +13,9 @@ champions paper trades:
               (--crown), since its champion was raised on a symbol it no longer trades. When the
               order rules (training_lib.ORDER_RULES) differ from those the run's champions were
               trained under (<run>/order_rules.txt), EVERY industry is crowned: the old models
-              learned on trades the broker does not make
+              learned on trades the broker does not make. When every industry is crowned, three
+              passes are trained instead of one: the first is crowned and the other two compete
+              with it on the champion rule, so the replacements are the best of three
   4. promote  every industry whose champion changed is promoted to paper: its daily-training
               state is cleared, so the next session re-seeds it from the new champion, and its
               StockNN is converted for inference now. Prod is promoted only for crowned industries
@@ -45,8 +47,16 @@ PAPER_REPO = os.environ.get("PAPER_REPO", "/root/trading")
 ACCOUNT = "acct0"
 LOCK = os.environ.get("TRADING_LOCK_PATH", "/run/trading/trading_active.lock")
 WATCHLIST = "universe_watchlist.json"
-TRAIN_ARGS = ["--passes", "1", "--sigma", "0.008", "--master-sigma", "0.006",
+TRAIN_ARGS = ["--sigma", "0.008", "--master-sigma", "0.006",
               "--sigma-decay", "1.0", "--start-day", "17", "--stop-day", "1255"]
+WEEKLY_PASSES = 1
+REPLACE_ALL_PASSES = 3      # every industry crowned: the trainer crowns the first, two compete
+
+
+def passes_for(industries, crown):
+    """One pass a week; three when every industry's model is being replaced outright, so the
+    replacement is the best of three passes rather than whatever one pass produced."""
+    return REPLACE_ALL_PASSES if crown and set(industries) <= set(crown) else WEEKLY_PASSES
 
 
 RULES_FILE = "order_rules.txt"
@@ -201,16 +211,34 @@ def promote(model_dir, champion_dir, industries, reset_state=True):
     return removed
 
 
-def crowned(ref_path, pass_num):
-    """{industry: (regime, score bp/day, previous champion pass)} for industries the pass took."""
-    out = {}
+def last_pass(ref_path):
+    """The run's newest pass number; 0 if it has none."""
+    try:
+        with open(ref_path) as f:
+            return max((int(t.split(",")[0]) for t in f if t[:1].isdigit()), default=0)
+    except OSError:
+        return 0
+
+
+def crowned(ref_path, first, last=None):
+    """{industry: (regime, score bp/day, previous champion pass, champion pass)} for industries
+    whose champion after pass `last` is one of the passes first..last. The regime is the one its
+    champion pass was judged under; the previous champion is the one standing before `first`."""
+    last = first if last is None else last
+    rows = {}
     with open(ref_path) as f:
         for line in f:
             if line.startswith("#") or line.startswith("pass,"):
                 continue
             t = line.strip().split(",")
-            if len(t) == 13 and int(t[0]) == pass_num and int(t[11]) == pass_num:
-                out[t[1]] = (t[8], float(t[12]) * 1e4, int(t[4]))
+            if len(t) == 13:
+                rows[int(t[0]), t[1]] = t
+    out = {}
+    for (p, ind), t in rows.items():
+        champ = int(t[11])
+        if p == last and first <= champ <= last:
+            out[ind] = (rows.get((champ, ind), t)[8], float(t[12]) * 1e4,
+                        int(rows.get((first, ind), t)[4]), champ)
     return out
 
 
@@ -366,35 +394,45 @@ def main(argv=None):
     swapped = set(crown)
     crown, note = rules_crown(a.run_dir, universe, crown, ORDER_RULES)
     rep += note
+    n_passes = passes_for(universe, crown)
     rep += ["", "## Pass"]
+    if n_passes > 1:
+        rep.append(f"- every industry is replaced: {n_passes} passes, the first crowned and the "
+                   "rest competing with it")
     if a.dry_run:
         rep.append("- dry run: no pass trained")
         print("\n".join(rep))
         return 0
     skip = Path(a.run_dir, "race_skip.txt").read_text().strip()
     log = os.path.join(a.run_dir, f"weekly_{today}.log")
-    cmd = ["./build/training_v4_cpp", "--continue-run", "--output", a.run_dir] + TRAIN_ARGS
+    cmd = (["./build/training_v4_cpp", "--continue-run", "--output", a.run_dir,
+            "--passes", str(n_passes)] + TRAIN_ARGS)
     if skip:
         cmd += ["--race-skip", skip]
     if crown:
         cmd += ["--crown", ",".join(crown)]
+    ref = os.path.join(a.run_dir, "pass_reference.csv")
+    first = last_pass(ref) + 1
     with open(log, "w") as f:
         rc = sh(cmd, check=False, stdout=f, stderr=subprocess.STDOUT).returncode
-    ref = os.path.join(a.run_dir, "pass_reference.csv")
-    with open(ref) as f:
-        pass_num = max(int(t.split(",")[0]) for t in f if t[:1].isdigit())
-    rep.append(f"- pass {pass_num}, rc {rc}, log {log}")
+    pass_num = last_pass(ref)
+    span = f"pass {pass_num}" if pass_num == first else f"passes {first}-{pass_num}"
+    rep.append(f"- {span}, rc {rc}, log {log}")
     if rc != 0:
         rep.append("- **CONCERN: the pass failed; nothing promoted**")
     else:
         if note:
             record_order_rules(a.run_dir, ORDER_RULES)
-        won = crowned(ref, pass_num)
+        won = crowned(ref, first, pass_num)
+
+        def why(i):
+            return "crowned after its swap" if i in swapped else "crowned: new order rules"
+
         rep.append("- champions taken: " + (", ".join(
             f"{i} ({s:+.2f} bp/day, "
-            + (("crowned after its swap)" if i in swapped else "crowned: new order rules)")
-               if r == "crown" else f"replaces p{p})")
-            for i, (r, s, p) in sorted(won.items())) or "none"))
+            + (f"p{c}, " if pass_num > first else "")
+            + (why(i) if r == "crown" or i in crown else f"replaces p{p}") + ")"
+            for i, (r, s, p, c) in sorted(won.items())) or "none"))
         # 4. promote
         champ = os.path.join(a.run_dir, "champion")
         if won:

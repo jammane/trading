@@ -109,6 +109,18 @@ def load_state(model_dir):
     symbols = [sym for syms in industries.values() for sym in syms]
     return {'industries': industries, 'histories': {sym: [] for sym in symbols}, 'cash': 20000.0, 'holdings': {sym: 0.0 for sym in symbols}}
 
+def current_industries(state):
+    """The industries to trade: always the universe, never the copy in state.json.
+
+    state.json's 'industries' is written on the first run, and reading it back froze the
+    universe at that run: a swap reached the trainer (universe.json) but not production, which
+    kept trading the removed symbol and fed it to the models in the new symbol's place, and
+    neither the new-symbol hold nor the orphaned-position sale ever fired. The copy in state is
+    refreshed for anything that inspects the file."""
+    state['industries'] = {ind: list(syms) for ind, syms in INDUSTRIES.items()}
+    return state['industries']
+
+
 def save_state(state, model_dir):
     """Persist the current trading state to {model_dir}/state.json."""
     state_file = os.path.join(model_dir, 'state.json')
@@ -1215,7 +1227,7 @@ def main():
 
         # Load state
         state = load_state(model_dir)
-        industries = state['industries']
+        industries = current_industries(state)
         sell_only = {x.strip() for x in args.sell_only.split(',') if x.strip()}
         unknown = sell_only - set(industries)
         if unknown:
