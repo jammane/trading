@@ -337,6 +337,11 @@ def promote_run(run_dir, paper_dir, prod_dir, binary="build/training_v4_cpp"):
     missing = [i for i in inds if not os.path.exists(os.path.join(champ, f"{i}_elite_0.bin"))]
     if missing:
         raise RuntimeError(f"{champ} has no champion for {', '.join(missing)}; nothing promoted")
+    if glob.glob(os.path.join(run_dir, "continue_p*")):
+        # the catch-up starts from one book, every champion's on the same day; passes added by
+        # --continue-run end later than the run's own, and their books are in continue_p<N>/
+        raise RuntimeError(f"{run_dir} has continued passes; promote_run is for a fresh run "
+                           "(a weekly pass promotes its own champions)")
     name = os.path.basename(os.path.normpath(run_dir))
     live = os.path.join(paper_dir, "cpp")
     stage = os.path.join(paper_dir, f"cpp.{name}")
