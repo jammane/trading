@@ -37,6 +37,13 @@
       "swap_date": "2026-10-18",
       "reason": "weekly pass",
       "price_at_swap": 82.61000061035156
+    },
+    "BZH": {
+      "industry": "real_estate",
+      "replaced_with": "CARR",
+      "swap_date": "2026-10-21",
+      "reason": "weekly pass",
+      "price_at_swap": 56.25
     }
   },
   "retired_rules": {
@@ -403,17 +410,6 @@
         "vol": 0.3785,
         "dollar_vol": 55244234,
         "score": 0.0422,
-        "checked": "2026-10-19"
-      },
-      {
-        "symbol": "CARR",
-        "exchange": "NYQ",
-        "yahoo_industry": "Building Products & Equipment",
-        "name": "Carrier Global Corporation",
-        "price": 55.21,
-        "vol": 0.3559,
-        "dollar_vol": 373186068,
-        "score": 0.0921,
         "checked": "2026-10-19"
       },
       {
