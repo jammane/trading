@@ -318,6 +318,13 @@ LIVE_STATE_FILES = ("book_next.txt", "book_base.json", "pending_decision.json",
                     "pending_decision.json.settled")     # paper's own, not the models'
 
 
+def run_setting(run_dir, name):
+    """A run's recorded setting (race_skip.txt, workers.txt), '' when the file is absent: every
+    pass of a run must train under the settings it started with."""
+    p = Path(run_dir, name)
+    return p.read_text().strip() if p.exists() else ""
+
+
 def promote_run(run_dir, paper_dir, prod_dir, binary="build/training_v4_cpp"):
     """A fresh run's champions replace every industry on paper, caught up to the present first.
 
@@ -540,12 +547,16 @@ def main(argv=None):
         rep.append("- dry run: no pass trained")
         print("\n".join(rep))
         return 0
-    skip = Path(a.run_dir, "race_skip.txt").read_text().strip()
+    skip = run_setting(a.run_dir, "race_skip.txt")
     log = os.path.join(a.run_dir, f"weekly_{today}.log")
     cmd = (["./build/training_v4_cpp", "--continue-run", "--output", a.run_dir,
             "--passes", str(n_passes)] + TRAIN_ARGS)
     if skip:
         cmd += ["--race-skip", skip]
+    # v7's full field does not fit the box with two StockNN workers; the run records its count
+    workers = run_setting(a.run_dir, "workers.txt")
+    if workers:
+        cmd += ["--workers", workers]
     if crown:
         cmd += ["--crown", ",".join(crown)]
     ref = os.path.join(a.run_dir, "pass_reference.csv")

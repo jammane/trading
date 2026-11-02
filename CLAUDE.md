@@ -1455,7 +1455,18 @@ History files per industry:
 - **C++**: `{ind}_hist.bin` — 2 ints (head, count) + `HIST_DAYS × HIST_PER_DAY × STOCKNN_PARAMS` floats
 - **Python**: `{ind}_hist_{day_slot}_{pos}.pt` (up to 50 files) + `{ind}_hist_meta.json` `{"head": 0, "count": 0}`
 
-**`mlock()`**: All hot model weight buffers in the C++ trainer are pinned in RAM via `mlock()` to prevent swap thrashing during inference. Pinned: `elite_buf`, `new_elites`, and `hist_buf` per worker (~315 MB/worker × 2 = 630 MB) plus MasterScratch buffers (~90 MB). Total locked ≈ 720 MB. `mlock()` failure is non-fatal (falls back to swappable). Not applicable to Python trainers.
+**`mlock()`**: only each worker's `elite_buf` (the hot inference read path, ~74 MB per worker) is pinned; `new_elites` and `hist_buf` (~250 MB per worker together) are swappable. (Older notes and comments say ~720 MB locked; that predates pinning only `elite_buf`.) `mlock()` failure is non-fatal. Not applicable to Python trainers.
+
+**Memory while paused (v7).** A trainer paused for production (`PAUSED` in its log) hands all three
+buffers back to the kernel (`WorkerScratch::release`, ~324 MB per worker) and logs how much; they
+are rewritten at the top of every training day, so nothing is lost. That leaves the box to
+production's own daily trainer, which needs the same buffers.
+
+**`--workers 1` for v7.** The full 46-entry field adds ~500 MB of race pools (mostly the
+evolutionary ones; an MT1C evo pool is 107 MB) and with two workers the run outgrew the
+droplet's 1.95 GB: days went from ~75 s to 150 s+ in swap. One worker frees ~324 MB. A run
+records its count in `RUN/workers.txt`, and the weekly pass passes it on (`run_setting`), as it
+does `race_skip.txt`.
 
 **Swap file (droplet):** `/swapfile` (2 GB, btrfs-compatible via `chattr +C` + `dd`) is active on the DigitalOcean droplet alongside `/dev/zram0` (1.9 GB), giving ~3.9 GB total swap. To recreate after a rebuild: `truncate -s 0 /swapfile && chattr +C /swapfile && dd if=/dev/zero of=/swapfile bs=1M count=2048 && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /etc/fstab`.
 
