@@ -49,9 +49,9 @@ def parse(path, rename=None):
             continue
         if p is None:
             continue
-        m = re.search(r"\]\s+(MT1\S*|TANH32)\s+(\w+)\s+loss", line)
+        m = re.search(r"\]\s+(MT1\S*|TANH32)\s+(\w+(?:\s+(?:q20|bt4))?)\s+loss", line)
         if m:
-            cur = m.group(1) + " " + m.group(2)
+            cur = m.group(1) + " " + " ".join(m.group(2).split())
             cur = rename.get(cur, cur)
             continue
         m = re.search(r"alloc bp/day: flat \S+ \| top4 \S+ \(([+-][\d.]+) vs flat\)", line)

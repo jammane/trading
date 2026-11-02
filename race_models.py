@@ -38,7 +38,19 @@ ARCH = {
     "MT1S-shr grad": "MT1S", "MT1S-shr grdC": "MT1S",
     "MT1S-stk evo": "MT1P", "MT1S-stk grad": "MT1P", "MT1S-stk grdC": "MT1P",
     "TANH32 grad": "TANH32", "TANH32 gdmn": "TANH32",
+    # restored in v7
+    "MT1C grdC": "MT1C", "MT1S-sum grad": "MT1S", "TANH32 grnk": "TANH32",
 }
+# The loser twins (v7): q20 (pinball at tau 0.2) for every MSE entry, bt4 (bottom-4 classifier)
+# for every single-output one. Same nets and file formats as the entry they twin; a bt4 net
+# outputs a bottom-4 logit, which predict() negates so higher = better as for every entry.
+Q20_OF = ("MT1 evo", "MT1 grad", "MT1 grdC", "MT1C evo", "MT1C grad", "MT1C grdC",
+          "MT1S-sum evo", "MT1S-sum grad", "MT1S-sum grdC", "MT1S-rep evo", "MT1S-shr grad",
+          "MT1S-shr grdC", "TANH32 grad", "MT1S-stk evo", "MT1S-stk grad", "MT1S-stk grdC")
+BT4_OF = ("MT1 evo", "MT1 grad", "MT1 grdC", "MT1C evo", "MT1C grad", "MT1C grdC",
+          "MT1S-sum evo", "MT1S-sum grad", "MT1S-sum grdC", "TANH32 grad")
+ARCH.update({f"{e} q20": ARCH[e] for e in Q20_OF})
+ARCH.update({f"{e} bt4": ARCH[e] for e in BT4_OF})
 
 
 def _layers(defs):
@@ -215,10 +227,14 @@ def mt1p_slices(in146, close, valid, cash, hold, bqty, bfrac, sfrac, sqty, raw):
 
 
 def slug(entry):
-    """'MT1S-stk evo' -> 'MT1S-stk_evo', 'MT1 evo' -> 'MT1______evo': the trainer pads each
-    name's architecture to 9 characters (race_slug)."""
-    a, s = entry.rsplit(" ", 1)
-    return f"{a:<9}{s}".replace(" ", "_")
+    """'MT1S-stk evo' -> 'MT1S-stk_evo', 'MT1 evo' -> 'MT1______evo', 'MT1 evo q20' ->
+    'MT1______evo__q20': the trainer pads each name's architecture to 9 characters and its search
+    to 4 (race_slug)."""
+    parts = entry.split()
+    out = f"{parts[0]:<9}{parts[1]}"
+    if len(parts) > 2:
+        out = f"{out:<13} {parts[2]}"
+    return out.replace(" ", "_")
 
 
 class RaceModel:
@@ -229,7 +245,8 @@ class RaceModel:
         self.W = np.asarray(W, np.float32)
         if self.W.size != PARAMS[self.arch]:
             raise ValueError(f"{entry}: {self.W.size} weights, expected {PARAMS[self.arch]}")
-        self.evo = entry.endswith(" evo")
+        self.evo = entry.split()[1] == "evo"
+        self.bt4 = entry.endswith(" bt4")
 
     @classmethod
     def load(cls, champion_dir, entry, industry):
@@ -241,8 +258,10 @@ class RaceModel:
         (built with mt1p_slices, raw for the grad entry and ratios for evo)."""
         a = self.arch
         if a == "MT1":
-            return mt1_forward(self.W, np.asarray(in74, np.float32))
-        if a == "MT1P":
-            return mt1p_forward(self.W, np.asarray(slices18, np.float32), self.evo)
-        x = np.asarray(in146, np.float32)
-        return {"MT1C": mt1c_forward, "MT1S": mt1s_forward, "TANH32": tanh32_forward}[a](self.W, x)
+            y = mt1_forward(self.W, np.asarray(in74, np.float32))
+        elif a == "MT1P":
+            y = mt1p_forward(self.W, np.asarray(slices18, np.float32), self.evo)
+        else:
+            x = np.asarray(in146, np.float32)
+            y = {"MT1C": mt1c_forward, "MT1S": mt1s_forward, "TANH32": tanh32_forward}[a](self.W, x)
+        return -y if self.bt4 else y

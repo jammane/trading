@@ -170,6 +170,26 @@ struct MT1Backprop {
         return (float)(loss / n);
     }
 
+    // train_batch with any per-row loss: dout(out, target, loss&) returns d(loss)/d(out) and
+    // accumulates the row's loss. backward() seeds 2(out - target), so passing out - g/2 as the
+    // target seeds exactly g (the trick ListNet uses in the race). The race's q20 and bt4 twins.
+    template <class DOut>
+    float train_batch_dout(const float* const* rows, const float* targets, int n, DOut dout) {
+        if (n <= 0) return 0.f;
+        batch_acc.assign(W.size(), 0.f);
+        double loss = 0.0;
+        for (int r = 0; r < n; r++) {
+            const float out = forward(rows[r]);
+            const float g = dout(out, targets[r], loss);
+            backward(out - 0.5f * g);
+            for (size_t k = 0; k < W.size(); k++) batch_acc[k] += grad[k];
+        }
+        const float inv = 1.f / (float)n;
+        for (size_t k = 0; k < W.size(); k++) grad[k] = batch_acc[k] * inv;
+        adam_step();
+        return (float)(loss / n);
+    }
+
     float loss_for(const float* in, float target) {
         const float p = forward(in);
         return (p - target) * (p - target);

@@ -29,9 +29,9 @@ for line in text.split("\n"):
         continue
     if p is None:
         continue
-    m = re.search(r"\]\s+(MT1\S*|TANH32)\s+(\w+)\s+loss.*within-day rank\s+(\S+)", line)
+    m = re.search(r"\]\s+(MT1\S*|TANH32)\s+(\w+(?:\s+(?:q20|bt4))?)\s+loss.*within-day rank\s+(\S+)", line)
     if m:
-        cur = m.group(1) + " " + m.group(2)
+        cur = m.group(1) + " " + " ".join(m.group(2).split())
         if v3_names and cur == "MT1S-stk evo":
             cur = "MT1S-rep evo"
         if cur not in order:
