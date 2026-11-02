@@ -926,12 +926,13 @@ def plan_industry_orders(symbols, sug, holdings, day_data, allocated_cash, holds
 # that trained the race (see upkeep_cpp.py), on the books this run recorded the session before.
 # Its state lives in <model_dir>/cpp; <model_dir>/champion is the seed it starts from.
 UPKEEP_BINARY = os.environ.get('TRAINER_BIN', 'build/training_v4_cpp')
-# The race entries the committees vote with -- the winner committee (TANH32 grad, MT1 grdC,
-# MT1 evo, MT1S-rep evo, MT1S-stk grad) and the loser committee (TANH32 grad, MT1S-stk evo,
-# ALLOC bayes mean), picked on the v5 champion composite. Only these are trained daily; the
-# trainer also always runs MT1C grad and MT1 evo, which it reads by index.
-UPKEEP_RACE_ONLY = ("TANH32 grad", "MT1 grdC", "MT1 evo", "MT1S-rep evo", "MT1S-stk grad",
-                    "MT1S-stk evo", "ALLOC bayes mean")
+# Every race entry the champion run raced (the v6 roster: all 17 less its --race-skip), not just
+# the committee members, so any of them can be put on a committee without first catching it up.
+# MT1C grad and MT1 evo, which the trainer reads by index, are on it anyway. ALLOC bayes is one
+# allocator whose mean and Thompson lines are both kept.
+UPKEEP_RACE_ONLY = ("MT1 evo", "MT1 grdC", "MT1C evo", "MT1C grad", "MT1S-sum evo",
+                    "MT1S-rep evo", "MT1S-shr grad", "TANH32 grad", "MT1S-stk evo",
+                    "MT1S-stk grad", "ALLOC bayes mean")
 
 
 def convert_stocknn(state_dir, model_dir):

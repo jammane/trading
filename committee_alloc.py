@@ -1,5 +1,5 @@
-"""The committee allocation production trades: a loser committee puts 4 industries in sell-only,
-and a winner committee tilts the other 8.
+"""The committee allocation production trades: a winner committee picks 4 industries to tilt
+toward, and a loser committee puts 4 of the other 8 in sell-only.
 
 Both committees vote with `votes_member` (`committee_race.py`), chosen on the v5 champion
 composite:
@@ -10,11 +10,16 @@ composite:
 Members are listed strongest first by their composite mean gap (the winner race for W1, the
 mirrored loser race for L1), because `votes_member` weights each member 1.1x the one below it.
 
+The winners decide first. W1 picks its 4 from all 12; L1 votes over all 12 but may flag only
+among the other 8, so where the two collide the industry is funded and L1 flags its next choice.
+L1 was chosen on v5 and showed no skill on the v6 composite (-0.88 bp/day) or in its first 13
+paper sessions, while W1 held up on both, so W1 is the one trusted with a disputed industry.
+
 The allocation splits today's cash. The 4 industries L1 flags get none, so they only sell, and
 they are never liquidated (a position the model does not sell stays held). The other 8 share the
-cash at (1 - t)/8 each, plus t/4 to each of the 4 W1 picks among them, with t = 0.5. W1 votes
-over all 12 but funds only among the 8. This is the rule `/root/sell_only.py` replayed on v5:
-composite +10.53 bp/day against flat, 8 of 10 passes.
+cash at (1 - t)/8 each, plus t/4 to each of the 4 W1 picks, with t = 0.5. (Until 2026-11-02 L1
+went first and W1 funded only among the 8 it left; that was the rule `/root/sell_only.py`
+replayed on v5: composite +10.53 bp/day against flat, 8 of 10 passes.)
 
 Predictions come from the race models the daily training step maintains, in each entry's own
 units. Only their order across the 12 industries matters to a vote.
@@ -109,9 +114,10 @@ def decide(industries, preds, cash, tilt=TILT):
     n = len(industries)
     ok = np.all([np.isfinite(preds[e]) for e in ENTRIES], axis=0)
     clean = {e: np.nan_to_num(preds[e], nan=0.0) for e in ENTRIES}
-    flagged = vote(LOSERS, clean, ok, losers=True) if ok.sum() > 4 else np.zeros(n, bool)
+    winners = vote(WINNERS, clean, ok) if ok.sum() >= 4 else np.zeros(n, bool)
+    flagged = (vote(LOSERS, clean, ok, losers=True, mask=~winners)
+               if (ok & ~winners).sum() > 4 else np.zeros(n, bool))
     keep = ~flagged
-    winners = vote(WINNERS, clean, ok, mask=keep) if (ok & keep).sum() >= 4 else np.zeros(n, bool)
     share = np.where(keep, (1.0 - tilt) / keep.sum(), 0.0) + winners * tilt / max(winners.sum(), 1)
     if not winners.any():
         share = keep / keep.sum()
