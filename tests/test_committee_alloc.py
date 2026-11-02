@@ -73,6 +73,20 @@ def test_allocation_sell_only_four_and_tilt_the_rest():
         assert a[ind] == pytest.approx(want)
 
 
+def test_a_winner_is_never_sell_only_and_the_losers_take_their_next_choice():
+    """Total collision: L1's members all expect 0..3 to do worst, while W1's majority picks 0..3
+    as best (TANH32 grad sits on both and votes the loser view). W1 keeps 0..3 and L1 flags its
+    next four, 4..7."""
+    up = -np.arange(12, dtype=float)                                 # 0 best ... 11 worst
+    p = {e: up.copy() for e in ca.ENTRIES}
+    for e in ca.LOSERS:
+        p[e] = -up                                                   # 0 worst ... 11 best
+    d = ca.decide(INDS, p, 1200.0)
+    assert sorted(d["winners"]) == ["i0", "i1", "i2", "i3"]
+    assert sorted(d["sell_only"]) == ["i4", "i5", "i6", "i7"]
+    assert all(d["allocations"][w] > 0 for w in d["winners"])
+
+
 def test_an_industry_without_predictions_sits_out_and_takes_the_base_share():
     p = _preds(4)
     p["MT1 evo"][5] = np.nan
