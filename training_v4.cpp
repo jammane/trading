@@ -1090,7 +1090,23 @@ struct MasterState {
     // elites removed — stored in MasterScratch (heap-allocated in main)
 };
 
-// ── Per-worker scratch (heap-allocated once per thread, ~162 MB total) ──────────
+// ── Per-worker scratch (heap-allocated once per thread, ~324 MB each) ───────────
+
+struct WorkerScratch;
+// Every live WorkerScratch, so a trainer paused for production can hand their pages back.
+static std::mutex                  g_scratch_mu;
+static std::vector<WorkerScratch*> g_scratches;
+
+// Drop the pages of [p, p + bytes) back to the kernel. Only the page-aligned interior is released
+// (madvise needs an aligned start); the partial pages at either end stay. The range reads as zeros
+// afterwards, so this is only for buffers rewritten before they are next read.
+static size_t release_pages(void* p, size_t bytes) {
+    const uintptr_t pg = (uintptr_t)sysconf(_SC_PAGESIZE);
+    const uintptr_t lo = ((uintptr_t)p + pg - 1) & ~(pg - 1);
+    const uintptr_t hi = ((uintptr_t)p + bytes) & ~(pg - 1);
+    if (hi <= lo) return 0;
+    return madvise((void*)lo, hi - lo, MADV_DONTNEED) == 0 ? (size_t)(hi - lo) : 0;
+}
 
 struct WorkerScratch {
     float*    elite_buf;    // [ELITE_POOL * STOCKNN_PARAMS] — loaded from disk per industry
@@ -1110,14 +1126,36 @@ struct WorkerScratch {
         wavg_buf   = new float[3 * STOCKNN_PARAMS]();
         mut_buf    = new float[STOCKNN_PARAMS]();
         hist_buf   = new float[hist]();
-        // Pin only elite_buf (hot inference read path) — 70 MB per worker.
+        // Pin only elite_buf (hot inference read path) — 74 MB per worker.
         // new_elites and hist_buf are write-heavy/sequential; swap-friendly.
         mlock(elite_buf, ep * sizeof(float));
+        std::lock_guard<std::mutex> g(g_scratch_mu);
+        g_scratches.push_back(this);
     }
     ~WorkerScratch() {
+        {
+            std::lock_guard<std::mutex> g(g_scratch_mu);
+            g_scratches.erase(std::remove(g_scratches.begin(), g_scratches.end(), this),
+                              g_scratches.end());
+        }
         delete[] elite_buf; delete[] new_elites;
         delete[] wavg_buf;  delete[] mut_buf;
         delete[] hist_buf;
+    }
+    // While paused for production. All three buffers are rewritten before they are next read:
+    // step_industry reloads elite_buf (load_or_init_industry writes every slot) and hist_buf
+    // (or zeroes hist_count) at the top of every industry-day, and selection writes each
+    // new_elites slot before reading it. So their pages can go back to the kernel and come back
+    // as zeros. Returns the bytes released.
+    size_t release() {
+        const size_t ep   = (size_t)ELITE_POOL * STOCKNN_PARAMS * sizeof(float);
+        const size_t hist = (size_t)HIST_DAYS * HIST_PER_DAY * STOCKNN_PARAMS * sizeof(float);
+        munlock(elite_buf, ep);   // madvise cannot drop locked pages
+        return release_pages(elite_buf, ep) + release_pages(new_elites, ep)
+             + release_pages(hist_buf, hist);
+    }
+    void reacquire() {
+        mlock(elite_buf, (size_t)ELITE_POOL * STOCKNN_PARAMS * sizeof(float));
     }
     float* elite(int i)      { return elite_buf  + (size_t)i * STOCKNN_PARAMS; }
     float* new_elite(int i)  { return new_elites + (size_t)i * STOCKNN_PARAMS; }
@@ -1443,16 +1481,31 @@ static bool trade_lock_active() {
 
 // Called between training days, never mid-day: the worker threads are parked on their semaphore
 // at that point, so sleeping here idles all of them.
+//
+// Paused, the trainer also hands back its workers' StockNN buffers (~324 MB per worker), which it
+// reloads from disk at the top of every training day anyway. The box has under 2 GB, and while
+// paused it shares it with production's own daily trainer (--upkeep), which needs the same
+// buffers: two resident copies is what pushes the pair into swap.
 static void wait_while_trading() {
     bool paused = false;
     while (trade_lock_active()) {
         if (!paused) {
-            log_msg("PAUSED — production is running (" + g_trade_lock + ")");
+            size_t freed = 0;
+            {
+                std::lock_guard<std::mutex> g(g_scratch_mu);
+                for (WorkerScratch* w : g_scratches) freed += w->release();
+            }
+            log_msg("PAUSED — production is running (" + g_trade_lock + "); released " +
+                    std::to_string(freed >> 20) + " MB of StockNN buffers");
             paused = true;
         }
         std::this_thread::sleep_for(std::chrono::seconds(TRADE_LOCK_POLL_SEC));
     }
-    if (paused) log_msg("RESUMED — production finished, training continues");
+    if (paused) {
+        std::lock_guard<std::mutex> g(g_scratch_mu);
+        for (WorkerScratch* w : g_scratches) w->reacquire();
+        log_msg("RESUMED — production finished, training continues");
+    }
 }
 
 static std::string elite_path(const std::string& dir, const char* prefix, int slot) {
