@@ -271,3 +271,11 @@ def test_promote_run_catches_up_then_swaps_in_the_new_state(tmp_path, monkeypatc
     assert converted == [str(live)]
     assert any("2026-10-21" in r and "2026-10-28" in r and "4 session" in r for r in rep)
 
+
+
+def test_a_run_setting_is_read_from_its_file_and_absent_is_empty(tmp_path):
+    """race_skip.txt and workers.txt: every pass of a run trains under the settings it started
+    with, and a run without the file passes nothing."""
+    assert wp.run_setting(tmp_path, "workers.txt") == ""
+    (tmp_path / "workers.txt").write_text("1\n")
+    assert wp.run_setting(tmp_path, "workers.txt") == "1"

@@ -3,7 +3,7 @@
 // Run:   ./build/training_v4_cpp --output models [--load-dir DIR] [--start-day N] [--stop-day N]
 //        [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F] [--workers N]
 
-#define TRAINER_VERSION "0.8.1.77"
+#define TRAINER_VERSION "0.8.1.81"
 
 #include <algorithm>
 #include <atomic>
@@ -337,7 +337,22 @@ enum RaceSrch  { SRCH_EVO, SRCH_GRAD };
 //           industry-day rather than one per row.
 // Both remove the day level by construction, so their across-day corr and allocation lines
 // are not meaningful; only within-day rank is.
-enum RaceLoss  { LOSS_MSE, LOSS_DEMEAN, LOSS_LIST };
+//
+// The LOSER TWINS. Flipping the target's sign is not a loser model: MSE and the evo score are
+// symmetric, so training on -P&L gives the same model negated, whose bottom 4 the loser committee
+// already reads by negating. A twin must care more about the bad end than the good one.
+//   Q20  pinball loss at RACE_Q20_TAU: the order set's 20th-percentile P&L rather than its mean.
+//        Evo pools score it with the same d/(err+d), pinball error against a trailing-20th-
+//        percentile baseline. Ranking industries on it leans toward the volatile ones -- q20 is
+//        roughly mean - 0.84 sd -- which is why BT4 races beside it.
+//   BT4  log loss on "this order set's return lands in the bottom 4 of the 12", against the other
+//        11 industries' slot-0 returns that day. The label needs all 12, so BT4 entries predict in
+//        the industry loop like everyone else and TRAIN after it (race_bt4_train). An evo BT4 pool
+//        scores the label scaled to MT1_PRED_SCALE. Published negated, so higher = better holds
+//        for every entry and every consumer (race_daily.csv, committee_race, committee_alloc).
+enum RaceLoss  { LOSS_MSE, LOSS_DEMEAN, LOSS_LIST, LOSS_Q20, LOSS_BT4 };
+static constexpr float RACE_Q20_TAU = 0.2f;
+static constexpr int   RACE_BT4_K   = 4;      // bottom-k of the day's industries
 
 struct RaceEntry {
     const char* name;
@@ -393,9 +408,10 @@ static constexpr float BP_LR_RECOVER = 1.05f;
 // somewhat stale across a boundary, since the pass re-seeds StockNN and the target distribution
 // shifts, but Adam re-adapts within a few hundred steps and zeroing them would make "carry" a
 // different thing than simply continuing to train.
-// Pruned after the v0.8.1.34 5-pass race: MT1C grdC, MT1S-sum grad and TANH32 grnk
-// beat flat allocation (top4) in at most 1 of 5 passes. TANH32 grad/gdmn scored as badly but
-// were trained per-row then and batched since, so they stay to be measured as they now are.
+// Every entry ever raced is back (v7): the three pruned after the v0.8.1.34 race (MT1C grdC,
+// MT1S-sum grad, TANH32 grnk) and everything the v6 --race-skip turned off. A committee is chosen
+// from the whole field, for the winner and the loser race alike, so a weak allocator can still be
+// a useful voter. New entries are APPENDED: RACE_DEPLOYED and RACE_LOG_POOL are positional.
 // ── Allocation judging: recency weight and trend ─────────────────────────────────────
 // The plain alloc line weights every scored day of a pass equally. Recent days are the ones most
 // like the market the allocator will actually face, so each pass also reports top4-vs-flat with
@@ -466,6 +482,38 @@ static constexpr RaceEntry RACE[] = {
     {"MT1S-stk evo ", ARCH_MT1P,   SRCH_EVO,  true,  true,  "r_mt1stk" },  // one pool per stock
     {"MT1S-stk grad", ARCH_MT1P,   SRCH_GRAD, true,  false, nullptr },     // one net per stock
     {"MT1S-stk grdC", ARCH_MT1P,   SRCH_GRAD, true,  true,  nullptr },
+    // restored (pruned after v0.8.1.34)
+    {"MT1C     grdC", ARCH_MT1C,   SRCH_GRAD, false, true,  nullptr },
+    {"MT1S-sum grad", ARCH_MT1S,   SRCH_GRAD, false, false, nullptr },
+    {"TANH32   grnk", ARCH_TANH32, SRCH_GRAD, false, false, nullptr, LOSS_LIST },
+    // loser twins, q20: one per MSE entry
+    {"MT1      evo  q20", ARCH_MT1,    SRCH_EVO,  false, true,  "r_mt1_q20",    LOSS_Q20 },
+    {"MT1      grad q20", ARCH_MT1,    SRCH_GRAD, false, false, nullptr,        LOSS_Q20 },
+    {"MT1      grdC q20", ARCH_MT1,    SRCH_GRAD, false, true,  nullptr,        LOSS_Q20 },
+    {"MT1C     evo  q20", ARCH_MT1C,   SRCH_EVO,  false, true,  "r_mt1c_q20",   LOSS_Q20 },
+    {"MT1C     grad q20", ARCH_MT1C,   SRCH_GRAD, false, false, nullptr,        LOSS_Q20 },
+    {"MT1C     grdC q20", ARCH_MT1C,   SRCH_GRAD, false, true,  nullptr,        LOSS_Q20 },
+    {"MT1S-sum evo  q20", ARCH_MT1S,   SRCH_EVO,  false, true,  "r_mt1s_q20",   LOSS_Q20 },
+    {"MT1S-sum grad q20", ARCH_MT1S,   SRCH_GRAD, false, false, nullptr,        LOSS_Q20 },
+    {"MT1S-sum grdC q20", ARCH_MT1S,   SRCH_GRAD, false, true,  nullptr,        LOSS_Q20 },
+    {"MT1S-rep evo  q20", ARCH_MT1S,   SRCH_EVO,  true,  true,  "r_mt1s2_q20",  LOSS_Q20 },
+    {"MT1S-shr grad q20", ARCH_MT1S,   SRCH_GRAD, true,  false, nullptr,        LOSS_Q20 },
+    {"MT1S-shr grdC q20", ARCH_MT1S,   SRCH_GRAD, true,  true,  nullptr,        LOSS_Q20 },
+    {"TANH32   grad q20", ARCH_TANH32, SRCH_GRAD, false, false, nullptr,        LOSS_Q20 },
+    {"MT1S-stk evo  q20", ARCH_MT1P,   SRCH_EVO,  true,  true,  "r_mt1stk_q20", LOSS_Q20 },
+    {"MT1S-stk grad q20", ARCH_MT1P,   SRCH_GRAD, true,  false, nullptr,        LOSS_Q20 },
+    {"MT1S-stk grdC q20", ARCH_MT1P,   SRCH_GRAD, true,  true,  nullptr,        LOSS_Q20 },
+    // loser twins, bt4: one per single-output entry (no per-symbol form of "bottom 4")
+    {"MT1      evo  bt4", ARCH_MT1,    SRCH_EVO,  false, true,  "r_mt1_bt4",    LOSS_BT4 },
+    {"MT1      grad bt4", ARCH_MT1,    SRCH_GRAD, false, false, nullptr,        LOSS_BT4 },
+    {"MT1      grdC bt4", ARCH_MT1,    SRCH_GRAD, false, true,  nullptr,        LOSS_BT4 },
+    {"MT1C     evo  bt4", ARCH_MT1C,   SRCH_EVO,  false, true,  "r_mt1c_bt4",   LOSS_BT4 },
+    {"MT1C     grad bt4", ARCH_MT1C,   SRCH_GRAD, false, false, nullptr,        LOSS_BT4 },
+    {"MT1C     grdC bt4", ARCH_MT1C,   SRCH_GRAD, false, true,  nullptr,        LOSS_BT4 },
+    {"MT1S-sum evo  bt4", ARCH_MT1S,   SRCH_EVO,  false, true,  "r_mt1s_bt4",   LOSS_BT4 },
+    {"MT1S-sum grad bt4", ARCH_MT1S,   SRCH_GRAD, false, false, nullptr,        LOSS_BT4 },
+    {"MT1S-sum grdC bt4", ARCH_MT1S,   SRCH_GRAD, false, true,  nullptr,        LOSS_BT4 },
+    {"TANH32   grad bt4", ARCH_TANH32, SRCH_GRAD, false, false, nullptr,        LOSS_BT4 },
 };
 static constexpr int RACE_N = (int)(sizeof(RACE) / sizeof(RACE[0]));
 
@@ -499,6 +547,12 @@ static_assert(RACE[RACE_DEPLOYED].arch == ARCH_MT1C && RACE[RACE_DEPLOYED].searc
 static_assert(RACE[RACE_LOG_POOL].arch == ARCH_MT1 && RACE[RACE_LOG_POOL].search == SRCH_EVO,
               "RACE_LOG_POOL must name MT1 evo");
 
+// DEMEAN and LIST remove the day level, so their across-industry lines mean nothing; every other
+// loss (MSE, and the loser twins Q20 and BT4) predicts a level that can be ranked across industries.
+static constexpr bool race_has_level(const RaceEntry& e) {
+    return e.loss != LOSS_DEMEAN && e.loss != LOSS_LIST;
+}
+
 static constexpr int TANH32_PARAMS = MT1C_IN * 32 + 32 + 32 * 8 + 8 + 8 + 1;   // 4,977
 static constexpr bool race_tanh32_is_grad_only() {
     for (const RaceEntry& e : RACE)
@@ -508,13 +562,18 @@ static constexpr bool race_tanh32_is_grad_only() {
 static_assert(race_tanh32_is_grad_only(), "TANH32 has no evolutionary forward; gradient only");
 static constexpr bool race_losses_are_supported() {
     for (const RaceEntry& e : RACE) {
-        if (e.loss == LOSS_MSE) continue;
+        if (e.loss == LOSS_MSE || e.loss == LOSS_Q20) continue;   // Q20: wherever MSE is
+        if (e.loss == LOSS_BT4) {                                  // one output, one label
+            if (e.arch == ARCH_MT1P || (e.arch == ARCH_MT1S && e.per_symbol)) return false;
+            continue;
+        }
         if (e.search != SRCH_GRAD || e.per_symbol) return false;
         if (e.arch != ARCH_MT1C && e.arch != ARCH_TANH32) return false;
     }
     return true;
 }
-static_assert(race_losses_are_supported(), "DEMEAN/LIST are implemented for MT1C and TANH32 grad only");
+static_assert(race_losses_are_supported(),
+              "DEMEAN/LIST: MT1C and TANH32 grad only; BT4: single-output entries only");
 
 // Weights per INDUSTRY for a gradient entry. MT1S-stk holds twelve stock nets; its evolutionary
 // pools are per stock and use race_pool_params instead.
@@ -531,24 +590,21 @@ static inline int race_pools(RaceArch a) {   // evolutionary pools per entry
 }
 // MT1S-stk evo: pool file prefix and seed salt for stock slot j of an industry. The tag lands in
 // the file name as <tag>_s<jj>_<industry>_slot_<n>.bin, so the 12 stock pools never collide.
-// One base tag only (asserted by the RACE table having a single ARCH_MT1P evo entry); the table
-// is built once under C++11's thread-safe static init, since worker threads save pools too.
-static const char* mt1p_pool_tag(const char* base, int j) {
-    static const std::vector<std::string> tags = [base]() {
-        std::vector<std::string> t(MT1C_SYMS);
-        for (int k = 0; k < MT1C_SYMS; k++) {
-            char b[64]; snprintf(b, sizeof(b), "%s_s%02d", base, k); t[k] = b;
-        }
+// Keyed by race entry, since the q20 twin is a second ARCH_MT1P evo entry. The table is built once
+// under C++11's thread-safe static init, since worker threads save pools too.
+static const char* mt1p_pool_tag(int v, int j) {
+    static const std::vector<std::string> tags = []() {
+        std::vector<std::string> t((size_t)RACE_N * MT1C_SYMS);
+        for (int e = 0; e < RACE_N; e++)
+            for (int k = 0; k < MT1C_SYMS; k++) {
+                char b[64];
+                snprintf(b, sizeof(b), "%s_s%02d", RACE[e].tag ? RACE[e].tag : "none", k);
+                t[(size_t)e * MT1C_SYMS + k] = b;
+            }
         return t;
     }();
-    return tags[j].c_str();
+    return tags[(size_t)v * MT1C_SYMS + j].c_str();
 }
-static constexpr bool race_one_mt1p_evo() {
-    int n = 0;
-    for (const RaceEntry& e : RACE) if (e.arch == ARCH_MT1P && e.search == SRCH_EVO) n++;
-    return n <= 1;
-}
-static_assert(race_one_mt1p_evo(), "mt1p_pool_tag caches ONE base tag");
 static inline uint64_t mt1p_salt(uint64_t salt, int j) {
     return salt ^ ((uint64_t)(j + 1) * 0x9E3779B97F4A7C15ULL);
 }
@@ -1034,7 +1090,23 @@ struct MasterState {
     // elites removed — stored in MasterScratch (heap-allocated in main)
 };
 
-// ── Per-worker scratch (heap-allocated once per thread, ~162 MB total) ──────────
+// ── Per-worker scratch (heap-allocated once per thread, ~324 MB each) ───────────
+
+struct WorkerScratch;
+// Every live WorkerScratch, so a trainer paused for production can hand their pages back.
+static std::mutex                  g_scratch_mu;
+static std::vector<WorkerScratch*> g_scratches;
+
+// Drop the pages of [p, p + bytes) back to the kernel. Only the page-aligned interior is released
+// (madvise needs an aligned start); the partial pages at either end stay. The range reads as zeros
+// afterwards, so this is only for buffers rewritten before they are next read.
+static size_t release_pages(void* p, size_t bytes) {
+    const uintptr_t pg = (uintptr_t)sysconf(_SC_PAGESIZE);
+    const uintptr_t lo = ((uintptr_t)p + pg - 1) & ~(pg - 1);
+    const uintptr_t hi = ((uintptr_t)p + bytes) & ~(pg - 1);
+    if (hi <= lo) return 0;
+    return madvise((void*)lo, hi - lo, MADV_DONTNEED) == 0 ? (size_t)(hi - lo) : 0;
+}
 
 struct WorkerScratch {
     float*    elite_buf;    // [ELITE_POOL * STOCKNN_PARAMS] — loaded from disk per industry
@@ -1054,14 +1126,36 @@ struct WorkerScratch {
         wavg_buf   = new float[3 * STOCKNN_PARAMS]();
         mut_buf    = new float[STOCKNN_PARAMS]();
         hist_buf   = new float[hist]();
-        // Pin only elite_buf (hot inference read path) — 70 MB per worker.
+        // Pin only elite_buf (hot inference read path) — 74 MB per worker.
         // new_elites and hist_buf are write-heavy/sequential; swap-friendly.
         mlock(elite_buf, ep * sizeof(float));
+        std::lock_guard<std::mutex> g(g_scratch_mu);
+        g_scratches.push_back(this);
     }
     ~WorkerScratch() {
+        {
+            std::lock_guard<std::mutex> g(g_scratch_mu);
+            g_scratches.erase(std::remove(g_scratches.begin(), g_scratches.end(), this),
+                              g_scratches.end());
+        }
         delete[] elite_buf; delete[] new_elites;
         delete[] wavg_buf;  delete[] mut_buf;
         delete[] hist_buf;
+    }
+    // While paused for production. All three buffers are rewritten before they are next read:
+    // step_industry reloads elite_buf (load_or_init_industry writes every slot) and hist_buf
+    // (or zeroes hist_count) at the top of every industry-day, and selection writes each
+    // new_elites slot before reading it. So their pages can go back to the kernel and come back
+    // as zeros. Returns the bytes released.
+    size_t release() {
+        const size_t ep   = (size_t)ELITE_POOL * STOCKNN_PARAMS * sizeof(float);
+        const size_t hist = (size_t)HIST_DAYS * HIST_PER_DAY * STOCKNN_PARAMS * sizeof(float);
+        munlock(elite_buf, ep);   // madvise cannot drop locked pages
+        return release_pages(elite_buf, ep) + release_pages(new_elites, ep)
+             + release_pages(hist_buf, hist);
+    }
+    void reacquire() {
+        mlock(elite_buf, (size_t)ELITE_POOL * STOCKNN_PARAMS * sizeof(float));
     }
     float* elite(int i)      { return elite_buf  + (size_t)i * STOCKNN_PARAMS; }
     float* new_elite(int i)  { return new_elites + (size_t)i * STOCKNN_PARAMS; }
@@ -1156,6 +1250,16 @@ struct MT1PoolScratch {
         float s = 0.f;
         for (int i = 0; i < actual_count; i++) s += actual_buf[i];
         return s / (float)actual_count;
+    }
+    // Trailing tau-quantile of realised P&L (linear interpolation): the q20 twins' baseline.
+    float quantile(float tau) const {
+        if (actual_count <= 0) return 0.f;
+        float v[MT1_BASELINE_DAYS];
+        for (int i = 0; i < actual_count; i++) v[i] = actual_buf[i];
+        std::sort(v, v + actual_count);
+        const float x = tau * (float)(actual_count - 1);
+        const int lo = (int)x, hi = std::min(lo + 1, actual_count - 1);
+        return v[lo] + (x - (float)lo) * (v[hi] - v[lo]);
     }
     // Floor on the score denominator. p10 of |actual| is ~$86 and the baseline's error can be
     // near zero on a day the trailing mean happens to land, which would make the score
@@ -1377,16 +1481,31 @@ static bool trade_lock_active() {
 
 // Called between training days, never mid-day: the worker threads are parked on their semaphore
 // at that point, so sleeping here idles all of them.
+//
+// Paused, the trainer also hands back its workers' StockNN buffers (~324 MB per worker), which it
+// reloads from disk at the top of every training day anyway. The box has under 2 GB, and while
+// paused it shares it with production's own daily trainer (--upkeep), which needs the same
+// buffers: two resident copies is what pushes the pair into swap.
 static void wait_while_trading() {
     bool paused = false;
     while (trade_lock_active()) {
         if (!paused) {
-            log_msg("PAUSED — production is running (" + g_trade_lock + ")");
+            size_t freed = 0;
+            {
+                std::lock_guard<std::mutex> g(g_scratch_mu);
+                for (WorkerScratch* w : g_scratches) freed += w->release();
+            }
+            log_msg("PAUSED — production is running (" + g_trade_lock + "); released " +
+                    std::to_string(freed >> 20) + " MB of StockNN buffers");
             paused = true;
         }
         std::this_thread::sleep_for(std::chrono::seconds(TRADE_LOCK_POLL_SEC));
     }
-    if (paused) log_msg("RESUMED — production finished, training continues");
+    if (paused) {
+        std::lock_guard<std::mutex> g(g_scratch_mu);
+        for (WorkerScratch* w : g_scratches) w->reacquire();
+        log_msg("RESUMED — production finished, training continues");
+    }
 }
 
 static std::string elite_path(const std::string& dir, const char* prefix, int slot) {
@@ -2872,7 +2991,8 @@ static bool mt1_is_barred(const MT1PoolScratch& sc, uint32_t lineage) {
 
 static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in,
                                  float actual, bool have_actual, int actual_day, float sigma,
-                                 MT1Forward fwd = mt1net_forward, uint64_t salt = 0) {
+                                 MT1Forward fwd = mt1net_forward, uint64_t salt = 0,
+                                 float tau = -1.f) {   // >= 0: score as a tau-quantile (q20)
     MT1DayResult r{};
     r.actual = actual;
 
@@ -2897,7 +3017,7 @@ static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in,
 
     // ── 2. SCORE ─────────────────────────────────────────────────────────────────
     if (have_actual) {
-        const float base = sc.baseline();
+        const float base = (tau >= 0.f) ? sc.quantile(tau) : sc.baseline();
         const float fl   = sc.floor_v();
         // Baseline and floor are built from sessions strictly before the one being scored:
         // `actual` is pushed below, not above.
@@ -2905,7 +3025,8 @@ static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in,
         r.baseline = base; r.floor_v = fl; r.scored = true;
         double sum = 0.0; float best = -1.f, worst = 2.f;
         for (int s = 0; s < MT1_POOL_SLOTS; s++) {
-            const float v = mt1_score(actual, sc.pending[s], base, fl);
+            const float v = (tau >= 0.f) ? mt1_score_q(actual, sc.pending[s], base, fl, tau)
+                                         : mt1_score(actual, sc.pending[s], base, fl);
             mt1_slot_record(sc.meta[s], v);
             sum += v;
             if (v > best)  best  = v;
@@ -5485,7 +5606,7 @@ int main(int argc, char* argv[]) {
                         for (int j = 0; j < MT1C_SYMS; j++)
                             load_or_init_mt1_pool(output_dir, load_dir, i,
                                                   race[v].pool[i * MT1C_SYMS + j],
-                                                  mt1p_pool_tag(RACE[v].tag, j),
+                                                  mt1p_pool_tag(v, j),
                                                   race_init(RACE[v].arch), mt1p_salt(r.salt, j));
                         continue;
                     }
@@ -5679,7 +5800,7 @@ int main(int argc, char* argv[]) {
                     bool have_champ = false;
                     for (int j = 0; j < per; j++) {
                         MT1PoolScratch& sc = r.pool[i * per + j];
-                        const char* tag = (per > 1) ? mt1p_pool_tag(RACE[v].tag, j) : RACE[v].tag;
+                        const char* tag = (per > 1) ? mt1p_pool_tag(v, j) : RACE[v].tag;
                         if (fs::exists(mt1_pool_path(output_dir, i, 0, tag))) continue;
                         if (!have_champ) {
                             const std::string wp = find_w(base + ".bin");
@@ -5752,6 +5873,26 @@ int main(int argc, char* argv[]) {
             MasterResult blk_master_res[MT1_DAYS];
             for (int d = 0; d < blk_len; d++) {
                 memset(race_day_ok, 0, sizeof(race_day_ok));
+                // BT4 labels need the other industries' slot-0 returns. StockNN has already run
+                // every industry for day d (blk_results), so they are known before the race loop
+                // and BT4 trains in it like any other entry. No leak: each industry's net predicts
+                // before it trains on day d, and no race weights are shared across industries.
+                float bt4_ret0[N_IND]; bool bt4_ok0[N_IND]; int bt4_n = 0;
+                for (int k = 0; k < N_IND; k++) {
+                    const IndResult& rk = blk_results[d][k];
+                    bt4_ret0[k] = (rk.book_prev > 1.f) ? (rk.slot0_score - rk.book_prev) / rk.book_prev
+                                                       : NAN;
+                    bt4_ok0[k] = std::isfinite(bt4_ret0[k]);
+                    bt4_n += bt4_ok0[k];
+                }
+                // 1 if a return of `ret` in industry i would sit in the day's bottom RACE_BT4_K
+                auto bt4_label = [&](int i, float ret) -> float {
+                    int below = 0;
+                    for (int k = 0; k < N_IND; k++)
+                        if (k != i && bt4_ok0[k] && bt4_ret0[k] < ret) below++;
+                    return below < RACE_BT4_K ? 1.f : 0.f;
+                };
+                const bool bt4_day = bt4_n >= 8;
                 MasterResult mr{}; bool inj = false;
                 float s0_pf = 0.f, s0_mkt = 0.f;
                 // MT2's input is now ONE number per industry: MT1's dollar prediction of that
@@ -6031,6 +6172,10 @@ int main(int argc, char* argv[]) {
                                          : (e.arch == ARCH_TANH32) ? r.tanh32[i].forward(row)
                                                                    : mt1s_forward(W, row);
                             }
+                            // BT4 nets output a bottom-4 logit; publish it negated, so higher =
+                            // better for every entry. Training below reads -mpred back as the logit.
+                            if (e.loss == LOSS_BT4)
+                                for (int m = 0; m < nm; m++) mpred[m] = -mpred[m];
                             // Distinct predictions from the FROZEN net, before today's training.
                             int dist = 0;
                             if (nm >= 3) {
@@ -6110,16 +6255,23 @@ int main(int argc, char* argv[]) {
                                     mt1_step_day(i, r.pool[i * MT1C_SYMS + j], s0[j], aj,
                                                  blk_actual_day[d] >= race_train_start(e, pass),
                                                  blk_actual_day[d], cur_mt1_sigma,
-                                                 race_forward(e.arch), mt1p_salt(r.salt, j));
+                                                 race_forward(e.arch), mt1p_salt(r.salt, j),
+                                                 e.loss == LOSS_Q20 ? RACE_Q20_TAU : -1.f);
                                 }
                             } else if (e.search == SRCH_EVO) {
                                 // One step per industry-day through the existing pool lifecycle.
                                 // Selection sees one scalar per model, so there is no per-row
                                 // notion here and nm plays no part.
-                                mt1_step_day(i, r.pool[i], ind_in, actual,
+                                // BT4 pools score the slot-0 label in MT1_PRED_SCALE units, so the
+                                // trailing mean is the base rate and the floor stays above $1.
+                                if (e.loss == LOSS_BT4 && !bt4_day) continue;
+                                const float evo_actual = (e.loss == LOSS_BT4)
+                                    ? MT1_PRED_SCALE * bt4_label(i, bt4_ret0[i]) : actual;
+                                mt1_step_day(i, r.pool[i], ind_in, evo_actual,
                                              blk_actual_day[d] >= race_train_start(e, pass),
                                              blk_actual_day[d], cur_mt1_sigma,
-                                             race_forward(e.arch), r.salt);
+                                             race_forward(e.arch), r.salt,
+                                             e.loss == LOSS_Q20 ? RACE_Q20_TAU : -1.f);
                             } else {
                                 // bit u set = last-hidden unit u was positive on some row today
                                 uint32_t alive = 0;
@@ -6128,14 +6280,38 @@ int main(int argc, char* argv[]) {
                                                  : (e.arch == ARCH_MT1P) ? MT1P_H2 : MT1S_H2;
                                 // Per-row target for the squared-error losses.
                                 static thread_local float tgt[MT1_BP_MODELS];
+                                if (e.loss == LOSS_BT4 && !bt4_day) continue;
                                 {
                                     double ybar = 0.0;
                                     for (int m = 0; m < nm; m++) ybar += mreal[m];
                                     ybar = nm ? ybar / nm : 0.0;
+                                    // mreal is P&L / MT1_PRED_SCALE; the label wants a return
+                                    const float to_ret = MT1_PRED_SCALE / fmaxf(ir.book_prev, 1.f);
                                     for (int m = 0; m < nm; m++)
                                         tgt[m] = (e.loss == LOSS_DEMEAN) ? mreal[m] - (float)ybar
+                                               : (e.loss == LOSS_BT4)    ? bt4_label(i, mreal[m] * to_ret)
                                                                          : mreal[m];
                                 }
+                                // d(loss)/d(output) for one row, accumulating the loss. MSE and
+                                // DEMEAN: squared error. Q20: doubled pinball (tau = 0.5 is |e|).
+                                // BT4: log loss on sigmoid(output) against the 0/1 label.
+                                auto dout = [&e](float out, float y, double& loss) -> float {
+                                    if (e.loss == LOSS_Q20) {
+                                        const float u = y - out;
+                                        loss += mt1_pinball2(u, RACE_Q20_TAU);
+                                        return u >= 0.f ? -2.f * RACE_Q20_TAU
+                                                        : 2.f * (1.f - RACE_Q20_TAU);
+                                    }
+                                    if (e.loss == LOSS_BT4) {
+                                        const float p = 1.f / (1.f + expf(-out));
+                                        loss -= y * logf(fmaxf(p, 1e-7f))
+                                              + (1.f - y) * logf(fmaxf(1.f - p, 1e-7f));
+                                        return p - y;
+                                    }
+                                    const float err = out - y;
+                                    loss += (double)err * err;
+                                    return 2.f * err;
+                                };
                                 if (e.loss == LOSS_LIST && nm >= 3) {
                                     // ListNet. dL/ds_m = softmax(s)_m - softmax(z)_m, with s the
                                     // frozen net's scores (mpred, computed above) and z the day's
@@ -6180,7 +6356,10 @@ int main(int argc, char* argv[]) {
                                     net.lr = r.lr[i];
                                     static thread_local const float* rp[MT1_BP_MODELS];
                                     for (int m = 0; m < nm; m++) rp[m] = mrows[m];
-                                    r.loss_sum += net.train_batch(rp, tgt, nm); r.loss_n++;
+                                    r.loss_sum += (e.loss == LOSS_MSE || e.loss == LOSS_DEMEAN)
+                                                  ? net.train_batch(rp, tgt, nm)
+                                                  : net.train_batch_dout(rp, tgt, nm, dout);
+                                    r.loss_n++;
                                 }
                                 if (e.loss != LOSS_LIST && e.arch != ARCH_TANH32)
                                 for (int m = 0; m < nm; m++) {
@@ -6191,16 +6370,12 @@ int main(int argc, char* argv[]) {
                                     if (e.arch == ARCH_MT1) {
                                         MT1NetCache c;
                                         mt1net_forward_cached(ww, row, 0.f, c);
-                                        const float err = c.out - tgt[m];
-                                        mt1net_backward(ww, c, 2.f * err, gg);
-                                        loss = (double)err * err;
+                                        mt1net_backward(ww, c, dout(c.out, tgt[m], loss), gg);
                                         for (int u = 0; u < 10; u++) if (c.d2[u] > 0.f) alive |= 1u << u;
                                     } else if (e.arch == ARCH_MT1C) {
                                         MT1CNetCache c;
                                         mt1cnet_forward_cached(ww, row, c);
-                                        const float err = c.out - tgt[m];
-                                        mt1cnet_backward(ww, c, 2.f * err, gg);
-                                        loss = (double)err * err;
+                                        mt1cnet_backward(ww, c, dout(c.out, tgt[m], loss), gg);
                                         for (int u = 0; u < 8; u++) if (c.c[u] > 0.f) alive |= 1u << u;
                                     } else if (e.arch == ARCH_MT1P) {
                                         // Each stock's net learns its own stock's P&L only, from
@@ -6209,9 +6384,8 @@ int main(int argc, char* argv[]) {
                                             const size_t off = (size_t)j * MT1P_PARAMS;
                                             MT1PCache c;
                                             mt1p_forward_cached(ww + off, mp_raw[m][j], c);
-                                            const float ej = c.out - msym[m][j];
-                                            mt1p_backward(ww + off, c, 2.f * ej, gg + off);
-                                            loss += (double)ej * ej;
+                                            mt1p_backward(ww + off, c, dout(c.out, msym[m][j], loss),
+                                                          gg + off);
                                             for (int u = 0; u < MT1P_H2; u++)
                                                 if (c.h2[u] > 0.f) alive |= 1u << u;
                                         }
@@ -6224,16 +6398,12 @@ int main(int argc, char* argv[]) {
                                             // TWELVE rows from one industry-day: each symbol is
                                             // graded on its own realised P&L, which is what the
                                             // decomposition in step_industry exists for.
-                                            for (int j = 0; j < MT1C_SYMS; j++) {
-                                                const float ej = c.per_sym[j] - msym[m][j];
-                                                ds[j] = 2.f * ej;
-                                                loss += (double)ej * ej;
-                                            }
+                                            for (int j = 0; j < MT1C_SYMS; j++)
+                                                ds[j] = dout(c.per_sym[j], msym[m][j], loss);
                                             loss /= MT1C_SYMS;
                                         } else {
-                                            const float err = c.out - tgt[m];
-                                            for (int j = 0; j < MT1C_SYMS; j++) ds[j] = 2.f * err;
-                                            loss = (double)err * err;
+                                            const float g = dout(c.out, tgt[m], loss);
+                                            for (int j = 0; j < MT1C_SYMS; j++) ds[j] = g;
                                         }
                                         mt1s_backward(ww, c, ds, gg);
                                         for (int j = 0; j < MT1C_SYMS; j++)
@@ -6630,7 +6800,7 @@ int main(int argc, char* argv[]) {
                             const MT1PoolScratch& ps = race[v].pool[i * MT1C_SYMS + j];
                             memcpy(snap.data() + (size_t)j * MT1P_PARAMS, ps.slot(ps.best_slot),
                                    MT1P_PARAMS * sizeof(float));
-                            save_mt1_pool(output_dir, i, ps, mt1p_pool_tag(RACE[v].tag, j));
+                            save_mt1_pool(output_dir, i, ps, mt1p_pool_tag(v, j));
                         }
                         if (!g_upkeep)
                             save_bin(race_weight_path(output_dir, v, i, pass + 1),
@@ -7036,7 +7206,7 @@ int main(int argc, char* argv[]) {
                     if (r.loss_n > 0) snprintf(ls, sizeof(ls), "%.5f", r.loss_sum / (double)r.loss_n);
                     else              snprintf(ls, sizeof(ls), "   --  ");
                     snprintf(m, sizeof(m),
-                             "   %-14s loss %s | within-day rank %s over %ld ind-days%s",
+                             "   %-18s loss %s | within-day rank %s over %ld ind-days%s",
                              RACE[v].name, ls, rk, r.rank_n,
                              r.rank_n == 0 ? "  (all tied every day: cannot rank)" : "");
                     log_msg(m);
@@ -7079,10 +7249,16 @@ int main(int argc, char* argv[]) {
                                  "        alloc bp/day: flat %+.2f | top4 %+.2f (%+.2f vs flat) | "
                                  "top6 %+.2f (%+.2f) | long-short %+.2f%s",
                                  fl, t4, t4 - fl, t6, t6 - fl, t4 - b4,
-                                 RACE[v].loss == LOSS_MSE ? "" : "  [n/a]");
+                                 race_has_level(RACE[v]) ? "" : "  [n/a]");
                         log_msg(m);
                         r.alloc_tr.report("        ", MT1_BP_START_DAY,
-                                          RACE[v].loss == LOSS_MSE ? "" : "  [n/a]");
+                                          race_has_level(RACE[v]) ? "" : "  [n/a]");
+                        // The loser committee's read: how far this entry's bottom 4 trailed the
+                        // flat book. Positive = the industries it ranks last really did lag.
+                        snprintf(m, sizeof(m),
+                                 "        losers bp/day: bottom4 %+.2f (flat - bottom4 %+.2f)%s",
+                                 b4, fl - b4, race_has_level(RACE[v]) ? "" : "  [n/a]");
+                        log_msg(m);
                     }
                     std::string traj = "        by day:";
                     for (size_t b = 0; b < r.bk_n.size(); b++) {
@@ -7111,7 +7287,7 @@ int main(int argc, char* argv[]) {
                         snprintf(m, sizeof(m),
                                  "        across-day corr %+.4f (mean of %d industries)%s",
                                  rsum / rn, rn,
-                                 RACE[v].loss == LOSS_MSE ? "" : "  [n/a: loss removes the day level]");
+                                 race_has_level(RACE[v]) ? "" : "  [n/a: loss removes the day level]");
                         log_msg(m);
                     }
                 }

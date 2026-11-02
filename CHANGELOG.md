@@ -8,7 +8,18 @@ entry is in its commit message.
 
 ## Unreleased
 
+### Added
+- **The full race field and loser twins (v7).** The three entries pruned after v0.8.1.34 are back
+  and nothing is skipped, and 26 loser twins race beside them: `q20` (pinball loss at the 20th
+  percentile, one per MSE entry) and `bt4` (a bottom-4-of-12 classifier, one per single-output
+  entry). 46 entries in all; every one is eligible for both committee races. Each entry's race
+  report gains a `losers bp/day` line.
+
 ### Changed
+- **The winner committee decides first.** W1 picks its 4 from all 12 and L1 flags 4 among the
+  other 8, so an industry both name is funded rather than sell-only.
+- **Daily training covers the whole race field**, not only the committee members, so any entry
+  can join a committee without first being caught up.
 - **Training trades under production's limits.** The fill simulators used to re-buy what they had
   just sold, spend the same morning's sale proceeds, size buys at the fill price and sell a
   position back the day it was bought, none of which production can do (on paper, 16 of 26

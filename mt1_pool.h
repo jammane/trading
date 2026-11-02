@@ -281,6 +281,20 @@ static inline float mt1_score(float actual, float predicted, float baseline, flo
     return d / (err + d);
 }
 
+// The q20 loser twins' score: the same d/(err+d), with pinball error at tau in place of |error|
+// and a trailing tau-quantile as the baseline. Doubled so tau = 0.5 reduces to mt1_score exactly,
+// which keeps the floor (built from |actual|) on the same scale.
+static inline float mt1_pinball2(float e, float tau) {
+    return 2.f * (e >= 0.f ? tau * e : (tau - 1.f) * e);
+}
+static inline float mt1_score_q(float actual, float predicted, float baseline, float floor_v,
+                                float tau) {
+    const float err  = mt1_pinball2(actual - predicted, tau);
+    const float base = mt1_pinball2(actual - baseline, tau);
+    const float d    = fmaxf(base, fmaxf(floor_v, 1e-6f));
+    return d / (err + d);
+}
+
 // Skill against the baseline over a window, in the same units the acceptance gate uses:
 // >0 beats the trailing mean, 0 ties it, <0 worse. Reported alongside the score so a pool that
 // has collapsed onto the mean cannot hide behind a healthy-looking average.
