@@ -499,7 +499,9 @@ class TestRaceInvariants:
 
     @staticmethod
     def _race_day_loop():
-        start = CPP.index('for (int v = 0; v < RACE_N; v++) {\n                            const RaceEntry& e = RACE[v];')
+        start = CPP.index('for (int v = 0; v < RACE_N; v++) {\n'
+                          '                            if (g_race_off[v]) continue;\n'
+                          '                            const RaceEntry& e = RACE[v];')
         return CPP[start:CPP.index('bp_pred[i] = mt1cnet_forward', start)]
 
     def test_every_evolutionary_entry_shares_one_step_function(self):
