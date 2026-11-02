@@ -902,10 +902,10 @@ data because they are handed the same bytes. Cost is small beside StockNN's 200 
 | architecture | `MT1` (MT1Net, 74 trailing features, no order intent), `MT1C` (MT1CNet, `cfeat146` with order intent), `MT1S` (per-symbol nets summed: `-sum`, `-rep` seed replicate, `-shr` shared encoder), `MT1S-stk` (one net per stock, 144), `TANH32` (MT1Backprop 146→32→8→1) |
 | search | `evo` (200-slot evolutionary pool) or gradient (`grad`, `grdC`, `gdmn`, `grnk`) |
 | carry | `grdC` = gradient that **carries** its weights and Adam moments across pass boundaries; `grad` restarts each pass; evo pools always carry |
-| loss | MSE (`grad`/`grdC`), demeaned MSE (`gdmn`), ListNet ranking (`grnk`) |
+| loss | MSE (`grad`/`grdC`), demeaned MSE (`gdmn`), ListNet ranking (`grnk`); loser twins `q20` and `bt4` (below) |
 
-The roster is 17 entries as of v0.8.1.38 (see **Pruning the losers**), plus the `ALLOC bayes`
-allocator, which is not a network. `MT1C grad` is the deployed entry (publishes `bp_pred`) and
+The roster is **46 entries** as of v7 (see **The full field and the loser twins**), plus the
+`ALLOC bayes` allocator, which is not a network. `MT1C grad` is the deployed entry (publishes `bp_pred`) and
 `MT1 evo` is the pool written to `mt_training_log.bin`; both are read by index and always run.
 The `MT1` rows are the **controls for rank**: with no order intent their 200 inputs are identical
 within an industry-day, so they cannot rank order sets and print `n/a` -- the role the old
@@ -985,6 +985,30 @@ gdmn also scored ≤1/5 but stay, because v0.8.1.36 changed their training (per-
 step), so v3 measured a different thing. MT1C grad and MT1S-sum grdC lose their carry/restart
 sibling; the grad-vs-grdC noise-floor read survives on MT1, MT1S-shr and MT1S-stk. For scale: the no-intent MT1 grdC control itself scored 4/5 and +1.88 bp/day, so no
 remaining entry has cleared noise either -- this removes the clearest losers, not the losers.
+
+**The full field and the loser twins (v7).** Every entry ever raced is back -- the three pruned
+above and everything v6's `--race-skip` turned off -- because a committee is chosen from the whole
+field, and a weak allocator can still be a useful voter, at either end. Beside them run
+**loser twins**: the same nets and files, trained to find the industries that will do worst.
+Flipping the target's sign would not do it: MSE and the evo score are symmetric, so training on
+−P&L gives the same model negated, whose bottom 4 the loser race already reads. A twin's loss has
+to care more about the bad end:
+
+- **`q20`** (16, one per MSE entry): pinball loss at τ = 0.2 -- each order set's 20th-percentile
+  P&L instead of its mean. Evo pools keep `d/(err+d)` with pinball error (`mt1_score_q`, doubled so
+  τ = 0.5 is `mt1_score`) against a trailing-20th-percentile baseline. Caution: q20 ≈ mean − 0.84
+  sd, so its bottom 4 lean toward the most volatile industries.
+- **`bt4`** (10, one per single-output entry; per-symbol nets have no per-symbol "bottom 4"): log
+  loss on whether the order set's return would land in the day's bottom 4 against the other 11
+  industries' slot-0 returns. StockNN has already run every industry when the race loop starts, so
+  the labels are known up front; each industry's net predicts before it trains and none is shared
+  across industries, so nothing leaks. Evo pools score the label × `MT1_PRED_SCALE`. A bt4 net
+  outputs a bottom-4 logit and publishes it **negated**, so higher = better for every entry and
+  every consumer (`race_daily.csv`, `committee_race`, `race_models.RaceModel.predict`).
+
+Each entry's report gains a `losers bp/day` line: its bottom 4's mean return and how far that
+trailed flat (positive = its last 4 really lagged). File names pad the search to 4 characters:
+`MT1 evo q20` → `race_MT1______evo__q20_<ind>.bin`.
 
 **Qualifier races and `--race-skip` (v4 → v5).** A race doubles as the qualifier for the next one.
 Rule: an entry must beat flat (whole-pass top-4 vs flat) in **more than 50%** of its counted passes.
@@ -1201,7 +1225,13 @@ champion composite:
 | committee | members, strongest first | role |
 |---|---|---|
 | L1 | TANH32 grad, ALLOC bayes mean, MT1S-stk evo | flags the 4 industries it expects to do worst: **sell-only** |
-| W1 | TANH32 grad, MT1 grdC, MT1 evo, MT1S-rep evo, MT1S-stk grad | picks 4 of the other 8 to tilt toward |
+| W1 | TANH32 grad, MT1 grdC, MT1 evo, MT1S-rep evo, MT1S-stk grad | picks 4 of all 12 to tilt toward |
+
+**The winners decide first (2026-11-02).** W1 picks from all 12; L1 votes over all 12 but may flag
+only among the other 8, so an industry both name is funded and L1 flags its next choice. Until
+then L1 went first and W1 funded among the 8 it left. L1 showed no skill on the v6 composite
+(−0.88 bp/day, 567 of 686 loser committees better) or in its first 13 paper sessions (the
+industries it flagged beat flat by +62 bp/day, t ≈ 1.6), while W1 held up on both.
 
 The member order is each entry's composite mean gap (the mirrored loser race for L1), because
 `votes_member` weights each member 1.1x the one below it; it is fixed in `committee_alloc.py`.
