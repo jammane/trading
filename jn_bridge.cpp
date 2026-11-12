@@ -3,6 +3,7 @@
 #include "jn_bridge.h"
 
 #include <jneuro/jneuro.hpp>
+#include <jneuro/modify.hpp>
 
 #include <cmath>
 #include <cstdio>
@@ -22,7 +23,26 @@ struct JNPool {
     std::vector<JNet> nets;
     std::deque<std::vector<double>> ring;     // oldest first; the newest row is today's
     std::vector<double> in;                   // scratch
+    // A saved net with mig_from outputs is widened on load: a fresh output (spec/12,
+    // add_output_fresh) is inserted at each of mig_at, ascending final indices.
+    int mig_from = -1;
+    std::vector<int> mig_at;
 };
+
+// Widen n to the pool's outputs when it has the registered older width. False if it fits neither.
+static bool fit_outputs(const JNPool* p, JNet& n, uint64_t salt) {
+    if ((int)n.n_inputs != p->n_in) return false;
+    if ((int)n.n_outputs == p->n_out) return true;
+    if ((int)n.n_outputs != p->mig_from) return false;
+    jneuro::Rng rng(p->seed ^ (salt * 0x9E3779B97F4A7C15ULL));
+    for (int at : p->mig_at) n = jneuro::add_output_fresh(n, rng, (std::uint32_t)at);
+    return (int)n.n_outputs == p->n_out;
+}
+
+void jn_set_output_migration(JNPool* p, int from_n_out, const std::vector<int>& insert_at) {
+    p->mig_from = from_n_out;
+    p->mig_at = insert_at;
+}
 
 static JNet make_net(const jneuro::AnyNet& any) { return std::get<JNet>(any); }
 
@@ -123,6 +143,18 @@ bool jn_save_slot(const JNPool* p, int slot, const std::string& path) {
     catch (const std::exception&) { return false; }
 }
 
+bool jn_load_slot(JNPool* p, int slot, const std::string& path) {
+    try {
+        if (slot < 0 || slot >= (int)p->nets.size() || !std::filesystem::exists(path)) return false;
+        JNet n = make_net(jneuro::load_net(path));
+        if (!fit_outputs(p, n, (uint64_t)slot + 1)) return false;
+        p->nets[slot] = std::move(n);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 bool jn_save(const JNPool* p, const std::string& dir, const std::string& prefix) {
     for (size_t s = 0; s < p->nets.size(); s++)
         if (!jn_save_slot(p, (int)s, dir + "/" + prefix + "_" + std::to_string(s) + ".jnet"))
@@ -143,7 +175,7 @@ bool jn_load(JNPool* p, const std::string& dir, const std::string& prefix) {
             const std::string path = dir + "/" + prefix + "_" + std::to_string(s) + ".jnet";
             if (!std::filesystem::exists(path)) return false;
             JNet n = make_net(jneuro::load_net(path));
-            if ((int)n.n_inputs != p->n_in || (int)n.n_outputs != p->n_out) return false;
+            if (!fit_outputs(p, n, s + 1)) return false;
             nets.push_back(std::move(n));
         }
         std::deque<std::vector<double>> ring;

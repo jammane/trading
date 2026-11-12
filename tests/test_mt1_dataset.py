@@ -256,7 +256,7 @@ class TestOrderIntentIsCausal:
         raise AssertionError('unbalanced braces in the intent block')
 
     def test_intent_is_recorded_before_any_next_day_price_is_read(self):
-        fn = CPP[CPP.index('float out48[48];'):CPP.index('slot_scores[slot] = compute_value_ind')]
+        fn = CPP[CPP.index('float sout[STOCK_OUT_N];'):CPP.index('slot_scores[slot] = compute_value_ind')]
         intent_at = fn.index("Record the deployed model's INTENT")
         nd_at = fn.index('float nd_open')
         assert intent_at < nd_at, \
@@ -318,7 +318,7 @@ class TestCompetitorInput:
 
     def test_width_matches_the_model(self):
         from models import MT1CNet
-        assert D.CFEAT == MT1CNet.N_IN == 146
+        assert D.CFEAT == MT1CNet.N_IN == 158
         assert D.CN_SYMS * D.CN_PER_SYM + 2 == D.CFEAT
 
     def test_field_names_match_the_cpp_offsets(self):
@@ -332,7 +332,7 @@ class TestCompetitorInput:
         assert [v for _, v in per_sym] == list(range(D.CN_PER_SYM)), 'per-symbol offsets have a gap'
 
     def test_cash_and_book_sit_after_every_symbol(self):
-        assert D.CN_CASH == 144 and D.CN_BOOK == 145
+        assert D.CN_CASH == 156 and D.CN_BOOK == 157
 
     def test_it_round_trips(self, tmp_path):
         blob, want = _synth()
@@ -429,15 +429,16 @@ class TestCompetitorInput:
         every one of those would silently start describing something else."""
         body = CPP[CPP.index('static void build_mt1c_input_for'):
                    CPP.index('// ── MT1 dataset log ─')]
-        # the four intent channels are read through the selectable aliases, not off ir directly
-        for alias in ('si_bqty', 'si_bfrac', 'si_sfrac', 'si_sqty'):
+        # the five intent channels are read through the selectable aliases, not off ir directly
+        for alias in ('si_bqty', 'si_bfrac', 'si_sfrac', 'si_sqty', 'si_sflag'):
             assert f'in_{alias[3:]}  ? in_{alias[3:]}  : ir.{alias}' in body \
                    or f'in_{alias[3:]} ? in_{alias[3:]} : ir.{alias}' in body, \
                    f'{alias} must fall back to slot 0 when no model is named'
             assert f'ir.{alias}[j]' not in body, \
                    f'{alias} must be read through the alias so a named model is honoured'
         # the old name survives as a slot-0 wrapper, so existing callers are unchanged
-        assert 'build_mt1c_input_for(day_sym, ir, nullptr, nullptr, nullptr, nullptr, out)' in body
+        assert ('build_mt1c_input_for(day_sym, ir, nullptr, nullptr, nullptr, nullptr, nullptr, out)'
+                in body)
 
     def test_intent_is_zero_when_there_is_nothing_to_spend_or_sell(self):
         body = CPP[CPP.index('static void build_mt1c_input'):

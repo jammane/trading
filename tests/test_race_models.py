@@ -77,7 +77,7 @@ def close(a, b):
     return abs(a - b) <= 1e-4 * max(1.0, abs(b))
 
 
-IN_WIDTH = {"MT1": 74, "MT1C": 146, "MT1S": 146, "TANH32": 146}
+IN_WIDTH = {"MT1": 74, "MT1C": rm.C_IN, "MT1S": rm.C_IN, "TANH32": rm.C_IN}
 
 
 @pytest.mark.parametrize("arch", ["MT1", "MT1C", "MT1S", "TANH32"])
@@ -108,11 +108,11 @@ def test_every_input_reaches_the_mt1s_output(exe, tmp_path):
     """MT1S reads 12 symbol blocks plus cash and book; a slicing slip would drop a block."""
     rng = np.random.default_rng(5)
     W = rng.normal(0, 0.5, rm.MT1S_PARAMS).astype(np.float32)
-    base = np.zeros(146, np.float32)
+    base = np.zeros(rm.C_IN, np.float32)
     b0 = rm.mt1s_forward(W, base)
-    moved = sum(abs(rm.mt1s_forward(W, np.where(np.arange(146) == k, 5.0, 0.0).astype(np.float32))
-                    - b0) > 1e-7 for k in range(146))
-    assert moved > 146 * 0.5
+    moved = sum(abs(rm.mt1s_forward(W, np.where(np.arange(rm.C_IN) == k, 5.0, 0.0).astype(np.float32))
+                    - b0) > 1e-7 for k in range(rm.C_IN))
+    assert moved > rm.C_IN * 0.5
 
 
 def test_wrong_size_is_refused():
@@ -130,19 +130,19 @@ def test_slug_matches_the_trainers_file_names():
 
 
 def test_mt1p_slices_ratio_and_raw_forms():
-    in146 = np.arange(146, dtype=np.float32) / 146
+    in146 = np.arange(rm.C_IN, dtype=np.float32) / rm.C_IN
     close_ = np.full(12, 50.0)
     valid = np.ones(12, bool)
     valid[3] = False
     hold = np.full(12, 10.0)
     bq, sq = np.full(12, 20.0), np.full(12, 5.0)
-    bf, sf = np.full(12, 0.25), np.full(12, 0.75)
-    raw = rm.mt1p_slices(in146, close_, valid, 1000.0, hold, bq, bf, sf, sq, raw=True)
-    rat = rm.mt1p_slices(in146, close_, valid, 1000.0, hold, bq, bf, sf, sq, raw=False)
-    assert np.allclose(raw[0, :12], in146[:12]) and np.allclose(raw[0, 12:14], in146[144:146])
-    assert np.allclose(raw[0, 14:], [20, 0.25, 0.75, 5])
-    assert np.allclose(rat[0, 14:], [20 / (1000 / 50), 0.25, 0.75, 5 / 10])
-    assert np.allclose(raw[3, 14:], [0, 0.5, 0.5, 0])          # no valid bar -> no order
+    bf, sf, fl = np.full(12, 0.25), np.full(12, 0.75), np.full(12, 0.2)
+    raw = rm.mt1p_slices(in146, close_, valid, 1000.0, hold, bq, bf, sf, sq, fl, raw=True)
+    rat = rm.mt1p_slices(in146, close_, valid, 1000.0, hold, bq, bf, sf, sq, fl, raw=False)
+    assert np.allclose(raw[0, :13], in146[:13]) and np.allclose(raw[0, 13:15], in146[156:158])
+    assert np.allclose(raw[0, 15:], [20, 0.25, 0.75, 5, 0.2])
+    assert np.allclose(rat[0, 15:], [20 / (1000 / 50), 0.25, 0.75, 5 / 10, 0.2])
+    assert np.allclose(raw[3, 15:], [0, 0.5, 0.5, 0, 0.5])     # no valid bar -> no order
 
 
 def test_champion_files_load_when_present():
@@ -151,6 +151,11 @@ def test_champion_files_load_when_present():
     d = "/root/ht_race_v5/champion"
     if not os.path.isdir(d):
         pytest.skip("no v5 champion store here")
+    # The v5 store predates StockNN's sell_flag (MT1C 11177 weights, now 11945): it can never load
+    # again, and the next full training replaces it. Skip it rather than read it.
+    mt1c = os.path.join(d, f"race_{rm.slug('MT1C evo')}_energy.bin")
+    if os.path.exists(mt1c) and os.path.getsize(mt1c) != 4 * rm.MT1C_PARAMS:
+        pytest.skip("champion store predates sell_flag (race inputs 146 wide)")
     n = 0
     for f in sorted(os.listdir(d)):
         if not f.startswith("race_"):
@@ -180,29 +185,29 @@ def test_cfeat146_hand_worked_symbol_and_industry_fields():
     o, h, l_, c, valid = _bars()
     hold = np.zeros(12)
     hold[0] = 100.0                                  # $5,100 at 51
-    intent = np.zeros((12, 4))
-    intent[0] = (30.7, 0.25, 0.9, 40.6)              # 30 buyable of 30.7; sells 40 of 100
-    intent[1] = (5.0, 1.7, -0.2, 0.0)                # fractions clamp into [0, 1]
+    intent = np.zeros((12, 5))
+    intent[0] = (30.7, 0.25, 0.9, 40.6, 0.8)         # 30 buyable of 30.7; sells 40 of 100
+    intent[1] = (5.0, 1.7, -0.2, 0.0, 1.3)           # fractions clamp into [0, 1]
     x = rm.build_cfeat146(o, h, l_, c, valid, hold, 4900.0, intent)
     book = 4900.0 + 5100.0
     mean_close = (51.0 * 10 + 102.0) / 11            # valid closes only
-    s0 = x[:12]
+    s0 = x[:13]
     assert np.allclose(s0[:4], [50 / 51, 52 / 51, 48 / 51, 51 / mean_close], rtol=1e-6)
     assert np.isclose(s0[6], 4.0 / ((100 + 153 + 52 + 48) / 7), rtol=1e-6)     # (H-L)/A
     assert np.isclose(s0[7], 5100.0 / book)                                   # position weight
     assert np.isclose(s0[8], 30.0 / 96.0)            # floor(30.7) of floor(4900/51)=96 affordable
-    assert np.allclose(s0[9:12], [0.25, 0.9, 0.40])
-    assert np.allclose(x[12 + 9:12 + 11], [1.0, 0.0])
-    assert np.allclose(x[24:28], [1, 1, 1, 1]) and not x[28:36].any()          # no valid bar
-    assert np.isclose(x[144], 4900.0 / book)
-    assert np.isclose(x[145], book / 25000.0)
+    assert np.allclose(s0[9:13], [0.25, 0.9, 0.40, 0.8])                      # ... sell_flag
+    assert np.allclose(x[13 + 9:13 + 11], [1.0, 0.0]) and x[13 + 12] == 1.0   # clamped
+    assert np.allclose(x[26:30], [1, 1, 1, 1]) and not x[30:39].any()          # no valid bar
+    assert np.isclose(x[156], 4900.0 / book)
+    assert np.isclose(x[157], book / 25000.0)
     assert np.isclose(rm.build_cfeat146(o, h, l_, c, valid, hold, 4900.0, intent,
-                                        book_base=10000.0)[145], 1.0)
+                                        book_base=10000.0)[157], 1.0)
 
 
 def test_cfeat146_non_finite_intent_reads_as_no_opinion():
     o, h, l_, c, valid = _bars()
-    intent = np.full((12, 4), np.nan)
+    intent = np.full((12, 5), np.nan)
     x = rm.build_cfeat146(o, h, l_, c, valid, np.zeros(12), 1000.0, intent)
     assert np.isfinite(x).all()
-    assert np.allclose(x[9:11], 0.5) and x[8] == 0 and x[11] == 0
+    assert np.allclose(x[9:11], 0.5) and x[8] == 0 and x[11] == 0 and x[12] == 0.5

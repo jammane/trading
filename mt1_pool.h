@@ -224,31 +224,32 @@ static inline float mt2inet_forward(const float* W, const float* in, float /*ext
 // in defs order, each [weights (out x in)] then [bias (out)]. KEEP IN SYNC — load_bin validates
 // by element count alone, so a drift with an unchanged total loads silently.
 //
-//   146 -> 64 -> 24 -> 8 -> 1    (leaky ReLU, slope MT1_LEAK, on every hidden layer)
+//   158 -> 64 -> 24 -> 8 -> 1    (leaky ReLU, slope MT1_LEAK, on every hidden layer)
 //
 // Input, per industry, all from TODAY's close and nothing earlier:
 //   per symbol (x12): O H L C | close_pos, close_vs_wap, (H-L)/A | holdings
-//                     | buy_qty, buy_price_frac, sell_all_price_frac, sell_qty   = 12
+//                     | buy_qty, buy_price_frac, sell_all_price_frac, sell_qty
+//                     | sell_flag (StockNN's 5th output: place the sell-all?)  = 13
 //   per industry:     cash, book value                                           =  2
 static constexpr int MT1C_SYMS    = 12;
-static constexpr int MT1C_PER_SYM = 12;
-static constexpr int MT1C_IN      = MT1C_SYMS * MT1C_PER_SYM + 2;   // 146
+static constexpr int MT1C_PER_SYM = 13;
+static constexpr int MT1C_IN      = MT1C_SYMS * MT1C_PER_SYM + 2;   // 158
 
-static constexpr int CN_L1_W = 0,     CN_L1_B = 9344;    // 64x146
-static constexpr int CN_L2_W = 9408,  CN_L2_B = 10944;   // 24x64
-static constexpr int CN_L3_W = 10968, CN_L3_B = 11160;   // 8x24
-static constexpr int CN_L4_W = 11168, CN_L4_B = 11176;   // 1x8
+static constexpr int CN_L1_W = 0,     CN_L1_B = 10112;   // 64x158
+static constexpr int CN_L2_W = 10176, CN_L2_B = 11712;   // 24x64
+static constexpr int CN_L3_W = 11736, CN_L3_B = 11928;   // 8x24
+static constexpr int CN_L4_W = 11936, CN_L4_B = 11944;   // 1x8
 
-static constexpr int MT1CNET_PARAMS = 11177;
+static constexpr int MT1CNET_PARAMS = 11945;
 static_assert(CN_L4_B + 1 == MT1CNET_PARAMS,
               "MT1CNet layout drifted from MT1CNET_PARAMS — check models.py MT1CNET_LAYER_DEFS");
 
-// Offsets of each per-symbol field inside the 146-vector, so the builder and any reader agree.
+// Offsets of each per-symbol field inside the 158-vector, so the builder and any reader agree.
 static constexpr int CN_OPEN = 0, CN_HIGH = 1, CN_LOW = 2, CN_CLOSE = 3;
 static constexpr int CN_CPOS = 4, CN_CWAP = 5, CN_RANGE_A = 6, CN_HOLD = 7;
-static constexpr int CN_BQTY = 8, CN_BFRAC = 9, CN_SFRAC = 10, CN_SQTY = 11;
-static constexpr int CN_CASH = MT1C_SYMS * MT1C_PER_SYM;        // 144
-static constexpr int CN_BOOK = CN_CASH + 1;                     // 145
+static constexpr int CN_BQTY = 8, CN_BFRAC = 9, CN_SFRAC = 10, CN_SQTY = 11, CN_SFLAG = 12;
+static constexpr int CN_CASH = MT1C_SYMS * MT1C_PER_SYM;        // 156
+static constexpr int CN_BOOK = CN_CASH + 1;                     // 157
 
 static inline float mt1cnet_forward(const float* W, const float* in, float /*extra*/) {
     float a[64], b[24], c[8];

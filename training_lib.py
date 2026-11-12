@@ -107,8 +107,15 @@ def to_cents(price, how):
 # (weekly_pass.rules_crown). 1: before plan_orders (re-buying sold symbols, spending same-day
 # proceeds, sizing at the fill price, sell_qty as a limit at the close). 2: plan_orders.
 # 3 (2026-11-12): fill prices calibrated to paper (limits at the limit, open buys at the open
-# + OPEN_BUY_PREMIUM capped at the limit) and StockNN selected on book P&L, not the trade delta.
+# + OPEN_BUY_PREMIUM capped at the limit), StockNN selected on book P&L, not the trade delta, and
+# StockNN's fifth output, sell_flag: a held symbol gets a sell-all limit only when the model asks
+# for one, so it can hold (keeping its stop) and add to a position; and no held stop on a day the
+# symbol is bought.
 ORDER_RULES = 3
+
+# StockNN's outputs per stock: buy_qty, buy_price_frac, sell_all_price_frac, sell_qty, sell_flag.
+# Mirrors STOCK_OUT_PER_SYM in training_v4.cpp and models.STOCK_OUT_PER_SYM.
+STOCK_OUT_PER_SYM = 5
 
 
 def plan_orders(symbols, sug, holdings, day_data, cash, skip=()):
@@ -116,13 +123,15 @@ def plan_orders(symbols, sug, holdings, day_data, cash, skip=()):
     THE one place the order rules live: production queues these, and every fill simulator
     (training_lib's and its twin plan_orders() in training_v4.cpp) fills exactly these.
 
-    sug: {sym: (buy_qty, buy_price_frac, sell_all_price_frac, sell_qty)}, the model's output.
+    sug: {sym: (buy_qty, buy_price_frac, sell_all_price_frac, sell_qty, sell_flag)}, the model's
+         output. A 4-tuple (no sell_flag) reads as flag on: the sell-all rule before 2026-11-12.
     cash: the industry's cash at the close. skip: symbols that get no orders (new-symbol hold).
 
     Production's limits, which the simulators must share or they train on trades the broker
     never makes (measured on paper 2026-10-14/15):
-      - a symbol sold today is not bought today (Alpaca rejects the buy as a wash trade), and
-        every held symbol gets a sell-all limit, so a held symbol is never added to;
+      - a symbol sold today is not bought today (Alpaca rejects the buy as a wash trade);
+      - a held symbol gets a sell-all limit only if sell_flag > 0.5. Otherwise the model holds:
+        no sell order, so the shares keep their stop, and the symbol may be bought (added to);
       - buys are sized at the close, against the cash the industry HAS: proceeds of tomorrow's
         sells are not in it, and an order that does not fill still used its share of the budget;
       - the quantity is fixed at the close, sized at the limit, not at the fill price;
@@ -135,7 +144,8 @@ def plan_orders(symbols, sug, holdings, day_data, cash, skip=()):
     for sym in symbols:
         if sym not in day_data or sym in skip:
             continue
-        _, _, sell_all_price_frac, sell_qty = sug[sym]
+        _, _, sell_all_price_frac, sell_qty = sug[sym][:4]
+        sell_flag = sug[sym][4] if len(sug[sym]) > 4 else 1.0
         cur_qty = holdings.get(sym, 0.0)
         low, high = day_data[sym]['low'], day_data[sym]['high']
         sell_all_price = low + sell_all_price_frac * max(high - low, 1e-9)
@@ -145,7 +155,7 @@ def plan_orders(symbols, sug, holdings, day_data, cash, skip=()):
                 sell_open[sym] = amount
                 cur_qty -= amount
                 sold.add(sym)
-        if cur_qty >= 1 and low <= sell_all_price <= high:
+        if cur_qty >= 1 and sell_flag > 0.5 and low <= sell_all_price <= high:
             sell_all[sym] = (int(cur_qty), to_cents(sell_all_price, 'up'))
             sold.add(sym)
 
@@ -157,7 +167,7 @@ def plan_orders(symbols, sug, holdings, day_data, cash, skip=()):
     for sym in symbols:
         if sym not in day_data or sym in skip or sym in sold:
             continue
-        buy_qty, buy_price_frac, _, _ = sug[sym]
+        buy_qty, buy_price_frac = sug[sym][0], sug[sym][1]
         low, high = day_data[sym]['low'], day_data[sym]['high']
         raw_price = low + buy_price_frac * max(high - low, 1e-9)
         if buy_qty > 1e-6 and raw_price > 0 and low <= raw_price <= high:
@@ -376,7 +386,8 @@ def _fill_sym_open_low(sym, port, plan, day_data, fill_data, low_first):
 
     stop_p = port['stop_prices'].get(sym, 0.0)
     remaining = hold.get(sym, 0.0)
-    if sym not in plan['sold'] and stop_p > 0 and remaining > 1e-6:
+    # No held stop beside a sell or an open buy (production cancels it; Alpaca wash-trade rule).
+    if sym not in plan['sold'] and sym not in plan['buys'] and stop_p > 0 and remaining > 1e-6:
         if nd_open <= stop_p:
             hold[sym] = 0.0
             port['cash'] += _sell_net(remaining, nd_open)
@@ -442,7 +453,8 @@ def _fill_sym_from_bars(sym, port, bars, plan):
         sells += cur
     stop_p = port['stop_prices'].get(sym, 0.0)
     remaining = hold.get(sym, 0.0)
-    if sym not in plan['sold'] and stop_p > 0 and remaining > 1e-6 and nd_open <= stop_p:
+    if (sym not in plan['sold'] and sym not in plan['buys'] and stop_p > 0 and remaining > 1e-6
+            and nd_open <= stop_p):
         hold[sym] = 0.0
         port['cash'] += _sell_net(remaining, nd_open)
         sells += remaining
@@ -458,8 +470,10 @@ def _fill_sym_from_bars(sym, port, bars, plan):
     for bar in bars[1:]:
         stop_p = port['stop_prices'].get(sym, 0.0)
         remaining = hold.get(sym, 0.0)
-        if (sym not in plan['sold'] and stop_p > 0 and remaining > 1e-6
-                and bar['low'] <= stop_p):
+        # After a buy fills, its own OTO stop is live (the walker's approximation: it covers
+        # the whole holding); before that, a symbol being bought has no stop.
+        if (sym not in plan['sold'] and (sym not in plan['buys'] or bought) and stop_p > 0
+                and remaining > 1e-6 and bar['low'] <= stop_p):
             hold[sym] = 0.0
             port['cash'] += _sell_net(remaining, stop_p * (1.0 - SLIPPAGE_RATE))
             sells += remaining
@@ -488,7 +502,7 @@ def _simulate_one_model(model, ref_cash, ref_hold, ref_stop, symbols,
     port = {'cash': ref_cash, 'holdings': dict(ref_hold), 'stop_prices': dict(ref_stop)}
     with torch.inference_mode():
         out = model(history_t, today_t)
-    out = out.view(len(symbols), 4)
+    out = out.view(len(symbols), STOCK_OUT_PER_SYM)
     plan = plan_orders(symbols, {s: out[j].tolist() for j, s in enumerate(symbols)},
                        port['holdings'], day_data, port['cash'])
 
@@ -1325,7 +1339,7 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
             out = model(history_t, today_t)
         del model
 
-        out = out.view(12, 4)
+        out = out.view(12, STOCK_OUT_PER_SYM)
         local_buys = local_sells = 0
         plan = plan_orders(symbols, {s: out[j].tolist() for j, s in enumerate(symbols)},
                            port['holdings'], day_data, port['cash'])

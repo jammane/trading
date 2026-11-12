@@ -66,10 +66,10 @@ def run_cpp(exe, tmp_path, w, x):
 
 class TestParity:
     def test_flat_vector_length(self):
-        assert flatten(MT1CNet()).numel() == MT1CNET_PARAMS == 11177
+        assert flatten(MT1CNet()).numel() == MT1CNET_PARAMS == 11945
 
     def test_input_width(self):
-        assert MT1CNet.N_IN == 146 == MT1CNet.N_SYMS * MT1CNet.PER_SYM + 2
+        assert MT1CNet.N_IN == 158 == MT1CNet.N_SYMS * MT1CNet.PER_SYM + 2
 
     @pytest.mark.parametrize('seed', [0, 1, 7, 42, 1234])
     def test_same_output_as_torch(self, cpp_exe, tmp_path, seed):
@@ -90,7 +90,7 @@ class TestParity:
         assert abs(run_cpp(cpp_exe, tmp_path, flatten(net), x[0])) < 1e-6
 
     def test_every_input_slot_reaches_the_output(self, cpp_exe, tmp_path):
-        """146 inputs laid out as 12 symbols x 12 fields + 2. An off-by-one in the builder would
+        """158 inputs laid out as 12 symbols x 13 fields + 2. An off-by-one in the builder would
         shift every symbol's block and still produce a number."""
         torch.manual_seed(5)
         net = MT1CNet().eval()
@@ -140,7 +140,8 @@ class TestParity:
         hdr = (Path(__file__).resolve().parent.parent / 'mt1_pool.h').read_text()
         blk = hdr[hdr.index('static constexpr int CN_OPEN'):hdr.index('static inline float mt1cnet_forward')]
         assert 'VOL' not in blk.upper()
-        assert MT1CNet.PER_SYM == 12, 'per-symbol width implies volume crept back in'
+        # 13 = the 12 bar/holding/intent fields plus sell_flag (CN_SFLAG); no volume among them
+        assert MT1CNet.PER_SYM == 13, 'per-symbol width implies volume crept back in'
 
 
 # ── MT2INet: the independent allocator ───────────────────────────────────────────
@@ -237,7 +238,7 @@ class TestMT2INetParity:
         """Same output shape, so all three drop into the same pool, score and target — the
         comparison isolates the feature set rather than the machinery."""
         from models import MT1Net
-        x74, x146, x888 = torch.randn(1, 74), torch.randn(1, 146), torch.randn(1, 888)
+        x74, x146, x888 = torch.randn(1, 74), torch.randn(1, 158), torch.randn(1, 888)
         assert MT1Net()(x74).shape == (1, 1)
         assert MT1CNet()(x146).shape == (1, 1)
         assert MT2INet()(x888).shape == (1, 1)

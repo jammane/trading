@@ -585,7 +585,21 @@ failures and never blocks the commit.
 
 All model classes are defined in `models.py` (single source of truth) and imported everywhere:
 
-- **`StockNN`** — one instance per industry sector (12 sectors). FC injection architecture: seed day → 14 inject layers → today layer → 2 flat layers → funnel. Output is `(12, 4)` — one row per stock in the sector, columns are `[buy_qty, buy_price_frac, sell_all_price_frac, sell_qty]`. The `today` vector is **232** wide as of v0.6.0.0 (was 208): 17 features per symbol × 12 + 15 cross-sym aggs + 13 state. `STOCKNN_PARAMS = 928825` (was 921625; `fc_today` is 422→300).
+- **`StockNN`** — one instance per industry sector (12 sectors). FC injection architecture: seed day → 14 inject layers → today layer → 2 flat layers → funnel. Output is `(12, 5)` — one row per stock in the sector, columns are `[buy_qty, buy_price_frac, sell_all_price_frac, sell_qty, sell_flag]` (`STOCK_OUT_PER_SYM`, mirrored in `models.py` and `training_lib`). The `today` vector is **232** wide as of v0.6.0.0 (was 208): 17 features per symbol × 12 + 15 cross-sym aggs + 13 state. `STOCKNN_PARAMS = 930169` (was 928825 before `sell_flag`, 921625 before v0.6.0.0; `fc_today` is 422→300).
+
+  **`sell_flag` (output column 4, 2026-11-12 — BREAKING).** A sigmoid that decides whether a held
+  symbol gets its sell-all limit at all: above 0.5 it does, at `sell_all_price_frac` in today's
+  range, as before; otherwise the model **holds** — no sell order, so the shares keep their GTC
+  stop (−10%) and the symbol may be bought, i.e. added to. Before it, every held position was
+  offered for sale every day inside a range it usually trades back into, and could never be added
+  to (a symbol with a sell placed is not bought: Alpaca's wash-trade rule), which is a large part
+  of why StockNN churned when holding was what paid. A high-priced "hold" limit was considered and
+  rejected: Alpaca does not let a sell limit and a stop cover the same shares, so it would hold
+  without protection and still block adding. The race nets read the flag as a 13th per-stock input
+  (`CN_SFLAG`; MT1C/TANH32 158 wide, MT1S 15, MT1S-stk 20). Every StockNN and race weight file
+  from before is unloadable; the next full training replaces them anyway. j_neuro pools saved with
+  48 outputs gain a fresh `sell_flag` output per stock on load (j_neuro spec/12
+  `add_output_fresh`, `jn_set_output_migration`).
 
   **`close_pos` (today feature 15, v0.6.0.0 — BREAKING).** `(4C − 2O − H − L) / (7(H − L))`, the
   intraday position of the close within today's bar; equivalently `2·(C−O)/(H−L) + CLV`. Defined in
@@ -847,12 +861,12 @@ four shapes in `tests/test_mt1_backprop.cpp`; worst relative error 1.1e-04.
 | constant | value | meaning |
 |---|---|---|
 | `MT1_BP_START_DAY` | 400 | first day that trains — the first 400 are ignored |
-| `MT1_BP_HIDDEN_A/B` | 32 / 8 | `MT1C_IN(146) → 32 → 8 → 1`, 4,977 params |
+| `MT1_BP_HIDDEN_A/B` | 32 / 8 | `MT1C_IN(158) → 32 → 8 → 1`, 5,361 params (4,977 at 146 wide, before `sell_flag`) |
 
 **Shape is 32/8 because bigger measured worse**, not for speed: the wider net read +0.0077 rank IC
 against +0.0184 for this one.
 
-**Inputs are MT1CNet's `cfeat146`** — that industry's features, today only, post-close, **carrying
+**Inputs are MT1CNet's `cfeat146`** (158 wide since `sell_flag`; the name is historical) — that industry's features, today only, post-close, **carrying
 that model's own order intent**. **One training row per scored model** (`MT1_BP_MODELS = N_SLOTS`),
 each row's target being its own realised `slot_score − book_prev`. The prediction published to
 `bp_pred` uses slot 0's intent, because slot 0 is what production places, and it predicts before it
@@ -902,7 +916,7 @@ data because they are handed the same bytes. Cost is small beside StockNN's 200 
 
 | axis | values |
 |---|---|
-| architecture | `MT1` (MT1Net, 74 trailing features, no order intent), `MT1C` (MT1CNet, `cfeat146` with order intent), `MT1S` (per-symbol nets summed: `-sum`, `-rep` seed replicate, `-shr` shared encoder), `MT1S-stk` (one net per stock, 144), `TANH32` (MT1Backprop 146→32→8→1) |
+| architecture | `MT1` (MT1Net, 74 trailing features, no order intent), `MT1C` (MT1CNet, `cfeat146` with order intent), `MT1S` (per-symbol nets summed: `-sum`, `-rep` seed replicate, `-shr` shared encoder), `MT1S-stk` (one net per stock, 144), `TANH32` (MT1Backprop 158→32→8→1) |
 | search | `evo` (200-slot evolutionary pool) or gradient (`grad`, `grdC`, `gdmn`, `grnk`) |
 | carry | `grdC` = gradient that **carries** its weights and Adam moments across pass boundaries; `grad` restarts each pass; evo pools always carry |
 | loss | MSE (`grad`/`grdC`), demeaned MSE (`gdmn`), ListNet ranking (`grnk`); loser twins `q20` and `bt4` (below) |
@@ -1133,11 +1147,24 @@ same day, same market move — which leaks hard and manufactures a ranking out o
 their own structure and remember earlier inputs (s_neurons). The trainer can use it in two places,
 both **off by default**:
 
-- `--jn-stocknn` — each industry's StockNN is a pool of 200 j_neuro nets (232 → 48) instead of the
-  928,825-param net. Selection keeps the top 20 in rank order and breeds 9 children from each;
-  there are no weighted-average blends, no 5-day elite history and no pass-boundary champion judging
-  (nets of different shapes cannot be averaged or stored in the flat buffers). Pools live in memory
-  and are saved at each pass end as `jn_<industry>_<slot>.jnet`; a `JN_STOCKNN` marker is written.
+- `--jn-stocknn` — each industry's StockNN is a pool of 200 j_neuro nets (232 → 60) instead of the
+  930,169-param net. Selection keeps the top 20 in rank order and breeds 9 children from each;
+  there are no weighted-average blends and no 5-day elite history (nets of different shapes cannot
+  be averaged or stored in the flat buffers). Pools live in memory and are saved at each pass end
+  as `jn_<industry>_<slot>.jnet`; a `JN_STOCKNN` marker is written.
+- **Champions work as for StockNN.** At each pass end the pool's 20 elites (slots 0–19, rank
+  order) are written as `jn_<industry>_elite_<k>.jnet`, and `pass_boundary` judges, crowns into
+  `champion/` and blends the next pass's seed from those files exactly as it does the flat elites
+  (`champ_elite_path`); the pool is then rebuilt from the seed with fresh children
+  (`jn_seed_from_elites`). `--continue-run` blends first and the pool starts from the run's elites;
+  a run seeded with `--load-dir champion/` starts from the champion's. A JN race entry's deployed
+  net (`race_p<N>_<entry>_<ind>.jnet`) travels into `champion/` with its pass's elites.
+- **Inputs are signed-log scaled** (`sign(x)·log1p(|x|)`) before they reach a JN StockNN net. The
+  today vector holds raw share volumes and their daily changes (~1e6) beside dollar prices and
+  O(1) ratios, and a new j_neuro net passes its inputs nearly straight through: on raw inputs the
+  first 2-pass smoke measured raw outputs p10 −1.5e5 … p90 +2.5e5, p99 3e38, half the price
+  fractions saturated and buy quantities in the 1e5s. Each pass end logs `JN StockNN raw outputs`
+  (p1/p10/p50/p90/p99 per output column, share exactly 0, share past the sigmoid's saturation).
 - `--jn-race` (or naming them in `--race-only`) — two race entries, `JN evo` (picks the top) and
   `JN evo bt4` (flags the bottom 4), reading MT1's 74 trailing features as a daily sequence.
 - `--jn-profile FILE` — the mutation profile; default j_neuro's `profiles/training.json`.
@@ -1146,7 +1173,8 @@ j_neuro computes in exact IEEE-754 and refuses fast-math, so it is reached only 
 `jn_bridge.{h,cpp}`, an opaque wrapper CMake builds with j_neuro's own flags. The build looks for a
 checkout at `../j_neuro` (`-DJNEURO_DIR=`; it needs `json-devel`); without one,
 `jn_bridge_stub.cpp` is linked and every JN flag is refused at startup. JN is refused under
-`--upkeep` and the control modes.
+`--upkeep` and the control modes, and production cannot run a JN net (it runs StockNN in torch),
+so JN champions are not promotable to paper or prod yet.
 
 A net replays its own warmup rows each day from a 64-row ring (`JN_RING_CAP`), so cost per day
 grows with the memory evolution gives it: measured, mean warmup went 4 → ~11 rows and levelled
@@ -1362,8 +1390,10 @@ the same morning's sale proceeds, sized at the fill price, and sold positions ba
 bought them (16 of 26 holdings matched on 10-14). Production's order rules now live in one place,
 `training_lib.plan_orders`, decided at the close before anything fills:
 
-- a symbol with a sell placed is not bought (Alpaca rejects the buy as a wash trade), and every
-  held symbol gets a sell-all limit, so a held symbol is never added to;
+- a symbol with a sell placed is not bought (Alpaca rejects the buy as a wash trade). Until
+  2026-11-12 every held symbol got a sell-all limit, so a held symbol was never added to; now it
+  gets one only when StockNN's `sell_flag` asks for it, and a held symbol with no sell may be
+  bought (that session it has no stop beside the open buy);
 - buys are sized against the cash the industry has at the close, at the limit, in whole shares,
   and an order that does not fill still used its share of the budget;
 - a sell-all limit exists only for shares held at the close, so a position bought today is not
@@ -1551,8 +1581,13 @@ the two to the same numbers.
 - A buy whose limit is at or above the next open fills at the **open + `OPEN_BUY_PREMIUM`
   (0.70%), capped at the limit**.
 - A triggered stop is a market order: `SLIPPAGE_RATE` (0.1%) below the stop.
-- Market sells and sell-alls that gap through at the open fill at the open (no sell prices are
-  recorded yet, so the sell side is not calibrated).
+- Market sells and sell-alls that gap through at the open fill at the open. The sell side is not
+  calibrated yet: since 2026-11-12 `fill_check.csv` records sell and stop prices on both sides
+  (`sim_sell_px`/`real_sell_px`, `sim_stop_px`/`real_stop_px`, share-weighted, and
+  `real_sell_types`), and the session summary prints the mean broker-vs-sim difference. A file
+  with the old columns is set aside as `fill_check.v1.csv`.
+- A held symbol has no stop on a day it is bought (added to), as in production, where Alpaca's
+  wash-trade rule keeps a held stop from being re-placed beside an open buy.
 
 Measured on `fill_check.csv` (2026-10-13..11-10): the old model, the open itself for open buys
 and 0.1% beyond the limit for intraday limit fills, priced buys **0.43% cheaper than paper on

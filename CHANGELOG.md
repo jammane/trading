@@ -20,6 +20,18 @@ entry is in its commit message.
   report gains a `losers bp/day` line.
 
 ### Changed
+- **BREAKING: StockNN can hold.** A fifth output per stock, `sell_flag`, decides whether a held
+  symbol gets its sell-all limit; when it does not, the position keeps its stop and can be added
+  to. Every held position used to be offered for sale every day and could never be added to. The
+  race nets read the flag as an input (MT1C and TANH32 158 wide, MT1S 15, MT1S-stk 20). StockNN
+  and race weight files from before do not load; the next full training replaces them. A held
+  symbol has no stop on a day it is bought, as in production.
+- **j_neuro StockNN takes the champion gate** like StockNN: elites are judged, crowned into
+  `champion/` and blended into the next pass's seed, and `--continue-run` and `--load-dir`
+  seed from them. Its inputs are signed-log scaled, and each pass logs the raw output census.
+- **`fill_check.csv` records sell and stop prices** on both sides, so the sell side of the fill
+  model can be calibrated as the buy side was.
+- **The MT1 dataset log is version 5** (the competitor input is 158 wide).
 - **Fill prices match paper.** A limit fills at the limit (it never filled worse on paper; the
   simulator charged 0.1% beyond it), and a buy whose limit is at or above the open fills at the
   open + 0.70%, capped at the limit (paper paid +0.60% over the open; the simulator used the open

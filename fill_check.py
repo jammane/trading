@@ -13,6 +13,10 @@ module sets that beside what Alpaca actually did, at three levels:
   fills    for every order: did the fill model fill it, and did the market? At what price? And
            the result -- each symbol's holding after the session, simulated against real.
 
+Sell prices are recorded on both sides (sim_sell_px / real_sell_px, the share-weighted average of
+the session's sells, and the same for stops) so the sell side of the fill model can be calibrated
+the way the buy side was (OPEN_BUY_PREMIUM); until 2026-11-12 only quantities were kept.
+
 A mismatch at a level is reported with the first level it shows up at, since a different intent
 explains every difference below it. The rows go to fill_check.csv (one per symbol with anything
 to compare) and a summary is printed; nothing here touches the broker except to read.
@@ -66,7 +70,8 @@ def compare(pending, sim, broker_orders, positions):
     intents = pending.get("intents") or {}
     rows, s = [], dict(symbols=0, intent_checked=0, intent_mismatch=0, buys_real=0,
                        buy_both=0, buy_sim_only=0, buy_real_only=0, buy_neither=0,
-                       buy_px_diff=[], hold_mismatch=0, notes=[])
+                       buy_px_diff=[], sell_px_diff=[], stop_px_diff=[], hold_mismatch=0,
+                       notes=[])
     for sym, sr in sim.items():
         r = real.get(sym, {"buy": None, "sell": [], "stop": []})
         held_before = float(pending.get("holdings", {}).get(sym, 0.0))
@@ -75,6 +80,12 @@ def compare(pending, sim, broker_orders, positions):
         # intent
         it = intents.get(sym)
         sim_it = [sr["bqty"], sr["bfrac"], sr["sfrac"], sr["sqty"]]
+        if "sflag" in sr:                       # StockNN's 5th output (orders_sim.csv, v0.9)
+            sim_it.append(sr["sflag"])
+        if it is not None and len(it) != len(sim_it):
+            s["notes"].append(f"{sym}: intent widths differ ({len(it)} vs {len(sim_it)}) -- "
+                              "production and trainer run different StockNN versions")
+            it = None
         if it is not None:
             d = max(rel(a, b) for a, b in zip(it, sim_it, strict=True))
             row.update(intent_diff=round(d, 6), intent_match=d <= INTENT_TOL)
@@ -108,8 +119,21 @@ def compare(pending, sim, broker_orders, positions):
         real_sold = sum(float(o["filled_qty"] or 0) for o in r["sell"])
         real_stopped = sum(float(o["filled_qty"] or 0) for o in r["stop"])
         sim_sold = sr["sold_open_q"] + sr["sold_all_q"]
+        real_sell_px = vwap([(o["filled_qty"], o["filled_px"]) for o in r["sell"]])
+        real_stop_px = vwap([(o["filled_qty"], o["filled_px"]) for o in r["stop"]])
+        sim_sell_px = vwap([(sr["sold_open_q"], sr["sold_open_px"]),
+                            (sr["sold_all_q"], sr["sold_all_px"])])
+        sim_stop_px = vwap([(sr["stopped_q"], sr["stopped_px"])])
         row.update(sim_sold=sim_sold, real_sold=real_sold, sim_stopped=sr["stopped_q"],
-                   real_stopped=real_stopped)
+                   real_stopped=real_stopped, sim_sell_px=round(sim_sell_px, 4),
+                   real_sell_px=round(real_sell_px, 4), sim_stop_px=round(sim_stop_px, 4),
+                   real_stop_px=round(real_stop_px, 4),
+                   real_sell_types="|".join(sorted({sell_kind(o) for o in r["sell"]
+                                                    if float(o["filled_qty"] or 0) > 0})))
+        if sim_sold > 0 and real_sold > 0:
+            s["sell_px_diff"].append((real_sell_px - sim_sell_px) / sim_sell_px)
+        if sr["stopped_q"] > 0 and real_stopped > 0:
+            s["stop_px_diff"].append((real_stop_px - sim_stop_px) / sim_stop_px)
         # result
         hold_sim, hold_real = sr["hold_after"], float(positions.get(sym, 0.0))
         row.update(sim_hold_after=hold_sim, real_hold_after=hold_real,
@@ -122,6 +146,17 @@ def compare(pending, sim, broker_orders, positions):
     if s["intent_checked"] == 0:
         s["notes"].append("no production intents recorded for this decision (before fill_check)")
     return rows, s
+
+
+def vwap(pairs):
+    """Share-weighted average price of [(qty, px)], 0.0 when nothing filled."""
+    q = sum(float(a or 0) for a, _ in pairs)
+    return sum(float(a or 0) * float(p or 0) for a, p in pairs) / q if q > 0 else 0.0
+
+
+def sell_kind(o):
+    """'market' (sell_qty at the open) or 'limit' (a sell-all) for a real sell order."""
+    return "limit" if o.get("limit") else "market"
 
 
 def summary_lines(s, date):
@@ -137,6 +172,11 @@ def summary_lines(s, date):
     if px:
         out.append(f"  fill price, market - sim: mean {sum(px) / len(px):+.4f}, worst "
                    f"{max(px, key=abs):+.4f} per share")
+    for lab, key in (("sell", "sell_px_diff"), ("stop", "stop_px_diff")):
+        d = s[key]
+        if d:
+            out.append(f"  {lab} fill price, market vs sim: mean {100 * sum(d) / len(d):+.3f}% "
+                       f"over {len(d)} symbol(s) (positive = the broker paid more)")
     out.append(f"  holdings after the session: {s['symbols'] - s['hold_mismatch']}/{s['symbols']} "
                f"as simulated")
     out += [f"  note: {n}" for n in s["notes"]]
@@ -149,8 +189,16 @@ def append_rows(path, rows):
     cols = ["date", "fill_date", "industry", "symbol", "held_before", "intent_diff",
             "intent_match", "real_buy_lim", "sim_buy_lim", "real_buy_qty", "real_buy_status",
             "sim_bought", "real_bought", "sim_buy_px", "real_buy_px", "sim_sold", "real_sold",
-            "sim_stopped", "real_stopped", "sim_hold_after", "real_hold_after", "hold_match",
+            "sim_stopped", "real_stopped", "sim_sell_px", "real_sell_px", "real_sell_types",
+            "sim_stop_px", "real_stop_px", "sim_hold_after", "real_hold_after", "hold_match",
             "fill", "note"]
+    # A file written with other columns (before sell prices were recorded) is set aside rather
+    # than appended to under a header that no longer describes the rows.
+    if os.path.exists(path):
+        with open(path, newline="") as f:
+            head = next(csv.reader(f), None)
+        if head != cols:
+            os.replace(path, path[:-4] + ".v1.csv" if path.endswith(".csv") else path + ".v1")
     new = not os.path.exists(path)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "a", newline="") as f:

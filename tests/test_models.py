@@ -30,34 +30,44 @@ class TestStockNN:
     def test_output_shape(self, stock_inputs):
         history, today = stock_inputs
         out = StockNN()(history, today)
-        assert out.shape == (1, 48)
+        assert out.shape == (1, 60)
 
-    def test_output_reshapes_to_12x4(self, stock_inputs):
+    def test_output_reshapes_to_12x5(self, stock_inputs):
         history, today = stock_inputs
-        out = StockNN()(history, today).view(12, 4)
-        assert out.shape == (12, 4)
+        out = StockNN()(history, today).view(12, 5)
+        assert out.shape == (12, 5)
 
     def test_buy_qty_nonnegative(self, stock_inputs):
         history, today = stock_inputs
-        out = StockNN()(history, today).view(12, 4)
+        out = StockNN()(history, today).view(12, 5)
         assert (out[:, 0] >= 0).all(), "buy_qty must be non-negative (ReLU)"
 
     def test_buy_price_frac_in_range(self, stock_inputs):
         history, today = stock_inputs
-        out = StockNN()(history, today).view(12, 4)
+        out = StockNN()(history, today).view(12, 5)
         assert (out[:, 1] >= 0).all() and (out[:, 1] <= 1).all(), \
             "buy_price_frac must be in [0, 1] (sigmoid)"
 
     def test_sell_all_price_frac_in_range(self, stock_inputs):
         history, today = stock_inputs
-        out = StockNN()(history, today).view(12, 4)
+        out = StockNN()(history, today).view(12, 5)
         assert (out[:, 2] >= 0).all() and (out[:, 2] <= 1).all(), \
             "sell_all_price_frac must be in [0, 1] (sigmoid)"
 
     def test_sell_qty_nonnegative(self, stock_inputs):
         history, today = stock_inputs
-        out = StockNN()(history, today).view(12, 4)
+        out = StockNN()(history, today).view(12, 5)
         assert (out[:, 3] >= 0).all(), "sell_qty must be non-negative (ReLU)"
+
+    def test_sell_flag_in_range(self, stock_inputs):
+        history, today = stock_inputs
+        out = StockNN()(history, today).view(12, 5)
+        assert (out[:, 4] >= 0).all() and (out[:, 4] <= 1).all(), \
+            "sell_flag must be in [0, 1] (sigmoid)"
+
+    def test_param_count_matches_the_trainer(self):
+        from models import STOCKNN_PARAMS
+        assert sum(p.numel() for p in StockNN().parameters()) == STOCKNN_PARAMS == 930169
 
     def test_deterministic(self, stock_inputs):
         history, today = stock_inputs
@@ -110,7 +120,7 @@ class TestStockNN:
     def test_output_layer_dims(self):
         model = StockNN()
         assert model.fc_out.in_features  == 111
-        assert model.fc_out.out_features == 48
+        assert model.fc_out.out_features == 60   # STOCK_OUT_N: 12 stocks x 5 outputs
 
     def test_batch_size_one(self, stock_inputs):
         history, today = stock_inputs

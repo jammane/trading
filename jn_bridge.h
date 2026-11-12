@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 struct JNPool;
 
@@ -58,9 +59,17 @@ void    jn_inject(JNPool* p, int slot, double pct, uint64_t seed);
 
 JNStats jn_stats(const JNPool* p);
 
+// Saved nets with from_n_out outputs load into this pool by inserting a fresh output (j_neuro
+// spec/12, add_output_fresh) at each index of insert_at, ascending in the final layout. Lets a
+// pool trained before an output was added carry on instead of restarting.
+void    jn_set_output_migration(JNPool* p, int from_n_out, const std::vector<int>& insert_at);
+
 // <dir>/<prefix>_<slot>.jnet for every slot, plus <prefix>_ring.bin (the history rows).
 bool    jn_save(const JNPool* p, const std::string& dir, const std::string& prefix);
 // Loads what jn_save wrote; false (pool unchanged) if any net is missing or does not match.
 bool    jn_load(JNPool* p, const std::string& dir, const std::string& prefix);
 // One slot alone, e.g. a deployed model for the champion store.
 bool    jn_save_slot(const JNPool* p, int slot, const std::string& path);
+// Loads one net written by jn_save_slot into slot; false (slot unchanged) if missing or the
+// widths do not match. The champion store and pass seeding move nets one at a time.
+bool    jn_load_slot(JNPool* p, int slot, const std::string& path);

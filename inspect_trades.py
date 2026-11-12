@@ -48,7 +48,7 @@ import yfinance as yf
 
 from fees import BUY_FILL, OPEN_BUY_PREMIUM, _sell_net
 from models import StockNN, stock_close_pos, stock_close_vs_wap
-from training_lib import plan_orders
+from training_lib import STOCK_OUT_PER_SYM, plan_orders
 from universe import INDUSTRIES
 
 
@@ -276,7 +276,7 @@ def simulate_trades(symbols, out_tensor, day_data, next_day_data, cash, holdings
     scores portfolios — both baseline and post-trade value are on the fill day so
     the delta reflects only the trading decision, not overnight price movement.
     """
-    out  = out_tensor.view(12, 4)
+    out  = out_tensor.view(12, STOCK_OUT_PER_SYM)
     nd   = next_day_data
 
     cur_holdings = {s: holdings.get(s, 0.0) for s in symbols}
@@ -293,7 +293,7 @@ def simulate_trades(symbols, out_tensor, day_data, next_day_data, cash, holdings
             sell_records[sym] = {'action': 'SKIP', 'reason': 'symbol missing from day_data'}
             continue
 
-        buy_qty, buy_price_frac, sell_all_price_frac, sell_qty = out[j].tolist()
+        buy_qty, buy_price_frac, sell_all_price_frac, sell_qty, sell_flag = out[j].tolist()
 
         low_t  = day_data[sym]['low']
         high_t = day_data[sym]['high']
@@ -313,6 +313,7 @@ def simulate_trades(symbols, out_tensor, day_data, next_day_data, cash, holdings
             'raw_buy_price_frac': buy_price_frac,
             'raw_sell_all_frac':  sell_all_price_frac,
             'raw_sell_qty':       sell_qty,
+            'raw_sell_flag':      sell_flag,
             'sell_all_limit':     sell_all_price,
             'day_low':            low_t,
             'day_high':           high_t,
@@ -380,6 +381,11 @@ def simulate_trades(symbols, out_tensor, day_data, next_day_data, cash, holdings
                     'reason': (f"Sell-all limit ${sell_all_price:.2f}; "
                                f"next-day range ${nd_low:.2f}–${nd_high:.2f} never reached limit."),
                 })
+        elif cur_qty_after > 1e-6 and sell_flag <= 0.5:
+            rec['sell_actions'].append({
+                'type':   'HOLD',
+                'reason': f"sell_flag {sell_flag:.3f} <= 0.5: no sell-all placed; the stop stays.",
+            })
         elif cur_qty_after <= 1e-6 and sell_all_price_frac > 0.05:
             rec['sell_actions'].append({
                 'type':   'SELL_ALL_NO_EXEC',
@@ -394,7 +400,7 @@ def simulate_trades(symbols, out_tensor, day_data, next_day_data, cash, holdings
             sell_records[sym]['buy_action'] = {'type': 'SKIP', 'reason': 'symbol missing'}
             continue
 
-        buy_qty, buy_price_frac, sell_all_price_frac, sell_qty = out[j].tolist()
+        buy_qty, buy_price_frac, sell_all_price_frac, sell_qty, sell_flag = out[j].tolist()
         low_t  = day_data[sym]['low']
         high_t = day_data[sym]['high']
         span_t = max(high_t - low_t, 1e-9)
