@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 
 import training_lib as tl
+from fees import OPEN_BUY_PREMIUM
 
 SYMS = [f"S{i}" for i in range(12)]
 
@@ -93,7 +94,9 @@ def test_the_planned_quantity_is_bought_even_when_the_fill_is_cheaper():
     plan = tl.plan_orders(["AAA"], {"AAA": (2.0, 0.0, 1.0, 0.0)}, {}, DAY, 1000.0)  # 2 @ $48
     port = {"cash": 1000.0, "holdings": {}, "stop_prices": {}}
     fill("AAA", port, plan, {"open": 30.0, "high": 31.0, "low": 29.0, "close": 30.0})
-    assert port["holdings"]["AAA"] == 2 and port["cash"] == pytest.approx(940.0)
+    # Filled at the open plus the paper-calibrated premium (fees.buy_fill_price), not at the $48 limit.
+    assert port["holdings"]["AAA"] == 2
+    assert port["cash"] == pytest.approx(1000.0 - 2 * 30.0 * (1 + OPEN_BUY_PREMIUM))
 
 
 def test_a_position_bought_today_is_not_sold_back_the_same_day():

@@ -46,7 +46,7 @@ from datetime import datetime, timedelta
 import torch
 import yfinance as yf
 
-from fees import BUY_FILL, SLIPPAGE_RATE, _sell_net
+from fees import BUY_FILL, OPEN_BUY_PREMIUM, _sell_net
 from models import StockNN, stock_close_pos, stock_close_vs_wap
 from training_lib import plan_orders
 from universe import INDUSTRIES
@@ -361,7 +361,7 @@ def simulate_trades(symbols, out_tensor, day_data, next_day_data, cash, holdings
                                    f"next-day open ${nd_open:.2f} ≥ limit → gapped above, filled at open."),
                 })
             elif nd_low < sell_all_price < nd_high:
-                slipped = sell_all_price * (1.0 - SLIPPAGE_RATE)
+                slipped = sell_all_price   # a limit fills at the limit
                 net = _sell_net(cur_qty_after, slipped)
                 cur_holdings[sym] = 0.0
                 cur_cash += net
@@ -372,7 +372,7 @@ def simulate_trades(symbols, out_tensor, day_data, next_day_data, cash, holdings
                     'net_cash':   net,
                     'reason':     (f"Sell-all limit ${sell_all_price:.2f}; "
                                    f"next-day range ${nd_low:.2f}–${nd_high:.2f} crossed limit → "
-                                   f"filled at ${slipped:.2f} (−{SLIPPAGE_RATE*100:.2f}% slip)."),
+                                   f"filled at the limit ${slipped:.2f}."),
                 })
             else:
                 rec['sell_actions'].append({
@@ -437,13 +437,13 @@ def simulate_trades(symbols, out_tensor, day_data, next_day_data, cash, holdings
         buy_amount, buy_price, stop_loss = plan['buys'][sym]
 
         if nd_open <= buy_price:
-            fill_price  = nd_open
-            fill_reason = f"Next-day open ${nd_open:.2f} ≤ buy limit ${buy_price:.2f} → gapped below, filled at open."
+            fill_price  = min(nd_open * (1.0 + OPEN_BUY_PREMIUM), buy_price)
+            fill_reason = (f"Next-day open ${nd_open:.2f} ≤ buy limit ${buy_price:.2f} → filled at the "
+                           f"open +{OPEN_BUY_PREMIUM*100:.2f}% (capped at the limit): ${fill_price:.2f}.")
         elif nd_low < buy_price < nd_high:
-            fill_price  = buy_price * (1.0 + SLIPPAGE_RATE)
+            fill_price  = buy_price
             fill_reason = (f"Buy limit ${buy_price:.2f} hit intraday "
-                           f"(range ${nd_low:.2f}–${nd_high:.2f}); "
-                           f"filled at ${fill_price:.2f} (+{SLIPPAGE_RATE*100:.2f}% slip).")
+                           f"(range ${nd_low:.2f}–${nd_high:.2f}); filled at the limit.")
         else:
             rec['buy_action'] = {
                 'type':      'BUY_NO_EXEC',

@@ -9,6 +9,10 @@ entry is in its commit message.
 ## Unreleased
 
 ### Added
+- **j_neuro nets in the trainer (experimental, off by default).** `--jn-stocknn` makes each
+  industry's StockNN a pool of j_neuro nets; `--jn-race` adds two race entries, `JN evo` and
+  `JN evo bt4`. Built only when a j_neuro checkout is found (`-DJNEURO_DIR`); otherwise the flags
+  are refused at startup. Not supported under `--upkeep`.
 - **The full race field and loser twins (v7).** The three entries pruned after v0.8.1.34 are back
   and nothing is skipped, and 26 loser twins race beside them: `q20` (pinball loss at the 20th
   percentile, one per MSE entry) and `bt4` (a bottom-4-of-12 classifier, one per single-output
@@ -16,6 +20,14 @@ entry is in its commit message.
   report gains a `losers bp/day` line.
 
 ### Changed
+- **Fill prices match paper.** A limit fills at the limit (it never filled worse on paper; the
+  simulator charged 0.1% beyond it), and a buy whose limit is at or above the open fills at the
+  open + 0.70%, capped at the limit (paper paid +0.60% over the open; the simulator used the open
+  itself). On balance training priced buys 0.43% cheaper than paper. Recalibrated to prod once
+  it runs.
+- **StockNN selection ranks on book P&L**, the slot's own `score − book_prev`, instead of the
+  trade delta against holding. The two rank alike except through the `invested_pct` multiplier,
+  which now also weights holders on up days.
 - **The zero-trade filter allows one idle day.** A StockNN model is excluded from selection only
   when it places no trades on two consecutive days, not on its first idle day. Mutations inherit
   their parent's record; history candidates stay exempt.

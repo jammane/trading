@@ -540,6 +540,9 @@ pytest tests across the files in `tests/`:
   rejected symbol, swaps happen only for stopped data or drift, the replacement is the first that
   rechecks and keeps the band, the book forgets exactly the swapped slot, and promotion clears
   exactly one industry's state even where industry names share words.
+- `test_fill_price.py` -- the paper-calibrated fill prices: open buys pay the premium but never
+  more than the limit, intraday limits fill at the limit, nothing fills at the low, and the C++
+  `buy_fill_price` matches `fees.buy_fill_price` on 2,000 random bars.
 - `test_fill_check.py` -- the simulated-vs-real comparison: a matching day agrees at every level,
   each way a fill can disagree is counted on its own side, a different intent is flagged as the
   first cause, and sells and stops compare the quantities that left the book.
@@ -1124,6 +1127,48 @@ Both measures are out-of-sample by construction: the net predicts a day before t
 prediction loop would score model *m+1* with a net that had already seen model *m*'s outcome —
 same day, same market move — which leaks hard and manufactures a ranking out of noise.
 
+### j_neuro nets (`--jn-stocknn`, `--jn-race`; experimental)
+
+[j_neuro](https://github.com/jammane/j_neuro) is an evolutionary net library whose nets grow
+their own structure and remember earlier inputs (s_neurons). The trainer can use it in two places,
+both **off by default**:
+
+- `--jn-stocknn` — each industry's StockNN is a pool of 200 j_neuro nets (232 → 48) instead of the
+  928,825-param net. Selection keeps the top 20 in rank order and breeds 9 children from each;
+  there are no weighted-average blends, no 5-day elite history and no pass-boundary champion judging
+  (nets of different shapes cannot be averaged or stored in the flat buffers). Pools live in memory
+  and are saved at each pass end as `jn_<industry>_<slot>.jnet`; a `JN_STOCKNN` marker is written.
+- `--jn-race` (or naming them in `--race-only`) — two race entries, `JN evo` (picks the top) and
+  `JN evo bt4` (flags the bottom 4), reading MT1's 74 trailing features as a daily sequence.
+- `--jn-profile FILE` — the mutation profile; default j_neuro's `profiles/training.json`.
+
+j_neuro computes in exact IEEE-754 and refuses fast-math, so it is reached only through
+`jn_bridge.{h,cpp}`, an opaque wrapper CMake builds with j_neuro's own flags. The build looks for a
+checkout at `../j_neuro` (`-DJNEURO_DIR=`; it needs `json-devel`); without one,
+`jn_bridge_stub.cpp` is linked and every JN flag is refused at startup. JN is refused under
+`--upkeep` and the control modes.
+
+A net replays its own warmup rows each day from a 64-row ring (`JN_RING_CAP`), so cost per day
+grows with the memory evolution gives it: measured, mean warmup went 4 → ~11 rows and levelled
+off, at ~15 s/day on one worker (StockNN: ~75 s/day). Every pass starts cold (the ring is cleared),
+so nothing trades for the first ~5 days. The nets are expected to need several passes to grow into
+their task.
+
+**Output scale (`JN_RACE_OUT_SCALE = 0.1`).** A new net has identity weights, so its output is in
+its inputs' units: unscaled, fresh nets predicted $172 / $2,188 / $9,235 (p10/p50/p90) against a
+target of $86–$1,650, every structured net lost to one that output exactly 0, and selection
+deployed those (JN evo had ≤2 of 12 industries non-zero on 65% of days). Scaled, it was 4%.
+`JN evo bt4` still leans to 0 (66%), because its target is a 0/1 label that 0 predicts two-thirds
+of the time.
+
+**Ties in the race.** A day's top 4 / top 6 / bottom 4 is scored as the expected return under a
+random order within tied predictions, so an all-tied day scores exactly flat instead of the first
+industries in universe order. `race_daily.csv` keeps the actual picks.
+
+**`RANK LEAK`.** The 500-day smoke read a within-day rank of +0.0909 over 11 industry-days on
+the no-intent rows (MT1, JN), which must read n/a; v7 never does, and the cause was not found. Any
+recurrence is logged with the day, industry, order-set count and prediction range.
+
 ### Production inference chain (when MT2 models available)
 
 ```
@@ -1447,7 +1492,7 @@ Each industry maintains **200 model slots** on disk as `.pt` files. The slot lay
 - Slots 17–19: weighted-average blends (top-5, top-10, top-15 weights)
 - Slots 20–199: Gaussian-noise mutations (9 children per parent, deterministic assignment)
 
-Each training day: all 200 slots reset to slot 0's portfolio → infer → simulate fills → score as `delta × invested_pct` → select + mutate. The `invested_pct` multiplier penalises cash-heavy winners.
+Each training day: all 200 slots reset to slot 0's portfolio → infer → simulate fills → score → select + mutate. The score is the slot's own **book P&L**, `slot_score − book_prev` (the held positions' move plus the trades' effect), multiplied by `invested_pct` when positive, which penalises cash-heavy winners. Until 2026-11-12 it was the trade delta `slot_score − baseline`; every slot starts from the same book, so the two differ by one constant per day and rank identically except through that sign-gated multiplier, which now also weights holders on up days. The −10% survival floor is still measured against simply holding.
 
 **Zero-trade filter: two idle days in a row.** A slot that places no trades is excluded from
 selection only if its model was also idle on its previous scored day; one null day is allowed,
@@ -1489,8 +1534,26 @@ does `race_skip.txt`.
 ### Fill simulation
 
 Orders are planned end-of-day N by `training_lib.plan_orders` (production's own order rules; see
-**Training trades under production's limits**) and filled against next-day OHLCV with
-`SLIPPAGE_RATE = 0.001`. Strict boundary: a buy limit at exactly `nd_low` does not fill.
+**Training trades under production's limits**) and filled against next-day OHLCV. Strict
+boundary: a buy limit at exactly `nd_low` does not fill.
+
+**Fill prices are calibrated to paper, and will be recalibrated to prod once it runs** (2026-11-12).
+`buy_fill_price` in `training_v4.cpp`, mirrored in `fees.py` and used by every simulator
+(`training_lib`, `inspect_trades.py`, `fill_reconciliation.py`); `tests/test_fill_price.py` holds
+the two to the same numbers.
+
+- A limit fills **at the limit**, never worse: 0 of 162 paper buys filled above their limit.
+- A buy whose limit is at or above the next open fills at the **open + `OPEN_BUY_PREMIUM`
+  (0.70%), capped at the limit**.
+- A triggered stop is a market order: `SLIPPAGE_RATE` (0.1%) below the stop.
+- Market sells and sell-alls that gap through at the open fill at the open (no sell prices are
+  recorded yet, so the sell side is not calibrated).
+
+Measured on `fill_check.csv` (2026-10-13..11-10): the old model, the open itself for open buys
+and 0.1% beyond the limit for intraday limit fills, priced buys **0.43% cheaper than paper on
+balance**. Open buys are 82% of fills and paper paid +0.60% over the open (119 fills, 20
+sessions, 19 positive; per-fill sd 1.3%); 0.70% is the premium that leaves zero mean error once
+the limit cap applies. Trading that is cheaper in training than at the broker rewards churn.
 
 ### Diagnostics and data dump
 

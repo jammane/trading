@@ -7,6 +7,29 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# j_neuro (optional): the evolutionary net library behind --jn-stocknn and the JN race entries.
+# It MUST be added before add_compile_options below: those options apply to every target created
+# after them, including a subdirectory's, and j_neuro requires exact IEEE-754 arithmetic
+# (-ffp-contract=off, no fast-math; its spec/02). The bridge is its own library for the same
+# reason -- it instantiates j_neuro's header templates, so it must be compiled with j_neuro's
+# flags, not the trainer's. Without a checkout the trainer builds exactly as before and the JN
+# flags are refused at startup.
+set(JNEURO_DIR "${CMAKE_SOURCE_DIR}/../j_neuro" CACHE PATH "j_neuro checkout")
+if(EXISTS "${JNEURO_DIR}/cpp/CMakeLists.txt")
+  set(JNEURO_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(JNEURO_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  add_subdirectory("${JNEURO_DIR}/cpp" jneuro EXCLUDE_FROM_ALL)
+  add_library(jn_bridge STATIC jn_bridge.cpp)
+  target_compile_options(jn_bridge PRIVATE -O2 -Wall -Wextra)
+  # PRIVATE, not PUBLIC: jneuro's flags are PUBLIC usage requirements, so a public link would
+  # carry -fno-fast-math into training_v4_cpp and silently change the trainer's own arithmetic.
+  target_link_libraries(jn_bridge PRIVATE jneuro)
+  set(HAVE_JNEURO ON)
+  message(STATUS "j_neuro: ${JNEURO_DIR} (JN entries and --jn-stocknn enabled)")
+else()
+  message(STATUS "j_neuro: not found at ${JNEURO_DIR} (JN entries disabled)")
+endif()
+
 # -ffast-math implies -ffinite-math-only, under which GCC folds std::isfinite()/isnan() to
 # constants. That silently disabled EVERY finiteness guard in the trainer: measured, the
 # order-intent sell aggregate came back NaN on 98.55% of industry-days because its only guard
@@ -30,6 +53,15 @@ add_executable(training_v4_cpp training_v4.cpp)
 target_compile_options(training_v4_cpp PRIVATE -Wall -Wextra)
 target_include_directories(training_v4_cpp PRIVATE ${CBLAS_INCLUDE_DIR})
 target_link_libraries(training_v4_cpp ${BLAS_LIBRARIES} pthread)
+if(HAVE_JNEURO)
+  target_compile_definitions(training_v4_cpp PRIVATE HAVE_JNEURO=1
+    JNEURO_DEFAULT_PROFILE="${JNEURO_DIR}/profiles/training.json")
+  target_link_libraries(training_v4_cpp jn_bridge)
+else()
+  # Same interface, every pool refused at creation: the JN flags then fail at startup with a
+  # message instead of the build needing #ifdefs through the trainer.
+  target_sources(training_v4_cpp PRIVATE jn_bridge_stub.cpp)
+endif()
 
 enable_testing()
 
