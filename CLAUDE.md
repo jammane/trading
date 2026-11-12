@@ -1165,9 +1165,14 @@ of the time.
 random order within tied predictions, so an all-tied day scores exactly flat instead of the first
 industries in universe order. `race_daily.csv` keeps the actual picks.
 
-**`RANK LEAK`.** The 500-day smoke read a within-day rank of +0.0909 over 11 industry-days on
-the no-intent rows (MT1, JN), which must read n/a; v7 never does, and the cause was not found. Any
-recurrence is logged with the day, industry, order-set count and prediction range.
+**`RANK LEAK` — found and fixed.** The 500-day smoke read a within-day rank of +0.0909 over 11
+industry-days on the no-intent rows (MT1, JN), which must read n/a. It was floating-point noise,
+not a leak of information: with every prediction tied, all ranks are equal, but the computed mean
+rank came out a hair off (all 105 ranks 52.0 on day 771), so the rank variance was a tiny positive
+number and `bp_rank_corr` returned an arbitrary finite value. Only `--jn-stocknn` exposed it,
+because only there do cold nets drop the scorable order sets below 200. `bp_rank_corr` now
+returns NaN when either side's ranks are all equal, checked exactly. The `RANK LEAK` log stays as
+the guard.
 
 ### Production inference chain (when MT2 models available)
 

@@ -4158,6 +4158,17 @@ static float bp_rank_corr(const float* a, const float* b, int n)
     static thread_local std::vector<float> ra, rb;
     bp_avg_ranks(a, n, ia, ra);
     bp_avg_ranks(b, n, ib, rb);
+    // A side whose ranks are all equal has no rank variance: say so EXACTLY, before any
+    // arithmetic. The variance test below cannot, because the mean is not exact -- with all 105
+    // ranks 52.0 the computed mean came out a hair off 52 (the --jn-stocknn smoke, day 771), so
+    // da was a tiny positive number and a constant prediction read as a finite rank: the
+    // +0.0909 over 11 ind-days on the no-intent rows. Only nm != 200 exposed it.
+    bool a_const = true, b_const = true;
+    for (int k = 1; k < n; k++) {
+        if (ra[k] != ra[0]) a_const = false;
+        if (rb[k] != rb[0]) b_const = false;
+    }
+    if (a_const || b_const) return NAN;
     double ma = 0.0, mb = 0.0;
     for (int k = 0; k < n; k++) { ma += ra[k]; mb += rb[k]; }
     ma /= n; mb /= n;
@@ -6532,8 +6543,9 @@ int main(int argc, char* argv[]) {
                                 const float rc = bp_rank_corr(mpred, mreal, nm);
                                 // MT1 and JN read no order intent, so all nm predictions are one
                                 // value and no rank can exist. A finite one means the measurement
-                                // leaks (the --jn-stocknn smoke read +0.0909 over 11 ind-days where
-                                // v7 reads n/a); log the first few with what explains them.
+                                // is broken; log the first few with what explains them. (The
+                                // --jn-stocknn smoke's +0.0909 was bp_rank_corr's inexact mean on
+                                // a constant rank vector, fixed there.)
                                 if (std::isfinite(rc) && (e.arch == ARCH_MT1 || e.arch == ARCH_JN)) {
                                     static std::atomic<int> leak_logged{0};
                                     if (leak_logged.fetch_add(1) < 20) {
