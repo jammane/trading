@@ -1770,6 +1770,8 @@ struct MasterResult {
 static void load_or_init_industry(const std::string& dir, const std::string& load_dir,
                                    int ind_i, float* elite_buf, int actual_day);
 static void save_industry_elites(const std::string& dir, int ind_i, const float* elite_buf);
+static void load_elite_idle(const std::string& dir, int ind_i, float* idle);
+static void save_elite_idle(const std::string& dir, int ind_i, const float* idle);
 static void load_ind_history(const std::string& dir, int ind_i, WorkerScratch& scratch);
 static void save_ind_history(const std::string& dir, int ind_i, const WorkerScratch& scratch);
 
@@ -1793,6 +1795,11 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     } else {
         load_ind_history(models_dir, ind_i, scratch);
     }
+    // Was each elite idle (no trades) on the day it was last scored? Reset at a pass start like
+    // the history ring: the elites there may be a blended seed the flags do not describe.
+    float elite_idle[ELITE_POOL] = {};
+    if (!(day_num == 0 && !g_upkeep) && !g_control_untrained)
+        load_elite_idle(models_dir, ind_i, elite_idle);
     const OHLCV* day_sym  = day.sym[ind_i];
     const OHLCV* fill_sym = fill ? fill->sym[ind_i] : day_sym;
     // Compute num_past = minimum history length across symbols
@@ -2401,23 +2408,35 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         return r;
     }
 
-    // Zero-trade inaction filter
+    // Zero-trade inaction filter: TWO consecutive idle days. A slot is excluded only if it made no
+    // trades today AND its model made none on its previous scored day, so an intermittent null
+    // day is allowed. A mutation child did not exist yesterday and inherits its parent's flag.
+    // History candidates stay exempt (see the selection loop).
     int new_streak = 0;
     bool all_inactive = false;
     bool inactive[N_SLOTS] = {};
     if (num_past >= HIST_WINDOW && day_num > 0) {
-        int n_inactive = 0;
+        int n_inactive = 0, n_spared = 0;
         for (int s = 0; s < N_SLOTS; s++) {
-            if (!trade_count[s]) { inactive[s] = true; n_inactive++; }
+            if (trade_count[s]) continue;
+            int src = (s < ELITE_POOL) ? s : (s - ELITE_POOL) / MUTATIONS_PER_PARENT;
+            if (elite_idle[src] > 0.5f) { inactive[s] = true; n_inactive++; }
+            else n_spared++;
         }
         if (n_inactive == N_SLOTS) {
             all_inactive = true;
             new_streak   = state.streak + 1;
-        } else if (n_inactive > 0) {
+        } else if (n_inactive > 0 || n_spared > 0) {
             log_msg(std::string("[") + IND_SHORT[ind_i] + "]   Zero-trade filter: " +
-                    std::to_string(n_inactive) + " slot(s) excluded");
+                    std::to_string(n_inactive) + " slot(s) excluded (idle 2 days), " +
+                    std::to_string(n_spared) + " idle today only");
         }
     }
+
+    // Idle flags the elites carry into tomorrow. Without selection (freeze, or nothing survived)
+    // the elites are unchanged, so each keeps its own result from today.
+    float next_idle[ELITE_POOL];
+    for (int k = 0; k < ELITE_POOL; k++) next_idle[k] = trade_count[k] ? 0.f : 1.f;
 
     // Selection scores with invested_pct multiplier
     float sel_scores[N_SLOTS];
@@ -2546,6 +2565,22 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                 state.portfolios[k] = new_ports[k];
             }
 
+            // Idle flags follow the models. A selected slot carries its own result today; a
+            // mutation was scored today as itself; a history candidate counts as traded (history
+            // scoring does not count trades, and it is exempt from the filter anyway). A blend is
+            // idle only if every model it averages was.
+            for (int k = 0; k < n_top; k++) {
+                int slot = src_rank[k];
+                next_idle[k] = (slot < N_SLOTS && !trade_count[slot]) ? 1.f : 0.f;
+            }
+            for (int k = n_top; k < ELITE_COUNT; k++) next_idle[k] = next_idle[0];
+            const int blend_n[3] = {n5, n10, n15};
+            for (int b = 0; b < 3; b++) {
+                float all_idle = 1.f;
+                for (int k = 0; k < blend_n[b]; k++) all_idle = std::min(all_idle, next_idle[k]);
+                next_idle[ELITE_COUNT + b] = all_idle;
+            }
+
             // Assign mutation children from new parents (ELITE_POOL parents × 9 each = 180)
             for (int mut_i = 0; mut_i < N_SLOTS - ELITE_POOL; mut_i++) {
                 int child_slot  = ELITE_POOL + mut_i;
@@ -2586,6 +2621,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                 for (int p = 0; p < STOCKNN_PARAMS; p++)
                     scratch.elite(k)[p] = 0.5f * scratch.elite(k - half)[p] + 0.5f * scratch.mut_buf[p];
                 state.portfolios[k] = state.portfolios[k - half];
+                next_idle[k] = 0.f;   // a new model: no idle day on record
             }
             new_streak = 0;
             log_msg(std::string("[") + IND_SHORT[ind_i] + "]   Diversity injection complete — streak reset");
@@ -2656,6 +2692,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     // burn 3 GB of I/O and leave a directory of weights that look trained.
     if (!g_control_untrained) {
         save_industry_elites(models_dir, ind_i, scratch.elite_buf);
+        save_elite_idle(models_dir, ind_i, next_idle);
         save_ind_history(models_dir, ind_i, scratch);
     }
 
@@ -3576,6 +3613,25 @@ static void save_industry_elites(const std::string& dir, int ind_i,
         if (!save_bin(path, elite_buf + (size_t)slot * STOCKNN_PARAMS, STOCKNN_PARAMS))
             log_msg("WARNING: could not save " + path);
     }
+}
+
+// Zero-trade filter memory: per elite slot, 1.0 if the model it holds made no trades on the day
+// it was last scored, else 0.0. A separate file, like the MT1 sidecar, because the elite weight
+// files are headerless arrays validated by exact element count. The name deliberately avoids
+// "_elite_": convert_weights.py, copy_elites() and prune_runs.sh all match that pattern as weights.
+// A missing file reads as "traded", which is also what a champion seed (which has none) gets.
+static std::string elite_idle_path(const std::string& dir, int ind_i) {
+    return dir + "/" + g_ind_names[ind_i] + "_idle.bin";
+}
+
+static void load_elite_idle(const std::string& dir, int ind_i, float* idle) {
+    if (!load_bin(elite_idle_path(dir, ind_i), idle, ELITE_POOL))
+        for (int k = 0; k < ELITE_POOL; k++) idle[k] = 0.f;
+}
+
+static void save_elite_idle(const std::string& dir, int ind_i, const float* idle) {
+    std::string path = elite_idle_path(dir, ind_i);
+    if (!save_bin(path, idle, ELITE_POOL)) log_msg("WARNING: could not save " + path);
 }
 
 // ── Pass-boundary seeding (v0.6.3.0) ──────────────────────────────────────────

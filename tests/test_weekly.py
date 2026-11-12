@@ -109,7 +109,8 @@ def test_clear_book_slot_zeroes_only_that_industry_and_slot(tmp_path):
 
 
 def test_promotion_clears_exactly_one_industrys_state(tmp_path):
-    names = ["consumer_services_elite_0.bin", "consumer_services_hist.bin",
+    names = ["consumer_services_elite_0.bin", "consumer_services_idle.bin",
+             "consumer_services_hist.bin",
              "race_TANH32___grad_consumer_services.bin",
              "race_TANH32___grad_consumer_services.adam.bin",
              "r_mt1_consumer_services_meta.bin", "r_mt1_consumer_services_slot_7.bin",
@@ -118,7 +119,7 @@ def test_promotion_clears_exactly_one_industrys_state(tmp_path):
     for n in names:
         (tmp_path / n).write_text("x")
     got = {p.split("/")[-1] for p in wp.industry_state_files(str(tmp_path), "consumer_services")}
-    assert got == set(names[:6])
+    assert got == set(names[:7])
 
 
 def test_state_keys_dropped_for_promoted_industries_only(tmp_path):
