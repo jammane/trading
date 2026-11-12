@@ -165,9 +165,10 @@ def clear_book_slot(book_path, industry, slot):
 # ── 4. Promotion ────────────────────────────────────────────────────────────────────────────────
 
 def industry_state_files(state_dir, industry):
-    """Every file of one industry's daily-training state: StockNN elites and history ring, race
-    models and their Adam moments, and the evolutionary pools with their metadata."""
-    pats = [f"{industry}_elite_*.bin", f"{industry}_hist.bin", f"race_*_{industry}.bin",
+    """Every file of one industry's daily-training state: StockNN elites, their idle flags and
+    history ring, race models and their Adam moments, and the evolutionary pools with their
+    metadata."""
+    pats = [f"{industry}_elite_*.bin", f"{industry}_idle.bin", f"{industry}_hist.bin", f"race_*_{industry}.bin",
             f"race_*_{industry}.adam.bin", f"r_*_{industry}_meta.bin",
             f"r_*_{industry}_slot_*.bin"]
     out = set()

@@ -1449,6 +1449,18 @@ Each industry maintains **200 model slots** on disk as `.pt` files. The slot lay
 
 Each training day: all 200 slots reset to slot 0's portfolio → infer → simulate fills → score as `delta × invested_pct` → select + mutate. The `invested_pct` multiplier penalises cash-heavy winners.
 
+**Zero-trade filter: two idle days in a row.** A slot that places no trades is excluded from
+selection only if its model was also idle on its previous scored day; one null day is allowed,
+two consecutive are not. Each of the 20 elite slots carries that flag in `{ind}_idle.bin` (20
+floats, 1 = idle; a missing file reads as traded, and the name avoids `_elite_` so the weight
+globs never match it). A mutation child inherits its parent's flag, a weighted-average blend is
+idle only if every model it averages was, and a promoted history candidate counts as traded.
+History candidates remain exempt from the filter. Flags reset at a pass start (not under
+`--upkeep`), and the weekly promotion deletes the file with the rest of an industry's state. Until
+the next training run the filter excluded every idle slot on its first idle day. The per-day log
+line reads `Zero-trade filter: N slot(s) excluded (idle 2 days), M idle today only`; when all 200
+are excluded, the streak and diversity injection behave as before.
+
 **5-day elite history:** After each selection step, the top-7 direct elites (slots 0–6) plus 3 wavg blends (slots 17–19) are saved into a 5-day circular buffer per industry. On each subsequent day these 10×N historical models are re-scored from scratch (same fill simulation, same reference portfolio) and made eligible for re-selection as direct elites — but NOT used as mutation parents unless they win a direct-elite slot. History resets at pass boundaries. Per-industry constants: `HIST_DAYS=5`, `HIST_PER_DAY=10`, `HIST_ELITE=7`, `HIST_WAVG=3`.
 
 History files per industry:

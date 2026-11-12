@@ -16,6 +16,9 @@ entry is in its commit message.
   report gains a `losers bp/day` line.
 
 ### Changed
+- **The zero-trade filter allows one idle day.** A StockNN model is excluded from selection only
+  when it places no trades on two consecutive days, not on its first idle day. Mutations inherit
+  their parent's record; history candidates stay exempt.
 - **The winner committee decides first.** W1 picks its 4 from all 12 and L1 flags 4 among the
   other 8, so an industry both name is funded rather than sell-only.
 - **Daily training covers the whole race field**, not only the committee members, so any entry
