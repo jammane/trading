@@ -872,6 +872,9 @@ static int g_jn_gate[N_IND];
 // would is bulked by the pct that lands exactly on the cap. Children of one parent start at the
 // same size; parents of different sizes give children of different sizes. 0 = not measured.
 static constexpr double JN_BULK_CAP = 3.0;
+// A JN race pool (200 slots under the MT1 lifecycle) keeps its top 20 by rank when bulked, the
+// same count as StockNN's elites; 180 children, MUTATIONS_PER_PARENT (9) per parent.
+static constexpr int JN_RACE_KEEP = 20;
 static double g_jn_start_nodes[N_IND];
 static double g_jn_end_nodes[N_IND];
 // A JN race net's raw output is multiplied by this before mt1_pred's tanh x MT1_PRED_SCALE. A net
@@ -1367,6 +1370,7 @@ struct MT1PoolScratch {
     // -- is this struct's, so a JN pool runs under exactly the lifecycle every evo entry does.
     JNPool*     jn{nullptr};
     int         jn_gate{-1};                // warm-in gate (g_jn_gate); -1 = read at first step
+    double      jn_start_nodes{0.0};        // pool mean nodes at the pass start (bulking)
     float*      mut_buf{nullptr};           // one model, breeding scratch
     MT1SlotMeta meta[MT1_POOL_SLOTS]{};
     int         best_slot{0};               // deployed model; ranked in place, never shuffled
@@ -3339,7 +3343,11 @@ static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in,
     // warmup, the pool predicts but nothing is scored, so nothing matures, culls or breeds.
     bool jn_warming = false;
     if (sc.jn) {
-        if (sc.jn_gate < 0) sc.jn_gate = std::max(JN_WARM_FLOOR, jn_stats(sc.jn).warm_max);
+        if (sc.jn_gate < 0) {
+            const JNStats js0 = jn_stats(sc.jn);
+            sc.jn_gate = std::max(JN_WARM_FLOOR, js0.warm_max);
+            sc.jn_start_nodes = js0.nodes_mean;
+        }
         jn_warming = jn_ring_len(sc.jn) <= sc.jn_gate;
     }
     for (int s = 0; s < MT1_POOL_SLOTS; s++) {
@@ -4556,6 +4564,16 @@ static void save_mt1_pool(const std::string& dir, int ind_i, const MT1PoolScratc
     if (sc.jn) {
         if (!jn_save(sc.jn, dir, jn_pool_prefix(ind_i, tag)))
             log_msg(std::string("WARNING: could not save j_neuro pool ") + tag + " " + g_ind_names[ind_i]);
+        // Bulking record, as for StockNN (jn_size_path): pool mean at this pass's start, and the
+        // mean of the pool's top JN_RACE_KEEP by rank -- the ones the next pass keeps as they are.
+        int order[MT1_POOL_SLOTS];
+        mt1_rank(sc, order);
+        double en = 0.0;
+        for (int k = 0; k < JN_RACE_KEEP; k++) en += jn_slot_nodes(sc.jn, order[k]);
+        if (FILE* sf = fopen(jn_size_path(dir, jn_pool_prefix(ind_i, tag).c_str()).c_str(), "w")) {
+            fprintf(sf, "%.3f %.3f\n", sc.jn_start_nodes, en / JN_RACE_KEEP);
+            fclose(sf);
+        }
     } else {
         for (int s = 0; s < MT1_POOL_SLOTS; s++)
             save_bin(mt1_pool_path(dir, ind_i, s, tag), sc.slot(s), sc.n_params);
@@ -4573,16 +4591,17 @@ static void save_mt1_pool(const std::string& dir, int ind_i, const MT1PoolScratc
     fclose(f);
 }
 
-static void load_or_init_mt1_pool(const std::string& dir, const std::string& load_dir,
-                                  int ind_i, MT1PoolScratch& sc,
-                                  const char* tag = "mt1", MT1Init init = mt1_init_weights,
-                                  uint64_t salt = 0) {
+static void load_or_init_mt1_pool_core(const std::string& dir, const std::string& load_dir,
+                                       int ind_i, MT1PoolScratch& sc, const char* tag,
+                                       MT1Init init, uint64_t salt, std::string& jn_from) {
     int loaded = 0;
     if (sc.jn) {
         // Nets as jn_pool_create built them (minimal, one seed each) unless a saved pool exists.
         const std::string pre = jn_pool_prefix(ind_i, tag);
-        if (jn_load(sc.jn, dir, pre) || (!load_dir.empty() && jn_load(sc.jn, load_dir, pre)))
-            loaded = MT1_POOL_SLOTS;
+        if (jn_load(sc.jn, dir, pre)) { loaded = MT1_POOL_SLOTS; jn_from = dir; }
+        else if (!load_dir.empty() && jn_load(sc.jn, load_dir, pre)) {
+            loaded = MT1_POOL_SLOTS; jn_from = load_dir;
+        }
         else
             for (int s = 0; s < MT1_POOL_SLOTS; s++) mt1_slot_init(sc.meta[s], sc.next_lineage++);
     }
@@ -4628,6 +4647,61 @@ static void load_or_init_mt1_pool(const std::string& dir, const std::string& loa
     if (sc.best_slot < 0 || sc.best_slot >= MT1_POOL_SLOTS) sc.best_slot = 0;
     // A prediction parked before the process died refers to an outcome we can no longer align.
     sc.has_pending = false;
+}
+
+// A JN race pool starting a pass from a saved pool is bulked like a JN StockNN seed
+// (jn_seed_from_elites): its top JN_RACE_KEEP by rank (and the deployed slot) stay as they are, and
+// every other slot is replaced by a bulked copy of one of them, MUTATIONS_PER_PARENT per parent in
+// rank order, by the shrinkage of the pass the pool came from (its jn_size record; capped at
+// JN_BULK_CAP x that pass's start size). The new slots start immature in their parent's lineage.
+static void jn_bulk_race_pool(const std::string& from, int ind_i, MT1PoolScratch& sc,
+                              const char* tag, uint64_t salt) {
+    const std::string pre = jn_pool_prefix(ind_i, tag);
+    double start = 0.0, end = 0.0;
+    jn_read_size(from, pre.c_str(), start, end);
+    const double pct = jn_bulk_pct(start, end);
+    if (pct < 0.0) {
+        log_msg(std::string(tag) + " " + g_ind_names[ind_i] + ": no size record -- not bulked");
+        return;
+    }
+    int order[MT1_POOL_SLOTS];
+    mt1_rank(sc, order);
+    int keep[JN_RACE_KEEP];
+    bool kept[MT1_POOL_SLOTS] = {};
+    for (int k = 0; k < JN_RACE_KEEP; k++) { keep[k] = order[k]; kept[order[k]] = true; }
+    kept[sc.best_slot] = true;
+    const double cap = JN_BULK_CAP * start;
+    double par_pct[JN_RACE_KEEP];
+    for (int k = 0; k < JN_RACE_KEEP; k++) {
+        const double n = (double)jn_slot_nodes(sc.jn, keep[k]);
+        par_pct[k] = n > 0.0 ? std::max(0.0, std::min(pct, (cap / n - 1.0) * 100.0)) : 0.0;
+    }
+    int c = 0, n_cap = 0; double child_n = 0.0;
+    for (int s = 0; s < MT1_POOL_SLOTS; s++) {
+        if (kept[s]) continue;
+        const int k = std::min(c / MUTATIONS_PER_PARENT, JN_RACE_KEEP - 1);
+        jn_bulk(sc.jn, keep[k], s, par_pct[k], 0,
+                mix_seed(salt ^ 0x42554C4BULL ^ ((uint64_t)ind_i << 32) ^ (uint64_t)s));
+        mt1_slot_init(sc.meta[s], sc.meta[keep[k]].lineage);
+        child_n += jn_slot_nodes(sc.jn, s);
+        c++;
+    }
+    for (int k = 0; k < JN_RACE_KEEP; k++) if (par_pct[k] < pct) n_cap++;
+    char m[300];
+    snprintf(m, sizeof(m), "%s %s: jn bulk: pass %.0f -> %.0f nodes (lost %.0f%%) -> +%.0f%%, cap %.0f; "
+             "%d kept, %d children %.0f mean; %d of %d parents at the cap",
+             tag, g_ind_names[ind_i].c_str(), start, end, 100.0 * (1.0 - end / start),
+             std::min(pct, 1e6), cap, MT1_POOL_SLOTS - c, c, c ? child_n / c : 0.0, n_cap, JN_RACE_KEEP);
+    log_msg(m);
+}
+
+static void load_or_init_mt1_pool(const std::string& dir, const std::string& load_dir,
+                                  int ind_i, MT1PoolScratch& sc,
+                                  const char* tag = "mt1", MT1Init init = mt1_init_weights,
+                                  uint64_t salt = 0) {
+    std::string jn_from;
+    load_or_init_mt1_pool_core(dir, load_dir, ind_i, sc, tag, init, salt, jn_from);
+    if (sc.jn && !jn_from.empty()) jn_bulk_race_pool(jn_from, ind_i, sc, tag, salt);
 }
 
 static void save_mt2_elites(const std::string& dir, MT2Scratch& scratch) {

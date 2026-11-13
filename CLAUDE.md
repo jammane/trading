@@ -1212,7 +1212,16 @@ different sizes give children of different sizes. Logged per industry as `jn bul
 nodes (lost L%) -> +P%, cap C; ...`. The record is `jn_size_<ind>.txt` ("start end"), written
 beside the elites and copied wherever they go (`copy_elites`: staging, `champion/`, the blended
 seed), so a pass started from champions bulks by the champion pass's own shrinkage. Elites with
-no record (from before this change) are mutated as before, and the log says so. `--jn-bulk-profile FILE` overrides the profile. The JN race pools are not bulked. The
+no record (from before this change) are mutated as before, and the log says so. `--jn-bulk-profile FILE` overrides the profile.
+
+The **JN race pools** are bulked the same way when a pass starts from a saved pool: the top 20 by
+rank (`JN_RACE_KEEP`, plus the deployed slot) stay as they are, every other slot becomes a bulked
+copy of one of them (9 per parent, in rank order, immature, in its parent's lineage), and the
+record (`jn_size_<entry>_<ind>_jn.txt`: pool mean at the pass start, top-20 mean at the save) is
+written with the pool at the pass end. `champion/` holds only a race entry's deployed net, not its
+pool, so a run seeded from champions starts its JN race pools fresh, as before.
+
+The
 training profile's own growth is now 1% of a net's neurons (`fill`, min 1) in 10% of generations
 for 10% of nets (j_neuro ed79fa6); removal stays off.
 
