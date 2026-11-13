@@ -59,6 +59,15 @@ void    jn_inject(JNPool* p, int slot, double pct, uint64_t seed);
 
 JNStats jn_stats(const JNPool* p);
 
+// Wall time spent inside the bridge, summed over every pool and thread since the last take.
+// A performance probe (`--jn-timing`); costs two clock reads per call.
+struct JNTiming {
+    double fwd = 0, fwd_warm = 0, fwd_reset = 0, fwd_step = 0;   // seconds; fwd = whole jn_forward
+    double mutate = 0, mut_grow = 0, permute = 0, inject = 0, stats = 0, rows = 0, save = 0;
+    long long n_fwd = 0, n_steps = 0, n_mut = 0, n_cold = 0;
+};
+JNTiming jn_timing_take();
+
 // Saved nets with from_n_out outputs load into this pool by inserting a fresh output (j_neuro
 // spec/12, add_output_fresh) at each index of insert_at, ascending in the final layout. Lets a
 // pool trained before an output was added carry on instead of restarting.

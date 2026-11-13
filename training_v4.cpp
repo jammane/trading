@@ -838,6 +838,7 @@ static inline uint64_t mix_seed(uint64_t base) { return splitmix64(base + g_run_
 // --jn-profile: the mutation profile (spec/09 JSON); default j_neuro's profiles/training.json.
 static bool        g_jn_stocknn = false;
 static bool        g_jn_race    = false;
+static bool        g_jn_timing  = false;   // --jn-timing: per-day time split (performance probe)
 #ifndef JNEURO_DEFAULT_PROFILE
 #define JNEURO_DEFAULT_PROFILE "../j_neuro/profiles/training.json"
 #endif
@@ -5487,6 +5488,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--race-only" && a+1<argc) { race_only = argv[++a]; }
         else if (arg == "--jn-stocknn") g_jn_stocknn = true;
         else if (arg == "--jn-race")    g_jn_race = true;
+        else if (arg == "--jn-timing")  g_jn_timing = true;
         else if (arg == "--jn-profile" && a+1<argc) { g_jn_profile = argv[++a]; }
         else if (arg == "--continue-run") g_continue = true;
         else if (arg == "--crown" && a+1<argc) {
@@ -7320,8 +7322,15 @@ int main(int argc, char* argv[]) {
                     write_mt_log_record(mt_log, rec);
                 }
             }
-            // 5. Save (per block ≈ 25 days). Always — under --no-save output_dir is the scratch.
+            // 5. Save -- on the pass's last day only (and every --upkeep run, whose one day is
+            //    the pass). Pools, gradient weights and MT2 are read back only at a pass start,
+            //    so a mid-pass save is never read. The save was written when a block was 25
+            //    days; since MT1_DAYS = 1 it ran daily, rewriting the whole race field (~85,000
+            //    files, ~900 MB on the 46-entry field) every day -- measured, about half of each
+            //    day's wall time was spent waiting on it. A run killed mid-pass loses its race
+            //    pools back to the previous pass's end. Under --no-save output_dir is the scratch.
             log_mem_stat(num_workers);
+            if (!g_upkeep && blk_actual_day[blk_len - 1] != day_start + num_days - 1) return;
             for (int i = 0; i < N_IND; i++) {
                 for (int v = 0; v < RACE_N; v++) {
                     if (g_race_off[v] || RACE[v].search != SRCH_GRAD || g_upkeep) continue;
@@ -7405,11 +7414,14 @@ int main(int argc, char* argv[]) {
             wctx.master_only = master_only;
             wctx.next_ind.store(0, std::memory_order_relaxed);
 
+            const auto tm_day0 = std::chrono::steady_clock::now();
             // Dispatch workers
             wctx.work_ready.release(num_workers);
 
             // Wait for all workers to finish
             for (int w = 0; w < num_workers; w++) wctx.work_done.acquire();
+            const auto tm_ind1 = std::chrono::steady_clock::now();
+            const JNTiming tm_jn_ind = g_jn_timing ? jn_timing_take() : JNTiming{};
 
             // Update industry OHLCV histories (main thread is canonical)
             for (int i = 0; i < N_IND; i++)
@@ -7517,7 +7529,27 @@ int main(int argc, char* argv[]) {
             memcpy(blk_perf[0],      fwd_ret,       sizeof(fwd_ret));   // MT2 market diagnostic only
             blk_day[0]        = day_ptr;
             blk_actual_day[0] = actual_day;
+            const auto tm_blk0 = std::chrono::steady_clock::now();
             process_block(1);
+            if (g_jn_timing) {
+                const auto tm_end = std::chrono::steady_clock::now();
+                auto sec = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+                const JNTiming b = jn_timing_take();   // JN race entries, inside process_block
+                const JNTiming& t = tm_jn_ind;         // JN StockNN, inside the industries
+                char tl[700];
+                snprintf(tl, sizeof(tl),
+                    "TIMING day %d: total %.1fs | industries %.1fs (jn fwd %.1fs [warm %.2f reset %.2f "
+                    "step %.1f] n=%lld steps=%lld (%.0f us/step) cold=%lld | mutate %.1fs n=%lld [grow %.2f] "
+                    "| permute %.2f inject %.2f stats %.2f rows %.3f | non-jn %.1fs) | between %.1fs | "
+                    "block %.1fs (jn race fwd %.1fs mut %.1fs)",
+                    actual_day, sec(tm_day0, tm_end), sec(tm_day0, tm_ind1), t.fwd, t.fwd_warm,
+                    t.fwd_reset, t.fwd_step, t.n_fwd, t.n_steps,
+                    t.n_steps ? 1e6 * t.fwd_step / (double)t.n_steps : 0.0, t.n_cold, t.mutate, t.n_mut,
+                    t.mut_grow, t.permute, t.inject, t.stats, t.rows,
+                    sec(tm_day0, tm_ind1) - (t.fwd + t.mutate + t.permute + t.inject + t.stats + t.rows),
+                    sec(tm_ind1, tm_blk0), sec(tm_blk0, tm_end), b.fwd, b.mutate);
+                log_msg(tl);
+            }
         }
 
         // ── UPKEEP: write back everything the next day continues from ──

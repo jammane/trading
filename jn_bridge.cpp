@@ -5,6 +5,8 @@
 #include <jneuro/jneuro.hpp>
 #include <jneuro/modify.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <deque>
@@ -21,6 +23,10 @@ struct JNPool {
     uint64_t seed = 0;
     jneuro::Profile profile = jneuro::Profile::defaults();
     std::vector<JNet> nets;
+    // get_warmup_steps() per slot, -1 = not yet computed. It depends on a net's structure only,
+    // but j_neuro recomputes it from the graph on every call (~2.4 ms on a ~420-node net, measured
+    // 2026-11-12: ~6 s of a JN StockNN day). Cleared wherever a slot gets a different net.
+    mutable std::vector<int> warm;
     std::deque<std::vector<double>> ring;     // oldest first; the newest row is today's
     std::vector<double> in;                   // scratch
     // A saved net with mig_from outputs is widened on load: a fresh output (spec/12,
@@ -44,6 +50,39 @@ void jn_set_output_migration(JNPool* p, int from_n_out, const std::vector<int>& 
     p->mig_at = insert_at;
 }
 
+// ── timing probe (jn_timing_take) ──
+enum { T_FWD, T_WARM, T_RESET, T_STEP, T_MUT, T_GROW, T_PERM, T_INJ, T_STATS, T_ROWS, T_SAVE,
+       C_FWD, C_STEPS, C_MUT, C_COLD, T_N };
+static std::atomic<long long> g_t[T_N];
+static inline long long now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+struct TScope {
+    int k; long long t0;
+    explicit TScope(int k_) : k(k_), t0(now_ns()) {}
+    ~TScope() { g_t[k].fetch_add(now_ns() - t0, std::memory_order_relaxed); }
+};
+static inline void tcount(int k, long long n = 1) { g_t[k].fetch_add(n, std::memory_order_relaxed); }
+
+JNTiming jn_timing_take() {
+    long long v[T_N];
+    for (int k = 0; k < T_N; k++) v[k] = g_t[k].exchange(0, std::memory_order_relaxed);
+    auto s = [&](int k) { return (double)v[k] * 1e-9; };
+    JNTiming t;
+    t.fwd = s(T_FWD); t.fwd_warm = s(T_WARM); t.fwd_reset = s(T_RESET); t.fwd_step = s(T_STEP);
+    t.mutate = s(T_MUT); t.mut_grow = s(T_GROW); t.permute = s(T_PERM); t.inject = s(T_INJ);
+    t.stats = s(T_STATS); t.rows = s(T_ROWS); t.save = s(T_SAVE);
+    t.n_fwd = v[C_FWD]; t.n_steps = v[C_STEPS]; t.n_mut = v[C_MUT]; t.n_cold = v[C_COLD];
+    return t;
+}
+
+static int warm_of(const JNPool* p, int slot) {
+    int& w = p->warm[(size_t)slot];
+    if (w < 0) { TScope tw(T_WARM); w = (int)p->nets[(size_t)slot].get_warmup_steps(); }
+    return w;
+}
+
 static JNet make_net(const jneuro::AnyNet& any) { return std::get<JNet>(any); }
 
 JNPool* jn_pool_create(int n_in, int n_out, int n_slots, int ring_cap,
@@ -61,6 +100,7 @@ JNPool* jn_pool_create(int n_in, int n_out, int n_slots, int ring_cap,
             p->nets.push_back(make_net(jneuro::create(n_in, n_out, jneuro::DepthType::U32, 5,
                                                       jneuro::Priority::Speed, rng)));
         }
+        p->warm.assign(p->nets.size(), -1);
         p->in.assign(n_in, 0.0);
         return p;
     } catch (const std::exception& e) {
@@ -73,6 +113,7 @@ void jn_pool_free(JNPool* p) { delete p; }
 int  jn_n_slots(const JNPool* p) { return (int)p->nets.size(); }
 
 void jn_push_row(JNPool* p, const float* row) {
+    TScope ts(T_ROWS);
     p->ring.emplace_back(row, row + p->n_in);
     while ((int)p->ring.size() > p->ring_cap) p->ring.pop_front();
 }
@@ -85,13 +126,19 @@ void jn_replace_row(JNPool* p, const float* row) {
 }
 
 bool jn_forward(JNPool* p, int slot, float* out) {
+    TScope ts(T_FWD);
+    tcount(C_FWD);
     for (int o = 0; o < p->n_out; o++) out[o] = 0.f;
     JNet& net = p->nets[slot];
-    const size_t warm = (size_t)net.get_warmup_steps();
-    if (p->ring.size() < warm + 1) return false;                // not enough history yet
-    net.reset();
+    const size_t warm = (size_t)warm_of(p, slot);
+    if (p->ring.size() < warm + 1) { tcount(C_COLD); return false; }   // not enough history yet
+    { TScope tr(T_RESET); net.reset_state(); }   // keeps the plan; a slot is never edited in place
     std::vector<double> y;
-    for (size_t r = p->ring.size() - warm - 1; r < p->ring.size(); r++) y = net.step(p->ring[r]);
+    {
+        TScope tst(T_STEP);
+        for (size_t r = p->ring.size() - warm - 1; r < p->ring.size(); r++) y = net.step(p->ring[r]);
+        tcount(C_STEPS, (long long)warm + 1);
+    }
     bool ok = true;
     for (int o = 0; o < p->n_out; o++) {
         const double v = y[o];
@@ -104,31 +151,42 @@ bool jn_forward(JNPool* p, int slot, float* out) {
 }
 
 void jn_mutate(JNPool* p, int src, int dst, uint64_t generation, uint64_t seed) {
+    TScope ts(T_MUT);
+    tcount(C_MUT);
     jneuro::Rng rng(seed);
-    const bool grow = jneuro::is_growth_generation(p->seed, generation, p->profile);
+    bool grow;
+    { TScope tg(T_GROW); grow = jneuro::is_growth_generation(p->seed, generation, p->profile); }
     p->nets[dst] = jneuro::mutate(p->nets[src], p->profile, generation, rng, nullptr, grow);
+    p->warm[(size_t)dst] = -1;
 }
 
 void jn_permute(JNPool* p, const int* src_of_dst, int n) {
+    TScope ts(T_PERM);
     std::vector<JNet> tmp;
     tmp.reserve(n);
     for (int k = 0; k < n; k++) tmp.push_back(p->nets[src_of_dst[k]].copy_genome());
-    for (int k = 0; k < n; k++) p->nets[k] = std::move(tmp[k]);
+    std::vector<int> tw(n);
+    for (int k = 0; k < n; k++) tw[k] = p->warm[(size_t)src_of_dst[k]];
+    for (int k = 0; k < n; k++) { p->nets[k] = std::move(tmp[k]); p->warm[(size_t)k] = tw[k]; }
 }
 
 void jn_inject(JNPool* p, int slot, double pct, uint64_t seed) {
+    TScope ts(T_INJ);
     jneuro::Rng rng(seed);
     p->nets[slot] = jneuro::inject_diversity(p->nets[slot], pct, rng);
+    p->warm[(size_t)slot] = -1;   // weights only, so unchanged in principle; recomputed to be safe
 }
 
 JNStats jn_stats(const JNPool* p) {
+    TScope ts(T_STATS);
     JNStats s;
     s.ring_len = (int)p->ring.size();
     if (p->nets.empty()) return s;
     double nodes = 0.0, warm = 0.0;
-    for (const auto& n : p->nets) {
+    for (size_t k = 0; k < p->nets.size(); k++) {
+        const auto& n = p->nets[k];
         const int nn = (int)n.nodes.size() - (int)n.n_inputs;
-        const int w  = (int)n.get_warmup_steps();
+        const int w  = warm_of(p, (int)k);
         nodes += nn; warm += w;
         if (nn > s.nodes_max) s.nodes_max = nn;
         if (w > s.warm_max) s.warm_max = w;
@@ -149,6 +207,7 @@ bool jn_load_slot(JNPool* p, int slot, const std::string& path) {
         JNet n = make_net(jneuro::load_net(path));
         if (!fit_outputs(p, n, (uint64_t)slot + 1)) return false;
         p->nets[slot] = std::move(n);
+        p->warm[(size_t)slot] = -1;
         return true;
     } catch (const std::exception&) {
         return false;
@@ -156,6 +215,7 @@ bool jn_load_slot(JNPool* p, int slot, const std::string& path) {
 }
 
 bool jn_save(const JNPool* p, const std::string& dir, const std::string& prefix) {
+    TScope ts(T_SAVE);
     for (size_t s = 0; s < p->nets.size(); s++)
         if (!jn_save_slot(p, (int)s, dir + "/" + prefix + "_" + std::to_string(s) + ".jnet"))
             return false;
@@ -191,6 +251,7 @@ bool jn_load(JNPool* p, const std::string& dir, const std::string& prefix) {
             if (!ok) return false;
         }
         p->nets = std::move(nets);
+        p->warm.assign(p->nets.size(), -1);
         p->ring = std::move(ring);
         while ((int)p->ring.size() > p->ring_cap) p->ring.pop_front();
         return true;

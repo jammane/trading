@@ -17,6 +17,7 @@ void    jn_mutate(JNPool*, int, int, uint64_t, uint64_t) {}
 void    jn_permute(JNPool*, const int*, int) {}
 void    jn_inject(JNPool*, int, double, uint64_t) {}
 JNStats jn_stats(const JNPool*) { return {}; }
+JNTiming jn_timing_take() { return {}; }
 bool    jn_save(const JNPool*, const std::string&, const std::string&) { return false; }
 bool    jn_load(JNPool*, const std::string&, const std::string&) { return false; }
 bool    jn_save_slot(const JNPool*, int, const std::string&) { return false; }

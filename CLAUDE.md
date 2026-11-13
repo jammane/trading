@@ -1171,16 +1171,38 @@ both **off by default**:
 
 j_neuro computes in exact IEEE-754 and refuses fast-math, so it is reached only through
 `jn_bridge.{h,cpp}`, an opaque wrapper CMake builds with j_neuro's own flags. The build looks for a
-checkout at `../j_neuro` (`-DJNEURO_DIR=`; it needs `json-devel`); without one,
+checkout at `../j_neuro` (`-DJNEURO_DIR=`; it needs `json-devel`; j_neuro d39c7d3 or later, for
+`Net::reset_state`); without one,
 `jn_bridge_stub.cpp` is linked and every JN flag is refused at startup. JN is refused under
 `--upkeep` and the control modes, and production cannot run a JN net (it runs StockNN in torch),
 so JN champions are not promotable to paper or prod yet.
 
 A net replays its own warmup rows each day from a 64-row ring (`JN_RING_CAP`), so cost per day
-grows with the memory evolution gives it: measured, mean warmup went 4 → ~11 rows and levelled
-off, at ~15 s/day on one worker (StockNN: ~75 s/day). Every pass starts cold (the ring is cleared),
-so nothing trades for the first ~5 days. The nets are expected to need several passes to grow into
-their task.
+grows with the memory evolution gives it. Every pass starts cold (the ring is cleared), so nothing
+trades for the first ~5 days. The nets are expected to need several passes to grow into their task.
+
+**Speed (2026-11-13).** `--jn-timing` logs one `TIMING day N:` line per day: the industries'
+time split into j_neuro forward (warmup lookup, reset, step, µs/step), mutate, permute, inject and
+the rest, then the post-industry block (MT1, MT2, race) with the JN race entries' share. Measured on
+the full 46-entry field plus JN, one worker, days 17-67 of a fresh pool: **~85 s/day → ~4.4 s/day**,
+results byte-identical (same `--seed`, training and holdings logs compared):
+
+| | before | after | change |
+|---|---|---|---|
+| block (race saves) | ~53 s | 0.2 s | race pools saved at pass end, not daily |
+| JN mutate (2,160/day) | ~21 s | 3.4 s | j_neuro d39c7d3: incremental path rule, fewer allocations |
+| JN warmup lookups | ~5.7 s | 0.06 s | cached per slot in `jn_bridge` (structure only) |
+| JN step | ~130 µs | ~36 µs | j_neuro d39c7d3 + `reset_state()` keeps each net's plan |
+
+Race days (400+) measured ~14-15 s/day on fresh nets (block ~9 s, JN ~5 s). Cost grows with the
+nets, so a real pass runs slower than fresh-net figures.
+
+**Race saves happen at pass end only.** `process_block`'s save step was written when a block was
+25 days; since `MT1_DAYS = 1` it ran daily, rewriting the race field's pools (~85,000 files,
+~900 MB on the 46-entry field) every day, about half of each day's wall time, and it filled the
+droplet's btrfs metadata on 2026-11-13. Pools, gradient weights and MT2 are read only at a pass
+start, so they are now saved on the pass's last day and on every `--upkeep` run. A run killed
+mid-pass loses its race pools back to the previous pass's end.
 
 **Output scale (`JN_RACE_OUT_SCALE = 0.1`).** A new net has identity weights, so its output is in
 its inputs' units: unscaled, fresh nets predicted $172 / $2,188 / $9,235 (p10/p50/p90) against a
