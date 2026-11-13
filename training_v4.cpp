@@ -843,6 +843,11 @@ static bool        g_jn_timing  = false;   // --jn-timing: per-day time split (p
 #define JNEURO_DEFAULT_PROFILE "../j_neuro/profiles/training.json"
 #endif
 static std::string g_jn_profile = JNEURO_DEFAULT_PROFILE;
+// --jn-bulk-profile: the profile that bulks the pass seed's children (profiles/bulk.json).
+#ifndef JNEURO_DEFAULT_BULK_PROFILE
+#define JNEURO_DEFAULT_BULK_PROFILE "../j_neuro/profiles/bulk.json"
+#endif
+static std::string g_jn_bulk_profile = JNEURO_DEFAULT_BULK_PROFILE;
 // Rows of history a JN pool keeps. A net replays its own get_warmup_steps() of them each day and
 // trades only once it has that many; 64 bounds the replay cost while leaving room for nets to
 // grow s_neuron chains well past StockNN's 15-day window.
@@ -858,6 +863,17 @@ static constexpr int JN_RING_CAP = 64;
 // pool's warmup is ~2. -1 = not yet read this pass.
 static constexpr int JN_WARM_FLOOR = HIST_WINDOW;
 static int g_jn_gate[N_IND];
+// Bulking between passes. Each pass records its pool's mean size at the start (read with the gate)
+// and its 20 elites' mean size at the end. The next pass's seed keeps the elites as they are and
+// fills the other 180 slots by BULKING them, not mutating them: each child is its parent grown by
+//   pct = (1/lost - 1) x 100,   lost = 1 - end/start           (the pass's shrinkage)
+// so a pass that threw most of its neurons away gets a small bulk, and one that kept nearly all
+// of them gets a large one. No child may pass JN_BULK_CAP x the pass-start size: a parent that
+// would is bulked by the pct that lands exactly on the cap. Children of one parent start at the
+// same size; parents of different sizes give children of different sizes. 0 = not measured.
+static constexpr double JN_BULK_CAP = 3.0;
+static double g_jn_start_nodes[N_IND];
+static double g_jn_end_nodes[N_IND];
 // A JN race net's raw output is multiplied by this before mt1_pred's tanh x MT1_PRED_SCALE. A net
 // starts with identity weights, so its output is in the units of its 74 inputs (|x| up to ~33),
 // not of the target. Measured on the --jn-stocknn smoke's own features (mt1_dataset.bin, 500 days,
@@ -2142,7 +2158,9 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     bool jn_warming = false;
     if (jp) {
         if (g_jn_gate[ind_i] < 0) {
-            g_jn_gate[ind_i] = std::max(JN_WARM_FLOOR, jn_stats(jp).warm_max);
+            const JNStats js0 = jn_stats(jp);
+            g_jn_gate[ind_i] = std::max(JN_WARM_FLOOR, js0.warm_max);
+            g_jn_start_nodes[ind_i] = js0.nodes_mean;
             log_msg(std::string("[") + IND_SHORT[ind_i] + "]   JN warm-in: selection starts once " +
                     std::to_string(g_jn_gate[ind_i] + 1) + " days of history are held (pool warmup max " +
                     std::to_string(jn_stats(jp).warm_max) + ", floor " +
@@ -4235,9 +4253,39 @@ static bool jn_write_elites(int ind_i, const std::string& dir) {
     return true;
 }
 
-// Slots 0..19 := the 20 elite files in dir; slots 20..199 := MUTATIONS_PER_PARENT children of
-// each, bred as the daily selection breeds them. False, pool untouched, if any file is missing.
-static bool jn_seed_from_elites(int ind_i, const std::string& dir, uint64_t generation) {
+// jn_bulk.txt: each industry's last pass start / end sizes, so --continue-run can bulk the seed
+// it blends. One line per industry: name start end.
+static void jn_save_bulk_sizes(const std::string& dir) {
+    FILE* f = fopen((dir + "/jn_bulk.txt").c_str(), "w");
+    if (!f) { log_msg("WARNING: cannot write " + dir + "/jn_bulk.txt"); return; }
+    for (int i = 0; i < N_IND; i++)
+        fprintf(f, "%s %.3f %.3f\n", g_ind_names[i].c_str(), g_jn_start_nodes[i], g_jn_end_nodes[i]);
+    fclose(f);
+}
+static void jn_load_bulk_sizes(const std::string& dir) {
+    FILE* f = fopen((dir + "/jn_bulk.txt").c_str(), "r");
+    if (!f) return;
+    char name[128]; double s, e;
+    while (fscanf(f, "%127s %lf %lf", name, &s, &e) == 3)
+        for (int i = 0; i < N_IND; i++)
+            if (g_ind_names[i] == name) { g_jn_start_nodes[i] = s; g_jn_end_nodes[i] = e; }
+    fclose(f);
+}
+
+// The bulk pct for one industry from its pass's shrinkage (see g_jn_start_nodes); -1 = not
+// measured, so the seed's children are mutated as the daily selection breeds them.
+static double jn_bulk_pct(double start, double end) {
+    if (start <= 0.0 || end <= 0.0) return -1.0;
+    const double lost = 1.0 - end / start;
+    return lost > 0.0 ? (1.0 / lost - 1.0) * 100.0 : 1e9;   // grew or held: bulk to the cap
+}
+
+// Slots 0..19 := the 20 elite files in dir, as they are; slots 20..199 := MUTATIONS_PER_PARENT
+// children of each. With a measured pass (start/end nodes > 0) the children are BULKED copies
+// of their parent (jn_bulk_pct, capped at JN_BULK_CAP x start); otherwise they are bred as the
+// daily selection breeds them. False, pool untouched, if any file is missing.
+static bool jn_seed_from_elites(int ind_i, const std::string& dir, uint64_t generation,
+                                double start_nodes = 0.0, double end_nodes = 0.0) {
     if (dir.empty()) return false;
     const char* ind = g_ind_names[ind_i].c_str();
     for (int k = 0; k < ELITE_POOL; k++)
@@ -4250,9 +4298,38 @@ static bool jn_seed_from_elites(int ind_i, const std::string& dir, uint64_t gene
             return false;
         }
     const uint64_t salt = jn_fresh_seed(0x4A4E5345ULL + (uint64_t)ind_i);   // "JNSE"
-    for (int mut_i = 0; mut_i < N_SLOTS - ELITE_POOL; mut_i++)
-        jn_mutate(p, mut_i / MUTATIONS_PER_PARENT, ELITE_POOL + mut_i, generation,
-                  mix_seed(salt ^ (uint64_t)mut_i));
+    const double pct = jn_bulk_pct(start_nodes, end_nodes);
+    if (pct < 0.0) {
+        for (int mut_i = 0; mut_i < N_SLOTS - ELITE_POOL; mut_i++)
+            jn_mutate(p, mut_i / MUTATIONS_PER_PARENT, ELITE_POOL + mut_i, generation,
+                      mix_seed(salt ^ (uint64_t)mut_i));
+        return true;
+    }
+    const double cap = JN_BULK_CAP * start_nodes;
+    double par_pct[ELITE_POOL], elite_n = 0.0;
+    for (int k = 0; k < ELITE_POOL; k++) {
+        const double n = (double)jn_slot_nodes(p, k);
+        elite_n += n;
+        par_pct[k] = n > 0.0 ? std::max(0.0, std::min(pct, (cap / n - 1.0) * 100.0)) : 0.0;
+    }
+    for (int mut_i = 0; mut_i < N_SLOTS - ELITE_POOL; mut_i++) {
+        const int par = mut_i / MUTATIONS_PER_PARENT;
+        jn_bulk(p, par, ELITE_POOL + mut_i, par_pct[par], generation,
+                mix_seed(salt ^ 0x42554C4BULL ^ (uint64_t)mut_i));   // "BULK"
+    }
+    double child_n = 0.0; int child_max = 0, n_capped = 0;
+    for (int s = ELITE_POOL; s < N_SLOTS; s++) {
+        const int n = jn_slot_nodes(p, s);
+        child_n += n; child_max = std::max(child_max, n);
+    }
+    for (int k = 0; k < ELITE_POOL; k++) if (par_pct[k] < pct) n_capped++;
+    char m[300];
+    snprintf(m, sizeof(m), "[%s]   jn bulk: pass %.0f -> %.0f nodes (lost %.0f%%) -> +%.0f%%, cap %.0f; "
+             "elites %.0f mean as they are, children %.0f mean (max %d); %d of %d parents at the cap",
+             IND_SHORT[ind_i], start_nodes, end_nodes, 100.0 * (1.0 - end_nodes / start_nodes),
+             std::min(pct, 1e6), cap, elite_n / ELITE_POOL, child_n / (N_SLOTS - ELITE_POOL),
+             child_max, n_capped, ELITE_POOL);
+    log_msg(m);
     return true;
 }
 
@@ -4986,7 +5063,7 @@ static void print_usage(const char* prog) {
         "          [--workers N] [--master-only] [--no-save] [--no-nn-race]\n"
         "          [--race-skip \"A,B,...\"]  switch race entries off (race_qualify.py RACE_SKIP)\n"
         "          [--race-only \"A,B,...\"]  run only these race entries (plus the deployed/logged two)\n"
-        "          [--jn-stocknn] [--jn-race] [--jn-profile FILE]  j_neuro StockNN / race entries\n"
+        "          [--jn-stocknn] [--jn-race] [--jn-profile FILE] [--jn-bulk-profile FILE]\n"
         "          [--seed N]   (default: clock, RE-SEEDED EVERY PASS; N derives passes from N)\n"
         "          [--trade-lock PATH | --no-trade-lock]  pause while production holds the lock\n"
         "          [--control-untrained]  NO-LEARNING CONTROL: re-randomise StockNN daily\n"
@@ -5525,6 +5602,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--jn-race")    g_jn_race = true;
         else if (arg == "--jn-timing")  g_jn_timing = true;
         else if (arg == "--jn-profile" && a+1<argc) { g_jn_profile = argv[++a]; }
+        else if (arg == "--jn-bulk-profile" && a+1<argc) { g_jn_bulk_profile = argv[++a]; }
         else if (arg == "--continue-run") g_continue = true;
         else if (arg == "--crown" && a+1<argc) {
             std::string list = argv[++a];
@@ -5957,12 +6035,15 @@ int main(int argc, char* argv[]) {
         log_msg("#  --jn-stocknn : StockNN is a j_neuro pool, not the 928k net  #");
         log_msg("#  Compare it with a StockNN run over the SAME day range.      #");
         log_msg("################################################################");
-        log_msg("j_neuro profile: " + g_jn_profile);
+        log_msg("j_neuro profile: " + g_jn_profile + "; bulk profile: " + g_jn_bulk_profile);
         for (int i = 0; i < N_IND; i++) {
             std::string err;
             g_jn_ind[i] = jn_pool_create(STOCK_TODAY_DIM, STOCK_OUT_N, N_SLOTS, JN_RING_CAP,
                                          g_jn_profile, jn_fresh_seed(0x5700ULL + (uint64_t)i), err);
             if (!g_jn_ind[i]) { log_msg("ERROR: --jn-stocknn: " + err); return 1; }
+            if (!jn_set_bulk_profile(g_jn_ind[i], g_jn_bulk_profile, err)) {
+                log_msg("ERROR: --jn-stocknn: " + err); return 1;
+            }
             // Pools saved before sell_flag (4 outputs per stock) gain a fresh sell_flag output
             // per stock on load (j_neuro add_output_fresh) rather than restarting.
             {
@@ -6067,8 +6148,10 @@ int main(int argc, char* argv[]) {
     // --jn-stocknn: the pool starts from the 20 elite files where there are any -- the run's own
     // seed (a continued run, just blended above), else --load-dir's (e.g. a champion/ store) --
     // with fresh children. The full saved pool, when jn_load found one, is otherwise kept.
+    if (g_jn_stocknn) jn_load_bulk_sizes(output_dir);
     for (int i = 0; i < N_IND && g_jn_stocknn; i++) {
-        const char* src = jn_seed_from_elites(i, output_dir, 0) ? "the run's elites"
+        const char* src = jn_seed_from_elites(i, output_dir, 0, g_jn_start_nodes[i], g_jn_end_nodes[i])
+                          ? "the run's elites"
                         : jn_seed_from_elites(i, load_dir, 0)   ? "--load-dir's elites" : nullptr;
         if (src) log_msg(std::string("[") + IND_SHORT[i] + "] j_neuro StockNN pool seeded from " + src);
     }
@@ -7721,7 +7804,15 @@ int main(int argc, char* argv[]) {
             if (judged)
                 pass_boundary(output_dir, pass + 1, day_start, day_end, judge, seed_next);
             for (int i = 0; i < N_IND && g_jn_stocknn; i++) {
-                if (judged && seed_next && !jn_seed_from_elites(i, output_dir, (uint64_t)day_end))
+                double en = 0.0;
+                for (int k = 0; k < ELITE_POOL; k++) en += jn_slot_nodes(g_jn_ind[i], k);
+                g_jn_end_nodes[i] = en / ELITE_POOL;
+            }
+            if (g_jn_stocknn) jn_save_bulk_sizes(output_dir);
+            for (int i = 0; i < N_IND && g_jn_stocknn; i++) {
+                if (judged && seed_next &&
+                    !jn_seed_from_elites(i, output_dir, (uint64_t)day_end,
+                                         g_jn_start_nodes[i], g_jn_end_nodes[i]))
                     log_msg("WARNING: j_neuro StockNN " + g_ind_names[i] +
                             " not reseeded from the pass seed -- it carries on as it ended");
                 if (!jn_save(g_jn_ind[i], output_dir, "jn_" + g_ind_names[i]))

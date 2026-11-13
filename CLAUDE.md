@@ -1171,8 +1171,8 @@ both **off by default**:
 
 j_neuro computes in exact IEEE-754 and refuses fast-math, so it is reached only through
 `jn_bridge.{h,cpp}`, an opaque wrapper CMake builds with j_neuro's own flags. The build looks for a
-checkout at `../j_neuro` (`-DJNEURO_DIR=`; it needs `json-devel`; j_neuro d39c7d3 or later, for
-`Net::reset_state`); without one,
+checkout at `../j_neuro` (`-DJNEURO_DIR=`; it needs `json-devel`; j_neuro ed79fa6 or later, for
+`Net::reset_state` and bulking); without one,
 `jn_bridge_stub.cpp` is linked and every JN flag is refused at startup. JN is refused under
 `--upkeep` and the control modes, and production cannot run a JN net (it runs StockNN in torch),
 so JN champions are not promotable to paper or prod yet.
@@ -1192,6 +1192,26 @@ from the first day on nets that could not trade yet. A JN run therefore starts a
 day (`--start-day 0`) instead of StockNN's 17: the gate replaces the fixed start. A race pool keeps
 feeding its baseline window while warming in. Removal stays off in the profile; JN1's nets fell
 from 421 to 192 nodes through pruned connections, not removals.
+
+**Bulking between passes (2026-11-13).** The next pass's seed keeps its 20 elites as they are and
+fills the other 180 slots by **bulking** each elite (j_neuro `profiles/bulk.json`, `growth_budget =
+fill`: growth only, an exact percentage of the net's neurons) instead of mutating it. The
+percentage comes from how much the pass just finished shrank its nets:
+
+```
+lost = 1 - (mean nodes of the 20 elites at pass end) / (pool mean nodes at pass start)
+pct  = (1/lost - 1) x 100          JN1: 421 -> 192, lost 54% -> +85%
+cap  = 3 x the pass-start size      a parent that would pass it bulks by the pct landing on it
+```
+
+A pass that discarded most of its neurons gets a small bulk; one that kept nearly all of them
+gets a large one, for exploration. Children of one elite start at the same size; elites of
+different sizes give children of different sizes. Logged per industry as `jn bulk: pass A -> B
+nodes (lost L%) -> +P%, cap C; ...`. The sizes are kept in `RUN/jn_bulk.txt`, so `--continue-run`
+bulks the seed it blends; a seed with no measured pass (`--load-dir`, a fresh run) is mutated as
+before. `--jn-bulk-profile FILE` overrides the profile. The JN race pools are not bulked. The
+training profile's own growth is now 1% of a net's neurons (`fill`, min 1) in 10% of generations
+for 10% of nets (j_neuro ed79fa6); removal stays off.
 
 **Speed (2026-11-13).** `--jn-timing` logs one `TIMING day N:` line per day: the industries'
 time split into j_neuro forward (warmup lookup, reset, step, µs/step), mutate, permute, inject and

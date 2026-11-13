@@ -22,6 +22,8 @@ struct JNPool {
     int n_in = 0, n_out = 0, ring_cap = 0;
     uint64_t seed = 0;
     jneuro::Profile profile = jneuro::Profile::defaults();
+    jneuro::Profile bulk = jneuro::Profile::defaults();   // jn_set_bulk_profile
+    bool has_bulk = false;
     std::vector<JNet> nets;
     // get_warmup_steps() per slot, -1 = not yet computed. It depends on a net's structure only,
     // but j_neuro recomputes it from the graph on every call (~2.4 ms on a ~420-node net, measured
@@ -43,6 +45,40 @@ static bool fit_outputs(const JNPool* p, JNet& n, uint64_t salt) {
     jneuro::Rng rng(p->seed ^ (salt * 0x9E3779B97F4A7C15ULL));
     for (int at : p->mig_at) n = jneuro::add_output_fresh(n, rng, (std::uint32_t)at);
     return (int)n.n_outputs == p->n_out;
+}
+
+bool jn_set_bulk_profile(JNPool* p, const std::string& path, std::string& err) {
+    try {
+        std::ifstream f(path);
+        if (!f) { err = "cannot read j_neuro bulk profile " + path; return false; }
+        std::stringstream ss; ss << f.rdbuf();
+        p->bulk = jneuro::profile_from_json(ss.str());
+        if (p->bulk.growth_budget() != "fill") { err = path + ": growth_budget must be fill"; return false; }
+        p->has_bulk = true;
+        return true;
+    } catch (const std::exception& e) {
+        err = std::string("j_neuro bulk profile: ") + e.what();
+        return false;
+    }
+}
+
+void jn_bulk(JNPool* p, int src, int dst, double pct, uint64_t generation, uint64_t seed) {
+    TScope ts(T_MUT);
+    if (pct <= 0.0 || !p->has_bulk) {
+        p->nets[(size_t)dst] = p->nets[(size_t)src].copy_genome();
+        p->warm[(size_t)dst] = p->warm[(size_t)src];
+        return;
+    }
+    jneuro::Profile prof = p->bulk;
+    prof.set_overall("growth_max_pct", pct);
+    jneuro::Rng rng(seed);
+    p->nets[(size_t)dst] = jneuro::mutate(p->nets[(size_t)src], prof, generation, rng, nullptr, true);
+    p->warm[(size_t)dst] = -1;
+}
+
+int jn_slot_nodes(const JNPool* p, int slot) {
+    const auto& n = p->nets[(size_t)slot];
+    return (int)n.nodes.size() - (int)n.n_inputs;
 }
 
 void jn_set_output_migration(JNPool* p, int from_n_out, const std::vector<int>& insert_at) {
