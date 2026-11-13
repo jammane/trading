@@ -110,3 +110,9 @@ target_include_directories(test_mt1_pool_cpp PRIVATE ${CMAKE_SOURCE_DIR})
 target_compile_options(test_mt1_pool_cpp PRIVATE -O2 -Wall -Wextra)
 target_link_libraries(test_mt1_pool_cpp m)
 add_test(NAME test_mt1_pool COMMAND test_mt1_pool_cpp)
+
+# ORDER entries' daily score (jnl_score.h): each level, both ends, ties, lexicographic composite.
+add_executable(test_jnl_score_cpp tests/test_jnl_score.cpp)
+target_include_directories(test_jnl_score_cpp PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_options(test_jnl_score_cpp PRIVATE -O2 -Wall -Wextra)
+add_test(NAME test_jnl_score COMMAND test_jnl_score_cpp)

@@ -44,6 +44,8 @@ void    jn_push_row(JNPool* p, const float* row);
 void    jn_clear_rows(JNPool* p);
 // Replace the newest row (same day, recomputed input).
 void    jn_replace_row(JNPool* p, const float* row);
+// Rows of history held (at most the ring capacity).
+int     jn_ring_len(const JNPool* p);
 
 // Reset slot, replay its warmup rows, step the newest row; outputs (n_out) as float.
 // Returns false, writing zeros, if the slot is not ready (or an output is not finite).
@@ -58,6 +60,13 @@ void    jn_permute(JNPool* p, const int* src_of_dst, int n);
 void    jn_inject(JNPool* p, int slot, double pct, uint64_t seed);
 
 JNStats jn_stats(const JNPool* p);
+
+// Bulking (j_neuro profiles/bulk.json, growth_budget = fill). Load the bulk profile once per pool;
+// then dst = src grown by pct% of its neurons (exactly, within rounding). pct <= 0 copies src.
+bool    jn_set_bulk_profile(JNPool* p, const std::string& path, std::string& err);
+void    jn_bulk(JNPool* p, int src, int dst, double pct, uint64_t generation, uint64_t seed);
+// Neurons (non-input nodes) in one slot's net, as jn_stats counts them.
+int     jn_slot_nodes(const JNPool* p, int slot);
 
 // Wall time spent inside the bridge, summed over every pool and thread since the last take.
 // A performance probe (`--jn-timing`); costs two clock reads per call.
