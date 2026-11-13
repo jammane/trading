@@ -69,6 +69,10 @@ JNStats jn_stats_n(const JNPool* p, int n);
 void    jn_set_persist(JNPool* p, int n);
 // dst := an exact copy of src (structure and weights).
 void    jn_copy(JNPool* p, int src, int dst);
+// A net's identity: a copy (jn_copy, jn_permute) keeps it, anything that makes a new net (create,
+// load, mutate, bulk, inject) gives a new one. Equal ids = the same net, so a caller can keep
+// clones out of a selection.
+uint64_t jn_id(const JNPool* p, int slot);
 
 // Bulking (j_neuro profiles/bulk.json, growth_budget = fill). Load the bulk profile once per pool;
 // then dst = src grown by pct% of its neurons (exactly, within rounding). pct <= 0 copies src.

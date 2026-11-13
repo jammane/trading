@@ -1238,7 +1238,11 @@ copied into an elite slot (counting as traded) and breeds the next day's childre
 candidate itself is never mutated. Within a pass the seed can therefore always win its place
 back after one bad day, instead of being lost for good. Logged on every selection line as
 `safety nets: C champ + H hist scored, c+h chosen`; a candidate in the elite list reads `cN`/`hN`.
-Champions count toward the warm-in gate. About 35% more JN forward work per day.
+Champions count toward the warm-in gate. The elite list takes **distinct nets only**: every net
+carries an identity (`jn_id`) that copies keep and breeding renews, and a candidate that is the
+same net as one already chosen is skipped -- yesterday's history entries are today's elite slots,
+so without this the list filled with clones (14 of 20 on one test day). Measured on days 32-60:
+3.9 s/day against JN2's 4.7 on the same days, so no measurable cost.
 
 The **JN race pools** get the champions only. Their lifecycle already keeps its best (a net is
 culled only after a sustained bad 16-day register, never the deployed one), so there is no

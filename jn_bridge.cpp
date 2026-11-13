@@ -31,6 +31,10 @@ struct JNPool {
     // but j_neuro recomputes it from the graph on every call (~2.4 ms on a ~420-node net, measured
     // 2026-11-12: ~6 s of a JN StockNN day). Cleared wherever a slot gets a different net.
     mutable std::vector<int> warm;
+    std::vector<uint64_t> id;   // jn_id: per slot, kept by copies, renewed by every new net
+    uint64_t next_id = 1;
+    void renew(size_t slot) { if (id.size() < nets.size()) id.resize(nets.size(), 0); id[slot] = next_id++; }
+    void renew_all() { id.assign(nets.size(), 0); for (size_t k = 0; k < nets.size(); k++) id[k] = next_id++; }
     std::deque<std::vector<double>> ring;     // oldest first; the newest row is today's
     std::vector<double> in;                   // scratch
     // A saved net with mig_from outputs is widened on load: a fresh output (spec/12,
@@ -65,9 +69,8 @@ bool jn_set_bulk_profile(JNPool* p, const std::string& path, std::string& err) {
 }
 
 void jn_bulk(JNPool* p, int src, int dst, double pct, uint64_t generation, uint64_t seed) {
-    if (pct <= 0.0 || !p->has_bulk) {
-        p->nets[(size_t)dst] = p->nets[(size_t)src].copy_genome();
-        p->warm[(size_t)dst] = p->warm[(size_t)src];
+    if (pct <= 0.0 || !p->has_bulk) {   // a plain copy, so the same net (same id)
+        jn_copy(p, src, dst);
         return;
     }
     jneuro::Profile prof = p->bulk;
@@ -75,6 +78,7 @@ void jn_bulk(JNPool* p, int src, int dst, double pct, uint64_t generation, uint6
     jneuro::Rng rng(seed);
     p->nets[(size_t)dst] = jneuro::mutate(p->nets[(size_t)src], prof, generation, rng, nullptr, true);
     p->warm[(size_t)dst] = -1;
+    p->renew((size_t)dst);
 }
 
 int jn_slot_nodes(const JNPool* p, int slot) {
@@ -138,6 +142,7 @@ JNPool* jn_pool_create(int n_in, int n_out, int n_slots, int ring_cap,
                                                       jneuro::Priority::Speed, rng)));
         }
         p->warm.assign(p->nets.size(), -1);
+        p->renew_all();
         p->in.assign(n_in, 0.0);
         return p;
     } catch (const std::exception& e) {
@@ -197,6 +202,7 @@ void jn_mutate(JNPool* p, int src, int dst, uint64_t generation, uint64_t seed) 
     { TScope tg(T_GROW); grow = jneuro::is_growth_generation(p->seed, generation, p->profile); }
     p->nets[dst] = jneuro::mutate(p->nets[src], p->profile, generation, rng, nullptr, grow);
     p->warm[(size_t)dst] = -1;
+    p->renew((size_t)dst);
 }
 
 void jn_permute(JNPool* p, const int* src_of_dst, int n) {
@@ -205,15 +211,19 @@ void jn_permute(JNPool* p, const int* src_of_dst, int n) {
     tmp.reserve(n);
     for (int k = 0; k < n; k++) tmp.push_back(p->nets[src_of_dst[k]].copy_genome());
     std::vector<int> tw(n);
-    for (int k = 0; k < n; k++) tw[k] = p->warm[(size_t)src_of_dst[k]];
-    for (int k = 0; k < n; k++) { p->nets[k] = std::move(tmp[k]); p->warm[(size_t)k] = tw[k]; }
+    std::vector<uint64_t> ti(n);
+    for (int k = 0; k < n; k++) { tw[k] = p->warm[(size_t)src_of_dst[k]]; ti[k] = p->id[(size_t)src_of_dst[k]]; }
+    for (int k = 0; k < n; k++) {
+        p->nets[k] = std::move(tmp[k]); p->warm[(size_t)k] = tw[k]; p->id[(size_t)k] = ti[k];
+    }
 }
 
 void jn_inject(JNPool* p, int slot, double pct, uint64_t seed) {
     TScope ts(T_INJ);
     jneuro::Rng rng(seed);
     p->nets[slot] = jneuro::inject_diversity(p->nets[slot], pct, rng);
-    p->warm[(size_t)slot] = -1;   // weights only, so unchanged in principle; recomputed to be safe
+    p->warm[(size_t)slot] = -1;
+    p->renew((size_t)slot);   // weights only, so unchanged in principle; recomputed to be safe
 }
 
 JNStats jn_stats(const JNPool* p) { return jn_stats_n(p, (int)p->nets.size()); }
@@ -248,7 +258,10 @@ void jn_copy(JNPool* p, int src, int dst) {
     if (src == dst) return;
     p->nets[(size_t)dst] = p->nets[(size_t)src].copy_genome();
     p->warm[(size_t)dst] = p->warm[(size_t)src];
+    p->id[(size_t)dst] = p->id[(size_t)src];
 }
+
+uint64_t jn_id(const JNPool* p, int slot) { return p->id[(size_t)slot]; }
 
 bool jn_save_slot(const JNPool* p, int slot, const std::string& path) {
     try { jneuro::save_net(path, p->nets[slot]); return true; }
@@ -262,6 +275,7 @@ bool jn_load_slot(JNPool* p, int slot, const std::string& path) {
         if (!fit_outputs(p, n, (uint64_t)slot + 1)) return false;
         p->nets[slot] = std::move(n);
         p->warm[(size_t)slot] = -1;
+        p->renew((size_t)slot);
         return true;
     } catch (const std::exception&) {
         return false;
@@ -305,7 +319,7 @@ bool jn_load(JNPool* p, const std::string& dir, const std::string& prefix) {
             if (!ok) return false;
         }
         // Persisted slots are replaced; scratch slots past them keep their nets.
-        for (size_t s = 0; s < nets.size(); s++) p->nets[s] = std::move(nets[s]);
+        for (size_t s = 0; s < nets.size(); s++) { p->nets[s] = std::move(nets[s]); p->renew(s); }
         p->warm.assign(p->nets.size(), -1);
         p->ring = std::move(ring);
         while ((int)p->ring.size() > p->ring_cap) p->ring.pop_front();

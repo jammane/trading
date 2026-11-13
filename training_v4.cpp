@@ -2819,9 +2819,24 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             // elites. Survivors are current slots only (the history ring is off in JN mode).
             std::sort(surviving.begin(), surviving.end(),
                       [](const auto& a, const auto& b){ return a.first > b.first; });
-            const int n_top = std::min((int)surviving.size(), ELITE_POOL);
+            // Distinct nets only: a champion or history candidate is often the very net that
+            // also sits in a working elite slot (yesterday's elites ARE today's slots 0..19), and
+            // the two score identically. Without this the elite list fills with clones.
             int src[ELITE_POOL], pool_src[ELITE_POOL];
-            for (int k = 0; k < ELITE_POOL; k++) src[k] = surviving[k < n_top ? k : 0].second;
+            int n_top = 0;
+            {
+                uint64_t taken[ELITE_POOL];
+                for (size_t q = 0; q < surviving.size() && n_top < ELITE_POOL; q++) {
+                    const int sl = surviving[q].second;
+                    const uint64_t id = jn_id(jp, sl < N_SLOTS ? sl : cand_slot[sl - N_SLOTS]);
+                    bool dup = false;
+                    for (int t = 0; t < n_top && !dup; t++) dup = taken[t] == id;
+                    if (dup) continue;
+                    taken[n_top] = id;
+                    src[n_top++] = sl;
+                }
+                for (int k = n_top; k < ELITE_POOL; k++) src[k] = src[0];   // fewer distinct: repeat the best
+            }
             Portfolio new_ports[ELITE_POOL];
             int n_from_champ = 0, n_from_hist = 0;
             for (int k = 0; k < ELITE_POOL; k++) {
