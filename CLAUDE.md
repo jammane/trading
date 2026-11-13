@@ -1230,6 +1230,15 @@ back after one bad day, instead of being lost for good. Logged on every selectio
 `safety nets: C champ + H hist scored, c+h chosen`; a candidate in the elite list reads `cN`/`hN`.
 Champions count toward the warm-in gate. About 35% more JN forward work per day.
 
+The **JN race pools** get the champions only. Their lifecycle already keeps its best (a net is
+culled only after a sustained bad 16-day register, never the deployed one), so there is no
+single-bad-day loss for a history to repair. A pool started from a saved pool copies its top 20,
+before bulking, into 20 extra slots; each champion is scored daily into its own register and is
+never culled or mutated. When a mature champion would rank among the day's parents and no copy of
+it is in the pool, it is copied back in, register and all, in place of the first cull victim, and
+breeds from the next day (`champions copied back into the pool this pass: N` at the save). A
+fresh pool has no champions.
+
 **Bulking at the pass start (2026-11-13).** A pass started from elites (the run's blended seed,
 or `champion/` through `--load-dir`) keeps its 20 elites as they are and fills the other 180 slots
 by **bulking** each elite (j_neuro `profiles/bulk.json`, `growth_budget =

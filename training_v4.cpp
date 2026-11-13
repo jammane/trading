@@ -1418,6 +1418,15 @@ struct MT1PoolScratch {
     JNPool*     jn{nullptr};
     int         jn_gate{-1};                // warm-in gate (g_jn_gate); -1 = read at first step
     double      jn_start_nodes{0.0};        // pool mean nodes at the pass start (bulking)
+    // JN champions (race pools): the pool's top JN_CHAMP_N at the pass start, before bulking, in
+    // slots MT1_POOL_SLOTS.. of the JNPool. Scored every day into their own registers, never
+    // culled or mutated; a mature one that would rank among the parents is copied back into the
+    // pool (jn_champ_reenter). champ_of[s] = k+1 while slot s holds a copy of champion k.
+    int         jn_champ_n{0};
+    MT1SlotMeta champ_meta[JN_CHAMP_N]{};
+    float       champ_pending[JN_CHAMP_N]{};
+    int8_t      champ_of[MT1_POOL_SLOTS]{};
+    int         champ_back{0};              // champions copied back in this pass (logged)
     float*      mut_buf{nullptr};           // one model, breeding scratch
     MT1SlotMeta meta[MT1_POOL_SLOTS]{};
     int         best_slot{0};               // deployed model; ranked in place, never shuffled
@@ -3432,7 +3441,7 @@ static void jn_race_read_gate(MT1PoolScratch& sc) {
         for (int i = 0; i < N_IND; i++) stock_max = std::max(stock_max, g_jn_gate[i]);
     sc.jn_gate = std::min(JN_RING_CAP - 1,
                           std::max(std::max(JN_WARM_FLOOR, js0.warm_max), stock_max));
-    sc.jn_start_nodes = js0.nodes_mean;
+    sc.jn_start_nodes = jn_stats_n(sc.jn, MT1_POOL_SLOTS).nodes_mean;
     static std::atomic<int> logged_pass{-1};
     if (logged_pass.exchange(g_cur_pass) != g_cur_pass)
         log_msg("JN race warm-in: floor " + std::to_string(stock_max) +
@@ -3462,7 +3471,30 @@ static void mt1_pool_evolve(int ind_i, MT1PoolScratch& sc, MT1DayResult& r, int 
             if (!mt1_is_barred(sc, sc.meta[order[k]].lineage)) parents[n_par++] = order[k];
         if (n_par == 0) parents[n_par++] = order[0];
 
-        for (int c = 0; c < n_cull; c++) {
+        // JN champions: a mature champion whose register would rank it among today's parents,
+        // and with no copy of it in the pool, is copied back in, register and all, into the
+        // slot the cull would have emptied first. It breeds from tomorrow, like any parent.
+        int c0 = 0;
+        if (sc.jn && sc.jn_champ_n > 0) {
+            const MT1SlotMeta& bar = sc.meta[parents[n_par - 1]];
+            bool live[JN_CHAMP_N] = {};
+            for (int s2 = 0; s2 < MT1_POOL_SLOTS; s2++)
+                if (sc.champ_of[s2] > 0) live[sc.champ_of[s2] - 1] = true;
+            for (int k = 0; k < sc.jn_champ_n && c0 < n_cull; k++) {
+                if (live[k] || !mt1_slot_mature(sc.champ_meta[k])) continue;
+                if (!mt1_slot_better(sc.champ_meta[k], bar)) continue;
+                const int victim = order[n_mature - 1 - c0];
+                if (victim == sc.best_slot) break;
+                jn_copy(sc.jn, MT1_POOL_SLOTS + k, victim);
+                sc.meta[victim] = sc.champ_meta[k];
+                sc.champ_of[victim] = (int8_t)(k + 1);
+                c0++;
+                r.births++;
+                sc.champ_back++;
+            }
+        }
+
+        for (int c = c0; c < n_cull; c++) {
             const int victim = order[n_mature - 1 - c];
             if (victim == sc.best_slot) continue;
             const int par = parents[c % n_par];
@@ -3473,6 +3505,7 @@ static void mt1_pool_evolve(int ind_i, MT1PoolScratch& sc, MT1DayResult& r, int 
             if (sc.jn) jn_mutate(sc.jn, par, victim, (uint64_t)actual_day, seed);
             else       mt1_mutate(sc.slot(par), sc.slot(victim), sc.n_params, sigma, seed);
             mt1_slot_init(sc.meta[victim], sc.meta[par].lineage);
+            sc.champ_of[victim] = 0;
             sc.retire_n++;
             sc.retire_age_sum += age;
             sc.retire_hist[mt1_life_bucket(age)]++;
@@ -3518,6 +3551,10 @@ static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in,
         }
         else       sc.pending[s] = mt1_pred(fwd(sc.slot(s), in, 0.f));
     }
+    for (int k = 0; k < sc.jn_champ_n; k++) {
+        float o = 0.f; jn_forward(sc.jn, MT1_POOL_SLOTS + k, &o);
+        sc.champ_pending[k] = mt1_pred(o * JN_RACE_OUT_SCALE);
+    }
     sc.has_pending = true;
     sc.pending_day = actual_day;
     // The deployed model's call, captured BEFORE selection can reorder the pool — this is the
@@ -3548,6 +3585,10 @@ static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in,
         r.score_mean = (float)(sum / MT1_POOL_SLOTS);
         r.score_best = best;
         r.score_min  = worst;
+        for (int k = 0; k < sc.jn_champ_n; k++)
+            mt1_slot_record(sc.champ_meta[k],
+                            (tau >= 0.f) ? mt1_score_q(actual, sc.champ_pending[k], base, fl, tau)
+                                         : mt1_score(actual, sc.champ_pending[k], base, fl));
         sc.has_pending = false;
         sc.push_actual(actual, actual_day);
     }
@@ -3579,6 +3620,12 @@ static MT1DayResult jnl_step_day(MT1PoolScratch& sc, const float* real12, bool h
             mt1_slot_record(sc.meta[s], v);
             sum += v; best = std::max(best, v); worst = std::min(worst, v);
             if (s == sc.best_slot) r.score0 = v;
+        }
+        float co[N_IND];
+        for (int k = 0; k < sc.jn_champ_n; k++) {
+            if (!jn_forward(sc.jn, MT1_POOL_SLOTS + k, co))
+                for (int i = 0; i < N_IND; i++) co[i] = 0.f;
+            mt1_slot_record(sc.champ_meta[k], jnl_composite(jnl_score(co, real12, N_IND, top)));
         }
         r.scored = true;
         r.score_mean = (float)(sum / MT1_POOL_SLOTS);
@@ -4734,6 +4781,9 @@ static void save_mt1_pool(const std::string& dir, int ind_i, const MT1PoolScratc
             fprintf(sf, "%.3f %.3f\n", sc.jn_start_nodes, en / JN_RACE_KEEP);
             fclose(sf);
         }
+        if (sc.jn_champ_n > 0)
+            log_msg(std::string(tag) + " " + pool_ind_name(ind_i) + ": champions copied back into "
+                    "the pool this pass: " + std::to_string(sc.champ_back));
     } else {
         for (int s = 0; s < MT1_POOL_SLOTS; s++)
             save_bin(mt1_pool_path(dir, ind_i, s, tag), sc.slot(s), sc.n_params);
@@ -4843,6 +4893,7 @@ static void jn_bulk_race_pool(const std::string& from, int ind_i, MT1PoolScratch
         jn_bulk(sc.jn, keep[k], s, par_pct[k], 0,
                 mix_seed(salt ^ 0x42554C4BULL ^ ((uint64_t)ind_i << 32) ^ (uint64_t)s));
         mt1_slot_init(sc.meta[s], sc.meta[keep[k]].lineage);
+        sc.champ_of[s] = 0;
         child_n += jn_slot_nodes(sc.jn, s);
         c++;
     }
@@ -4861,7 +4912,21 @@ static void load_or_init_mt1_pool(const std::string& dir, const std::string& loa
                                   uint64_t salt = 0) {
     std::string jn_from;
     load_or_init_mt1_pool_core(dir, load_dir, ind_i, sc, tag, init, salt, jn_from);
-    if (sc.jn && !jn_from.empty()) jn_bulk_race_pool(jn_from, ind_i, sc, tag, salt);
+    if (!sc.jn) return;
+    // Champions: the top JN_CHAMP_N of the pool as it was saved, before bulking; their working
+    // copies are marked live. A fresh pool has none.
+    for (int s2 = 0; s2 < MT1_POOL_SLOTS; s2++) sc.champ_of[s2] = 0;
+    sc.jn_champ_n = 0; sc.champ_back = 0;
+    if (jn_from.empty()) return;
+    int order[MT1_POOL_SLOTS];
+    mt1_rank(sc, order);
+    for (int k = 0; k < JN_CHAMP_N; k++) {
+        jn_copy(sc.jn, order[k], MT1_POOL_SLOTS + k);
+        mt1_slot_init(sc.champ_meta[k], sc.meta[order[k]].lineage);
+        sc.champ_of[order[k]] = (int8_t)(k + 1);
+    }
+    sc.jn_champ_n = JN_CHAMP_N;
+    jn_bulk_race_pool(jn_from, ind_i, sc, tag, salt);
 }
 
 static void save_mt2_elites(const std::string& dir, MT2Scratch& scratch) {
@@ -6183,12 +6248,13 @@ int main(int argc, char* argv[]) {
                 for (int p = 0; p < npools; p++) {
                     std::string err;
                     r.pool[p].jn = jn_pool_create(whole ? 888 : 74, whole ? N_IND : 1,
-                                                  MT1_POOL_SLOTS, JN_RING_CAP, g_jn_profile,
+                                                  MT1_POOL_SLOTS + JN_CHAMP_N, JN_RING_CAP, g_jn_profile,
                                                   jn_fresh_seed(((uint64_t)v << 8) | (uint64_t)p), err);
                     if (!r.pool[p].jn) {
                         log_msg("ERROR: " + race_norm_name(RACE[v].name) + ": " + err);
                         return 1;
                     }
+                    jn_set_persist(r.pool[p].jn, MT1_POOL_SLOTS);   // champion slots are scratch
                 }
                 log_msg("MT1 race: " + race_norm_name(RACE[v].name) + " -- j_neuro " +
                         (whole ? "888->12 nets, one whole-market pool" : "74->1 nets") +
