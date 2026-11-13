@@ -912,6 +912,11 @@ static constexpr int JN_POOL_SLOTS   = JN_HIST_BASE + JN_HIST_DAYS * JN_HIST_PER
 static constexpr int JN_CAND_MAX     = JN_CHAMP_N + JN_HIST_DAYS * JN_HIST_PER_DAY;
 static_assert(JN_HIST_PER_DAY <= ELITE_POOL, "history takes the top elites of a day");
 static int g_jn_champ_n[N_IND];        // champions held (0 until a pass is seeded from elites)
+// Champions are a fallback for a book that failed: they are offered (scored, and eligible as
+// elites) only at the first selection after a hard-floor reset of that industry. g_ind_resets
+// counts the run's resets; g_jn_champ_seen is how many StockNN's champions have answered.
+static int g_ind_resets[N_IND];
+static int g_jn_champ_seen[N_IND];
 static int g_jn_hist_head[N_IND], g_jn_hist_count[N_IND];
 // A JN race pool (200 slots under the MT1 lifecycle) keeps its top 20 by rank when bulked, the
 // same count as StockNN's elites; 180 children, MUTATIONS_PER_PARENT (9) per parent.
@@ -920,6 +925,13 @@ static constexpr int JN_RACE_KEEP = 20;
 static constexpr int RACE_ALL_IND = -1;
 static std::string pool_ind_name(int ind_i) {
     return ind_i == RACE_ALL_IND ? std::string("all") : g_ind_names[ind_i];
+}
+// Resets so far in a pool's industry; a whole-market pool counts every industry's.
+static int resets_of(int ind_i) {
+    if (ind_i != RACE_ALL_IND) return g_ind_resets[ind_i];
+    int n = 0;
+    for (int i = 0; i < N_IND; i++) n += g_ind_resets[i];
+    return n;
 }
 
 static double g_jn_start_nodes[N_IND];
@@ -1427,6 +1439,7 @@ struct MT1PoolScratch {
     float       champ_pending[JN_CHAMP_N]{};
     int8_t      champ_of[MT1_POOL_SLOTS]{};
     int         champ_back{0};              // champions copied back in this pass (logged)
+    int         champ_reset_seen{0};        // resets_of() already answered (copy-back gate)
     float*      mut_buf{nullptr};           // one model, breeding scratch
     MT1SlotMeta meta[MT1_POOL_SLOTS]{};
     int         best_slot{0};               // deployed model; ranked in place, never shuffled
@@ -2556,8 +2569,13 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     float hist_scores[CAND_CAP] = {};
     int cand_slot[CAND_CAP] = {};
     int n_hist = jp ? 0 : scratch.hist_count * HIST_PER_DAY;
+    // Champions only at the first selection after a reset (g_ind_resets); a reset seen on a
+    // frozen (warm-in) day is answered by nothing.
+    const bool champ_open = jp && g_ind_resets[ind_i] > g_jn_champ_seen[ind_i];
+    if (jp) g_jn_champ_seen[ind_i] = g_ind_resets[ind_i];
+    const int n_champ = (champ_open && !freeze) ? g_jn_champ_n[ind_i] : 0;
     if (jp && !freeze) {
-        for (int k = 0; k < g_jn_champ_n[ind_i]; k++) cand_slot[n_hist++] = JN_CHAMP_BASE + k;
+        for (int k = 0; k < n_champ; k++) cand_slot[n_hist++] = JN_CHAMP_BASE + k;
         for (int d = 0; d < g_jn_hist_count[ind_i]; d++)
             for (int j = 0; j < JN_HIST_PER_DAY; j++)
                 cand_slot[n_hist++] = JN_HIST_BASE + d * JN_HIST_PER_DAY + j;
@@ -2709,6 +2727,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     if (!g_upkeep && baseline < abs_floor) {
         log_msg(std::string("[") + IND_SHORT[ind_i] +
                 "] Production below floor — resetting portfolios");
+        g_ind_resets[ind_i]++;   // opens the champions for the next selection
         for (int s = 0; s < N_SLOTS; s++) {
             state.portfolios[s].cash = IND_STARTING_CASH;
             for (int j = 0; j < IND_SYMS; j++) {
@@ -2887,7 +2906,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             snprintf(jl, sizeof(jl), " | jn nodes %.0f (max %d) warm %.1f (max %d) cold %d"
                      " | safety nets: %d champ + %d hist scored, %d+%d chosen",
                      js.nodes_mean, js.nodes_max, js.warm_mean, js.warm_max, jn_cold,
-                     g_jn_champ_n[ind_i], n_hist - g_jn_champ_n[ind_i], n_from_champ, n_from_hist);
+                     n_champ, n_hist - n_champ, n_from_champ, n_from_hist);
             log_msg(std::string("[") + IND_SHORT[ind_i] + "]   Selection done | elite=[" + disp +
                     "] | top=$" + std::to_string((int)surviving[0].first) + jl);
         } else if (!surviving.empty()) {
@@ -3493,8 +3512,14 @@ static void mt1_pool_evolve(int ind_i, MT1PoolScratch& sc, MT1DayResult& r, int 
         // JN champions: a mature champion whose register would rank it among today's parents,
         // and with no copy of it in the pool, is copied back in, register and all, into the
         // slot the cull would have emptied first. It breeds from tomorrow, like any parent.
+        // Only on a day the pool's industry (any industry, for a whole-market pool) has had a
+        // hard-floor reset since the last copy-back check: champions are a fallback, not a
+        // standing competitor. Their registers are kept every day so they are judged on 16 days.
         int c0 = 0;
-        if (sc.jn && sc.jn_champ_n > 0) {
+        const int resets_now = resets_of(ind_i);
+        const bool champ_open = resets_now > sc.champ_reset_seen;
+        sc.champ_reset_seen = resets_now;
+        if (sc.jn && sc.jn_champ_n > 0 && champ_open) {
             const MT1SlotMeta& bar = sc.meta[parents[n_par - 1]];
             bool live[JN_CHAMP_N] = {};
             for (int s2 = 0; s2 < MT1_POOL_SLOTS; s2++)
@@ -4544,6 +4569,7 @@ static bool jn_seed_from_elites(int ind_i, const std::string& dir, uint64_t gene
     // list for the whole pass (JN_CHAMP_BASE).
     for (int k = 0; k < JN_CHAMP_N; k++) jn_copy(p, k, JN_CHAMP_BASE + k);
     g_jn_champ_n[ind_i] = JN_CHAMP_N;
+    g_jn_champ_seen[ind_i] = g_ind_resets[ind_i];   // a reset of the last pass opens nothing
     const uint64_t salt = jn_fresh_seed(0x4A4E5345ULL + (uint64_t)ind_i);   // "JNSE"
     double start_nodes = 0.0, end_nodes = 0.0;
     jn_read_size(dir, ind, start_nodes, end_nodes);
@@ -4940,6 +4966,7 @@ static void load_or_init_mt1_pool(const std::string& dir, const std::string& loa
     // copies are marked live. A fresh pool has none.
     for (int s2 = 0; s2 < MT1_POOL_SLOTS; s2++) sc.champ_of[s2] = 0;
     sc.jn_champ_n = 0; sc.champ_back = 0;
+    sc.champ_reset_seen = resets_of(ind_i);
     if (jn_from.empty()) return;
     int order[MT1_POOL_SLOTS];
     mt1_rank(sc, order);
