@@ -63,7 +63,6 @@ bool jn_set_bulk_profile(JNPool* p, const std::string& path, std::string& err) {
 }
 
 void jn_bulk(JNPool* p, int src, int dst, double pct, uint64_t generation, uint64_t seed) {
-    TScope ts(T_MUT);
     if (pct <= 0.0 || !p->has_bulk) {
         p->nets[(size_t)dst] = p->nets[(size_t)src].copy_genome();
         p->warm[(size_t)dst] = p->warm[(size_t)src];
