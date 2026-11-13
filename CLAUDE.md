@@ -1178,8 +1178,18 @@ checkout at `../j_neuro` (`-DJNEURO_DIR=`; it needs `json-devel`; j_neuro d39c7d
 so JN champions are not promotable to paper or prod yet.
 
 A net replays its own warmup rows each day from a 64-row ring (`JN_RING_CAP`), so cost per day
-grows with the memory evolution gives it. Every pass starts cold (the ring is cleared), so nothing
-trades for the first ~5 days. The nets are expected to need several passes to grow into their task.
+grows with the memory evolution gives it. Every pass starts cold (the ring is cleared), and a net
+cannot act until the ring holds its warmup + 1 rows. The nets are expected to need several passes to
+grow into their task.
+
+**Warm-in gate (2026-11-13).** Each pass runs forward only -- no selection, mutation, culling or
+scoring -- until the ring is deeper than the largest warmup in the pool as it stood at the pass
+start (`g_jn_gate` for StockNN, `MT1PoolScratch::jn_gate` for the JN race pools; read once per pass,
+logged as `JN warm-in: selection starts once N days of history are held`). Before it, selection ran
+from the first day on nets that could not trade yet. A JN run therefore starts at the data's first
+day (`--start-day 0`) instead of StockNN's 17: the gate replaces the fixed start. A race pool keeps
+feeding its baseline window while warming in. Removal stays off in the profile; JN1's nets fell
+from 421 to 192 nodes through pruned connections, not removals.
 
 **Speed (2026-11-13).** `--jn-timing` logs one `TIMING day N:` line per day: the industries'
 time split into j_neuro forward (warmup lookup, reset, step, µs/step), mutate, permute, inject and

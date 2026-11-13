@@ -9,6 +9,8 @@ entry is in its commit message.
 ## Unreleased
 
 ### Changed
+- **JN warm-in gate**: a JN pool is not selected, culled or scored until its history ring is
+  deeper than the pass-start pool's largest warmup; JN runs start at day 0.
 - **Race pools, gradient weights and MT2 are saved at pass end only** (and every `--upkeep` run).
   The save had run daily since blocks became one day, rewriting ~85,000 files (~900 MB) a day on
   the 46-entry field: about half of each day's wall time. Nothing reads them mid-pass.
