@@ -853,7 +853,10 @@ static constexpr int JN_RING_CAP = 64;
 // culling or scoring -- until the ring is deeper than the largest warmup in the pool AS IT STOOD
 // AT THE PASS START. The gate is fixed for the pass: children born later may need more history,
 // but they are judged on the same footing as every other net that could not act yet.
-// -1 = not yet read this pass.
+// A pool reporting a warmup under JN_WARM_FLOOR (= HIST_WINDOW, 15) days waits 15: StockNN's
+// 15-day features (15-day high/low, day-over-day deltas) are incomplete before then, and a fresh
+// pool's warmup is ~2. -1 = not yet read this pass.
+static constexpr int JN_WARM_FLOOR = HIST_WINDOW;
 static int g_jn_gate[N_IND];
 // A JN race net's raw output is multiplied by this before mt1_pred's tanh x MT1_PRED_SCALE. A net
 // starts with identity weights, so its output is in the units of its 74 inputs (|x| up to ~33),
@@ -2139,10 +2142,11 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     bool jn_warming = false;
     if (jp) {
         if (g_jn_gate[ind_i] < 0) {
-            g_jn_gate[ind_i] = jn_stats(jp).warm_max;
+            g_jn_gate[ind_i] = std::max(JN_WARM_FLOOR, jn_stats(jp).warm_max);
             log_msg(std::string("[") + IND_SHORT[ind_i] + "]   JN warm-in: selection starts once " +
                     std::to_string(g_jn_gate[ind_i] + 1) + " days of history are held (pool warmup max " +
-                    std::to_string(g_jn_gate[ind_i]) + ")");
+                    std::to_string(jn_stats(jp).warm_max) + ", floor " +
+                    std::to_string(JN_WARM_FLOOR) + ")");
         }
         jn_warming = jn_ring_len(jp) <= g_jn_gate[ind_i];
         freeze = freeze || jn_warming;
@@ -3303,7 +3307,7 @@ static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in,
     // warmup, the pool predicts but nothing is scored, so nothing matures, culls or breeds.
     bool jn_warming = false;
     if (sc.jn) {
-        if (sc.jn_gate < 0) sc.jn_gate = jn_stats(sc.jn).warm_max;
+        if (sc.jn_gate < 0) sc.jn_gate = std::max(JN_WARM_FLOOR, jn_stats(sc.jn).warm_max);
         jn_warming = jn_ring_len(sc.jn) <= sc.jn_gate;
     }
     for (int s = 0; s < MT1_POOL_SLOTS; s++) {

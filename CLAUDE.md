@@ -1185,7 +1185,9 @@ grow into their task.
 **Warm-in gate (2026-11-13).** Each pass runs forward only -- no selection, mutation, culling or
 scoring -- until the ring is deeper than the largest warmup in the pool as it stood at the pass
 start (`g_jn_gate` for StockNN, `MT1PoolScratch::jn_gate` for the JN race pools; read once per pass,
-logged as `JN warm-in: selection starts once N days of history are held`). Before it, selection ran
+logged as `JN warm-in: selection starts once N days of history are held`). A pool reporting a
+warmup under `JN_WARM_FLOOR` = 15 days waits 15, when StockNN's 15-day features are complete (a
+fresh pool's warmup is ~2). Before it, selection ran
 from the first day on nets that could not trade yet. A JN run therefore starts at the data's first
 day (`--start-day 0`) instead of StockNN's 17: the gate replaces the fixed start. A race pool keeps
 feeding its baseline window while warming in. Removal stays off in the profile; JN1's nets fell
