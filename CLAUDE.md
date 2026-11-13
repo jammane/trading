@@ -1202,7 +1202,12 @@ both **off by default**:
 j_neuro computes in exact IEEE-754 and refuses fast-math, so it is reached only through
 `jn_bridge.{h,cpp}`, an opaque wrapper CMake builds with j_neuro's own flags. The build looks for a
 checkout at `../j_neuro` (`-DJNEURO_DIR=`; it needs `json-devel`; j_neuro ed79fa6 or later, for
-`Net::reset_state` and bulking); without one,
+`Net::reset_state` and bulking). j_neuro 7fe26c6 (spec 0.6, s_neuron length and history
+nodes) is backward compatible for saved nets: 300 of JN3's `.jnet` files load with identical
+warmups and bit-identical outputs under both versions. Its profiles are `spec_version` 0.6, which a
+trainer built against an older j_neuro refuses, and mutation and bulking produce different
+children from the same seed (an old and a new build agree to the bit through day 13 of a seeded
+run, then diverge as the bulked children with long memories start trading); without one,
 `jn_bridge_stub.cpp` is linked and every JN flag is refused at startup. JN is refused under
 `--upkeep` and the control modes, and production cannot run a JN net (it runs StockNN in torch),
 so JN champions are not promotable to paper or prod yet.
