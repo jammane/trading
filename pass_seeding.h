@@ -28,9 +28,17 @@
 // v2 fixes both. The decay keeps an effective sample of ~400 days while leaning toward the end of
 // the pass, which is what the seeded models are: v1's reason for a short window -- the pool at the
 // end of a pass is not the mid-pass pool, which has long since been culled -- is answered by the
-// weighting rather than by discarding 95% of the pass. A reset day has book_prev == slot0_score by
-// construction, so it contributes a return of exactly 0 instead of a jump. Summing RETURNS rather
-// than dollars keeps a pass that grew its book from being judged on a bigger base.
+// weighting rather than by discarding 95% of the pass. Summing RETURNS rather than dollars keeps a
+// pass that grew its book from being judged on a bigger base.
+//
+// HARD-FLOOR RESETS (v3). A reset recapitalises a book that fell below $22,500 back to $25,000.
+// The trainer's reset day has book_prev == slot0_score, so as a return it is 0 -- the top-up was
+// free money. Since v3 the judge charges it as a loss when it falls in the pass's LAST TWO YEARS
+// (PASS_JUDGE_RESET_RECENT sessions): such a reset day scores -topup / book, the top-up as a
+// fraction of the book it rescued (about -11% for a reset from $22,400). An older reset still
+// scores 0. The losing days that led there count as they always did, so a recent reset costs a
+// pass twice: once for the fall and once for the money that would have had to be put in.
+// resets / resets_recent / topup_recent are a readout (logged at the boundary).
 //
 // pass_share_new only uses the two scores' signs and ratio, so it works unchanged on this scale.
 static constexpr double PASS_JUDGE_RECENCY = 0.995;
@@ -42,7 +50,12 @@ static constexpr int PASS_JUDGE_MIN_DAYS = 15;
 // CHANGES: v2 kept every column but champ_pct/chal_pct/new_champ_pct now hold the v2 score (a
 // mean daily return, ~1e-3) instead of a 15-day percent change (~1e-2). Mixing the two would crown
 // on a units mismatch, so a file of another version is set aside, never read.
-static constexpr int PASS_REF_VERSION = 2;
+// v3: same columns, but the score now charges hard-floor top-ups as losses (PassJudge::add_reset),
+// so v2 scores are higher than v3 would be for the same pass and must not be compared with them.
+static constexpr int PASS_REF_VERSION = 3;
+
+// Resets in the last two years (504 sessions) of a pass are charged their top-up; older ones are not.
+static constexpr int PASS_JUDGE_RESET_RECENT = 504;
 
 struct PassJudge {
     double w = 0.0, w2 = 0.0, wr = 0.0;
@@ -54,6 +67,21 @@ struct PassJudge {
         const double wt = std::pow(PASS_JUDGE_RECENCY, (double)(age > 0 ? age : 0));
         w += wt; w2 += wt * wt; wr += wt * (book_now - book_prev) / book_prev;
         n++;
+    }
+    // A hard-floor reset day: book is the book that fell below the floor, topup the money put in
+    // to restore it. Scored as the return -topup / book (see the HARD-FLOOR RESETS note).
+    int resets = 0, resets_recent = 0;
+    double topup_recent = 0.0;
+    void add_reset(double book, double topup, int age) {
+        if (!(book > 1.0) || !(topup >= 0.0) || !std::isfinite(topup)) return;
+        resets++;
+        if (age < PASS_JUDGE_RESET_RECENT) {
+            add(book, book - topup, age);
+            resets_recent++;
+            topup_recent += topup;
+        } else {
+            add(book, book, age);   // older than two years: 0, as before v3
+        }
     }
     bool   have()     const { return w > 0.0; }
     double score()    const { return w > 0.0 ? wr / w : 0.0; }

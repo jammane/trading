@@ -195,6 +195,16 @@ leaning on its end, which answers v1's reason for a short window (the end-of-pas
 mid-pass pool) without discarding 95% of the data. A hard last-N-days window was rejected for the
 race and the champion alike: the last N days of every pass are the same calendar days.
 
+**Recent resets are charged (v3, 2026-11-13).** A hard-floor reset recapitalises a book that fell
+below $22,500 back to $25,000; as a return it scored 0, so the top-up was free. Since v3 a reset
+in the pass's **last two years** (504 sessions) scores `-topup / book`, the top-up as a loss on
+the book it rescued (about -11% for a reset from $22,400); older resets still score 0. The losing
+days before it count as always, so a recent reset costs a pass twice. The boundary logs each
+industry's `judge: pN ... resets R, r in the last 2 years charged $X of top-up as loss`
+(`PassJudge::add_reset`, tested in `tests/test_pass_seeding.cpp`). `pass_reference.csv` is
+**schema v3**: same columns, but v2 scores are not comparable, so a v2 file is set aside and the
+run's champions restart at its next boundary (JN1/JN2's are rescored from their logs instead).
+
 The score is a mean **return**, not dollars, so a pass that grew its book is not judged on a larger
 base. `pass_share_new` uses only sign and ratio, so the seed blend works unchanged on the new scale.
 `pass_reference.csv` is **schema v2**: same columns, but `*_pct` now hold the v2 score (~1e-3, not

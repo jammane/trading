@@ -2000,6 +2000,9 @@ struct IndResult {
         float stopped_q, stopped_px, bought_q, bought_px;
         int   low_first;
     } sim[IND_SYMS];
+    // Hard-floor reset only: the money put in to restore the book to IND_STARTING_CASH. The
+    // champion judge charges it as a loss (PassJudge::add_reset); everything else ignores it.
+    float topup = 0.f;
 };
 
 struct MasterResult {
@@ -2722,6 +2725,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         r.book_base      = g_book_base[ind_i];
         r.baseline       = baseline;
         r.slot0_score    = baseline;
+        r.topup          = IND_STARTING_CASH - baseline;   // charged as a loss by the judge
         r.new_streak     = 0;
         r.elite_max_val  = IND_STARTING_CASH;
         r.elite_min_val  = IND_STARTING_CASH;
@@ -4369,6 +4373,10 @@ static void pass_boundary(const std::string& out_dir, int pass_num,
         const bool  have = judge[i].have();
         const float chal_pct = have ? (float)judge[i].score() : 0.f;
         char msg[320];
+        snprintf(msg, sizeof(msg), "   judge: p%d %+.2f bp/day; resets %d, %d in the last 2 years "
+                 "charged $%.0f of top-up as loss", pass_num, chal_pct * 1e4f, judge[i].resets,
+                 judge[i].resets_recent, judge[i].topup_recent);
+        log_msg(std::string("[") + IND_SHORT[i] + "]" + msg);
 
         if (!copy_elites(out_dir, stage_dir, ind, pass_num)) {
             log_msg(std::string("[") + IND_SHORT[i] +
@@ -7967,10 +7975,15 @@ int main(int argc, char* argv[]) {
                     ? (mst->ind_hist_count < IND_HIST_CAP ? mst->ind_val_hist[i][mst->ind_hist_count - 1]
                                                           : mst->ind_val_hist[i][IND_HIST_CAP - 1])
                     : static_cast<float>(IND_STARTING_CASH);
-                // Reset days carry book_prev == slot0_score, so they score exactly 0, not a jump.
-                if (judge_win)
-                    judge[i].add(results[i].book_prev, results[i].slot0_score,
-                                 (day_end - 1) - actual_day);
+                // A reset day is charged its top-up as a loss (PassJudge::add_reset); any other
+                // day scores its book return.
+                if (judge_win) {
+                    const int age = (day_end - 1) - actual_day;
+                    if (results[i].topup > 0.f)
+                        judge[i].add_reset(results[i].book_prev, results[i].topup, age);
+                    else
+                        judge[i].add(results[i].book_prev, results[i].slot0_score, age);
+                }
                 // The portfolio index now compounds the BOOK's return, not the trading ratio.
                 // It used to be slot0_score/baseline - 1, which is the trade delta over the
                 // reference book -- so the curve MT1 saw ended pass 1 near -7% while the book it
