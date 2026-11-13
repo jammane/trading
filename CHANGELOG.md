@@ -6,6 +6,20 @@ entry is in its commit message.
 
 ---
 
+## Unreleased
+
+### Changed
+- **Race pools, gradient weights and MT2 are saved at pass end only** (and every `--upkeep` run).
+  The save had run daily since blocks became one day, rewriting ~85,000 files (~900 MB) a day on
+  the 46-entry field: about half of each day's wall time. Nothing reads them mid-pass.
+- **j_neuro StockNN ~19x faster per day** (85 s → 4.4 s on days 17-67, results byte-identical):
+  the above, j_neuro d39c7d3 (required), each slot's warmup cached in `jn_bridge`, and
+  `reset_state()` keeping each net's evaluation plan.
+
+### Added
+- `--jn-timing`: one `TIMING day N:` line per day splitting the day's time (j_neuro forward,
+  mutate, the rest; the post-industry block).
+
 ## 0.9.0.0 — StockNN sell_flag (BREAKING), j_neuro nets (2026-11-12)
 
 ### Added
