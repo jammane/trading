@@ -19,7 +19,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from fees import BUY_FILL, SLIPPAGE_RATE, _sell_net
+from fees import BUY_FILL, OPEN_BUY_PREMIUM, SLIPPAGE_RATE, _sell_net, buy_fill_price
 from models import MasterNN, StockNN, stock_close_pos, stock_close_vs_wap
 
 DUMP_DIR = 'data_dump'  # overridden by production_v2.py to logs/ACCOUNT/SUBTYPE/data_dump
@@ -106,7 +106,16 @@ def to_cents(price, how):
 # broker does not make, so a change here makes the weekly pass crown every industry outright
 # (weekly_pass.rules_crown). 1: before plan_orders (re-buying sold symbols, spending same-day
 # proceeds, sizing at the fill price, sell_qty as a limit at the close). 2: plan_orders.
-ORDER_RULES = 2
+# 3 (2026-11-12): fill prices calibrated to paper (limits at the limit, open buys at the open
+# + OPEN_BUY_PREMIUM capped at the limit), StockNN selected on book P&L, not the trade delta, and
+# StockNN's fifth output, sell_flag: a held symbol gets a sell-all limit only when the model asks
+# for one, so it can hold (keeping its stop) and add to a position; and no held stop on a day the
+# symbol is bought.
+ORDER_RULES = 3
+
+# StockNN's outputs per stock: buy_qty, buy_price_frac, sell_all_price_frac, sell_qty, sell_flag.
+# Mirrors STOCK_OUT_PER_SYM in training_v4.cpp and models.STOCK_OUT_PER_SYM.
+STOCK_OUT_PER_SYM = 5
 
 
 def plan_orders(symbols, sug, holdings, day_data, cash, skip=()):
@@ -114,13 +123,15 @@ def plan_orders(symbols, sug, holdings, day_data, cash, skip=()):
     THE one place the order rules live: production queues these, and every fill simulator
     (training_lib's and its twin plan_orders() in training_v4.cpp) fills exactly these.
 
-    sug: {sym: (buy_qty, buy_price_frac, sell_all_price_frac, sell_qty)}, the model's output.
+    sug: {sym: (buy_qty, buy_price_frac, sell_all_price_frac, sell_qty, sell_flag)}, the model's
+         output. A 4-tuple (no sell_flag) reads as flag on: the sell-all rule before 2026-11-12.
     cash: the industry's cash at the close. skip: symbols that get no orders (new-symbol hold).
 
     Production's limits, which the simulators must share or they train on trades the broker
     never makes (measured on paper 2026-10-14/15):
-      - a symbol sold today is not bought today (Alpaca rejects the buy as a wash trade), and
-        every held symbol gets a sell-all limit, so a held symbol is never added to;
+      - a symbol sold today is not bought today (Alpaca rejects the buy as a wash trade);
+      - a held symbol gets a sell-all limit only if sell_flag > 0.5. Otherwise the model holds:
+        no sell order, so the shares keep their stop, and the symbol may be bought (added to);
       - buys are sized at the close, against the cash the industry HAS: proceeds of tomorrow's
         sells are not in it, and an order that does not fill still used its share of the budget;
       - the quantity is fixed at the close, sized at the limit, not at the fill price;
@@ -133,7 +144,8 @@ def plan_orders(symbols, sug, holdings, day_data, cash, skip=()):
     for sym in symbols:
         if sym not in day_data or sym in skip:
             continue
-        _, _, sell_all_price_frac, sell_qty = sug[sym]
+        _, _, sell_all_price_frac, sell_qty = sug[sym][:4]
+        sell_flag = sug[sym][4] if len(sug[sym]) > 4 else 1.0
         cur_qty = holdings.get(sym, 0.0)
         low, high = day_data[sym]['low'], day_data[sym]['high']
         sell_all_price = low + sell_all_price_frac * max(high - low, 1e-9)
@@ -143,7 +155,7 @@ def plan_orders(symbols, sug, holdings, day_data, cash, skip=()):
                 sell_open[sym] = amount
                 cur_qty -= amount
                 sold.add(sym)
-        if cur_qty >= 1 and low <= sell_all_price <= high:
+        if cur_qty >= 1 and sell_flag > 0.5 and low <= sell_all_price <= high:
             sell_all[sym] = (int(cur_qty), to_cents(sell_all_price, 'up'))
             sold.add(sym)
 
@@ -155,7 +167,7 @@ def plan_orders(symbols, sug, holdings, day_data, cash, skip=()):
     for sym in symbols:
         if sym not in day_data or sym in skip or sym in sold:
             continue
-        buy_qty, buy_price_frac, _, _ = sug[sym]
+        buy_qty, buy_price_frac = sug[sym][0], sug[sym][1]
         low, high = day_data[sym]['low'], day_data[sym]['high']
         raw_price = low + buy_price_frac * max(high - low, 1e-9)
         if buy_qty > 1e-6 and raw_price > 0 and low <= raw_price <= high:
@@ -369,12 +381,13 @@ def _fill_sym_open_low(sym, port, plan, day_data, fill_data, low_first):
         cur = hold.get(sym, 0.0)
         if not low_first and cur > 1e-6 and nd_low < limit < nd_high:
             hold[sym] = 0.0
-            port['cash'] += _sell_net(cur, limit * (1.0 - SLIPPAGE_RATE))
+            port['cash'] += _sell_net(cur, limit)
             sells += cur
 
     stop_p = port['stop_prices'].get(sym, 0.0)
     remaining = hold.get(sym, 0.0)
-    if sym not in plan['sold'] and stop_p > 0 and remaining > 1e-6:
+    # No held stop beside a sell or an open buy (production cancels it; Alpaca wash-trade rule).
+    if sym not in plan['sold'] and sym not in plan['buys'] and stop_p > 0 and remaining > 1e-6:
         if nd_open <= stop_p:
             hold[sym] = 0.0
             port['cash'] += _sell_net(remaining, nd_open)
@@ -386,12 +399,7 @@ def _fill_sym_open_low(sym, port, plan, day_data, fill_data, low_first):
 
     if sym in plan['buys']:
         qty, limit, stop = plan['buys'][sym]
-        if nd_open <= limit:
-            fill_price = nd_open
-        elif nd_low < limit < nd_high:   # strict: not right at the day's extreme
-            fill_price = limit * (1.0 + SLIPPAGE_RATE)
-        else:
-            fill_price = 0.0
+        fill_price = buy_fill_price(nd_open, nd_low, nd_high, limit)
         if fill_price > 0:
             hold[sym] = hold.get(sym, 0.0) + qty
             port['cash'] -= qty * fill_price * BUY_FILL
@@ -411,7 +419,7 @@ def _fill_sell_all_intraday(sym, port, plan, day_data, fill_data):
     cur = port['holdings'].get(sym, 0.0)
     if cur > 1e-6 and nd_low < limit < nd_high:   # strict: not at the day's extreme
         port['holdings'][sym] = 0.0
-        port['cash'] += _sell_net(cur, limit * (1.0 - SLIPPAGE_RATE))
+        port['cash'] += _sell_net(cur, limit)
         return cur
     return 0.0
 
@@ -445,14 +453,15 @@ def _fill_sym_from_bars(sym, port, bars, plan):
         sells += cur
     stop_p = port['stop_prices'].get(sym, 0.0)
     remaining = hold.get(sym, 0.0)
-    if sym not in plan['sold'] and stop_p > 0 and remaining > 1e-6 and nd_open <= stop_p:
+    if (sym not in plan['sold'] and sym not in plan['buys'] and stop_p > 0 and remaining > 1e-6
+            and nd_open <= stop_p):
         hold[sym] = 0.0
         port['cash'] += _sell_net(remaining, nd_open)
         sells += remaining
     bought = False
     if buy and nd_open <= buy[1]:
         hold[sym] = hold.get(sym, 0.0) + buy[0]
-        port['cash'] -= buy[0] * nd_open * BUY_FILL
+        port['cash'] -= buy[0] * min(nd_open * (1.0 + OPEN_BUY_PREMIUM), buy[1]) * BUY_FILL
         port['stop_prices'][sym] = buy[2]
         buys += buy[0]
         bought = True
@@ -461,14 +470,16 @@ def _fill_sym_from_bars(sym, port, bars, plan):
     for bar in bars[1:]:
         stop_p = port['stop_prices'].get(sym, 0.0)
         remaining = hold.get(sym, 0.0)
-        if (sym not in plan['sold'] and stop_p > 0 and remaining > 1e-6
-                and bar['low'] <= stop_p):
+        # After a buy fills, its own OTO stop is live (the walker's approximation: it covers
+        # the whole holding); before that, a symbol being bought has no stop.
+        if (sym not in plan['sold'] and (sym not in plan['buys'] or bought) and stop_p > 0
+                and remaining > 1e-6 and bar['low'] <= stop_p):
             hold[sym] = 0.0
             port['cash'] += _sell_net(remaining, stop_p * (1.0 - SLIPPAGE_RATE))
             sells += remaining
             break
         if buy and not bought and bar['low'] <= buy[1]:
-            fill_price = buy[1] * (1.0 + SLIPPAGE_RATE)
+            fill_price = buy[1]   # a limit fills at the limit
             hold[sym] = hold.get(sym, 0.0) + buy[0]
             port['cash'] -= buy[0] * fill_price * BUY_FILL
             port['stop_prices'][sym] = buy[2]
@@ -477,7 +488,7 @@ def _fill_sym_from_bars(sym, port, bars, plan):
         cur = hold.get(sym, 0.0)
         if sell_all is not None and cur > 1e-6 and bar['high'] >= sell_all:
             hold[sym] = 0.0
-            port['cash'] += _sell_net(cur, sell_all * (1.0 - SLIPPAGE_RATE))
+            port['cash'] += _sell_net(cur, sell_all)
             sells += cur
             break
 
@@ -491,7 +502,7 @@ def _simulate_one_model(model, ref_cash, ref_hold, ref_stop, symbols,
     port = {'cash': ref_cash, 'holdings': dict(ref_hold), 'stop_prices': dict(ref_stop)}
     with torch.inference_mode():
         out = model(history_t, today_t)
-    out = out.view(len(symbols), 4)
+    out = out.view(len(symbols), STOCK_OUT_PER_SYM)
     plan = plan_orders(symbols, {s: out[j].tolist() for j, s in enumerate(symbols)},
                        port['holdings'], day_data, port['cash'])
 
@@ -1237,6 +1248,10 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
     ref_stop  = {sym: portfolios[0]['stop_prices'].get(sym, 0.0) for sym in symbols}
     baseline_score = compute_value({'cash': ref_cash, 'holdings': ref_hold},
                                    val_data, symbols)
+    # The same book at TODAY's close (falling back to the fill bar where today's is missing, as
+    # the C++ does): the selection score is each slot's own book P&L, score - book_prev.
+    book_prev = compute_value({'cash': ref_cash, 'holdings': ref_hold},
+                              {**fill_data, **day_data}, symbols)
 
     for slot in range(pool_size):
         portfolios[slot]['cash']        = ref_cash
@@ -1324,7 +1339,7 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
             out = model(history_t, today_t)
         del model
 
-        out = out.view(12, 4)
+        out = out.view(12, STOCK_OUT_PER_SYM)
         local_buys = local_sells = 0
         plan = plan_orders(symbols, {s: out[j].tolist() for j, s in enumerate(symbols)},
                            port['holdings'], day_data, port['cash'])
@@ -1471,16 +1486,18 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
             log(f"[{sn(industry)}] Day {actual_day + 1}/{total_avail}   "
                 f"Zero-trade filter: {len(inactive_slots)} slot(s) excluded")
 
-    # ── Delta-based selection scores with invested_pct multiplier ────────────
-    # Selection score = raw delta adjusted by invested_pct:
-    # positive-delta slots are scaled down proportional to cash held,
-    # so a slot that earned $50 by deploying 80% outranks one that
-    # earned $50 while sitting 90% in cash.
+    # ── P&L-based selection scores with invested_pct multiplier ──────────────
+    # Selection score = the slot's own book P&L (score - book_prev: held positions' move plus the
+    # trades' effect), adjusted by invested_pct: positive scores are scaled down in proportion to
+    # cash held, so a slot that earned $50 by deploying 80% outranks one that earned $50 while
+    # sitting 90% in cash. Mirrors sel_score_of in training_v4.cpp. It was the trade delta
+    # (score - baseline_score); the two differ by one constant per day, so they rank identically
+    # except through the sign-gated multiplier.
     scores_dict = dict(scores)
     below_floor = {s for s, v in scores if v < survival_floor}
     sel_scores  = []
     for s, raw in scores:
-        raw_delta = raw - baseline_score
+        raw_delta = raw - book_prev
         if raw_delta > 0:
             invested_pct = max(0.0, 1.0 - portfolios[s]['cash'] / raw)
             sel_scores.append((s, raw_delta * invested_pct))
@@ -1493,7 +1510,7 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
     hist_below_floor = set()
     for h, hscore, hport in hist_scored:
         vslot     = pool_size + h
-        raw_delta = hscore - baseline_score
+        raw_delta = hscore - book_prev
         if raw_delta > 0:
             invested_pct = max(0.0, 1.0 - hport['cash'] / hscore) if hscore > 0 else 0.0
             sel_scores.append((vslot, raw_delta * invested_pct))
@@ -1544,7 +1561,9 @@ def step_industry(industry, symbols, output_dir, portfolios, histories,
         selection_and_mutation(
             industry, output_dir, StockNN,
             sel_scores, portfolios,
-            survival_floor=-(baseline_score * 0.1),
+            # A loss of 10% against simply HOLDING, as before: the scores are now P&L, which is
+            # the trade delta plus (baseline_score - book_prev), the same for every slot.
+            survival_floor=-(baseline_score * 0.1) + (baseline_score - book_prev),
             inactive_slots=inactive_slots | below_floor | hist_below_floor,
             actual_day=actual_day, total_avail=total_avail,
             n_slots=pool_size,

@@ -156,7 +156,7 @@ static inline void mt1net_backward(const float* W, const MT1NetCache& c, float d
     mt1net_trunk_bwd(W, NT_P_A1_W, c, 1, d_concat + 28, g);
 }
 
-// ── MT1CNet (146 -> 1, 11177 params) ─────────────────────────────────────────────
+// ── MT1CNet (158 -> 1, 11945 params) ─────────────────────────────────────────────
 
 struct MT1CNetCache {
     float in[MT1C_IN];
@@ -211,15 +211,15 @@ static inline void mt1cnet_backward(const float* W, const MT1CNetCache& k, float
 //   MT1S-sum    one loss per industry-day on the summed output    -- architecture benefit only
 //   MT1S-stock  one loss per SYMBOL-day on that symbol's own P&L  -- 12x the rows
 // They share this code; only the target differs.
-static constexpr int MT1S_PER_SYM = MT1C_PER_SYM + 2;         // 12 features + cash + book
+static constexpr int MT1S_PER_SYM = MT1C_PER_SYM + 2;         // 13 features + cash + book
 static constexpr int MT1S_H1 = 16, MT1S_H2 = 8;
 static constexpr int SS_L1_W = 0,
-                     SS_L1_B = MT1S_H1 * MT1S_PER_SYM,                    // 224
-                     SS_L2_W = SS_L1_B + MT1S_H1,                         // 240
-                     SS_L2_B = SS_L2_W + MT1S_H2 * MT1S_H1,               // 368
-                     SS_L3_W = SS_L2_B + MT1S_H2,                         // 376
-                     SS_L3_B = SS_L3_W + MT1S_H2;                         // 384
-static constexpr int MT1SNET_PARAMS = SS_L3_B + 1;                        // 385
+                     SS_L1_B = MT1S_H1 * MT1S_PER_SYM,                    // 240
+                     SS_L2_W = SS_L1_B + MT1S_H1,                         // 256
+                     SS_L2_B = SS_L2_W + MT1S_H2 * MT1S_H1,               // 384
+                     SS_L3_W = SS_L2_B + MT1S_H2,                         // 392
+                     SS_L3_B = SS_L3_W + MT1S_H2;                         // 400
+static constexpr int MT1SNET_PARAMS = SS_L3_B + 1;                        // 401
 
 struct MT1SCache {
     float in[MT1C_SYMS][MT1S_PER_SYM];
@@ -287,23 +287,23 @@ static inline void mt1s_backward(const float* W, const MT1SCache& k, const float
 // realised P&L. Unlike MT1S, nothing is shared across the industry's twelve symbols. Inputs:
 //   0-11   that stock's 12 MT1C features (7 bar-shape, holding weight, 4 order-intent ratios)
 //   12-13  industry cash / book and book / starting cash (the MT1C tail, repeated per stock)
-//   14-17  StockNN's four outputs for that stock: buy_qty, buy_price_frac, sell_all_price_frac,
-//          sell_qty. The GRADIENT entries read them RAW (share counts unrounded and unscaled);
+//   15-19  StockNN's five outputs for that stock: buy_qty, buy_price_frac, sell_all_price_frac,
+//          sell_qty, sell_flag. The GRADIENT entries read them RAW (share counts unrounded and unscaled);
 //          the EVOLUTIONARY entry reads the quantities as unrounded, uncapped ratios
 //          (buy_qty / affordable shares, sell_qty / held shares). The price fractions are the
 //          raw sigmoids in both, so they repeat MT1C features 9-10 bit-for-bit.
 // The raw quantities are what MT1C's CN_BQTY / CN_SQTY discard: those are floored to whole
 // shares and capped at what is affordable or held, which ties many order sets.
-static constexpr int MT1P_IN = MT1C_PER_SYM + 2 + 4;          // 18
+static constexpr int MT1P_IN = MT1C_PER_SYM + 2 + 5;          // 20
 static constexpr int MT1P_H1 = 16, MT1P_H2 = 8;
 static constexpr int SP_L1_W = 0,
-                     SP_L1_B = MT1P_H1 * MT1P_IN,                         // 288
-                     SP_L2_W = SP_L1_B + MT1P_H1,                         // 304
-                     SP_L2_B = SP_L2_W + MT1P_H2 * MT1P_H1,               // 432
-                     SP_L3_W = SP_L2_B + MT1P_H2,                         // 440
-                     SP_L3_B = SP_L3_W + MT1P_H2;                         // 448
-static constexpr int MT1P_PARAMS = SP_L3_B + 1;                           // 449, ONE stock's net
-static_assert(MT1P_PARAMS == 449, "MT1P layout");
+                     SP_L1_B = MT1P_H1 * MT1P_IN,                         // 320
+                     SP_L2_W = SP_L1_B + MT1P_H1,                         // 336
+                     SP_L2_B = SP_L2_W + MT1P_H2 * MT1P_H1,               // 464
+                     SP_L3_W = SP_L2_B + MT1P_H2,                         // 472
+                     SP_L3_B = SP_L3_W + MT1P_H2;                         // 480
+static constexpr int MT1P_PARAMS = SP_L3_B + 1;                           // 481, ONE stock's net
+static_assert(MT1P_PARAMS == 481, "MT1P layout");
 
 struct MT1PCache {
     float in[MT1P_IN];

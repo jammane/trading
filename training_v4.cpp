@@ -3,7 +3,7 @@
 // Run:   ./build/training_v4_cpp --output models [--load-dir DIR] [--start-day N] [--stop-day N]
 //        [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F] [--workers N]
 
-#define TRAINER_VERSION "0.8.1.86"
+#define TRAINER_VERSION "0.9.0.0"
 
 #include <algorithm>
 #include <atomic>
@@ -41,6 +41,7 @@
 #include "sort_util.h"      // small fixed-buffer index sort (shared with tests/test_sort_util.cpp)
 #include "bayes_online.h"   // online conditional models trained during the pass
 #include "mt1_backprop.h"   // gradient-trained MT1 (forward/backward/Adam, no autodiff lib)
+#include "jn_bridge.h"      // j_neuro nets (--jn-stocknn, JN race entries); opaque, no fast-math
 
 // Force OpenBLAS single-threaded: multi-threaded BLAS with N worker threads causes
 // 2×N threads competing for N CPUs, multiplying overhead 2-3× per forward pass.
@@ -182,6 +183,13 @@ static inline double size_buy_d(double buy_qty, double price, double cash, doubl
     const double w = std::floor(amount + 1e-4);
     return w > 0.0 ? w : 0.0;
 }
+// StockNN's outputs per stock (v0.9, 2026-11-12): buy_qty (ReLU), buy_price_frac, sell_all_price_frac
+// (sigmoids, 0..1 across today's low..high), sell_qty (ReLU, sold at the next open) and sell_flag
+// (sigmoid): above 0.5 the sell-all limit is placed; otherwise the model holds -- no sell order, so
+// the shares keep their stop and the symbol may be bought today. Mirrored by models.STOCK_OUT_PER_SYM.
+static constexpr int   STOCK_OUT_PER_SYM = 5;
+static constexpr int   STOCK_OUT_N     = 12 * STOCK_OUT_PER_SYM;    // 60
+static constexpr int   SO_BQTY = 0, SO_BFRAC = 1, SO_SFRAC = 2, SO_SQTY = 3, SO_SFLAG = 4;
 struct OrderPlan {
     float sell_open[IND_SYMS];   // shares sold by market order at the next open
     float sell_lim[IND_SYMS];    // sell-all limit; 0 = none placed
@@ -190,7 +198,7 @@ struct OrderPlan {
     float buy_stop[IND_SYMS];
     bool  sold[IND_SYMS];        // a sell was placed: no buy, and no stop beside it
 };
-static void plan_orders(const float* out48, const float* low, const float* high,
+static void plan_orders(const float* sout, const float* low, const float* high,
                         const float* close, const unsigned char* valid, const float* hold,
                         float cash, OrderPlan& p) {
     double port_value = cash;
@@ -200,14 +208,17 @@ static void plan_orders(const float* out48, const float* low, const float* high,
         if (!valid[j]) continue;
         port_value += (double)hold[j] * close[j];
         const double lo = low[j], hi = high[j], span = std::max(hi - lo, 1e-9);
-        const double sell_all = lo + (double)out48[4*j+2] * span;
-        const double sell_qty = out48[4*j+3];
+        const float* o = sout + STOCK_OUT_PER_SYM * j;
+        const double sell_all = lo + (double)o[SO_SFRAC] * span;
+        const double sell_qty = o[SO_SQTY];
         double cur = hold[j];
         if (sell_qty > 1e-6 && cur > 1e-6) {
             const double amount = std::floor(std::min(sell_qty, cur));
             if (amount >= 1.0) { p.sell_open[j] = (float)amount; cur -= amount; p.sold[j] = true; }
         }
-        if (cur >= 1.0 && lo <= sell_all && sell_all <= hi) {
+        // sell_flag > 0.5: place the sell-all limit. Otherwise the model holds: no order, so the
+        // shares keep their stop and the symbol may be bought (added to) today.
+        if (cur >= 1.0 && o[SO_SFLAG] > 0.5f && lo <= sell_all && sell_all <= hi) {
             p.sell_lim[j] = (float)to_cents(sell_all, +1);
             p.sold[j] = true;
         }
@@ -216,8 +227,8 @@ static void plan_orders(const float* out48, const float* low, const float* high,
     for (int j = 0; j < IND_SYMS; j++) {
         if (!valid[j] || p.sold[j]) continue;
         const double lo = low[j], hi = high[j], span = std::max(hi - lo, 1e-9);
-        const double raw = lo + (double)out48[4*j+1] * span;
-        const double buy_qty = out48[4*j+0];
+        const double raw = lo + (double)sout[STOCK_OUT_PER_SYM*j + SO_BFRAC] * span;
+        const double buy_qty = sout[STOCK_OUT_PER_SYM*j + SO_BQTY];
         if (!(buy_qty > 1e-6 && raw > 0.0 && lo <= raw && raw <= hi)) continue;
         const double price = to_cents(raw, -1);
         const double amount = size_buy_d(buy_qty, price, remaining, port_value,
@@ -233,9 +244,31 @@ static void plan_orders(const float* out48, const float* low, const float* high,
 static constexpr float SEC_FEE_RATE        = 0.0000278f;
 static constexpr float FINRA_TAF_PER_SHARE = 0.000166f;
 static constexpr float FINRA_TAF_MAX       = 8.30f;
+// Fill prices, calibrated to PAPER until prod runs (then to prod). Mirrored in fees.py and used by
+// every simulator here and in training_lib.py / inspect_trades.py / fill_reconciliation.py.
+//   Stops become market orders when triggered: SLIPPAGE_RATE below the stop.
+//   Limit orders fill AT the limit, never worse: 0 of 162 paper buys filled above their limit
+//     (fill_check.csv, 2026-10-13..11-10). A flat 0.1% slippage was charged on them until
+//     2026-11-12; it made intraday limit fills 0.24% dearer than paper.
+//   A buy whose limit is at or above the next open fills at the open PLUS OPEN_BUY_PREMIUM, capped
+//     at the limit. The simulator used the open itself, and paper paid +0.60% over it on average
+//     (119 fills, 20 sessions, 19 of them positive; per-fill sd 1.3%), so 82% of buys were
+//     0.58% cheaper in training than in paper. 0.70% is the premium that leaves zero mean error
+//     once the limit cap is applied. Recalibrate from fill_check.csv as sessions accumulate.
 static constexpr float SLIPPAGE_RATE       = 0.001f;
+static constexpr float OPEN_BUY_PREMIUM    = 0.0070f;
+// Price a limit buy fills at against the next bar, or 0 if it does not fill (strict at the low).
+static inline float buy_fill_price(float nd_open, float nd_low, float nd_high, float buy_lim) {
+    if (nd_open <= buy_lim) return std::min(nd_open * (1.f + OPEN_BUY_PREMIUM), buy_lim);
+    if (nd_low < buy_lim && buy_lim < nd_high) return buy_lim;
+    return 0.f;
+}
 
-static constexpr int   STOCKNN_PARAMS  = 928825;
+// v0.9 (2026-11-12, BREAKING): StockNN emits FIVE values per stock -- buy_qty, buy_price_frac,
+// sell_all_price_frac, sell_qty and sell_flag -- so 60 outputs, not 48 (928,825 params before).
+// sell_flag (sigmoid) decides whether a sell-all limit is placed at all (see plan_orders and
+// STOCK_OUT_PER_SYM). Every StockNN file from before is unloadable (load_bin checks the count).
+static constexpr int   STOCKNN_PARAMS  = 930169;
 // New flat 5-layer MasterNN: 444→444→444→312→180→48
 // fc1: 444×444+444=197580  fc2: +197580=395160  fc3: 444×312+312=138840→534000
 // fc4: 312×180+180=56340→590340  fc_out: 180×48+48=8688→599028
@@ -324,7 +357,12 @@ using MT1Forward = float (*)(const float*, const float*, float);
 // exactly twelve independent optimisers sharing only the industry's lr). The evolutionary entry
 // runs 144 pools, one per stock, each scored against that stock's own slot-0 P&L. The industry
 // prediction is the sum of the twelve stock predictions.
-enum RaceArch  { ARCH_MT1, ARCH_MT1C, ARCH_MT1S, ARCH_TANH32, ARCH_MT1P };
+// ARCH_JN is a j_neuro net (jn_bridge.h): grown, not a fixed layout. It reads MT1Net's 74 trailing
+// features (no order intent, so like MT1 it cannot rank order sets), as a DAILY SEQUENCE -- its
+// s_neurons remember earlier days -- and is evolutionary only, through the same pool lifecycle as
+// every evo entry; only prediction and breeding go to j_neuro (MT1PoolScratch::jn). Off unless
+// --jn-race is given or --race-only names it.
+enum RaceArch  { ARCH_MT1, ARCH_MT1C, ARCH_MT1S, ARCH_TANH32, ARCH_MT1P, ARCH_JN };
 enum RaceSrch  { SRCH_EVO, SRCH_GRAD };
 // Gradient loss. MSE is the original: squared error on the order set's raw dollar P&L.
 //   DEMEAN  squared error on (P&L - that industry-day's mean across the 200 order sets). The
@@ -514,6 +552,9 @@ static constexpr RaceEntry RACE[] = {
     {"MT1S-sum grad bt4", ARCH_MT1S,   SRCH_GRAD, false, false, nullptr,        LOSS_BT4 },
     {"MT1S-sum grdC bt4", ARCH_MT1S,   SRCH_GRAD, false, true,  nullptr,        LOSS_BT4 },
     {"TANH32   grad bt4", ARCH_TANH32, SRCH_GRAD, false, false, nullptr,        LOSS_BT4 },
+    // j_neuro (off by default; --jn-race or --race-only). Appended so no index above moves.
+    {"JN       evo ",     ARCH_JN,     SRCH_EVO,  false, true,  "r_jn"   },
+    {"JN       evo  bt4", ARCH_JN,     SRCH_EVO,  false, true,  "r_jn_bt4",     LOSS_BT4 },
 };
 static constexpr int RACE_N = (int)(sizeof(RACE) / sizeof(RACE[0]));
 
@@ -560,6 +601,12 @@ static constexpr bool race_tanh32_is_grad_only() {
     return true;
 }
 static_assert(race_tanh32_is_grad_only(), "TANH32 has no evolutionary forward; gradient only");
+static constexpr bool race_jn_is_evo_only() {
+    for (const RaceEntry& e : RACE)
+        if (e.arch == ARCH_JN && e.search != SRCH_EVO) return false;
+    return true;
+}
+static_assert(race_jn_is_evo_only(), "JN nets have no gradient; evolutionary only");
 static constexpr bool race_losses_are_supported() {
     for (const RaceEntry& e : RACE) {
         if (e.loss == LOSS_MSE || e.loss == LOSS_Q20) continue;   // Q20: wherever MSE is
@@ -580,6 +627,7 @@ static_assert(race_losses_are_supported(),
 static inline int race_params(RaceArch a) {
     return a == ARCH_MT1 ? MT1NET_PARAMS : a == ARCH_MT1C ? MT1CNET_PARAMS
          : a == ARCH_MT1S ? MT1SNET_PARAMS : a == ARCH_MT1P ? MT1C_SYMS * MT1P_PARAMS
+         : a == ARCH_JN ? 1      // nets live in MT1PoolScratch::jn; the flat slot is a placeholder
          : TANH32_PARAMS;
 }
 static inline int race_pool_params(RaceArch a) {
@@ -617,9 +665,13 @@ static inline float mt1p_forward_mt1f(const float* W, const float* in, float /*e
 }
 using MT1Init2 = void (*)(float*, uint64_t);
 
+// ARCH_JN never reaches a flat forward (mt1_step_day routes it to the JNPool); this stub only
+// keeps the dispatch total, so an unexpected call reads nothing and returns 0.
+static inline float jn_flat_forward_unused(const float*, const float*, float) { return 0.f; }
 static inline MT1Forward race_forward(RaceArch a) {
     return a == ARCH_MT1 ? mt1net_forward : a == ARCH_MT1C ? mt1cnet_forward
-         : a == ARCH_MT1P ? mt1p_forward_mt1f : mt1s_forward_mt1f;
+         : a == ARCH_MT1P ? mt1p_forward_mt1f : a == ARCH_JN ? jn_flat_forward_unused
+         : mt1s_forward_mt1f;
 }
 // 146 -> 32 -> 8 -> 1. Deliberately smaller than MT1CNet's 11,177: measured offline, the larger
 // shape scored WORSE on the same data (+0.0077 vs +0.0184). The target is close to pure noise,
@@ -779,6 +831,36 @@ static inline uint64_t splitmix64(uint64_t z) {
     return z ^ (z >> 31);
 }
 static inline uint64_t mix_seed(uint64_t base) { return splitmix64(base + g_run_seed); }
+
+// ── j_neuro (jn_bridge.h) ─────────────────────────────────────────────────────────
+// --jn-stocknn: every industry's StockNN is a pool of j_neuro nets instead of the 928,825-param
+//               StockNN (step_industry, JN branches). --jn-race: the JN race entries run.
+// --jn-profile: the mutation profile (spec/09 JSON); default j_neuro's profiles/training.json.
+static bool        g_jn_stocknn = false;
+static bool        g_jn_race    = false;
+#ifndef JNEURO_DEFAULT_PROFILE
+#define JNEURO_DEFAULT_PROFILE "../j_neuro/profiles/training.json"
+#endif
+static std::string g_jn_profile = JNEURO_DEFAULT_PROFILE;
+// Rows of history a JN pool keeps. A net replays its own get_warmup_steps() of them each day and
+// trades only once it has that many; 64 bounds the replay cost while leaving room for nets to
+// grow s_neuron chains well past StockNN's 15-day window.
+static constexpr int JN_RING_CAP = 64;
+// A JN race net's raw output is multiplied by this before mt1_pred's tanh x MT1_PRED_SCALE. A net
+// starts with identity weights, so its output is in the units of its 74 inputs (|x| up to ~33),
+// not of the target. Measured on the --jn-stocknn smoke's own features (mt1_dataset.bin, 500 days,
+// fresh pools): |raw| p10/p50/p90 = 0.017 / 0.22 / 1.6, i.e. $172 / $2,188 / $9,235 unscaled,
+// against a target of |actual| p10 ~$86, p90 ~$1,650. Every structured net lost to one that output
+// exactly 0, and selection deployed those: JN evo had <=2 of 12 industries non-zero on 65% of days.
+// 0.1 maps the fresh distribution to $17 / $222 / $1,600, the target's own spread; v_neuron weights
+// still evolve the scale from there.
+static constexpr float JN_RACE_OUT_SCALE = 0.1f;
+// A fresh seed per pool: from the clock, as every other seed in the run, unless --seed pins it.
+static uint64_t jn_fresh_seed(uint64_t k) {
+    const uint64_t t = g_seed_arg ? g_run_seed
+        : (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    return splitmix64(t ^ (k * 0xD1B54A32D192ED03ULL));
+}
 // --dir-reps: NO EFFECT since v0.8.0.0 -- the direction pool it tuned was deleted with the
 // heads/tails MT1. Still parsed so old launch lines do not fail; nothing reads g_dir_reps.
 // Original note: how many times the direction pool replays each block. The gentle 8.3% cull only turns
@@ -823,7 +905,8 @@ static constexpr int STOCK_FC2_B   = 903850;
 static constexpr int STOCK_FC3_W   = 904024;
 static constexpr int STOCK_FC3_B   = 923338;
 static constexpr int STOCK_OUT_W   = 923449;
-static constexpr int STOCK_OUT_B   = 928777;
+static constexpr int STOCK_OUT_B   = 930109;   // + 60x111
+static_assert(STOCK_OUT_B + STOCK_OUT_N == STOCKNN_PARAMS, "StockNN layout drifted");
 
 // Float offsets into the flat weight array for MasterNN (5-layer flat FC)
 static constexpr int MAST_FC1_W   = 0;
@@ -916,10 +999,49 @@ static inline float stock_close_pos(float o, float h, float l, float c) {
 }
 
 // StockNN forward — weights[] is STOCKNN_PARAMS floats in the offset layout above.
-// hist15x60 is row-major [15][60], row 0 = oldest.  today232 is [232].
+// Output sout is [STOCK_OUT_N] = reshape of [12][STOCK_OUT_PER_SYM]; activations applied per column.
 // Output out48 is [48] = reshape of [12][4]; activations applied per column.
+// --jn-stocknn: one j_neuro pool per industry, N_SLOTS nets of STOCK_TODAY_DIM -> 48, kept in
+// memory for the run (saved at each pass end). Created in main.
+static JNPool* g_jn_ind[N_IND] = {};
+
+// StockNN's own output shaping (the tail of stock_forward), applied to a JN net's raw outputs so
+// plan_orders reads the same four columns in the same ranges: quantities ReLU, fractions sigmoid.
+// JN StockNN raw-output census: a reservoir sample per industry of the 5 raw outputs of
+// (warm slot, symbol) pairs, before jn_stock_outputs. A new net's outputs are in its inputs' units
+// (see JN_RACE_OUT_SCALE), so this is the read on whether the sigmoid price fracs saturate and the
+// ReLU quantities are share counts or noise. Logged and reset at each pass end. Each industry is
+// stepped by one worker at a time, so the per-industry entries need no lock.
+static constexpr int JN_CEN_KEEP = 8192;
+struct JNOutCensus {
+    long n = 0;
+    uint64_t rng = 0x9E3779B97F4A7C15ULL;
+    float v[JN_CEN_KEEP][STOCK_OUT_PER_SYM];
+    void add(const float* o5) {
+        long at = n++;
+        if (at >= JN_CEN_KEEP) {
+            rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+            at = (long)((rng >> 11) % (uint64_t)n);
+            if (at >= JN_CEN_KEEP) return;
+        }
+        for (int c = 0; c < STOCK_OUT_PER_SYM; c++) v[at][c] = o5[c];
+    }
+};
+static JNOutCensus g_jn_cen[N_IND];
+
+static inline void jn_stock_outputs(float* sout) {
+    for (int j = 0; j < IND_SYMS; j++) {
+        float* o = sout + STOCK_OUT_PER_SYM * j;
+        o[SO_BQTY]  = fmaxf(0.f, o[SO_BQTY]);
+        o[SO_BFRAC] = sigmoidf(o[SO_BFRAC]);
+        o[SO_SFRAC] = sigmoidf(o[SO_SFRAC]);
+        o[SO_SQTY]  = fmaxf(0.f, o[SO_SQTY]);
+        o[SO_SFLAG] = sigmoidf(o[SO_SFLAG]);
+    }
+}
+
 static void stock_forward(const float* W, const float* hist15x60,
-                          const float* today232, float* out48) {
+                          const float* today232, float* sout) {
     float x[300], y[300], cat[STOCK_TODAY_IN], fc1[237], fc2[174], fc3[111];
     static_assert(STOCK_TODAY_IN >= STOCK_INJ_IN[13], "cat too small for inject concat");
 
@@ -953,14 +1075,17 @@ static void stock_forward(const float* W, const float* hist15x60,
     sgemv_relu(W + STOCK_FC3_W, W + STOCK_FC3_B, fc2, fc3, 111, 174);
 
     // Output (no activation yet)
-    sgemv_only(W + STOCK_OUT_W, W + STOCK_OUT_B, fc3, out48, 48, 111);
+    sgemv_only(W + STOCK_OUT_W, W + STOCK_OUT_B, fc3, sout, STOCK_OUT_N, 111);
 
-    // Per-column activations: [buy_qty=ReLU, buy_price=Sig, sell_all=Sig, sell_qty=ReLU]
+    // Per-column activations: [buy_qty=ReLU, buy_price=Sig, sell_all=Sig, sell_qty=ReLU,
+    // sell_flag=Sig]
     for (int j = 0; j < 12; j++) {
-        out48[4*j+0] = fmaxf(0.f, out48[4*j+0]);
-        out48[4*j+1] = sigmoidf(out48[4*j+1]);
-        out48[4*j+2] = sigmoidf(out48[4*j+2]);
-        out48[4*j+3] = fmaxf(0.f, out48[4*j+3]);
+        float* o = sout + STOCK_OUT_PER_SYM * j;
+        o[SO_BQTY]  = fmaxf(0.f, o[SO_BQTY]);
+        o[SO_BFRAC] = sigmoidf(o[SO_BFRAC]);
+        o[SO_SFRAC] = sigmoidf(o[SO_SFRAC]);
+        o[SO_SQTY]  = fmaxf(0.f, o[SO_SQTY]);
+        o[SO_SFLAG] = sigmoidf(o[SO_SFLAG]);
     }
 }
 
@@ -1117,14 +1242,17 @@ struct WorkerScratch {
     int       hist_head{0}; // circular write index into hist_buf, 0..HIST_DAYS-1
     int       hist_count{0};// days of valid history populated, 0..HIST_DAYS
     uint64_t  mut_seeds[N_SLOTS - ELITE_POOL];
+    // Params per model in these buffers: STOCKNN_PARAMS, or 1 under --jn-stocknn, where StockNN
+    // is a j_neuro pool and the ~324 MB of flat buffers would never be read.
+    size_t    np_;
 
-    WorkerScratch() {
-        size_t ep   = (size_t)ELITE_POOL * STOCKNN_PARAMS;
-        size_t hist = (size_t)HIST_DAYS * HIST_PER_DAY * STOCKNN_PARAMS;
+    WorkerScratch() : np_(g_jn_stocknn ? 1 : (size_t)STOCKNN_PARAMS) {
+        size_t ep   = (size_t)ELITE_POOL * np_;
+        size_t hist = (size_t)HIST_DAYS * HIST_PER_DAY * np_;
         elite_buf  = new float[ep]();
         new_elites = new float[ep]();
-        wavg_buf   = new float[3 * STOCKNN_PARAMS]();
-        mut_buf    = new float[STOCKNN_PARAMS]();
+        wavg_buf   = new float[3 * np_]();
+        mut_buf    = new float[np_]();
         hist_buf   = new float[hist]();
         // Pin only elite_buf (hot inference read path) — 74 MB per worker.
         // new_elites and hist_buf are write-heavy/sequential; swap-friendly.
@@ -1148,14 +1276,14 @@ struct WorkerScratch {
     // new_elites slot before reading it. So their pages can go back to the kernel and come back
     // as zeros. Returns the bytes released.
     size_t release() {
-        const size_t ep   = (size_t)ELITE_POOL * STOCKNN_PARAMS * sizeof(float);
-        const size_t hist = (size_t)HIST_DAYS * HIST_PER_DAY * STOCKNN_PARAMS * sizeof(float);
+        const size_t ep   = (size_t)ELITE_POOL * np_ * sizeof(float);
+        const size_t hist = (size_t)HIST_DAYS * HIST_PER_DAY * np_ * sizeof(float);
         munlock(elite_buf, ep);   // madvise cannot drop locked pages
         return release_pages(elite_buf, ep) + release_pages(new_elites, ep)
              + release_pages(hist_buf, hist);
     }
     void reacquire() {
-        mlock(elite_buf, (size_t)ELITE_POOL * STOCKNN_PARAMS * sizeof(float));
+        mlock(elite_buf, (size_t)ELITE_POOL * np_ * sizeof(float));
     }
     float* elite(int i)      { return elite_buf  + (size_t)i * STOCKNN_PARAMS; }
     float* new_elite(int i)  { return new_elites + (size_t)i * STOCKNN_PARAMS; }
@@ -1206,6 +1334,10 @@ struct MT1PoolScratch {
     // arguments.
     int         n_params{MT1NET_PARAMS};
     float*      pool{nullptr};              // [MT1_POOL_SLOTS x n_params], persistent
+    // A JN entry's nets (jn_bridge.h). When set, mt1_step_day predicts and breeds through it and
+    // `pool` is a placeholder; everything else -- registers, maturity, culling, lineage, scoring
+    // -- is this struct's, so a JN pool runs under exactly the lifecycle every evo entry does.
+    JNPool*     jn{nullptr};
     float*      mut_buf{nullptr};           // one model, breeding scratch
     MT1SlotMeta meta[MT1_POOL_SLOTS]{};
     int         best_slot{0};               // deployed model; ranked in place, never shuffled
@@ -1237,7 +1369,7 @@ struct MT1PoolScratch {
         pool    = new float[(size_t)MT1_POOL_SLOTS * np]();
         mut_buf = new float[np]();
     }
-    ~MT1PoolScratch() { delete[] pool; delete[] mut_buf; }
+    ~MT1PoolScratch() { delete[] pool; delete[] mut_buf; jn_pool_free(jn); }
     MT1PoolScratch(const MT1PoolScratch&) = delete;
     MT1PoolScratch& operator=(const MT1PoolScratch&) = delete;
 
@@ -1410,7 +1542,7 @@ static void init_stock_weights(float* W, PCG32& rng) {
     kaiming_init(W + STOCK_FC1_W,   237, 300, rng);
     kaiming_init(W + STOCK_FC2_W,   174, 237, rng);
     kaiming_init(W + STOCK_FC3_W,   111, 174, rng);
-    kaiming_init(W + STOCK_OUT_W,    48, 111, rng);
+    kaiming_init(W + STOCK_OUT_W,    STOCK_OUT_N, 111, rng);
 }
 
 // init_master_weights() removed in v0.8.1.10: its only caller was load_or_init_master(), also removed (-Wunused-function).
@@ -1510,6 +1642,14 @@ static void wait_while_trading() {
 
 static std::string elite_path(const std::string& dir, const char* prefix, int slot) {
     return dir + "/" + prefix + "_elite_" + std::to_string(slot) + ".bin";
+}
+// The champion store and the pass seed handle an industry's 20 elites as files. Under
+// --jn-stocknn they are j_neuro nets, jn_<industry>_elite_<k>.jnet (slots 0..19 of the pool after
+// the pass's last selection, in rank order); otherwise the flat StockNN files above.
+static std::string champ_elite_path(const std::string& dir, const char* ind, int slot) {
+    if (g_jn_stocknn)
+        return dir + "/jn_" + ind + "_elite_" + std::to_string(slot) + ".jnet";
+    return elite_path(dir, ind, slot);
 }
 
 // ── Logging ────────────────────────────────────────────────────────────────────
@@ -1717,11 +1857,13 @@ struct IndResult {
     float slot_bfrac[N_SLOTS][IND_SYMS];
     float slot_sfrac[N_SLOTS][IND_SYMS];
     float slot_sqty [N_SLOTS][IND_SYMS];
+    float slot_sflag[N_SLOTS][IND_SYMS];
     // Per-symbol slot-0 state and intent, for the MT1CNet competitor's 146-wide input. Holdings
     // and cash are the PRE-trade reference book — what is actually held at today's close, since
     // today's orders do not fill until tomorrow.
     float ref_hold[IND_SYMS], ref_cash_v;
     float si_bqty[IND_SYMS], si_bfrac[IND_SYMS], si_sfrac[IND_SYMS], si_sqty[IND_SYMS];
+    float si_sflag[IND_SYMS];
     float baseline, slot0_score, best_delta;
     float top_hold, top_cash;
     int   new_streak;
@@ -1785,11 +1927,18 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                                int actual_day, int total_avail,
                                int day_num, int num_days,
                                float sigma, bool freeze, const bool* seq_flags) {
+    // --jn-stocknn: this industry's models are a j_neuro pool held in memory (g_jn_ind); there is
+    // no flat elite file to load and no history ring (nets of different shapes cannot be blended
+    // or re-scored from a flat buffer), so both StockNN loads are skipped.
+    JNPool* const jp = g_jn_stocknn ? g_jn_ind[ind_i] : nullptr;
     // Load this industry's elites from disk (or random init on first day)
-    load_or_init_industry(models_dir, load_dir, ind_i, scratch.elite_buf, actual_day);
+    if (!jp) load_or_init_industry(models_dir, load_dir, ind_i, scratch.elite_buf, actual_day);
     // Load per-industry elite history (or reset at pass start). --upkeep runs are one-day passes
     // that continue each other, so the ring carries from file like everything else.
-    if (day_num == 0 && !g_upkeep) {
+    if (jp) {
+        scratch.hist_head  = 0;
+        scratch.hist_count = 0;
+    } else if (day_num == 0 && !g_upkeep) {
         scratch.hist_head  = 0;
         scratch.hist_count = 0;
     } else {
@@ -1960,6 +2109,24 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     today_arr[TODAY_STATE_OFF] = ref_cash;
     for (int j = 0; j < IND_SYMS; j++) today_arr[TODAY_STATE_OFF + 1 + j] = ref_hold[j];
 
+    // A JN pool sees the days as a sequence: today's row joins its ring, and each net replays its
+    // warmup rows before today's (jn_bridge.h). The state block is slot 0's book on each day.
+    // A JN net sees its inputs nearly as they are (a new net is identity-weighted), and today_arr
+    // holds raw share volumes and their daily changes (~1e6) beside dollar prices and O(1)
+    // ratios: measured on the first 2-pass smoke, raw outputs ran p10 -1.5e5 .. p90 +2.5e5 with
+    // p99 at 3e38, half the price fractions saturated and buy quantities in the 1e5s. The 928k
+    // net learns that rescaling in fc_today; j_neuro gets it done for it: signed log1p, which keeps
+    // order and sign and puts every input on a 0..~15 scale.
+    if (jp) {
+        float jn_row[STOCK_TODAY_DIM];
+        for (int k = 0; k < STOCK_TODAY_DIM; k++) {
+            const float x = std::isfinite(today_arr[k]) ? today_arr[k] : 0.f;
+            jn_row[k] = std::copysign(std::log1p(std::fabs(x)), x);
+        }
+        jn_push_row(jp, jn_row);
+    }
+    int jn_cold = 0;    // nets with less history than their warmup: no orders today
+
     // ── Inference + trade loop ────────────────────────────────────────────────
     float slot_scores[N_SLOTS];
     int   trade_count[N_SLOTS] = {};
@@ -1979,7 +2146,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
 
     // slot-0 order intent, accumulated on the slot == 0 iteration only
     float si_bq[IND_SYMS] = {}, si_bf[IND_SYMS] = {};
-    float si_sf[IND_SYMS] = {}, si_sq[IND_SYMS] = {};
+    float si_sf[IND_SYMS] = {}, si_sq[IND_SYMS] = {}, si_fl[IND_SYMS] = {};
     // ...and every slot's, for the gradient MT1. static because N_SLOTS x IND_SYMS x 4 floats is
     // 38 KB and step_industry runs on worker threads with modest stacks; one per thread.
     //
@@ -1993,6 +2160,8 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     memset(res_sym_pnl, 0, sizeof(res_sym_pnl));
     static thread_local float res_slot_bq[N_SLOTS][IND_SYMS], res_slot_bf[N_SLOTS][IND_SYMS];
     static thread_local float res_slot_sf[N_SLOTS][IND_SYMS], res_slot_sq[N_SLOTS][IND_SYMS];
+    static thread_local float res_slot_fl[N_SLOTS][IND_SYMS];
+    memset(res_slot_fl, 0, sizeof(res_slot_fl));
     memset(res_slot_bq, 0, sizeof(res_slot_bq));
     memset(res_slot_bf, 0, sizeof(res_slot_bf));
     memset(res_slot_sf, 0, sizeof(res_slot_sf));
@@ -2002,7 +2171,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     double oi_bf = 0.0, oi_bf2 = 0.0;
 
     IndResult::SimExec s0[IND_SYMS] = {};
-    float out48[48];
+    float sout[STOCK_OUT_N];
     // The decision day's bar, as plan_orders() reads it: every slot (and every history model)
     // plans its orders from the same close, the same reference book and the same cash.
     float d_low[IND_SYMS], d_high[IND_SYMS], d_close[IND_SYMS];
@@ -2015,19 +2184,26 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     for (int slot = 0; slot < N_SLOTS; slot++) {
         Portfolio& port = state.portfolios[slot];
 
-        // Select weights
-        const float* W;
-        if (slot < ELITE_POOL) {
-            W = scratch.elite(slot);
+        if (jp) {
+            // The JN children already exist (bred at the end of the previous day's selection).
+            if (!jn_forward(jp, slot, sout)) jn_cold++;   // not warm: zeros, so no buys
+            else for (int j = 0; j < IND_SYMS; j++)
+                if (day_sym[j].valid) g_jn_cen[ind_i].add(sout + STOCK_OUT_PER_SYM * j);
+            jn_stock_outputs(sout);
         } else {
-            int mut_i  = slot - ELITE_POOL;
-            int parent = mut_i / MUTATIONS_PER_PARENT;
-            memcpy(mut_buf, scratch.elite(parent), STOCKNN_PARAMS * sizeof(float));
-            apply_gaussian(mut_buf, STOCKNN_PARAMS, sigma, mut_seeds[mut_i]);
-            W = mut_buf;
+            // Select weights
+            const float* W;
+            if (slot < ELITE_POOL) {
+                W = scratch.elite(slot);
+            } else {
+                int mut_i  = slot - ELITE_POOL;
+                int parent = mut_i / MUTATIONS_PER_PARENT;
+                memcpy(mut_buf, scratch.elite(parent), STOCKNN_PARAMS * sizeof(float));
+                apply_gaussian(mut_buf, STOCKNN_PARAMS, sigma, mut_seeds[mut_i]);
+                W = mut_buf;
+            }
+            stock_forward(W, history_arr, today_arr, sout);
         }
-
-        stock_forward(W, history_arr, today_arr, out48);
 
         float local_buy = 0.f, local_sell = 0.f;
         // Cash moved BY each symbol: negative when this symbol's buy consumed cash, positive when
@@ -2035,15 +2211,17 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         // the attribution is exact rather than apportioned.
         float sym_cash[IND_SYMS] = {};
         // Production's orders for this slot, decided at the close; the fills below fill these.
-        plan_orders(out48, d_low, d_high, d_close, d_valid, ref_hold, ref_cash, plan);
+        plan_orders(sout, d_low, d_high, d_close, d_valid, ref_hold, ref_cash, plan);
 
         // ── Phase 1: partial sells, gap sell_all, high-first sell_all, stops, buys ─
         for (int j = 0; j < IND_SYMS; j++) {
             if (!day_sym[j].valid) continue;
-            float buy_qty            = out48[4*j+0];
-            float buy_price_frac     = out48[4*j+1];
-            float sell_all_price_frac = out48[4*j+2];
-            float sell_qty           = out48[4*j+3];
+            const float* so          = sout + STOCK_OUT_PER_SYM * j;
+            float buy_qty            = so[SO_BQTY];
+            float buy_price_frac     = so[SO_BFRAC];
+            float sell_all_price_frac = so[SO_SFRAC];
+            float sell_qty           = so[SO_SQTY];
+            float sell_flag          = so[SO_SFLAG];
 
             float low_t  = day_sym[j].low;
             float high_t = day_sym[j].high;
@@ -2058,10 +2236,11 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             // consumer (the dataset log and MT1Net's feature slice) and stay slot-0 only.
             res_slot_bq[slot][j] = buy_qty;              res_slot_bf[slot][j] = buy_price_frac;
             res_slot_sf[slot][j] = sell_all_price_frac;  res_slot_sq[slot][j] = sell_qty;
+            res_slot_fl[slot][j] = sell_flag;
             if (slot == 0) {
                 const float close_t = day_sym[j].close;
                 si_bq[j] = buy_qty;  si_bf[j] = buy_price_frac;
-                si_sf[j] = sell_all_price_frac; si_sq[j] = sell_qty;
+                si_sf[j] = sell_all_price_frac; si_sq[j] = sell_qty; si_fl[j] = sell_flag;
                 // The aggregates below are features too, so a non-finite raw output must not
                 // propagate into them. TWO independent guards on purpose: the comparisons
                 // reject NaN on their own, and the explicit isfinite() catches the infinities
@@ -2135,7 +2314,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             // High-first: intraday sell_all fires before buy
             if (sell_lim > 0.f && !low_first && port.holdings[j] > 1e-6f &&
                 nd_low < sell_lim && sell_lim < nd_high) {
-                float slipped = sell_lim * (1.f - SLIPPAGE_RATE);
+                float slipped = sell_lim;   // a limit fills at the limit (see OPEN_BUY_PREMIUM)
                 float amt = port.holdings[j];
                 port.holdings[j] = 0.f;
                 port.cash        += sell_net(amt, slipped);
@@ -2146,7 +2325,9 @@ static IndResult step_industry(int ind_i, IndustryState& state,
 
             // Stop loss -- only where production holds one: Alpaca reserves the shares a stop
             // covers, so a symbol with a sell placed today has its stop cancelled, not re-placed.
-            float stop_p = plan.sold[j] ? 0.f : port.stop_prices[j];
+            // ...nor on a day the symbol is bought: production does not re-place a held stop
+            // beside an open buy (wash trade), so the held shares go unprotected that session.
+            float stop_p = (plan.sold[j] || plan.buy_q[j] > 0.f) ? 0.f : port.stop_prices[j];
             if (stop_p > 0.f && port.holdings[j] > 1e-6f) {
                 if (nd_open <= stop_p) {
                     float amt = port.holdings[j];
@@ -2169,10 +2350,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             // Limit buy: the planned quantity at the planned limit, sized at the close
             if (plan.buy_q[j] > 0.f) {
                 float fill_price = 0.f;
-                if (nd_open <= buy_lim)
-                    fill_price = nd_open;
-                else if (nd_low < buy_lim && buy_lim < nd_high)
-                    fill_price = buy_lim * (1.f + SLIPPAGE_RATE);
+                fill_price = buy_fill_price(nd_open, nd_low, nd_high, buy_lim);
                 if (fill_price > 0.f) {
                     const float buy_amount = plan.buy_q[j];
                     port.holdings[j]    += buy_amount;
@@ -2199,7 +2377,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             float nd_high = fill_sym[j].valid ? fill_sym[j].high : day_sym[j].high;
 
             if (port.holdings[j] > 1e-6f && nd_low < sell_lim && sell_lim < nd_high) {
-                float slipped = sell_lim * (1.f - SLIPPAGE_RATE);
+                float slipped = sell_lim;   // a limit fills at the limit (see OPEN_BUY_PREMIUM)
                 float amt = port.holdings[j];
                 port.holdings[j] = 0.f;
                 port.cash        += sell_net(amt, slipped);
@@ -2261,9 +2439,9 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             port.holdings[j]    = ref_hold[j];
             port.stop_prices[j] = ref_stop[j];
         }
-        stock_forward(W, history_arr, today_arr, out48);
+        stock_forward(W, history_arr, today_arr, sout);
         OrderPlan hp;
-        plan_orders(out48, d_low, d_high, d_close, d_valid, ref_hold, ref_cash, hp);
+        plan_orders(sout, d_low, d_high, d_close, d_valid, ref_hold, ref_cash, hp);
         float local_buy = 0.f, local_sell = 0.f;
         // ── Phase 1: sells at open, gap sell_all, high-first sell_all, stops, buys ─
         // The same rules as the slot loop above, filling the same plan.
@@ -2288,13 +2466,15 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             }
             if (sell_lim > 0.f && !low_first && port.holdings[j] > 1e-6f &&
                 nd_low < sell_lim && sell_lim < nd_high) {
-                float slipped = sell_lim * (1.f - SLIPPAGE_RATE);
+                float slipped = sell_lim;   // a limit fills at the limit (see OPEN_BUY_PREMIUM)
                 float amt = port.holdings[j];
                 port.holdings[j] = 0.f;
                 port.cash        += sell_net(amt, slipped);
                 local_sell       += amt;
             }
-            float stop_p = hp.sold[j] ? 0.f : port.stop_prices[j];
+            // ...nor on a day the symbol is bought: production does not re-place a held stop
+            // beside an open buy (wash trade), so the held shares go unprotected that session.
+            float stop_p = (hp.sold[j] || hp.buy_q[j] > 0.f) ? 0.f : port.stop_prices[j];
             if (stop_p > 0.f && port.holdings[j] > 1e-6f) {
                 if (nd_open <= stop_p) {
                     float amt = port.holdings[j];
@@ -2311,10 +2491,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             }
             if (hp.buy_q[j] > 0.f) {
                 float fill_price = 0.f;
-                if (nd_open <= buy_lim)
-                    fill_price = nd_open;
-                else if (nd_low < buy_lim && buy_lim < nd_high)
-                    fill_price = buy_lim * (1.f + SLIPPAGE_RATE);
+                fill_price = buy_fill_price(nd_open, nd_low, nd_high, buy_lim);
                 if (fill_price > 0.f) {
                     port.holdings[j]    += hp.buy_q[j];
                     port.cash           -= hp.buy_q[j] * fill_price;
@@ -2332,7 +2509,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             float nd_low  = fill_sym[j].valid ? fill_sym[j].low  : day_sym[j].low;
             float nd_high = fill_sym[j].valid ? fill_sym[j].high : day_sym[j].high;
             if (port.holdings[j] > 1e-6f && nd_low < sell_lim && sell_lim < nd_high) {
-                float slipped = sell_lim * (1.f - SLIPPAGE_RATE);
+                float slipped = sell_lim;   // a limit fills at the limit (see OPEN_BUY_PREMIUM)
                 float amt = port.holdings[j];
                 port.holdings[j] = 0.f;
                 port.cash        += sell_net(amt, slipped);
@@ -2438,23 +2615,28 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     float next_idle[ELITE_POOL];
     for (int k = 0; k < ELITE_POOL; k++) next_idle[k] = trade_count[k] ? 0.f : 1.f;
 
-    // Selection scores with invested_pct multiplier
+    // Selection scores with invested_pct multiplier. The score is the slot's own book P&L,
+    // slot_score - book_prev (held positions' move + the trades' effect), not the trade delta
+    // slot_score - baseline. Every slot starts from the same book, so the two differ by one
+    // constant per day and rank identically EXCEPT through the sign-gated multiplier below: on an
+    // up day a holder now scores positive and is weighted by how invested it is, where before it
+    // scored 0 and was not. The survival floor stays on the trade delta (see selection).
     float sel_scores[N_SLOTS];
-    for (int s = 0; s < N_SLOTS; s++) {
-        float raw_delta = slot_scores[s] - baseline;
-        if (raw_delta > 0.f && slot_scores[s] > 0.f) {
-            float invested_pct = std::max(0.f, 1.f - state.portfolios[s].cash / slot_scores[s]);
-            sel_scores[s] = raw_delta * invested_pct;
-        } else {
-            sel_scores[s] = raw_delta;
-        }
-    }
+    auto sel_score_of = [&](float score, float cash) {
+        const float pnl = score - book_prev;
+        return (pnl > 0.f && score > 0.f) ? pnl * std::max(0.f, 1.f - cash / score) : pnl;
+    };
+    for (int s = 0; s < N_SLOTS; s++)
+        sel_scores[s] = sel_score_of(slot_scores[s], state.portfolios[s].cash);
 
     // Preserve slot 0's own portfolio before selection overwrites it
     Portfolio slot0_own = state.portfolios[0];
 
     // ── Selection + mutation ─────────────────────────────────────────────────
     if (!freeze) {
+        // The survival floor is a loss against simply holding (trade delta below -10% of the
+        // book), not a loss of book value: measured on the P&L score, a sector falling 10% in a
+        // day would put every slot under it and leave nothing to select.
         float survival_floor = -(baseline * 0.1f);
         float below_floor_thresh = baseline * 0.9f;
 
@@ -2463,29 +2645,63 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         for (int s = 0; s < N_SLOTS; s++) {
             if (inactive[s]) continue;
             if (slot_scores[s] < below_floor_thresh) continue;
-            if (sel_scores[s] < survival_floor) continue;
+            if (slot_scores[s] - baseline < survival_floor) continue;
             surviving.push_back({sel_scores[s], s});
         }
         // History candidates (no inactive filter; slot index = N_SLOTS+h)
         for (int h = 0; h < n_hist; h++) {
-            float raw_delta = hist_scores[h] - baseline;
-            float sel_h = (raw_delta > 0.f && hist_scores[h] > 0.f)
-                ? raw_delta * std::max(0.f, 1.f - hist_ports[h].cash / hist_scores[h])
-                : raw_delta;
+            const float sel_h = sel_score_of(hist_scores[h], hist_ports[h].cash);
             if (hist_scores[h] < below_floor_thresh) continue;
-            if (sel_h < survival_floor) continue;
+            if (hist_scores[h] - baseline < survival_floor) continue;
             surviving.push_back({sel_h, N_SLOTS + h});
         }
         if (surviving.empty()) {
             // relax: drop inactive filter (history already included above)
             for (int s = 0; s < N_SLOTS; s++) {
                 if (slot_scores[s] < below_floor_thresh) continue;
-                if (sel_scores[s] < survival_floor) continue;
+                if (slot_scores[s] - baseline < survival_floor) continue;
                 surviving.push_back({sel_scores[s], s});
             }
         }
 
-        if (!surviving.empty()) {
+        if (!surviving.empty() && jp) {
+            // ── JN selection: the top ELITE_POOL survivors become the elites, in rank order, and
+            // each breeds MUTATIONS_PER_PARENT children for tomorrow. j_neuro nets differ in
+            // shape, so there are no weighted-average blends: all 20 parent slots are direct
+            // elites. Survivors are current slots only (the history ring is off in JN mode).
+            std::sort(surviving.begin(), surviving.end(),
+                      [](const auto& a, const auto& b){ return a.first > b.first; });
+            const int n_top = std::min((int)surviving.size(), ELITE_POOL);
+            int src[ELITE_POOL];
+            for (int k = 0; k < ELITE_POOL; k++) src[k] = surviving[k < n_top ? k : 0].second;
+            Portfolio new_ports[ELITE_POOL];
+            for (int k = 0; k < ELITE_POOL; k++) {
+                new_ports[k] = state.portfolios[src[k]];
+                next_idle[k] = trade_count[src[k]] ? 0.f : 1.f;
+            }
+            jn_permute(jp, src, ELITE_POOL);
+            for (int k = 0; k < ELITE_POOL; k++) state.portfolios[k] = new_ports[k];
+            for (int mut_i = 0; mut_i < N_SLOTS - ELITE_POOL; mut_i++) {
+                const int child = ELITE_POOL + mut_i, parent = mut_i / MUTATIONS_PER_PARENT;
+                jn_mutate(jp, parent, child, (uint64_t)actual_day,
+                          mix_seed(mut_seeds[mut_i] ^ 0x4A4E5F4D555441ULL));   // "JN_MUTA"
+                state.portfolios[child] = state.portfolios[parent];
+            }
+            std::string disp;
+            for (int k = 0; k < std::min(n_top, 5); k++) {
+                const int sl = src[k];
+                if (k > 0) disp += ",";
+                disp += sl < ELITE_POOL ? std::to_string(sl) + ".0"
+                      : std::to_string((sl - ELITE_POOL) / MUTATIONS_PER_PARENT) + "." +
+                        std::to_string((sl - ELITE_POOL) % MUTATIONS_PER_PARENT + 1);
+            }
+            const JNStats js = jn_stats(jp);
+            char jl[200];
+            snprintf(jl, sizeof(jl), " | jn nodes %.0f (max %d) warm %.1f (max %d) cold %d",
+                     js.nodes_mean, js.nodes_max, js.warm_mean, js.warm_max, jn_cold);
+            log_msg(std::string("[") + IND_SHORT[ind_i] + "]   Selection done | elite=[" + disp +
+                    "] | top=$" + std::to_string((int)surviving[0].first) + jl);
+        } else if (!surviving.empty()) {
             std::sort(surviving.begin(), surviving.end(),
                       [](const auto& a, const auto& b){ return a.first > b.first; });
             int n_top = std::min((int)surviving.size(), ELITE_COUNT);
@@ -2615,7 +2831,13 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         if (all_inactive && new_streak >= 2) {
             int half = ELITE_COUNT / 2;
             PCG32 div_rng; div_rng.seed(mix_seed((uint64_t)actual_day * 99991ULL + ind_i));
-            for (int k = half; k < ELITE_COUNT; k++) {
+            for (int k = half; k < ELITE_COUNT && jp; k++) {
+                // JN: re-randomise half of the v_neuron weights of the lower elites
+                jn_inject(jp, k, 50.0, mix_seed(((uint64_t)actual_day << 20) ^ ((uint64_t)ind_i << 8) ^ k));
+                state.portfolios[k] = state.portfolios[k - half];
+                next_idle[k] = 0.f;
+            }
+            for (int k = half; k < ELITE_COUNT && !jp; k++) {
                 // blend top half with random: 0.5 * elite + 0.5 * random (reuse mut_buf)
                 init_stock_weights(scratch.mut_buf, div_rng);
                 for (int p = 0; p < STOCKNN_PARAMS; p++)
@@ -2632,7 +2854,8 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     state.portfolios[0] = slot0_own;
 
     // ── Push today's top-7 elites + 3 wavg slots to history circular buffer ──
-    {
+    // (StockNN only: under --jn-stocknn the flat buffers are 1 float and there is no ring.)
+    if (!jp) {
         int hd = scratch.hist_head;
         for (int k = 0; k < HIST_ELITE; k++)
             memcpy(scratch.hist(hd, k), scratch.elite(k), STOCKNN_PARAMS * sizeof(float));
@@ -2690,7 +2913,9 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     // redirected to a scratch directory instead. The one case that genuinely skips the write is
     // --control-untrained, where tomorrow re-randomises rather than loads, so saving would only
     // burn 3 GB of I/O and leave a directory of weights that look trained.
-    if (!g_control_untrained) {
+    if (jp) {
+        save_elite_idle(models_dir, ind_i, next_idle);   // the pool itself is saved at pass end
+    } else if (!g_control_untrained) {
         save_industry_elites(models_dir, ind_i, scratch.elite_buf);
         save_elite_idle(models_dir, ind_i, next_idle);
         save_ind_history(models_dir, ind_i, scratch);
@@ -2704,6 +2929,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         res.si_bfrac[j] = si_bf[j];
         res.si_sfrac[j] = si_sf[j];
         res.si_sqty[j]  = si_sq[j];
+        res.si_sflag[j] = si_fl[j];
     }
     res.oi_n_buy    = (float)oi_nb;
     res.oi_n_sell   = (float)oi_ns;
@@ -2721,6 +2947,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         memcpy(res.slot_bfrac[s], res_slot_bf[s], IND_SYMS * sizeof(float));
         memcpy(res.slot_sfrac[s], res_slot_sf[s], IND_SYMS * sizeof(float));
         memcpy(res.slot_sqty [s], res_slot_sq[s], IND_SYMS * sizeof(float));
+        memcpy(res.slot_sflag[s], res_slot_fl[s], IND_SYMS * sizeof(float));
         memcpy(res.slot_sym_pnl[s], res_sym_pnl[s], IND_SYMS * sizeof(float));
     }
     res.book_prev     = book_prev;
@@ -2970,10 +3197,14 @@ static void mt1c_init_weights(float* W, uint64_t seed) {
     kaiming_init(W + CN_L4_W,  1,  8, rng);
 }
 
+// JN pools build their nets in jn_pool_create; the 1-float placeholder slot is left alone (the
+// MT1S fallthrough would write a whole MT1S net into it).
+static void jn_init_unused(float*, uint64_t) {}
 static inline MT1Init2 race_init(RaceArch a) {
     return a == ARCH_MT1 ? mt1_init_weights
          : a == ARCH_MT1C ? mt1c_init_weights
-         : a == ARCH_MT1P ? mt1p_init_weights : mt1s_init_weights;
+         : a == ARCH_MT1P ? mt1p_init_weights : a == ARCH_JN ? jn_init_unused
+         : mt1s_init_weights;
 }
 
 // Kaiming-init one MT2INet.
@@ -3044,8 +3275,15 @@ static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in,
     // `actual` spans close(t)..close(t+1) — two days out, with a full day's hole in between — so
     // MT1 was solving a strictly harder problem than the one production asks. Out-of-sample is a
     // property of what the model can see, not of the order the loop happens to run in.
-    for (int s = 0; s < MT1_POOL_SLOTS; s++)
-        sc.pending[s] = mt1_pred(fwd(sc.slot(s), in, 0.f));
+    // A JN pool's nets read the industry's row history, which the caller appended (jn_push_row)
+    // before this call; `in` is that row. A net not yet warmed predicts $0.
+    for (int s = 0; s < MT1_POOL_SLOTS; s++) {
+        if (sc.jn) {
+            float o = 0.f; jn_forward(sc.jn, s, &o);
+            sc.pending[s] = mt1_pred(o * JN_RACE_OUT_SCALE);
+        }
+        else       sc.pending[s] = mt1_pred(fwd(sc.slot(s), in, 0.f));
+    }
     sc.has_pending = true;
     sc.pending_day = actual_day;
     // The deployed model's call, captured BEFORE selection can reorder the pool — this is the
@@ -3103,7 +3341,8 @@ static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in,
                                 ^ ((uint64_t)ind_i << 32) ^ ((uint64_t)victim * 2654435761ULL)
                                 ^ salt;
             const uint32_t age = sc.meta[victim].n_pred;
-            mt1_mutate(sc.slot(par), sc.slot(victim), sc.n_params, sigma, seed);
+            if (sc.jn) jn_mutate(sc.jn, par, victim, (uint64_t)actual_day, seed);
+            else       mt1_mutate(sc.slot(par), sc.slot(victim), sc.n_params, sigma, seed);
             mt1_slot_init(sc.meta[victim], sc.meta[par].lineage);
             sc.retire_n++;
             sc.retire_age_sum += age;
@@ -3686,7 +3925,7 @@ static bool copy_elites(const std::string& from, const std::string& to, const ch
                         int pass_num = 0) {
     for (int slot = 0; slot < ELITE_POOL; slot++) {
         std::error_code ec;
-        fs::copy_file(elite_path(from, ind, slot), elite_path(to, ind, slot),
+        fs::copy_file(champ_elite_path(from, ind, slot), champ_elite_path(to, ind, slot),
                       fs::copy_options::overwrite_existing, ec);
         if (ec) return false;
     }
@@ -3705,6 +3944,11 @@ static bool copy_elites(const std::string& from, const std::string& to, const ch
         std::error_code ec2;
         if (fs::exists(src, ec2))
             fs::copy_file(src, to + "/race_" + nm + "_" + ind + ".bin",
+                          fs::copy_options::overwrite_existing, ec2);
+        // A JN race entry's deployed net is a .jnet, not a flat .bin (see race_weight_path).
+        const std::string jsrc = src.substr(0, src.size() - 4) + ".jnet";
+        if (fs::exists(jsrc, ec2))
+            fs::copy_file(jsrc, to + "/race_" + nm + "_" + ind + ".jnet",
                           fs::copy_options::overwrite_existing, ec2);
     }
     return true;
@@ -3768,15 +4012,15 @@ static void reseed_for_continue(const std::string& out_dir, int last_pass) {
         pass_interleave(share, ELITE_POOL, src, idx);
         bool ok = true;
         for (int k = 0; k < ELITE_POOL && ok; k++) {
-            fs::copy_file(elite_path(out_dir, ind_buf, k), elite_path(stage_dir, ind_buf, k),
+            fs::copy_file(champ_elite_path(out_dir, ind_buf, k), champ_elite_path(stage_dir, ind_buf, k),
                           fs::copy_options::overwrite_existing, ec);
             ok = !ec;
         }
         if (!ok) { log_msg(std::string("continue: cannot stage ") + ind_buf + " -- seed unchanged"); continue; }
         for (int k = 0; k < ELITE_POOL; k++)
-            fs::copy_file(src[k] == 0 ? elite_path(champ_dir, ind_buf, idx[k])
-                                      : elite_path(stage_dir, ind_buf, idx[k]),
-                          elite_path(out_dir, ind_buf, k), fs::copy_options::overwrite_existing, ec);
+            fs::copy_file(src[k] == 0 ? champ_elite_path(champ_dir, ind_buf, idx[k])
+                                      : champ_elite_path(stage_dir, ind_buf, idx[k]),
+                          champ_elite_path(out_dir, ind_buf, k), fs::copy_options::overwrite_existing, ec);
         char msg[200];
         snprintf(msg, sizeof(msg), "continue: %s seeded from champion p%d + p%d (share_new %.2f)",
                  ind_buf, ncp, last_pass, share);
@@ -3849,7 +4093,7 @@ static void pass_boundary(const std::string& out_dir, int pass_num,
 
         bool champ_ok = prev[i].found;
         for (int slot = 0; slot < ELITE_POOL && champ_ok; slot++)
-            if (!fs::exists(elite_path(champ_dir, ind, slot))) champ_ok = false;
+            if (!fs::exists(champ_elite_path(champ_dir, ind, slot))) champ_ok = false;
         if (prev[i].found && !champ_ok)
             log_msg(std::string("[") + IND_SHORT[i] +
                     "]   pass-seed: champion weights MISSING — falling back to 100% from this pass");
@@ -3879,9 +4123,9 @@ static void pass_boundary(const std::string& out_dir, int pass_num,
         // Blend champion + staged challenger into the live directory — next pass's seed.
         if (seed_next) {
             for (int k = 0; k < ELITE_POOL; k++) {
-                const std::string from = (src[k] == 0) ? elite_path(champ_dir, ind, idx[k])
-                                                       : elite_path(stage_dir, ind, idx[k]);
-                fs::copy_file(from, elite_path(out_dir, ind, k),
+                const std::string from = (src[k] == 0) ? champ_elite_path(champ_dir, ind, idx[k])
+                                                       : champ_elite_path(stage_dir, ind, idx[k]);
+                fs::copy_file(from, champ_elite_path(out_dir, ind, k),
                               fs::copy_options::overwrite_existing, ec);
             }
         }
@@ -3906,6 +4150,74 @@ static void pass_boundary(const std::string& out_dir, int pass_num,
     fclose(csv);
     fs::remove_all(stage_dir, ec);
     if (seed_next) write_seeded_marker(out_dir, pass_num);
+}
+
+// Pass-end summary of g_jn_cen over all industries, then reset.
+static void jn_census_report(int pass_num) {
+    std::vector<float> col[STOCK_OUT_PER_SYM];
+    long seen = 0;
+    for (int i = 0; i < N_IND; i++) {
+        const JNOutCensus& c = g_jn_cen[i];
+        seen += c.n;
+        const long k = std::min<long>(c.n, JN_CEN_KEEP);
+        for (long r = 0; r < k; r++)
+            for (int q = 0; q < STOCK_OUT_PER_SYM; q++) col[q].push_back(c.v[r][q]);
+        g_jn_cen[i] = JNOutCensus{};
+    }
+    if (col[0].empty()) { log_msg("JN StockNN outputs: no warm forward this pass"); return; }
+    static const char* name[STOCK_OUT_PER_SYM] = {"buy_qty  raw", "buy_frac raw", "sell_frc raw",
+                                                  "sell_qty raw", "sell_flg raw"};
+    char m[320];
+    snprintf(m, sizeof(m), "JN StockNN raw outputs, pass %d: %ld warm (net, symbol) outputs, "
+             "%zu sampled. Fracs saturate past |raw| 9.2; qty is shares (ReLU).",
+             pass_num, seen, col[0].size());
+    log_msg(m);
+    for (int q = 0; q < STOCK_OUT_PER_SYM; q++) {
+        std::vector<float>& v = col[q];
+        std::sort(v.begin(), v.end());
+        auto at = [&](double f) { return v[(size_t)std::min<double>(v.size() - 1, f * v.size())]; };
+        long zero = 0, sat = 0, pos = 0;
+        for (float x : v) { zero += (x == 0.f); sat += (std::fabs(x) > 9.2f); pos += (x > 0.f); }
+        const double n = (double)v.size();
+        snprintf(m, sizeof(m), "   %s p1 %+.3g p10 %+.3g p50 %+.3g p90 %+.3g p99 %+.3g | ==0 %.1f%% "
+                 ">0 %.1f%% |x|>9.2 %.1f%%", name[q], at(0.01), at(0.10), at(0.50), at(0.90),
+                 at(0.99), 100.0 * zero / n, 100.0 * pos / n, 100.0 * sat / n);
+        log_msg(m);
+    }
+}
+
+// ── --jn-stocknn and the champion store ──────────────────────────────────────────────────────
+// A JN pool lives in memory, so the pass boundary reaches it through files exactly as it reaches
+// StockNN's: the pool's 20 elites (slots 0..19 after the last selection, in rank order) are written
+// as jn_<ind>_elite_<k>.jnet, pass_boundary judges, crowns into champion/ and blends the next
+// pass's seed in those files, and the pool is rebuilt from them.
+static bool jn_write_elites(int ind_i, const std::string& dir) {
+    for (int k = 0; k < ELITE_POOL; k++)
+        if (!jn_save_slot(g_jn_ind[ind_i], k,
+                          champ_elite_path(dir, g_ind_names[ind_i].c_str(), k)))
+            return false;
+    return true;
+}
+
+// Slots 0..19 := the 20 elite files in dir; slots 20..199 := MUTATIONS_PER_PARENT children of
+// each, bred as the daily selection breeds them. False, pool untouched, if any file is missing.
+static bool jn_seed_from_elites(int ind_i, const std::string& dir, uint64_t generation) {
+    if (dir.empty()) return false;
+    const char* ind = g_ind_names[ind_i].c_str();
+    for (int k = 0; k < ELITE_POOL; k++)
+        if (!fs::exists(champ_elite_path(dir, ind, k))) return false;
+    JNPool* p = g_jn_ind[ind_i];
+    for (int k = 0; k < ELITE_POOL; k++)
+        if (!jn_load_slot(p, k, champ_elite_path(dir, ind, k))) {
+            log_msg(std::string("[") + IND_SHORT[ind_i] + "]   jn seed: cannot load " +
+                    champ_elite_path(dir, ind, k) + " -- pool partly reseeded");
+            return false;
+        }
+    const uint64_t salt = jn_fresh_seed(0x4A4E5345ULL + (uint64_t)ind_i);   // "JNSE"
+    for (int mut_i = 0; mut_i < N_SLOTS - ELITE_POOL; mut_i++)
+        jn_mutate(p, mut_i / MUTATIONS_PER_PARENT, ELITE_POOL + mut_i, generation,
+                  mix_seed(salt ^ (uint64_t)mut_i));
+    return true;
 }
 
 // save_master_elites() removed in v0.8.1.10: unreferenced (-Wunused-function).
@@ -3997,6 +4309,17 @@ static float bp_rank_corr(const float* a, const float* b, int n)
     static thread_local std::vector<float> ra, rb;
     bp_avg_ranks(a, n, ia, ra);
     bp_avg_ranks(b, n, ib, rb);
+    // A side whose ranks are all equal has no rank variance: say so EXACTLY, before any
+    // arithmetic. The variance test below cannot, because the mean is not exact -- with all 105
+    // ranks 52.0 the computed mean came out a hair off 52 (the --jn-stocknn smoke, day 771), so
+    // da was a tiny positive number and a constant prediction read as a finite rank: the
+    // +0.0909 over 11 ind-days on the no-intent rows. Only nm != 200 exposed it.
+    bool a_const = true, b_const = true;
+    for (int k = 1; k < n; k++) {
+        if (ra[k] != ra[0]) a_const = false;
+        if (rb[k] != rb[0]) b_const = false;
+    }
+    if (a_const || b_const) return NAN;
     double ma = 0.0, mb = 0.0;
     for (int k = 0; k < n; k++) { ma += ra[k]; mb += rb[k]; }
     ma /= n; mb /= n;
@@ -4096,10 +4419,20 @@ static std::string mt1_meta_path(const std::string& dir, int ind_i, const char* 
 
 // Written every block, which is what makes evolutionary carryover work: load_or_init_mt1_pool
 // reads these back at the next pass start so the pool continues rather than restarting.
+// A JN pool's nets: <dir>/<tag>_<industry>_jn_<slot>.jnet, plus its row ring.
+static std::string jn_pool_prefix(int ind_i, const char* tag) {
+    return std::string(tag) + "_" + g_ind_names[ind_i] + "_jn";
+}
+
 static void save_mt1_pool(const std::string& dir, int ind_i, const MT1PoolScratch& sc,
                           const char* tag = "mt1") {
-    for (int s = 0; s < MT1_POOL_SLOTS; s++)
-        save_bin(mt1_pool_path(dir, ind_i, s, tag), sc.slot(s), sc.n_params);
+    if (sc.jn) {
+        if (!jn_save(sc.jn, dir, jn_pool_prefix(ind_i, tag)))
+            log_msg(std::string("WARNING: could not save j_neuro pool ") + tag + " " + g_ind_names[ind_i]);
+    } else {
+        for (int s = 0; s < MT1_POOL_SLOTS; s++)
+            save_bin(mt1_pool_path(dir, ind_i, s, tag), sc.slot(s), sc.n_params);
+    }
     FILE* f = fopen(mt1_meta_path(dir, ind_i, tag).c_str(), "wb");
     if (!f) return;
     uint32_t hdr[4] = {MT1_META_MAGIC, MT1_META_VERSION, (uint32_t)MT1_POOL_SLOTS,
@@ -4118,7 +4451,15 @@ static void load_or_init_mt1_pool(const std::string& dir, const std::string& loa
                                   const char* tag = "mt1", MT1Init init = mt1_init_weights,
                                   uint64_t salt = 0) {
     int loaded = 0;
-    for (int s = 0; s < MT1_POOL_SLOTS; s++) {
+    if (sc.jn) {
+        // Nets as jn_pool_create built them (minimal, one seed each) unless a saved pool exists.
+        const std::string pre = jn_pool_prefix(ind_i, tag);
+        if (jn_load(sc.jn, dir, pre) || (!load_dir.empty() && jn_load(sc.jn, load_dir, pre)))
+            loaded = MT1_POOL_SLOTS;
+        else
+            for (int s = 0; s < MT1_POOL_SLOTS; s++) mt1_slot_init(sc.meta[s], sc.next_lineage++);
+    }
+    for (int s = 0; s < MT1_POOL_SLOTS && !sc.jn; s++) {
         if (load_bin(mt1_pool_path(dir, ind_i, s, tag), sc.slot(s), sc.n_params) ||
             (!load_dir.empty() &&
              load_bin(mt1_pool_path(load_dir, ind_i, s, tag), sc.slot(s), sc.n_params))) {
@@ -4130,8 +4471,9 @@ static void load_or_init_mt1_pool(const std::string& dir, const std::string& loa
         }
     }
     if (loaded == 0) {
-        log_msg(std::string(tag) + " " + g_ind_names[ind_i] + ": random init (200 slots, "
-                + std::to_string(sc.n_params) + " params)");
+        log_msg(std::string(tag) + " " + g_ind_names[ind_i] + (sc.jn
+                ? std::string(": j_neuro minimal nets (200 slots)")
+                : ": random init (200 slots, " + std::to_string(sc.n_params) + " params)"));
         return;
     }
     // Metadata is optional: weights without it are usable, they just start the registers empty,
@@ -4293,11 +4635,12 @@ static inline float cn_clamp(float v, float lo, float hi) {
 static void build_mt1c_input_for(const OHLCV* day_sym, const IndResult& ir,
                                  const float* in_bqty, const float* in_bfrac,
                                  const float* in_sfrac, const float* in_sqty,
-                                 float* out /*MT1C_IN*/) {
+                                 const float* in_sflag, float* out /*MT1C_IN*/) {
     const float* si_bqty  = in_bqty  ? in_bqty  : ir.si_bqty;
     const float* si_bfrac = in_bfrac ? in_bfrac : ir.si_bfrac;
     const float* si_sfrac = in_sfrac ? in_sfrac : ir.si_sfrac;
     const float* si_sqty  = in_sqty  ? in_sqty  : ir.si_sqty;
+    const float* si_sflag = in_sflag ? in_sflag : ir.si_sflag;
     // Everything here is SCALE-FREE, and that is not cosmetic. MT1Net's own 74 inputs are already
     // normalised (returns lifted by RETURN_SCALE = 100, every polynomial level-normalised), so raw
     // dollars here would make the comparison measure normalisation rather than feature set.
@@ -4356,6 +4699,8 @@ static void build_mt1c_input_for(const OHLCV* day_sym, const IndResult& ir,
         // fallback (mid-range) so a non-finite output reads as "no opinion" rather than "at the low".
         f[CN_BFRAC] = cn_clamp(cn_ok(si_bfrac[j], 0.5f), 0.f, 1.f);
         f[CN_SFRAC] = cn_clamp(cn_ok(si_sfrac[j], 0.5f), 0.f, 1.f);
+        // StockNN's sell_flag (a sigmoid): > 0.5 places the sell-all, otherwise the model holds.
+        f[CN_SFLAG] = cn_clamp(cn_ok(si_sflag[j], 0.5f), 0.f, 1.f);
     }
     out[CN_CASH] = cn_clamp(cn_ok(ir.ref_cash_v) / book, 0.f, 1.f);
     out[CN_BOOK] = cn_ok(ir.book_prev) / (ir.book_base > 0.f ? ir.book_base : (float)IND_STARTING_CASH);
@@ -4363,11 +4708,11 @@ static void build_mt1c_input_for(const OHLCV* day_sym, const IndResult& ir,
 
 // Slot 0's intent -- the deployed model. Every existing caller wants this.
 static void build_mt1c_input(const OHLCV* day_sym, const IndResult& ir, float* out /*MT1C_IN*/) {
-    build_mt1c_input_for(day_sym, ir, nullptr, nullptr, nullptr, nullptr, out);
+    build_mt1c_input_for(day_sym, ir, nullptr, nullptr, nullptr, nullptr, nullptr, out);
 }
 
 // MT1S-stk's per-stock inputs for ONE order set: that stock's 12 MT1C features, the industry cash
-// and book, then StockNN's four outputs for that stock (see MT1P_IN in mt1_grad.h). `raw` selects
+// and book, then StockNN's five outputs for that stock (see MT1P_IN in mt1_grad.h). `raw` selects
 // the gradient entries' form -- share counts exactly as StockNN emitted them -- over the
 // evolutionary entry's unrounded, uncapped ratios. A symbol with no valid bar reads as no order.
 static void build_mt1p_slices(const float* in146, const OHLCV* day_sym, const IndResult& ir,
@@ -4383,6 +4728,7 @@ static void build_mt1p_slices(const float* in146, const OHLCV* day_sym, const In
         float sq = ok ? fmaxf(0.f, cn_ok(ir.slot_sqty[slot][j])) : 0.f;
         const float bf = ok ? cn_ok(ir.slot_bfrac[slot][j], 0.5f) : 0.5f;
         const float sf = ok ? cn_ok(ir.slot_sfrac[slot][j], 0.5f) : 0.5f;
+        const float fl = ok ? cn_ok(ir.slot_sflag[slot][j], 0.5f) : 0.5f;
         if (!raw) {
             const float afford = ok ? cn_ok(ir.ref_cash_v) / b.close : 0.f;
             const float held   = cn_ok(ir.ref_hold[j]);
@@ -4393,6 +4739,7 @@ static void build_mt1p_slices(const float* in146, const OHLCV* day_sym, const In
         f[MT1C_PER_SYM + 3] = bf;
         f[MT1C_PER_SYM + 4] = sf;
         f[MT1C_PER_SYM + 5] = sq;
+        f[MT1C_PER_SYM + 6] = fl;
     }
 }
 
@@ -4410,7 +4757,7 @@ static void build_mt1p_slices(const float* in146, const OHLCV* day_sym, const In
 // curve. The identity is also a free self-check: book_now - book_prev must equal mkt_move +
 // trade_delta to floating-point tolerance on every row.
 static constexpr uint32_t DS_LOG_MAGIC   = 0x4D543144u;   // "MT1D"
-static constexpr uint32_t DS_LOG_VERSION = 4u;   // v4: + MT2INet, three pools paired
+static constexpr uint32_t DS_LOG_VERSION = 5u;   // v5: cfeat 158 wide (sell_flag); v4: + MT2INet
 static constexpr int      DS_FEAT        = 74;            // per industry, = MT1Net's input width
 
 struct DSLogRecord {
@@ -4603,6 +4950,7 @@ static void print_usage(const char* prog) {
         "          [--workers N] [--master-only] [--no-save] [--no-nn-race]\n"
         "          [--race-skip \"A,B,...\"]  switch race entries off (race_qualify.py RACE_SKIP)\n"
         "          [--race-only \"A,B,...\"]  run only these race entries (plus the deployed/logged two)\n"
+        "          [--jn-stocknn] [--jn-race] [--jn-profile FILE]  j_neuro StockNN / race entries\n"
         "          [--seed N]   (default: clock, RE-SEEDED EVERY PASS; N derives passes from N)\n"
         "          [--trade-lock PATH | --no-trade-lock]  pause while production holds the lock\n"
         "          [--control-untrained]  NO-LEARNING CONTROL: re-randomise StockNN daily\n"
@@ -5137,6 +5485,9 @@ int main(int argc, char* argv[]) {
         }
         else if (arg == "--upkeep" && a+1<argc) { g_upkeep = true; upkeep_book_path = argv[++a]; }
         else if (arg == "--race-only" && a+1<argc) { race_only = argv[++a]; }
+        else if (arg == "--jn-stocknn") g_jn_stocknn = true;
+        else if (arg == "--jn-race")    g_jn_race = true;
+        else if (arg == "--jn-profile" && a+1<argc) { g_jn_profile = argv[++a]; }
         else if (arg == "--continue-run") g_continue = true;
         else if (arg == "--crown" && a+1<argc) {
             std::string list = argv[++a];
@@ -5184,6 +5535,21 @@ int main(int argc, char* argv[]) {
         for (int v = 0; v < RACE_N; v++)
             g_race_off[v] = !want[v] && v != RACE_DEPLOYED && v != RACE_LOG_POOL;
         g_bayes_off = !bayes;
+    }
+    // JN race entries are opt-in: a run that names neither --jn-race nor a JN entry in --race-only
+    // (the weekly pass continuing a run, production's upkeep) must not grow two entries mid-run.
+    if (race_only.empty() && !g_jn_race)
+        for (int v = 0; v < RACE_N; v++) if (RACE[v].arch == ARCH_JN) g_race_off[v] = true;
+    bool jn_any_race = false;
+    for (int v = 0; v < RACE_N; v++) if (RACE[v].arch == ARCH_JN && !g_race_off[v]) jn_any_race = true;
+    if (g_jn_stocknn && (g_control_random || g_control_untrained || master_only)) {
+        fprintf(stderr, "ERROR: --jn-stocknn cannot be combined with the StockNN control modes "
+                        "or --master-only\n");
+        return 1;
+    }
+    if (g_upkeep && (g_jn_stocknn || jn_any_race)) {
+        fprintf(stderr, "ERROR: j_neuro nets are not supported under --upkeep yet\n");
+        return 1;
     }
     if (g_upkeep) {
         if (output_dir.empty() || !account.empty()) {
@@ -5428,7 +5794,7 @@ int main(int argc, char* argv[]) {
     // StockNN raw-output census: how many price fractions sit at exactly 0 / 1 (or within 1e-4 of
     // an end), and how many quantities are zero. Per pass, scored days only.
     struct FracCensus { long n = 0, b0 = 0, b1 = 0, s0 = 0, s1 = 0, bnear = 0, snear = 0,
-                        bq0 = 0, sq0 = 0; };
+                        bq0 = 0, sq0 = 0, hold = 0, held = 0; };
     FracCensus frac_census;
 
     std::vector<RaceState> race(RACE_N);
@@ -5447,6 +5813,19 @@ int main(int argc, char* argv[]) {
             const int npools = race_pools(RACE[v].arch);
             r.pool = std::make_unique<MT1PoolScratch[]>(npools);
             for (int p = 0; p < npools; p++) r.pool[p].alloc(race_pool_params(RACE[v].arch));
+            if (RACE[v].arch == ARCH_JN) {
+                for (int p = 0; p < npools; p++) {
+                    std::string err;
+                    r.pool[p].jn = jn_pool_create(74, 1, MT1_POOL_SLOTS, JN_RING_CAP, g_jn_profile,
+                                                  jn_fresh_seed(((uint64_t)v << 8) | (uint64_t)p), err);
+                    if (!r.pool[p].jn) {
+                        log_msg("ERROR: " + race_norm_name(RACE[v].name) + ": " + err);
+                        return 1;
+                    }
+                }
+                log_msg("MT1 race: " + race_norm_name(RACE[v].name) + " -- j_neuro 74->1 nets, profile "
+                        + g_jn_profile);
+            }
         } else if (RACE[v].arch == ARCH_TANH32) {
             // MT1Backprop owns weights and moments. w/m/v/g are still sized to N_IND -- EMPTY, not
             // absent -- so every `.w[i].empty()` guard stays in bounds (the v0.8.1.29 segfault was
@@ -5535,6 +5914,43 @@ int main(int argc, char* argv[]) {
         fprintf(csv, "\n");
     }
 
+    if (g_jn_stocknn) {
+        log_msg("");
+        log_msg("################################################################");
+        log_msg("#  --jn-stocknn : StockNN is a j_neuro pool, not the 928k net  #");
+        log_msg("#  Compare it with a StockNN run over the SAME day range.      #");
+        log_msg("################################################################");
+        log_msg("j_neuro profile: " + g_jn_profile);
+        for (int i = 0; i < N_IND; i++) {
+            std::string err;
+            g_jn_ind[i] = jn_pool_create(STOCK_TODAY_DIM, STOCK_OUT_N, N_SLOTS, JN_RING_CAP,
+                                         g_jn_profile, jn_fresh_seed(0x5700ULL + (uint64_t)i), err);
+            if (!g_jn_ind[i]) { log_msg("ERROR: --jn-stocknn: " + err); return 1; }
+            // Pools saved before sell_flag (4 outputs per stock) gain a fresh sell_flag output
+            // per stock on load (j_neuro add_output_fresh) rather than restarting.
+            {
+                std::vector<int> at;
+                for (int j = 0; j < IND_SYMS; j++) at.push_back(STOCK_OUT_PER_SYM * j + SO_SFLAG);
+                jn_set_output_migration(g_jn_ind[i], 4 * IND_SYMS, at);
+            }
+            const std::string pre = "jn_" + g_ind_names[i];
+            const bool loaded = jn_load(g_jn_ind[i], output_dir, pre)
+                             || (!load_dir.empty() && jn_load(g_jn_ind[i], load_dir, pre));
+            const JNStats js = jn_stats(g_jn_ind[i]);
+            char m[200];
+            snprintf(m, sizeof(m), "[%s] j_neuro StockNN pool: %s, %d nets, %.0f nodes (max %d), "
+                     "warmup %.1f (max %d)", IND_SHORT[i], loaded ? "loaded" : "minimal nets",
+                     N_SLOTS, js.nodes_mean, js.nodes_max, js.warm_mean, js.warm_max);
+            log_msg(m);
+        }
+        if (FILE* mk = fopen((output_dir + "/JN_STOCKNN").c_str(), "w")) {
+            fprintf(mk, "StockNN in this run is a j_neuro pool (--jn-stocknn, v%s, profile %s).\n"
+                        "There are no StockNN elite files; convert_weights.py does not apply.\n",
+                    TRAINER_VERSION, g_jn_profile.c_str());
+            fclose(mk);
+        }
+    }
+
     if (g_control_untrained) {
         FILE* mk = fopen((output_dir + "/CONTROL_UNTRAINED").c_str(), "w");
         if (mk) {
@@ -5611,6 +6027,14 @@ int main(int argc, char* argv[]) {
                 ", logs in " + log_dir);
         reseed_for_continue(output_dir, g_pass_base);
     }
+    // --jn-stocknn: the pool starts from the 20 elite files where there are any -- the run's own
+    // seed (a continued run, just blended above), else --load-dir's (e.g. a champion/ store) --
+    // with fresh children. The full saved pool, when jn_load found one, is otherwise kept.
+    for (int i = 0; i < N_IND && g_jn_stocknn; i++) {
+        const char* src = jn_seed_from_elites(i, output_dir, 0) ? "the run's elites"
+                        : jn_seed_from_elites(i, load_dir, 0)   ? "--load-dir's elites" : nullptr;
+        if (src) log_msg(std::string("[") + IND_SHORT[i] + "] j_neuro StockNN pool seeded from " + src);
+    }
     for (int pass = g_pass_base; pass < g_pass_base + passes; pass++) {
         float decay         = powf(sigma_decay, (float)(pass - g_pass_base));
         float cur_sigma     = sigma        * decay;
@@ -5668,6 +6092,7 @@ int main(int argc, char* argv[]) {
                     }
                     load_or_init_mt1_pool(output_dir, load_dir, i, race[v].pool[i],
                                           RACE[v].tag, race_init(RACE[v].arch), r.salt);
+                    if (race[v].pool[i].jn) jn_clear_rows(race[v].pool[i].jn);   // new calendar
                     continue;
                 }
                 if (RACE[v].carry && pass > g_pass_base) continue;   // keep weights, Adam moments AND lr
@@ -5735,6 +6160,7 @@ int main(int argc, char* argv[]) {
             }
             ind_states[i].streak = 0;
             for (int s = 1; s < N_SLOTS; s++) ind_states[i].portfolios[s] = ind_states[i].portfolios[0];
+            if (g_jn_ind[i]) jn_clear_rows(g_jn_ind[i]);   // the calendar restarts each pass
         }
         // Load MT1 head+tail pools (heads/tails redesign) and MT2 once at pass start
         for (int i = 0; i < N_IND; i++) {
@@ -6016,7 +6442,8 @@ int main(int argc, char* argv[]) {
                             for (int m = 0; m < MT1_BP_MODELS; m++) {
                                 build_mt1c_input_for(blk_day[d]->sym[i], ir,
                                                      ir.slot_bqty[m], ir.slot_bfrac[m],
-                                                     ir.slot_sfrac[m], ir.slot_sqty[m], mrow[m]);
+                                                     ir.slot_sfrac[m], ir.slot_sqty[m],
+                                                     ir.slot_sflag[m], mrow[m]);
                                 bool okm = true;
                                 for (int q = 0; q < MT1C_IN; q++)
                                     if (!std::isfinite(mrow[m][q])) { okm = false; break; }
@@ -6083,7 +6510,8 @@ int main(int argc, char* argv[]) {
                             if (!std::isfinite(y)) continue;
                             build_mt1c_input_for(blk_day[d]->sym[i], ir,
                                                  ir.slot_bqty[m], ir.slot_bfrac[m],
-                                                 ir.slot_sfrac[m], ir.slot_sqty[m], mrows[nm]);
+                                                 ir.slot_sfrac[m], ir.slot_sqty[m],
+                                                     ir.slot_sflag[m], mrows[nm]);
                             bool ok_in = true;
                             for (int q = 0; q < MT1C_IN; q++)
                                 if (!std::isfinite(mrows[nm][q])) { ok_in = false; break; }
@@ -6161,6 +6589,10 @@ int main(int argc, char* argv[]) {
                                     frac_census.bnear += (bf < 1e-4f || bf > 1.f - 1e-4f);
                                     frac_census.snear += (sf < 1e-4f || sf > 1.f - 1e-4f);
                                     frac_census.bq0 += !(bq > 0.f); frac_census.sq0 += !(sq > 0.f);
+                                    if (ir.ref_hold[j] >= 1.f) {   // the flag matters only when held
+                                        frac_census.held++;
+                                        frac_census.hold += !(ir.slot_sflag[m][j] > 0.5f);
+                                    }
                                 }
                         }
 
@@ -6188,10 +6620,14 @@ int main(int argc, char* argv[]) {
                             RaceState& r = race[v];
                             // MT1Net reads the industry's 74 curves, which carry no order intent,
                             // so every model presents it the same vector -- see the RACE comment.
-                            const float* ind_in = (e.arch == ARCH_MT1)
+                            const float* ind_in = (e.arch == ARCH_MT1 || e.arch == ARCH_JN)
                                                   ? &blk_888[d][i * 74] : bin;
+                            // A JN pool's history grows every day, before the train/measure gate
+                            // below, so its nets are warm by the time the entry starts training.
+                            if (e.arch == ARCH_JN) jn_push_row(r.pool[i].jn, ind_in);
                             // MT1S-stk evo has twelve pools per industry, read per stock below.
                             const float* W = (e.arch == ARCH_MT1P && e.search == SRCH_EVO)
+                                             || e.arch == ARCH_JN
                                              ? nullptr
                                              : (e.search == SRCH_EVO)
                                              ? r.pool[i].slot(r.pool[i].best_slot)
@@ -6203,7 +6639,15 @@ int main(int argc, char* argv[]) {
                             const bool measure = blk_actual_day[d] >= MT1_BP_START_DAY;
                             const bool train   = blk_actual_day[d] >= race_train_start(e, pass);
                             if (!measure && !train) continue;
+                            // JN: one input per industry-day (no order intent), so one forward
+                            // of the deployed net serves every order set, as MT1's does.
+                            float jn_dep = 0.f;
+                            if (e.arch == ARCH_JN && nm > 0) {
+                                jn_forward(r.pool[i].jn, r.pool[i].best_slot, &jn_dep);
+                                jn_dep *= JN_RACE_OUT_SCALE;   // same units mt1_step_day scores
+                            }
                             for (int m = 0; m < nm; m++) {
+                                if (e.arch == ARCH_JN) { mpred[m] = jn_dep; continue; }
                                 if (e.arch == ARCH_MT1P) {
                                     // Industry prediction = the twelve stock predictions summed.
                                     // Evo pools score tanh(out) x scale per stock, in dollars, so
@@ -6274,6 +6718,30 @@ int main(int argc, char* argv[]) {
                                 r.distinct_sum += dist; r.distinct_n++;
 
                                 const float rc = bp_rank_corr(mpred, mreal, nm);
+                                // MT1 and JN read no order intent, so all nm predictions are one
+                                // value and no rank can exist. A finite one means the measurement
+                                // is broken; log the first few with what explains them. (The
+                                // --jn-stocknn smoke's +0.0909 was bp_rank_corr's inexact mean on
+                                // a constant rank vector, fixed there.)
+                                if (std::isfinite(rc) && (e.arch == ARCH_MT1 || e.arch == ARCH_JN)) {
+                                    static std::atomic<int> leak_logged{0};
+                                    if (leak_logged.fetch_add(1) < 20) {
+                                        float plo = mpred[0], phi = mpred[0], ylo = mreal[0], yhi = mreal[0];
+                                        int pnan = 0;
+                                        for (int m = 0; m < nm; m++) {
+                                            if (!std::isfinite(mpred[m])) pnan++;
+                                            plo = fminf(plo, mpred[m]); phi = fmaxf(phi, mpred[m]);
+                                            ylo = fminf(ylo, mreal[m]); yhi = fmaxf(yhi, mreal[m]);
+                                        }
+                                        char c[320];
+                                        snprintf(c, sizeof(c),
+                                                 "[%s]   RANK LEAK %s day %d: rank %+.4f nm %d distinct %d "
+                                                 "pred [%.9g, %.9g] non-finite %d | real [%.4g, %.4g]",
+                                                 IND_SHORT[i], race_norm_name(e.name).c_str(),
+                                                 blk_actual_day[d], rc, nm, dist, plo, phi, pnan, ylo, yhi);
+                                        log_msg(c);
+                                    }
+                                }
                                 if (std::isfinite(rc)) {
                                     r.rank_sum += rc; r.rank_n++;
                                     const int bk = (blk_actual_day[d] - MT1_BP_START_DAY) / BP_BUCKET;
@@ -6587,10 +7055,32 @@ int main(int argc, char* argv[]) {
                             sort_index_prefix(idx, n, [&](int a, int b) {
                                 return race_day_pred[v][a] > race_day_pred[v][b];
                             });
+                            // Expected mean return of sorted positions [from, from+cnt) under a
+                            // uniformly random order WITHIN each run of equal predictions: a tie
+                            // group overlapping the slice contributes (overlap) x (the group's
+                            // mean return). Plain slicing let sort order decide ties, so an entry
+                            // predicting a constant "picked" the first industries in universe
+                            // order: the --jn-stocknn smoke's JN evo bt4 tied all 12 on 54% of
+                            // days and its alloc lines measured universe order, not the model.
+                            // Untied days are unchanged; an all-tied day scores exactly flat.
+                            // race_daily.csv keeps the actual picks (rd_row below).
                             auto mean_of = [&](int from, int cnt) {
+                                if (!cnt) return 0.0;
+                                const float* pr = race_day_pred[v];
                                 double t = 0.0;
-                                for (int k = 0; k < cnt; k++) t += race_day_ret[idx[from + k]];
-                                return cnt ? t / cnt : 0.0;
+                                int g0 = 0;
+                                while (g0 < from + cnt) {
+                                    int g1 = g0 + 1;
+                                    while (g1 < n && pr[idx[g1]] == pr[idx[g0]]) g1++;
+                                    const int lo = std::max(g0, from), hi = std::min(g1, from + cnt);
+                                    if (hi > lo) {
+                                        double gm = 0.0;
+                                        for (int k = g0; k < g1; k++) gm += race_day_ret[idx[k]];
+                                        t += (hi - lo) * gm / (g1 - g0);
+                                    }
+                                    g0 = g1;
+                                }
+                                return t / cnt;
                             };
                             r.alloc_flat += flat;
                             r.alloc_tr.add(mean_of(0, std::min(4, n)) - flat, alloc_age, alloc_seg);
@@ -6865,7 +7355,14 @@ int main(int argc, char* argv[]) {
                     }
                     const MT1PoolScratch& sc = race[v].pool[i];
                     // Per-pass snapshot of the deployed model, for the weight comparison...
-                    if (!g_upkeep)
+                    // A JN pool is 200 .jnet files, not one flat array, so it is written on the
+                    // pass's last day only (the next pass loads it from there), deployed net and all.
+                    if (sc.jn) {
+                        if (blk_actual_day[0] != day_start + num_days - 1) continue;
+                        std::string pth = race_weight_path(output_dir, v, i, pass + 1);
+                        pth.replace(pth.size() - 4, 4, ".jnet");
+                        jn_save_slot(sc.jn, sc.best_slot, pth);
+                    } else if (!g_upkeep)
                         save_bin(race_weight_path(output_dir, v, i, pass + 1),
                                  sc.slot(sc.best_slot), sc.n_params);
                     // ...and the whole pool, which is what the NEXT pass loads to carry on.
@@ -7071,7 +7568,7 @@ int main(int argc, char* argv[]) {
                 FILE* of = fopen((log_dir + "/orders_sim.csv").c_str(), "w");
                 if (of) {
                     fprintf(of, "date,fill_date,industry,symbol,hold_before,cash_before,bqty,bfrac,"
-                                "sfrac,sqty,buy_lim,sell_all_lim,stop_before,low_first,fill_open,"
+                                "sfrac,sqty,sflag,buy_lim,sell_all_lim,stop_before,low_first,fill_open,"
                                 "fill_high,fill_low,fill_close,sold_open_q,sold_open_px,sold_all_q,"
                                 "sold_all_px,stopped_q,stopped_px,bought_q,bought_px,stop_after,"
                                 "hold_after,cash_after\n");
@@ -7081,13 +7578,14 @@ int main(int argc, char* argv[]) {
                         for (int j = 0; j < IND_SYMS; j++) {
                             const IndResult::SimExec& e = R.sim[j];
                             const OHLCV& b = fd.sym[i][j];
-                            fprintf(of, "%s,%s,%s,%s,%.6f,%.4f,%.6g,%.6g,%.6g,%.6g,%.4f,%.4f,%.4f,%d,"
+                            fprintf(of, "%s,%s,%s,%s,%.6f,%.4f,%.6g,%.6g,%.6g,%.6g,%.6g,%.4f,%.4f,%.4f,%d,"
                                         "%.4f,%.4f,%.4f,%.4f,%.6f,%.4f,%.6f,%.4f,%.6f,%.4f,%.6f,%.4f,"
                                         "%.4f,%.6f,%.4f\n",
                                     dates[day_start].c_str(), dates[day_start + 1].c_str(),
                                     g_ind_names[i].c_str(), g_syms[i][j].c_str(), R.ref_hold[j],
                                     R.ref_cash_v, R.slot_bqty[0][j], R.slot_bfrac[0][j],
-                                    R.slot_sfrac[0][j], R.slot_sqty[0][j], e.buy_lim,
+                                    R.slot_sfrac[0][j], R.slot_sqty[0][j], R.slot_sflag[0][j],
+                                    e.buy_lim,
                                     e.sell_all_lim, e.stop_before, e.low_first,
                                     b.valid ? b.open : 0.f, b.valid ? b.high : 0.f,
                                     b.valid ? b.low : 0.f, b.valid ? b.close : 0.f,
@@ -7142,9 +7640,24 @@ int main(int argc, char* argv[]) {
             // shorter than the judging window.
             // Never in control mode: crowning a champion from random weights would write those
             // weights into champion/, where the NEXT real run would seed from them.
-            if (!master_only && !g_control_untrained && (day_end - day_start) > PASS_JUDGE_MIN_DAYS)
-                pass_boundary(output_dir, pass + 1, day_start, day_end,
-                              judge, /*seed_next=*/g_continue || pass + 1 < g_pass_base + passes);
+            // --jn-stocknn takes the same gate: its 20 elites are written as .jnet files first,
+            // and after a seeding boundary the pool is rebuilt from the blended seed.
+            const bool seed_next = g_continue || pass + 1 < g_pass_base + passes;
+            if (g_jn_stocknn) jn_census_report(pass + 1);
+            for (int i = 0; i < N_IND && g_jn_stocknn; i++)
+                if (!jn_write_elites(i, output_dir))
+                    log_msg("WARNING: could not write j_neuro StockNN elites " + g_ind_names[i]);
+            const bool judged = !master_only && !g_control_untrained &&
+                                (day_end - day_start) > PASS_JUDGE_MIN_DAYS;
+            if (judged)
+                pass_boundary(output_dir, pass + 1, day_start, day_end, judge, seed_next);
+            for (int i = 0; i < N_IND && g_jn_stocknn; i++) {
+                if (judged && seed_next && !jn_seed_from_elites(i, output_dir, (uint64_t)day_end))
+                    log_msg("WARNING: j_neuro StockNN " + g_ind_names[i] +
+                            " not reseeded from the pass seed -- it carries on as it ended");
+                if (!jn_save(g_jn_ind[i], output_dir, "jn_" + g_ind_names[i]))
+                    log_msg("WARNING: could not save j_neuro StockNN pool " + g_ind_names[i]);
+            }
 
             // ── how well did the gradient MT1 predict the TRADING OUTCOME? ──────────────
             //
@@ -7228,6 +7741,13 @@ int main(int argc, char* argv[]) {
                                  "%.1f%% (ReLU at or below zero = no order)",
                                  100.0 * frac_census.bq0 / n, 100.0 * frac_census.sq0 / n);
                         log_msg(c);
+                        if (frac_census.held > 0) {
+                            snprintf(c, sizeof(c),
+                                     "   StockNN sell_flag: holds (no sell-all) on %.1f%% of %ld "
+                                     "held order-set x stock outputs",
+                                     100.0 * frac_census.hold / frac_census.held, frac_census.held);
+                            log_msg(c);
+                        }
                     }
                     if (balloc.n > 0 && !g_bayes_off) {
                         const double n = (double)balloc.n, fl = 1e4 * balloc.flat / n;

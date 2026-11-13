@@ -37,7 +37,7 @@ import fill_check
 import training_lib
 import upkeep_cpp
 from fees import SELL_FILL, _sell_net
-from models import MasterNN, StockNN, stock_close_pos, stock_close_vs_wap
+from models import STOCK_OUT_PER_SYM, MasterNN, StockNN, stock_close_pos, stock_close_vs_wap
 from universe import INDUSTRIES
 from upkeep import (
     load_mt1_rolling_state,
@@ -761,8 +761,8 @@ def generate_liquidation_sells(industry, symbols, liquidation_target,
 
 
 def stocknn_outputs(model, symbols, histories, day_data, holdings, cash):
-    """The industry model's (12, 4) output at today's close for a book holding `holdings` with
-    `cash` to spend: per symbol buy_qty, buy_price_frac, sell_all_price_frac, sell_qty."""
+    """The industry model's (12, 5) output at today's close for a book holding `holdings` with
+    `cash` to spend: per symbol buy_qty, buy_price_frac, sell_all_price_frac, sell_qty, sell_flag."""
     # Rolling stats for new input features
     sym_stats = {}
     for sym in symbols:
@@ -847,7 +847,7 @@ def stocknn_outputs(model, symbols, histories, day_data, holdings, cash):
 
     with torch.no_grad():
         out = model(history_t, today_t)
-    out  = out.view(12, 4)   # (buy_qty, buy_price, sell_all_price, sell_qty)
+    out  = out.view(12, STOCK_OUT_PER_SYM)   # (buy_qty, buy_price, sell_all_price, sell_qty, sell_flag)
     return out.tolist()
 
 
@@ -859,7 +859,8 @@ def plan_industry_orders(symbols, sug, holdings, day_data, allocated_cash, holds
                          sell_only=False, stops=None):
     """One industry's orders from StockNN's suggestions: sells, then buys, then stops.
 
-    sug:   {sym: (buy_qty, buy_price_frac, sell_all_price_frac, sell_qty)}, the model's output
+    sug:   {sym: (buy_qty, buy_price_frac, sell_all_price_frac, sell_qty, sell_flag)}, the model's
+           output (training_lib.plan_orders: sell_flag > 0.5 places the sell-all limit)
     holds: {sym: runs left} -- symbols under the new-symbol hold get no orders
     stops: {sym: stop price} protecting held shares -- the open stops the caller cancelled, or the
            stop recorded for a position whose stop expired
@@ -867,7 +868,8 @@ def plan_industry_orders(symbols, sug, holdings, day_data, allocated_cash, holds
     Every price is rounded to an increment Alpaca accepts (to_cents). A buy carries its stop-loss
     in the same order (`stop`, submitted as one OTO order: the stop goes live when the buy fills),
     because Alpaca rejects a separate sell stop while a buy for the same symbol is open ("potential
-    wash trade"). For the same reason a symbol the model sells today is not also bought today.
+    wash trade"). For the same reason a symbol the model sells today is not also bought today,
+    and a held symbol being added to (sell_flag off, bought today) has no stop that session.
 
     Held shares keep their protection: the caller cancels a held symbol's stops before selling
     (Alpaca reserves the shares a stop covers), so a GTC stop is re-placed, at its old price, for
@@ -1380,7 +1382,7 @@ def main():
             print(f"Master liquidation orders (3x tier-0): {liq_str}")
 
         orders = []
-        intents = {}       # {sym: StockNN's raw (buy_qty, buy_frac, sell_all_frac, sell_qty)}
+        intents = {}       # {sym: StockNN's raw (buy_qty, buy_frac, sell_all_frac, sell_qty, sell_flag)}
 
         # Liquidate any positions in symbols that have been removed from the universe.
         # Queued as market orders so they fill regardless of intraday price.

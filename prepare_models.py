@@ -31,7 +31,7 @@ STOCK_LAYER_DEFS = [
     ('fc_fc1',   237, 300),
     ('fc_fc2',   174, 237),
     ('fc_fc3',   111, 174),
-    ('fc_out',    48, 111),
+    ('fc_out',    60, 111),   # STOCK_OUT_N
 ]
 
 MASTER_LAYER_DEFS = [

@@ -52,13 +52,14 @@ def load_model(entry, industry, state_dir, seed_dir):
 
 def industry_inputs(bars, hold, cash, intent, book_base):
     """One industry's race inputs at today's close. bars: [12] (o, h, l, c) or None for a symbol
-    without a usable bar; hold: [12] shares; intent: [12, 4] StockNN output.
+    without a usable bar; hold: [12] shares; intent: [12, 5] StockNN output.
     -> (in146, raw slices18, ratio slices18)"""
     valid = [b is not None for b in bars]
     o, h, lo, c = (np.array([b[k] if b else 0.0 for b in bars], np.float64) for k in range(4))
     in146 = rm.build_cfeat146(o, h, lo, c, valid, hold, cash, intent, book_base=book_base)
     it = np.asarray(intent, np.float64)
-    sl = [rm.mt1p_slices(in146, c, valid, cash, hold, it[:, 0], it[:, 1], it[:, 2], it[:, 3], raw)
+    sl = [rm.mt1p_slices(in146, c, valid, cash, hold, it[:, 0], it[:, 1], it[:, 2], it[:, 3],
+                         it[:, 4], raw)
           for raw in (True, False)]
     return in146, sl[0], sl[1]
 

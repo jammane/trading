@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 
 import training_lib as tl
+from fees import OPEN_BUY_PREMIUM
 
 SYMS = [f"S{i}" for i in range(12)]
 
@@ -41,9 +42,10 @@ def random_book(rng):
         q = rng.choice([0.0, 0.0, rng.uniform(0, 20), 1e9, 2.4e15])
         sug[s] = (f32(q), f32(rng.choice([0.0, 1.0, rng.random()])),
                   f32(rng.choice([0.0, 1.0, rng.random(), 1.5])),
-                  f32(rng.choice([0.0, 0.0, rng.uniform(0, 4), 1e12])))
+                  f32(rng.choice([0.0, 0.0, rng.uniform(0, 4), 1e12])),
+                  f32(rng.choice([0.0, 1.0, 0.5, rng.random()])))      # sell_flag
     for s in SYMS:
-        sug.setdefault(s, (0.0, 0.0, 0.0, 0.0))
+        sug.setdefault(s, (0.0, 0.0, 0.0, 0.0, 0.0))
     return day, hold, sug, f32(rng.choice([0.0, 75.0, 562.5, rng.uniform(0, 3000)]))
 
 
@@ -55,6 +57,30 @@ DAY = {s: {"open": 50.0, "high": 52.0, "low": 48.0, "close": 50.0} for s in ("AA
 def test_a_held_symbol_is_sold_and_not_bought():
     p = tl.plan_orders(["AAA"], {"AAA": (1e9, 0.0, 1.0, 0.0)}, {"AAA": 3.0}, DAY, 10_000.0)
     assert p["sell_all"] == {"AAA": (3, 52.0)} and not p["buys"] and p["sold"] == {"AAA"}
+
+
+def test_sell_flag_off_holds_and_may_add():
+    # sell_flag <= 0.5: no sell-all, so the symbol is not "sold" and can be bought (added to)
+    p = tl.plan_orders(["AAA"], {"AAA": (2.0, 0.0, 1.0, 0.0, 0.2)}, {"AAA": 3.0}, DAY, 10_000.0)
+    assert not p["sell_all"] and not p["sold"] and p["buys"]["AAA"][0] == 2
+    # flag on: the sell-all is placed, and the symbol is not bought
+    p = tl.plan_orders(["AAA"], {"AAA": (2.0, 0.0, 1.0, 0.0, 0.9)}, {"AAA": 3.0}, DAY, 10_000.0)
+    assert p["sell_all"] == {"AAA": (3, 52.0)} and not p["buys"]
+
+
+def test_a_held_stop_protects_a_position_the_model_holds():
+    plan = tl.plan_orders(["AAA"], {"AAA": (0.0, 0.0, 1.0, 0.0, 0.0)}, {"AAA": 3.0}, DAY, 0.0)
+    port = {"cash": 0.0, "holdings": {"AAA": 3.0}, "stop_prices": {"AAA": 45.0}}
+    fill("AAA", port, plan, {"open": 46.0, "high": 47.0, "low": 40.0, "close": 41.0})
+    assert port["holdings"].get("AAA", 0.0) == 0.0            # no sell order: the stop fired
+
+
+def test_no_held_stop_on_a_day_the_symbol_is_added_to():
+    # production does not re-place a held stop beside an open buy (wash trade)
+    plan = tl.plan_orders(["AAA"], {"AAA": (2.0, 0.0, 1.0, 0.0, 0.0)}, {"AAA": 3.0}, DAY, 1000.0)
+    port = {"cash": 1000.0, "holdings": {"AAA": 3.0}, "stop_prices": {"AAA": 49.0}}
+    fill("AAA", port, plan, {"open": 48.5, "high": 49.5, "low": 47.0, "close": 48.0})
+    assert port["holdings"]["AAA"] == 3.0 + 2                  # the $49 stop did not fire
 
 
 def test_buys_are_sized_against_the_cash_at_the_close():
@@ -93,7 +119,9 @@ def test_the_planned_quantity_is_bought_even_when_the_fill_is_cheaper():
     plan = tl.plan_orders(["AAA"], {"AAA": (2.0, 0.0, 1.0, 0.0)}, {}, DAY, 1000.0)  # 2 @ $48
     port = {"cash": 1000.0, "holdings": {}, "stop_prices": {}}
     fill("AAA", port, plan, {"open": 30.0, "high": 31.0, "low": 29.0, "close": 30.0})
-    assert port["holdings"]["AAA"] == 2 and port["cash"] == pytest.approx(940.0)
+    # Filled at the open plus the paper-calibrated premium (fees.buy_fill_price), not at the $48 limit.
+    assert port["holdings"]["AAA"] == 2
+    assert port["cash"] == pytest.approx(1000.0 - 2 * 30.0 * (1 + OPEN_BUY_PREMIUM))
 
 
 def test_a_position_bought_today_is_not_sold_back_the_same_day():
@@ -157,16 +185,17 @@ def test_cpp_twin_plans_the_same_orders(tmp_path):
 int main() {
     float cash;
     while (scanf("%f", &cash) == 1) {
-        float out48[48], low[IND_SYMS], high[IND_SYMS], close[IND_SYMS], hold[IND_SYMS];
+        float sout[STOCK_OUT_N], low[IND_SYMS], high[IND_SYMS], close[IND_SYMS], hold[IND_SYMS];
         unsigned char valid[IND_SYMS];
         for (int j = 0; j < IND_SYMS; j++) {
             int v;
-            scanf("%d %f %f %f %f %f %f %f %f", &v, &low[j], &high[j], &close[j], &hold[j],
-                  &out48[4*j], &out48[4*j+1], &out48[4*j+2], &out48[4*j+3]);
+            float* o = sout + STOCK_OUT_PER_SYM * j;
+            scanf("%d %f %f %f %f %f %f %f %f %f", &v, &low[j], &high[j], &close[j], &hold[j],
+                  &o[0], &o[1], &o[2], &o[3], &o[4]);
             valid[j] = (unsigned char)v;
         }
         OrderPlan p;
-        plan_orders(out48, low, high, close, valid, hold, cash, p);
+        plan_orders(sout, low, high, close, valid, hold, cash, p);
         for (int j = 0; j < IND_SYMS; j++)
             printf("%.0f %.4f %.0f %.4f %.4f %d\n", p.sell_open[j], p.sell_lim[j], p.buy_q[j],
                    p.buy_lim[j], p.buy_stop[j], p.sold[j] ? 1 : 0);
@@ -188,7 +217,7 @@ int main() {
     res = subprocess.run([str(exe)], input="\n".join(lines) + "\n", capture_output=True,
                          text=True, check=True).stdout.split("\n")
 
-    n_buys = 0
+    n_buys = n_holds = 0
     for k, (day, hold, sug, cash) in enumerate(books):
         plan = tl.plan_orders(SYMS, sug, hold, day, cash)
         for j, s in enumerate(SYMS):
@@ -201,4 +230,6 @@ int main() {
             assert float(bs) == pytest.approx(stop, abs=0.0100001)   # float vs double near a half cent
             assert bool(int(sold)) == (s in plan["sold"])
             n_buys += q > 0
+            n_holds += hold.get(s, 0) >= 1 and sug[s][4] <= 0.5
     assert n_buys > 100, "the random books must exercise buys"
+    assert n_holds > 100, "the random books must exercise sell_flag holds"

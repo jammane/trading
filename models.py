@@ -60,6 +60,13 @@ def stock_close_pos(open_, high, low, close):
     return (4.0 * close - 2.0 * open_ - high - low) / (7.0 * rng)
 
 
+# StockNN's outputs per stock: buy_qty, buy_price_frac, sell_all_price_frac, sell_qty, sell_flag.
+# Mirrors STOCK_OUT_PER_SYM in training_v4.cpp and training_lib.STOCK_OUT_PER_SYM.
+STOCK_OUT_PER_SYM = 5
+STOCK_OUT_N = 12 * STOCK_OUT_PER_SYM
+STOCKNN_PARAMS = 930169
+
+
 class StockNN(nn.Module):
     """
     FC injection architecture — no LSTM.
@@ -84,13 +91,14 @@ class StockNN(nn.Module):
     Inject (×14):     (180+5i)+60     → FC → 125+5i  (grows 120→190)
     Today:            190+232=422     → FC → 300
     Flat:             300             → FC → 300  (×2)
-    Funnel:           300→237→174→111→48
+    Funnel:           300→237→174→111→60
 
-    Output (1,48) → reshape (12,4):
+    Output (1,60) → reshape (12,5)  (v0.9, BREAKING: was (12,4), 928,825 params; now 930,169):
       col 0: buy_qty              (ReLU)
       col 1: buy_price_frac       (Sigmoid, 0–1 in low-high range)
       col 2: sell_all_price_frac  (Sigmoid, 0–1 in low-high range)
       col 3: sell_qty             (ReLU)
+      col 4: sell_flag            (Sigmoid; > 0.5 places the sell-all limit, else the model holds)
     """
 
     def __init__(self):
@@ -105,7 +113,7 @@ class StockNN(nn.Module):
         self.fc_fc1    = nn.Linear(300, 237)
         self.fc_fc2    = nn.Linear(237, 174)
         self.fc_fc3    = nn.Linear(174, 111)
-        self.fc_out    = nn.Linear(111,  48)
+        self.fc_out    = nn.Linear(111,  STOCK_OUT_N)
 
     def forward(self, history, today):
         x = F.relu(self.fc_seed(history[:, 0, :]))
@@ -117,12 +125,14 @@ class StockNN(nn.Module):
         x   = F.relu(self.fc_fc1(x))
         x   = F.relu(self.fc_fc2(x))
         x   = F.relu(self.fc_fc3(x))
-        out = self.fc_out(x).view(12, 4)
+        out = self.fc_out(x).view(12, STOCK_OUT_PER_SYM)
         qty_buy   = F.relu(out[:, 0:1])
         price_buy = torch.sigmoid(out[:, 1:2])
         price_sal = torch.sigmoid(out[:, 2:3])
         qty_sell  = F.relu(out[:, 3:4])
-        return torch.cat([qty_buy, price_buy, price_sal, qty_sell], dim=1).view(1, 48)
+        sell_flag = torch.sigmoid(out[:, 4:5])
+        return torch.cat([qty_buy, price_buy, price_sal, qty_sell, sell_flag],
+                         dim=1).view(1, STOCK_OUT_N)
 
 
 class MasterNN(nn.Module):
@@ -265,8 +275,9 @@ class MT1CNet(nn.Module):
                            close_pos, close_vs_wap, (H-L)/A                     3
                            holdings                                             1
                            buy_qty, buy_price_frac, sell_all_price_frac, sell_qty  4
+                           sell_flag (StockNN's 5th output)                     1
         per industry       cash, book value                                     2
-                                                                        total = 146
+                                                                        total = 158
 
     Volume is deliberately excluded: without history there is no norm to read it against, so 1M
     shares carries no information about whether that is high or low for the symbol.
@@ -280,8 +291,8 @@ class MT1CNet(nn.Module):
     """
 
     N_SYMS = 12
-    PER_SYM = 12
-    N_IN = N_SYMS * PER_SYM + 2          # 146
+    PER_SYM = 13
+    N_IN = N_SYMS * PER_SYM + 2          # 158
 
     def __init__(self):
         super().__init__()

@@ -10,9 +10,9 @@ Each prediction is in the entry's own units, as in `race_daily.csv`. Only their 
 12 industries matters to a vote, and the race ranked the raw outputs, so they are not rescaled.
 
   MT1      MT1Net, 74 trailing features -> 1 (ReLU; raw logit)
-  MT1C     MT1CNet, cfeat146 -> 64 -> 24 -> 8 -> 1 (leaky ReLU; raw)
-  MT1S     one 14 -> 16 -> 8 -> 1 encoder applied to each of the 12 symbols, summed (raw)
-  MT1P     MT1S-stk: one 18 -> 16 -> 8 -> 1 net per stock, summed. The evo entry sums
+  MT1C     MT1CNet, cfeat146 (158 wide) -> 64 -> 24 -> 8 -> 1 (leaky ReLU; raw)
+  MT1S     one 15 -> 16 -> 8 -> 1 encoder applied to each of the 12 symbols, summed (raw)
+  MT1P     MT1S-stk: one 20 -> 16 -> 8 -> 1 net per stock, summed. The evo entry sums
            tanh(out) x MT1_PRED_SCALE per stock on ratio inputs; the grad entry sums raw outputs
            on raw share counts -- the units each was trained in.
   TANH32   MT1Backprop, cfeat146 -> 32 -> 8 -> 1 (tanh hidden; linear output)
@@ -24,11 +24,12 @@ import numpy as np
 LEAK = np.float32(0.1)                 # MT1_LEAK
 PRED_SCALE = np.float32(10000.0)       # MT1_PRED_SCALE
 N_SYMS = 12
-PER_SYM = 12                           # MT1C_PER_SYM
-C_IN = N_SYMS * PER_SYM + 2            # 146
-CN_CASH, CN_BOOK = 144, 145
-S_IN = PER_SYM + 2                     # MT1S_PER_SYM, 14
-P_IN = PER_SYM + 2 + 4                 # MT1P_IN, 18
+PER_SYM = 13                           # MT1C_PER_SYM (12 until StockNN's sell_flag, v0.9)
+C_IN = N_SYMS * PER_SYM + 2            # 158 (the name cfeat146 in this module is historical)
+CN_CASH, CN_BOOK = 156, 157
+CN_SFLAG = 12                          # per-symbol offset of StockNN's sell_flag
+S_IN = PER_SYM + 2                     # MT1S_PER_SYM, 15
+P_IN = PER_SYM + 2 + 5                 # MT1P_IN, 20
 
 # entry name (as in race_daily.csv) -> architecture. The ALLOC bayes lines are not networks.
 ARCH = {
@@ -72,7 +73,7 @@ _T32, TANH32_PARAMS = _layers([(32, C_IN), (8, 32), (1, 8)])
 PARAMS = {"MT1": MT1_PARAMS, "MT1C": MT1C_PARAMS, "MT1S": MT1S_PARAMS,
           "MT1P": N_SYMS * MT1P_PARAMS, "TANH32": TANH32_PARAMS}
 assert (MT1_PARAMS, MT1C_PARAMS, MT1S_PARAMS, MT1P_PARAMS, TANH32_PARAMS) == \
-    (3501, 11177, 385, 449, 4977)
+    (3501, 11945, 401, 481, 5361)
 
 
 def _dense(W, layer, x):
@@ -127,7 +128,7 @@ def mt1s_forward(W, in146):
 
 
 def mt1p_forward(W, slices18, evo):
-    """slices18 [12, 18] (mt1p_slices). W holds the twelve stock nets back to back."""
+    """slices18 [12, 20] (mt1p_slices). W holds the twelve stock nets back to back."""
     total = np.float32(0)
     for j, s in enumerate(slices18):
         Wj = W[j * MT1P_PARAMS:(j + 1) * MT1P_PARAMS]
@@ -152,11 +153,11 @@ def whole_shares(q):
 
 
 def build_cfeat146(o, h, lo, c, valid, hold, cash, intent, book_base=IND_STARTING_CASH):
-    """MT1C's 146 inputs for one industry at today's close (build_mt1c_input_for).
+    """MT1C's 158 inputs for one industry at today's close (build_mt1c_input_for).
 
     o, h, l, c, valid: today's bars for the 12 symbols. hold: shares held (the book BEFORE
-    today's orders); cash: the industry's cash. intent: [12, 4] StockNN output for the deployed
-    model, columns buy_qty, buy_price_frac, sell_all_price_frac, sell_qty.
+    today's orders); cash: the industry's cash. intent: [12, 5] StockNN output for the deployed
+    model, columns buy_qty, buy_price_frac, sell_all_price_frac, sell_qty, sell_flag.
 
     Every feature is scale-free except CN_BOOK, which the trainer reads as book / $25,000 -- the
     simulated industry's starting cash. `book_base` is the paper industry's own starting capital,
@@ -179,7 +180,7 @@ def build_cfeat146(o, h, lo, c, valid, hold, cash, intent, book_base=IND_STARTIN
     for j in range(N_SYMS):
         f = j * PER_SYM
         ok = bool(valid[j]) and h[j] > lo[j] and c[j] > 1e-6
-        bq, bf, sf, sq = (intent[j][k] for k in range(4))
+        bq, bf, sf, sq, fl = (intent[j][k] for k in range(5))
         if ok:
             A = (2 * o[j] + 3 * c[j] + h[j] + lo[j]) / 7
             out[f:f + 7] = (o[j] / c[j], h[j] / c[j], lo[j] / c[j], c[j] / mean_close,
@@ -196,14 +197,15 @@ def build_cfeat146(o, h, lo, c, valid, hold, cash, intent, book_base=IND_STARTIN
         out[f + 11] = clamp(whole_shares(min(fin(sq), pos)) / pos, 0.0, 1.0) if pos > 1e-9 else 0.0
         out[f + 9] = clamp(fin(bf, 0.5), 0.0, 1.0)
         out[f + 10] = clamp(fin(sf, 0.5), 0.0, 1.0)
+        out[f + CN_SFLAG] = clamp(fin(fl, 0.5), 0.0, 1.0)
     out[CN_CASH] = clamp(fin(cash) / bk, 0.0, 1.0)
     out[CN_BOOK] = fin(book) / book_base
     return out
 
 
-def mt1p_slices(in146, close, valid, cash, hold, bqty, bfrac, sfrac, sqty, raw):
-    """[12, 18] MT1S-stk inputs for one order set (build_mt1p_slices in training_v4.cpp): the
-    MT1S slice, then that stock's four StockNN outputs. `raw` keeps share counts as StockNN
+def mt1p_slices(in146, close, valid, cash, hold, bqty, bfrac, sfrac, sqty, sflag, raw):
+    """[12, 20] MT1S-stk inputs for one order set (build_mt1p_slices in training_v4.cpp): the
+    MT1S slice, then that stock's five StockNN outputs. `raw` keeps share counts as StockNN
     emitted them (the grad entry); otherwise quantities are ratios to what could be bought or is
     held (the evo entry). A symbol without a valid bar reads as no order."""
     out = np.zeros((N_SYMS, P_IN), np.float32)
@@ -217,12 +219,13 @@ def mt1p_slices(in146, close, valid, cash, hold, bqty, bfrac, sfrac, sqty, raw):
         sq = max(0.0, fin(sqty[j])) if ok else 0.0
         bf = fin(bfrac[j], 0.5) if ok else 0.5
         sf = fin(sfrac[j], 0.5) if ok else 0.5
+        fl = fin(sflag[j], 0.5) if ok else 0.5
         if not raw:
             afford = fin(cash) / close[j] if ok else 0.0
             held = fin(hold[j])
             bq = bq / afford if afford > 1e-9 else 0.0
             sq = sq / held if held > 1e-9 else 0.0
-        out[j, S_IN:] = (bq, bf, sf, sq)
+        out[j, S_IN:] = (bq, bf, sf, sq, fl)
     return out
 
 

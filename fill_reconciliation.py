@@ -34,7 +34,7 @@ import os
 import sys
 from collections import defaultdict
 
-SLIPPAGE_RATE = 0.001          # must mirror training_v4.cpp / training_lib.py
+from fees import OPEN_BUY_PREMIUM  # the trainer's fill model (training_v4.cpp buy_fill_price)
 STOCK_DATA_DIR = 'stock_data'
 
 
@@ -59,14 +59,14 @@ def simulate(side, limit, bar):
         return True, o, 'market@open'
     if side == 'buy':
         if o <= limit:
-            return True, o, 'gap@open'
+            return True, min(o * (1.0 + OPEN_BUY_PREMIUM), limit), 'gap@open'
         if low < limit < h:
-            return True, limit * (1.0 + SLIPPAGE_RATE), 'touch@limit'
+            return True, limit, 'touch@limit'
         return False, None, 'no-touch'
     if o >= limit:
         return True, o, 'gap@open'
     if low < limit < h:
-        return True, limit * (1.0 - SLIPPAGE_RATE), 'touch@limit'
+        return True, limit, 'touch@limit'
     return False, None, 'no-touch'
 
 
@@ -172,7 +172,8 @@ def main():
         n = len(errs)
         print(f'   n={n}  mean={1e4*sum(errs)/n:+.1f} bp  median={1e4*errs[n//2]:+.1f} bp'
               f'  p10={1e4*errs[n//10]:+.1f}  p90={1e4*errs[9*n//10]:+.1f}')
-        print(f'   (simulator applies a flat {1e4*SLIPPAGE_RATE:.0f} bp; positive = we paid worse)')
+        print(f'   (simulator: limits at the limit, open buys at open +{1e4*OPEN_BUY_PREMIUM:.0f} bp; '
+              'positive = we paid worse)')
     else:
         print('   no filled orders with a comparable simulated price yet')
 
