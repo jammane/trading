@@ -3,7 +3,7 @@
 // Run:   ./build/training_v4_cpp --output models [--load-dir DIR] [--start-day N] [--stop-day N]
 //        [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F] [--workers N]
 
-#define TRAINER_VERSION "0.9.0.10"
+#define TRAINER_VERSION "0.9.0.16"
 
 #include <algorithm>
 #include <atomic>
@@ -894,6 +894,25 @@ static int g_jn_gate[N_IND];
 // would is bulked by the pct that lands exactly on the cap. Children of one parent start at the
 // same size; parents of different sizes give children of different sizes. 0 = not measured.
 static constexpr double JN_BULK_CAP = 3.0;
+// JN StockNN safety nets: candidates scored every day beside the 200 working nets, selectable as
+// elites (a selected one is copied into an elite slot and breeds the next day's children), but
+// never mutated, culled or saved with the pool themselves. They live in extra pool slots past
+// N_SLOTS (jn_set_persist keeps them out of the pool files):
+//   CHAMPIONS  slots 200..219: the 20 elites the pass was seeded from, before bulking -- a
+//              static list for the whole pass, so a pass can always fall back on its seed
+//   HISTORY    slots 220..269: the top JN_HIST_PER_DAY elites of each of the last JN_HIST_DAYS
+//              days, a ring, the JN form of flat StockNN's 5-day elite history
+// Neither is used for --upkeep (JN is refused there). History resets at each pass start.
+static constexpr int JN_CHAMP_N      = ELITE_POOL;
+static constexpr int JN_HIST_DAYS    = HIST_DAYS;
+static constexpr int JN_HIST_PER_DAY = HIST_PER_DAY;
+static constexpr int JN_CHAMP_BASE   = N_SLOTS;
+static constexpr int JN_HIST_BASE    = N_SLOTS + JN_CHAMP_N;
+static constexpr int JN_POOL_SLOTS   = JN_HIST_BASE + JN_HIST_DAYS * JN_HIST_PER_DAY;
+static constexpr int JN_CAND_MAX     = JN_CHAMP_N + JN_HIST_DAYS * JN_HIST_PER_DAY;
+static_assert(JN_HIST_PER_DAY <= ELITE_POOL, "history takes the top elites of a day");
+static int g_jn_champ_n[N_IND];        // champions held (0 until a pass is seeded from elites)
+static int g_jn_hist_head[N_IND], g_jn_hist_count[N_IND];
 // A JN race pool (200 slots under the MT1 lifecycle) keeps its top 20 by rank when bulked, the
 // same count as StockNN's elites; 180 children, MUTATIONS_PER_PARENT (9) per parent.
 static constexpr int JN_RACE_KEEP = 20;
@@ -1399,6 +1418,15 @@ struct MT1PoolScratch {
     JNPool*     jn{nullptr};
     int         jn_gate{-1};                // warm-in gate (g_jn_gate); -1 = read at first step
     double      jn_start_nodes{0.0};        // pool mean nodes at the pass start (bulking)
+    // JN champions (race pools): the pool's top JN_CHAMP_N at the pass start, before bulking, in
+    // slots MT1_POOL_SLOTS.. of the JNPool. Scored every day into their own registers, never
+    // culled or mutated; a mature one that would rank among the parents is copied back into the
+    // pool (jn_champ_reenter). champ_of[s] = k+1 while slot s holds a copy of champion k.
+    int         jn_champ_n{0};
+    MT1SlotMeta champ_meta[JN_CHAMP_N]{};
+    float       champ_pending[JN_CHAMP_N]{};
+    int8_t      champ_of[MT1_POOL_SLOTS]{};
+    int         champ_back{0};              // champions copied back in this pass (logged)
     float*      mut_buf{nullptr};           // one model, breeding scratch
     MT1SlotMeta meta[MT1_POOL_SLOTS]{};
     int         best_slot{0};               // deployed model; ranked in place, never shuffled
@@ -1972,6 +2000,9 @@ struct IndResult {
         float stopped_q, stopped_px, bought_q, bought_px;
         int   low_first;
     } sim[IND_SYMS];
+    // Hard-floor reset only: the money put in to restore the book to IND_STARTING_CASH. The
+    // champion judge charges it as a loss (PassJudge::add_reset); everything else ignores it.
+    float topup = 0.f;
 };
 
 struct MasterResult {
@@ -2204,12 +2235,14 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     bool jn_warming = false;
     if (jp) {
         if (g_jn_gate[ind_i] < 0) {
-            const JNStats js0 = jn_stats(jp);
-            g_jn_gate[ind_i] = std::max(JN_WARM_FLOOR, js0.warm_max);
-            g_jn_start_nodes[ind_i] = js0.nodes_mean;
+            // Size over the working pool; warmup over it AND the champions, which must be warm
+            // before they are judged (history slots are copies of working nets).
+            const JNStats js0 = jn_stats_n(jp, N_SLOTS + g_jn_champ_n[ind_i]);
+            g_jn_gate[ind_i] = std::min(JN_RING_CAP - 1, std::max(JN_WARM_FLOOR, js0.warm_max));
+            g_jn_start_nodes[ind_i] = jn_stats_n(jp, N_SLOTS).nodes_mean;
             log_msg(std::string("[") + IND_SHORT[ind_i] + "]   JN warm-in: selection starts once " +
                     std::to_string(g_jn_gate[ind_i] + 1) + " days of history are held (pool warmup max " +
-                    std::to_string(jn_stats(jp).warm_max) + ", floor " +
+                    std::to_string(js0.warm_max) + ", floor " +
                     std::to_string(JN_WARM_FLOOR) + ")");
         }
         jn_warming = jn_ring_len(jp) <= g_jn_gate[ind_i];
@@ -2516,22 +2549,32 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     }
 
     // ── Score history models ─────────────────────────────────────────────────
-    Portfolio hist_ports[HIST_DAYS * HIST_PER_DAY] = {};
-    float hist_scores[HIST_DAYS * HIST_PER_DAY] = {};
-    int n_hist = scratch.hist_count * HIST_PER_DAY;
+    // Candidates beside the 200: flat StockNN's 5-day history, or under --jn-stocknn the
+    // champions and the JN history (pool slots cand_slot[h]; see JN_CHAMP_BASE).
+    constexpr int CAND_CAP = std::max(HIST_DAYS * HIST_PER_DAY, JN_CAND_MAX);
+    Portfolio hist_ports[CAND_CAP] = {};
+    float hist_scores[CAND_CAP] = {};
+    int cand_slot[CAND_CAP] = {};
+    int n_hist = jp ? 0 : scratch.hist_count * HIST_PER_DAY;
+    if (jp && !freeze) {
+        for (int k = 0; k < g_jn_champ_n[ind_i]; k++) cand_slot[n_hist++] = JN_CHAMP_BASE + k;
+        for (int d = 0; d < g_jn_hist_count[ind_i]; d++)
+            for (int j = 0; j < JN_HIST_PER_DAY; j++)
+                cand_slot[n_hist++] = JN_HIST_BASE + d * JN_HIST_PER_DAY + j;
+    }
     // Score one arbitrary weight vector against TODAY's reference portfolio and return the
     // resulting portfolio value. Lifted out of the history loop unchanged so the control sampler
     // can reuse it verbatim: this body IS the fill simulation, and a third hand-copy of it is
     // exactly how two sides of a calculation drift apart in this codebase.
-    auto score_weights = [&](const float* W, Portfolio& port) -> float {
+    // score_plan fills one set of StockNN outputs; score_weights runs a flat net first.
+    auto score_plan = [&](const float* so, Portfolio& port) -> float {
         port.cash = ref_cash;
         for (int j = 0; j < IND_SYMS; j++) {
             port.holdings[j]    = ref_hold[j];
             port.stop_prices[j] = ref_stop[j];
         }
-        stock_forward(W, history_arr, today_arr, sout);
         OrderPlan hp;
-        plan_orders(sout, d_low, d_high, d_close, d_valid, ref_hold, ref_cash, hp);
+        plan_orders(so, d_low, d_high, d_close, d_valid, ref_hold, ref_cash, hp);
         float local_buy = 0.f, local_sell = 0.f;
         // ── Phase 1: sells at open, gap sell_all, high-first sell_all, stops, buys ─
         // The same rules as the slot loop above, filling the same plan.
@@ -2610,9 +2653,23 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         return compute_value_ind(port, day_sym, fill_sym);
     };
 
-    for (int h = 0; h < n_hist; h++)
-        hist_scores[h] = score_weights(scratch.hist(h / HIST_PER_DAY, h % HIST_PER_DAY),
-                                       hist_ports[h]);
+    auto score_weights = [&](const float* W, Portfolio& port) -> float {
+        stock_forward(W, history_arr, today_arr, sout);
+        return score_plan(sout, port);
+    };
+
+    if (jp) {
+        float cso[STOCK_OUT_N];
+        for (int h = 0; h < n_hist; h++) {
+            jn_forward(jp, cand_slot[h], cso);   // a cold candidate is all zeros: it holds
+            jn_stock_outputs(cso);
+            hist_scores[h] = score_plan(cso, hist_ports[h]);
+        }
+    } else {
+        for (int h = 0; h < n_hist; h++)
+            hist_scores[h] = score_weights(scratch.hist(h / HIST_PER_DAY, h % HIST_PER_DAY),
+                                           hist_ports[h]);
+    }
 
     // ── Score, flags, floor check ────────────────────────────────────────────
     float best_score  = *std::max_element(slot_scores, slot_scores + N_SLOTS);
@@ -2668,6 +2725,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         r.book_base      = g_book_base[ind_i];
         r.baseline       = baseline;
         r.slot0_score    = baseline;
+        r.topup          = IND_STARTING_CASH - baseline;   // charged as a loss by the judge
         r.new_streak     = 0;
         r.elite_max_val  = IND_STARTING_CASH;
         r.elite_min_val  = IND_STARTING_CASH;
@@ -2761,15 +2819,40 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             // elites. Survivors are current slots only (the history ring is off in JN mode).
             std::sort(surviving.begin(), surviving.end(),
                       [](const auto& a, const auto& b){ return a.first > b.first; });
-            const int n_top = std::min((int)surviving.size(), ELITE_POOL);
-            int src[ELITE_POOL];
-            for (int k = 0; k < ELITE_POOL; k++) src[k] = surviving[k < n_top ? k : 0].second;
-            Portfolio new_ports[ELITE_POOL];
-            for (int k = 0; k < ELITE_POOL; k++) {
-                new_ports[k] = state.portfolios[src[k]];
-                next_idle[k] = trade_count[src[k]] ? 0.f : 1.f;
+            // Distinct nets only: a champion or history candidate is often the very net that
+            // also sits in a working elite slot (yesterday's elites ARE today's slots 0..19), and
+            // the two score identically. Without this the elite list fills with clones.
+            int src[ELITE_POOL], pool_src[ELITE_POOL];
+            int n_top = 0;
+            {
+                uint64_t taken[ELITE_POOL];
+                for (size_t q = 0; q < surviving.size() && n_top < ELITE_POOL; q++) {
+                    const int sl = surviving[q].second;
+                    const uint64_t id = jn_id(jp, sl < N_SLOTS ? sl : cand_slot[sl - N_SLOTS]);
+                    bool dup = false;
+                    for (int t = 0; t < n_top && !dup; t++) dup = taken[t] == id;
+                    if (dup) continue;
+                    taken[n_top] = id;
+                    src[n_top++] = sl;
+                }
+                for (int k = n_top; k < ELITE_POOL; k++) src[k] = src[0];   // fewer distinct: repeat the best
             }
-            jn_permute(jp, src, ELITE_POOL);
+            Portfolio new_ports[ELITE_POOL];
+            int n_from_champ = 0, n_from_hist = 0;
+            for (int k = 0; k < ELITE_POOL; k++) {
+                if (src[k] < N_SLOTS) {
+                    pool_src[k]  = src[k];
+                    new_ports[k] = state.portfolios[src[k]];
+                    next_idle[k] = trade_count[src[k]] ? 0.f : 1.f;
+                } else {   // a champion or history candidate: copied in, counts as traded
+                    const int h = src[k] - N_SLOTS;
+                    pool_src[k]  = cand_slot[h];
+                    new_ports[k] = hist_ports[h];
+                    next_idle[k] = 0.f;
+                    (cand_slot[h] < JN_HIST_BASE ? n_from_champ : n_from_hist)++;
+                }
+            }
+            jn_permute(jp, pool_src, ELITE_POOL);
             for (int k = 0; k < ELITE_POOL; k++) state.portfolios[k] = new_ports[k];
             for (int mut_i = 0; mut_i < N_SLOTS - ELITE_POOL; mut_i++) {
                 const int child = ELITE_POOL + mut_i, parent = mut_i / MUTATIONS_PER_PARENT;
@@ -2777,18 +2860,34 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                           mix_seed(mut_seeds[mut_i] ^ 0x4A4E5F4D555441ULL));   // "JN_MUTA"
                 state.portfolios[child] = state.portfolios[parent];
             }
+            // Today's top elites join the history ring, overwriting its oldest day.
+            {
+                int& head = g_jn_hist_head[ind_i];
+                for (int j = 0; j < JN_HIST_PER_DAY; j++)
+                    jn_copy(jp, j, JN_HIST_BASE + head * JN_HIST_PER_DAY + j);
+                head = (head + 1) % JN_HIST_DAYS;
+                g_jn_hist_count[ind_i] = std::min(g_jn_hist_count[ind_i] + 1, JN_HIST_DAYS);
+            }
             std::string disp;
             for (int k = 0; k < std::min(n_top, 5); k++) {
                 const int sl = src[k];
                 if (k > 0) disp += ",";
+                if (sl >= N_SLOTS) {
+                    const int ps = cand_slot[sl - N_SLOTS];
+                    disp += ps < JN_HIST_BASE ? "c" + std::to_string(ps - JN_CHAMP_BASE)
+                                              : "h" + std::to_string(ps - JN_HIST_BASE);
+                    continue;
+                }
                 disp += sl < ELITE_POOL ? std::to_string(sl) + ".0"
                       : std::to_string((sl - ELITE_POOL) / MUTATIONS_PER_PARENT) + "." +
                         std::to_string((sl - ELITE_POOL) % MUTATIONS_PER_PARENT + 1);
             }
-            const JNStats js = jn_stats(jp);
-            char jl[200];
-            snprintf(jl, sizeof(jl), " | jn nodes %.0f (max %d) warm %.1f (max %d) cold %d",
-                     js.nodes_mean, js.nodes_max, js.warm_mean, js.warm_max, jn_cold);
+            const JNStats js = jn_stats_n(jp, N_SLOTS);
+            char jl[240];
+            snprintf(jl, sizeof(jl), " | jn nodes %.0f (max %d) warm %.1f (max %d) cold %d"
+                     " | safety nets: %d champ + %d hist scored, %d+%d chosen",
+                     js.nodes_mean, js.nodes_max, js.warm_mean, js.warm_max, jn_cold,
+                     g_jn_champ_n[ind_i], n_hist - g_jn_champ_n[ind_i], n_from_champ, n_from_hist);
             log_msg(std::string("[") + IND_SHORT[ind_i] + "]   Selection done | elite=[" + disp +
                     "] | top=$" + std::to_string((int)surviving[0].first) + jl);
         } else if (!surviving.empty()) {
@@ -3348,6 +3447,27 @@ static bool mt1_is_barred(const MT1PoolScratch& sc, uint32_t lineage) {
 // previous session's close to this one — the thing yesterday's prediction was a prediction OF.
 // `have_actual` is false only on the first day of a pass, before any outcome exists.
 
+// A second-level JN pool's warm-in gate (the race entries: JN evo, JN evo bt4, JN list dec/inc),
+// read once per pass at its first step. It is the larger of its own (the pool's largest warmup,
+// never under JN_WARM_FLOOR) and, under --jn-stocknn, the LARGEST StockNN gate over all twelve
+// industries: these nets learn from what StockNN does, so none is judged before every industry's
+// StockNN has begun selecting. Never above JN_RING_CAP - 1, the deepest the ring can hold -- a
+// gate past it would keep the pool warming in forever. Logged once per pass.
+static void jn_race_read_gate(MT1PoolScratch& sc) {
+    const JNStats js0 = jn_stats(sc.jn);
+    int stock_max = 0;
+    if (g_jn_stocknn)
+        for (int i = 0; i < N_IND; i++) stock_max = std::max(stock_max, g_jn_gate[i]);
+    sc.jn_gate = std::min(JN_RING_CAP - 1,
+                          std::max(std::max(JN_WARM_FLOOR, js0.warm_max), stock_max));
+    sc.jn_start_nodes = jn_stats_n(sc.jn, MT1_POOL_SLOTS).nodes_mean;
+    static std::atomic<int> logged_pass{-1};
+    if (logged_pass.exchange(g_cur_pass) != g_cur_pass)
+        log_msg("JN race warm-in: floor " + std::to_string(stock_max) +
+                " (largest StockNN gate); first pool read gate " + std::to_string(sc.jn_gate) +
+                " (own warmup max " + std::to_string(js0.warm_max) + ")");
+}
+
 // The pool lifecycle's selection step, shared by every evolutionary race pool: rank, cull the
 // worst mature models (never the deployed one), breed replacements from the unbarred elite.
 static void mt1_pool_evolve(int ind_i, MT1PoolScratch& sc, MT1DayResult& r, int actual_day,
@@ -3370,7 +3490,30 @@ static void mt1_pool_evolve(int ind_i, MT1PoolScratch& sc, MT1DayResult& r, int 
             if (!mt1_is_barred(sc, sc.meta[order[k]].lineage)) parents[n_par++] = order[k];
         if (n_par == 0) parents[n_par++] = order[0];
 
-        for (int c = 0; c < n_cull; c++) {
+        // JN champions: a mature champion whose register would rank it among today's parents,
+        // and with no copy of it in the pool, is copied back in, register and all, into the
+        // slot the cull would have emptied first. It breeds from tomorrow, like any parent.
+        int c0 = 0;
+        if (sc.jn && sc.jn_champ_n > 0) {
+            const MT1SlotMeta& bar = sc.meta[parents[n_par - 1]];
+            bool live[JN_CHAMP_N] = {};
+            for (int s2 = 0; s2 < MT1_POOL_SLOTS; s2++)
+                if (sc.champ_of[s2] > 0) live[sc.champ_of[s2] - 1] = true;
+            for (int k = 0; k < sc.jn_champ_n && c0 < n_cull; k++) {
+                if (live[k] || !mt1_slot_mature(sc.champ_meta[k])) continue;
+                if (!mt1_slot_better(sc.champ_meta[k], bar)) continue;
+                const int victim = order[n_mature - 1 - c0];
+                if (victim == sc.best_slot) break;
+                jn_copy(sc.jn, MT1_POOL_SLOTS + k, victim);
+                sc.meta[victim] = sc.champ_meta[k];
+                sc.champ_of[victim] = (int8_t)(k + 1);
+                c0++;
+                r.births++;
+                sc.champ_back++;
+            }
+        }
+
+        for (int c = c0; c < n_cull; c++) {
             const int victim = order[n_mature - 1 - c];
             if (victim == sc.best_slot) continue;
             const int par = parents[c % n_par];
@@ -3381,6 +3524,7 @@ static void mt1_pool_evolve(int ind_i, MT1PoolScratch& sc, MT1DayResult& r, int 
             if (sc.jn) jn_mutate(sc.jn, par, victim, (uint64_t)actual_day, seed);
             else       mt1_mutate(sc.slot(par), sc.slot(victim), sc.n_params, sigma, seed);
             mt1_slot_init(sc.meta[victim], sc.meta[par].lineage);
+            sc.champ_of[victim] = 0;
             sc.retire_n++;
             sc.retire_age_sum += age;
             sc.retire_hist[mt1_life_bucket(age)]++;
@@ -3416,11 +3560,7 @@ static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in,
     // warmup, the pool predicts but nothing is scored, so nothing matures, culls or breeds.
     bool jn_warming = false;
     if (sc.jn) {
-        if (sc.jn_gate < 0) {
-            const JNStats js0 = jn_stats(sc.jn);
-            sc.jn_gate = std::max(JN_WARM_FLOOR, js0.warm_max);
-            sc.jn_start_nodes = js0.nodes_mean;
-        }
+        if (sc.jn_gate < 0) jn_race_read_gate(sc);
         jn_warming = jn_ring_len(sc.jn) <= sc.jn_gate;
     }
     for (int s = 0; s < MT1_POOL_SLOTS; s++) {
@@ -3429,6 +3569,10 @@ static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in,
             sc.pending[s] = mt1_pred(o * JN_RACE_OUT_SCALE);
         }
         else       sc.pending[s] = mt1_pred(fwd(sc.slot(s), in, 0.f));
+    }
+    for (int k = 0; k < sc.jn_champ_n; k++) {
+        float o = 0.f; jn_forward(sc.jn, MT1_POOL_SLOTS + k, &o);
+        sc.champ_pending[k] = mt1_pred(o * JN_RACE_OUT_SCALE);
     }
     sc.has_pending = true;
     sc.pending_day = actual_day;
@@ -3460,6 +3604,10 @@ static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in,
         r.score_mean = (float)(sum / MT1_POOL_SLOTS);
         r.score_best = best;
         r.score_min  = worst;
+        for (int k = 0; k < sc.jn_champ_n; k++)
+            mt1_slot_record(sc.champ_meta[k],
+                            (tau >= 0.f) ? mt1_score_q(actual, sc.champ_pending[k], base, fl, tau)
+                                         : mt1_score(actual, sc.champ_pending[k], base, fl));
         sc.has_pending = false;
         sc.push_actual(actual, actual_day);
     }
@@ -3477,11 +3625,7 @@ static MT1DayResult jnl_step_day(MT1PoolScratch& sc, const float* real12, bool h
                                  int actual_day, uint64_t salt, float* dep12) {
     MT1DayResult r{};
     bool warming = false;
-    if (sc.jn_gate < 0) {
-        const JNStats js0 = jn_stats(sc.jn);
-        sc.jn_gate = std::max(JN_WARM_FLOOR, js0.warm_max);
-        sc.jn_start_nodes = js0.nodes_mean;
-    }
+    if (sc.jn_gate < 0) jn_race_read_gate(sc);
     warming = jn_ring_len(sc.jn) <= sc.jn_gate;
     static thread_local float outs[MT1_POOL_SLOTS][N_IND];
     for (int s = 0; s < MT1_POOL_SLOTS; s++)
@@ -3495,6 +3639,12 @@ static MT1DayResult jnl_step_day(MT1PoolScratch& sc, const float* real12, bool h
             mt1_slot_record(sc.meta[s], v);
             sum += v; best = std::max(best, v); worst = std::min(worst, v);
             if (s == sc.best_slot) r.score0 = v;
+        }
+        float co[N_IND];
+        for (int k = 0; k < sc.jn_champ_n; k++) {
+            if (!jn_forward(sc.jn, MT1_POOL_SLOTS + k, co))
+                for (int i = 0; i < N_IND; i++) co[i] = 0.f;
+            mt1_slot_record(sc.champ_meta[k], jnl_composite(jnl_score(co, real12, N_IND, top)));
         }
         r.scored = true;
         r.score_mean = (float)(sum / MT1_POOL_SLOTS);
@@ -4238,6 +4388,10 @@ static void pass_boundary(const std::string& out_dir, int pass_num,
         const bool  have = judge[i].have();
         const float chal_pct = have ? (float)judge[i].score() : 0.f;
         char msg[320];
+        snprintf(msg, sizeof(msg), "   judge: p%d %+.2f bp/day; resets %d, %d in the last 2 years "
+                 "charged $%.0f of top-up as loss", pass_num, chal_pct * 1e4f, judge[i].resets,
+                 judge[i].resets_recent, judge[i].topup_recent);
+        log_msg(std::string("[") + IND_SHORT[i] + "]" + msg);
 
         if (!copy_elites(out_dir, stage_dir, ind, pass_num)) {
             log_msg(std::string("[") + IND_SHORT[i] +
@@ -4386,6 +4540,10 @@ static bool jn_seed_from_elites(int ind_i, const std::string& dir, uint64_t gene
                     champ_elite_path(dir, ind, k) + " -- pool partly reseeded");
             return false;
         }
+    // The pass's champions: these 20 elites as loaded, before any bulking -- a static candidate
+    // list for the whole pass (JN_CHAMP_BASE).
+    for (int k = 0; k < JN_CHAMP_N; k++) jn_copy(p, k, JN_CHAMP_BASE + k);
+    g_jn_champ_n[ind_i] = JN_CHAMP_N;
     const uint64_t salt = jn_fresh_seed(0x4A4E5345ULL + (uint64_t)ind_i);   // "JNSE"
     double start_nodes = 0.0, end_nodes = 0.0;
     jn_read_size(dir, ind, start_nodes, end_nodes);
@@ -4646,6 +4804,9 @@ static void save_mt1_pool(const std::string& dir, int ind_i, const MT1PoolScratc
             fprintf(sf, "%.3f %.3f\n", sc.jn_start_nodes, en / JN_RACE_KEEP);
             fclose(sf);
         }
+        if (sc.jn_champ_n > 0)
+            log_msg(std::string(tag) + " " + pool_ind_name(ind_i) + ": champions copied back into "
+                    "the pool this pass: " + std::to_string(sc.champ_back));
     } else {
         for (int s = 0; s < MT1_POOL_SLOTS; s++)
             save_bin(mt1_pool_path(dir, ind_i, s, tag), sc.slot(s), sc.n_params);
@@ -4755,6 +4916,7 @@ static void jn_bulk_race_pool(const std::string& from, int ind_i, MT1PoolScratch
         jn_bulk(sc.jn, keep[k], s, par_pct[k], 0,
                 mix_seed(salt ^ 0x42554C4BULL ^ ((uint64_t)ind_i << 32) ^ (uint64_t)s));
         mt1_slot_init(sc.meta[s], sc.meta[keep[k]].lineage);
+        sc.champ_of[s] = 0;
         child_n += jn_slot_nodes(sc.jn, s);
         c++;
     }
@@ -4773,7 +4935,21 @@ static void load_or_init_mt1_pool(const std::string& dir, const std::string& loa
                                   uint64_t salt = 0) {
     std::string jn_from;
     load_or_init_mt1_pool_core(dir, load_dir, ind_i, sc, tag, init, salt, jn_from);
-    if (sc.jn && !jn_from.empty()) jn_bulk_race_pool(jn_from, ind_i, sc, tag, salt);
+    if (!sc.jn) return;
+    // Champions: the top JN_CHAMP_N of the pool as it was saved, before bulking; their working
+    // copies are marked live. A fresh pool has none.
+    for (int s2 = 0; s2 < MT1_POOL_SLOTS; s2++) sc.champ_of[s2] = 0;
+    sc.jn_champ_n = 0; sc.champ_back = 0;
+    if (jn_from.empty()) return;
+    int order[MT1_POOL_SLOTS];
+    mt1_rank(sc, order);
+    for (int k = 0; k < JN_CHAMP_N; k++) {
+        jn_copy(sc.jn, order[k], MT1_POOL_SLOTS + k);
+        mt1_slot_init(sc.champ_meta[k], sc.meta[order[k]].lineage);
+        sc.champ_of[order[k]] = (int8_t)(k + 1);
+    }
+    sc.jn_champ_n = JN_CHAMP_N;
+    jn_bulk_race_pool(jn_from, ind_i, sc, tag, salt);
 }
 
 static void save_mt2_elites(const std::string& dir, MT2Scratch& scratch) {
@@ -6095,12 +6271,13 @@ int main(int argc, char* argv[]) {
                 for (int p = 0; p < npools; p++) {
                     std::string err;
                     r.pool[p].jn = jn_pool_create(whole ? 888 : 74, whole ? N_IND : 1,
-                                                  MT1_POOL_SLOTS, JN_RING_CAP, g_jn_profile,
+                                                  MT1_POOL_SLOTS + JN_CHAMP_N, JN_RING_CAP, g_jn_profile,
                                                   jn_fresh_seed(((uint64_t)v << 8) | (uint64_t)p), err);
                     if (!r.pool[p].jn) {
                         log_msg("ERROR: " + race_norm_name(RACE[v].name) + ": " + err);
                         return 1;
                     }
+                    jn_set_persist(r.pool[p].jn, MT1_POOL_SLOTS);   // champion slots are scratch
                 }
                 log_msg("MT1 race: " + race_norm_name(RACE[v].name) + " -- j_neuro " +
                         (whole ? "888->12 nets, one whole-market pool" : "74->1 nets") +
@@ -6203,9 +6380,10 @@ int main(int argc, char* argv[]) {
         log_msg("j_neuro profile: " + g_jn_profile + "; bulk profile: " + g_jn_bulk_profile);
         for (int i = 0; i < N_IND; i++) {
             std::string err;
-            g_jn_ind[i] = jn_pool_create(STOCK_TODAY_DIM, STOCK_OUT_N, N_SLOTS, JN_RING_CAP,
+            g_jn_ind[i] = jn_pool_create(STOCK_TODAY_DIM, STOCK_OUT_N, JN_POOL_SLOTS, JN_RING_CAP,
                                          g_jn_profile, jn_fresh_seed(0x5700ULL + (uint64_t)i), err);
             if (!g_jn_ind[i]) { log_msg("ERROR: --jn-stocknn: " + err); return 1; }
+            jn_set_persist(g_jn_ind[i], N_SLOTS);   // champion + history slots are scratch
             if (!jn_set_bulk_profile(g_jn_ind[i], g_jn_bulk_profile, err)) {
                 log_msg("ERROR: --jn-stocknn: " + err); return 1;
             }
@@ -6219,7 +6397,7 @@ int main(int argc, char* argv[]) {
             const std::string pre = "jn_" + g_ind_names[i];
             const bool loaded = jn_load(g_jn_ind[i], output_dir, pre)
                              || (!load_dir.empty() && jn_load(g_jn_ind[i], load_dir, pre));
-            const JNStats js = jn_stats(g_jn_ind[i]);
+            const JNStats js = jn_stats_n(g_jn_ind[i], N_SLOTS);
             char m[200];
             snprintf(m, sizeof(m), "[%s] j_neuro StockNN pool: %s, %d nets, %.0f nodes (max %d), "
                      "warmup %.1f (max %d)", IND_SHORT[i], loaded ? "loaded" : "minimal nets",
@@ -6454,6 +6632,7 @@ int main(int argc, char* argv[]) {
             for (int s = 1; s < N_SLOTS; s++) ind_states[i].portfolios[s] = ind_states[i].portfolios[0];
             if (g_jn_ind[i]) jn_clear_rows(g_jn_ind[i]);   // the calendar restarts each pass
             g_jn_gate[i] = -1;                                // re-read from this pass's pool
+            g_jn_hist_head[i] = g_jn_hist_count[i] = 0;       // JN history restarts each pass
         }
         // Load MT1 head+tail pools (heads/tails redesign) and MT2 once at pass start
         for (int i = 0; i < N_IND; i++) {
@@ -7811,10 +7990,15 @@ int main(int argc, char* argv[]) {
                     ? (mst->ind_hist_count < IND_HIST_CAP ? mst->ind_val_hist[i][mst->ind_hist_count - 1]
                                                           : mst->ind_val_hist[i][IND_HIST_CAP - 1])
                     : static_cast<float>(IND_STARTING_CASH);
-                // Reset days carry book_prev == slot0_score, so they score exactly 0, not a jump.
-                if (judge_win)
-                    judge[i].add(results[i].book_prev, results[i].slot0_score,
-                                 (day_end - 1) - actual_day);
+                // A reset day is charged its top-up as a loss (PassJudge::add_reset); any other
+                // day scores its book return.
+                if (judge_win) {
+                    const int age = (day_end - 1) - actual_day;
+                    if (results[i].topup > 0.f)
+                        judge[i].add_reset(results[i].book_prev, results[i].topup, age);
+                    else
+                        judge[i].add(results[i].book_prev, results[i].slot0_score, age);
+                }
                 // The portfolio index now compounds the BOOK's return, not the trading ratio.
                 // It used to be slot0_score/baseline - 1, which is the trade delta over the
                 // reference book -- so the curve MT1 saw ended pass 1 near -7% while the book it

@@ -184,7 +184,7 @@ static void test_constants()
 {
     current_suite = "constants";
     CHECK(PASS_JUDGE_MIN_DAYS == 15);
-    CHECK(PASS_REF_VERSION == 2);
+    CHECK(PASS_REF_VERSION == 3);   // v3: recent hard-floor top-ups charged as losses
     CHECK(PASS_JUDGE_RECENCY == 0.995);
     // half-life ~138 days -- the figure CLAUDE.md and the race header quote
     CHECK(NEAR(std::log(0.5) / std::log(PASS_JUDGE_RECENCY), 138.3, 0.5));
@@ -215,6 +215,29 @@ static void test_judge_reset_day_scores_zero_not_a_jump()
     CHECK(a.score() < 0.001);                // diluted by one zero, never inflated
     CHECK(a.score() > 0.0009 * 0.9);
     CHECK(b.score() > 10.0 * a.score());     // the contamination the fix removes
+}
+
+static void test_judge_recent_reset_charges_topup()
+{
+    current_suite = "judge/reset-topup";
+    // v3: a reset in the last two years is charged its top-up as a loss; an older one scores 0.
+    PassJudge flat, recent, old;
+    for (int age = 700; age >= 0; age--) {
+        flat.add(25000.0, 25000.0, age);
+        if (age == 100) recent.add_reset(22400.0, 2600.0, age);
+        else            recent.add(25000.0, 25000.0, age);
+        if (age == 600) old.add_reset(22400.0, 2600.0, age);
+        else            old.add(25000.0, 25000.0, age);
+    }
+    CHECK(NEAR(flat.score(), 0.0, 1e-15));
+    CHECK(recent.score() < 0.0);
+    CHECK(NEAR(old.score(), 0.0, 1e-15));       // older than 504 sessions: not charged
+    CHECK(recent.resets == 1 && recent.resets_recent == 1 && NEAR(recent.topup_recent, 2600.0, 1e-9));
+    CHECK(old.resets == 1 && old.resets_recent == 0 && NEAR(old.topup_recent, 0.0, 1e-12));
+    // The charge is exactly the top-up as a return on the rescued book, at that day's weight.
+    const double wt = std::pow(PASS_JUDGE_RECENCY, 100.0);
+    CHECK(NEAR(recent.score() * recent.w, wt * (-2600.0 / 22400.0), 1e-12));
+    CHECK(recent.n == 701);
 }
 
 static void test_judge_recent_days_count_more()
@@ -293,6 +316,7 @@ int main()
     test_regime_labels();
     test_judge_constant_return_scores_that_return();
     test_judge_reset_day_scores_zero_not_a_jump();
+    test_judge_recent_reset_charges_topup();
     test_judge_recent_days_count_more();
     test_judge_effective_days();
     test_judge_ignores_invalid_days();

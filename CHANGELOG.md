@@ -9,12 +9,20 @@ entry is in its commit message.
 ## Unreleased
 
 ### Added
+- **JN safety nets**: each JN StockNN pool scores its pass's 20 seed elites (champions, before
+  bulking) and the last 5 days' top 10 elites (history) every day beside the 200 working nets; any
+  of them can be re-selected as an elite and breed, but none is mutated or saved with the pool.
+  The JN race pools get the champions only (their top 20 at the pass start, before bulking),
+  copied back into the pool when one would rank among the parents.
 - **`JN list dec` / `JN list inc`** (`--jn-race`): whole-market j_neuro pools whose twelve outputs
   sort into a predicted order of tomorrow's industry returns, scored on how many of their first 4
   (top or bottom) are right, then pairwise order, then correlation (`jnl_score.h`, tested).
 ### Changed
+- **Champion judging charges recent hard-floor resets** (`pass_reference.csv` v3): a reset in a
+  pass's last two years scores its top-up as a loss on the rescued book instead of 0.
 - **JN warm-in gate**: a JN pool is not selected, culled or scored until its history ring is
   deeper than the pass-start pool's largest warmup, and at least 15 days; JN runs start at day 0.
+  The JN race pools' gate is never below the largest StockNN gate across the 12 industries.
 - **JN bulking at the pass start**: a pass started from elites or champions fills its 180 children with bulked copies of the 20 elites
   (j_neuro `bulk.json`) by `(1/lost - 1) x 100`%, `lost` being the pass's shrinkage, capped at
   3x the pass-start size. Requires j_neuro ed79fa6. `--jn-bulk-profile`. The JN race pools are bulked

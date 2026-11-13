@@ -195,6 +195,16 @@ leaning on its end, which answers v1's reason for a short window (the end-of-pas
 mid-pass pool) without discarding 95% of the data. A hard last-N-days window was rejected for the
 race and the champion alike: the last N days of every pass are the same calendar days.
 
+**Recent resets are charged (v3, 2026-11-13).** A hard-floor reset recapitalises a book that fell
+below $22,500 back to $25,000; as a return it scored 0, so the top-up was free. Since v3 a reset
+in the pass's **last two years** (504 sessions) scores `-topup / book`, the top-up as a loss on
+the book it rescued (about -11% for a reset from $22,400); older resets still score 0. The losing
+days before it count as always, so a recent reset costs a pass twice. The boundary logs each
+industry's `judge: pN ... resets R, r in the last 2 years charged $X of top-up as loss`
+(`PassJudge::add_reset`, tested in `tests/test_pass_seeding.cpp`). `pass_reference.csv` is
+**schema v3**: same columns, but v2 scores are not comparable, so a v2 file is set aside and the
+run's champions restart at its next boundary (JN1/JN2's are rescored from their logs instead).
+
 The score is a mean **return**, not dollars, so a pass that grew its book is not judged on a larger
 base. `pass_share_new` uses only sign and ratio, so the seed blend works unchanged on the new scale.
 `pass_reference.csv` is **schema v2**: same columns, but `*_pct` now hold the v2 score (~1e-3, not
@@ -1207,11 +1217,41 @@ scoring -- until the ring is deeper than the largest warmup in the pool as it st
 start (`g_jn_gate` for StockNN, `MT1PoolScratch::jn_gate` for the JN race pools; read once per pass,
 logged as `JN warm-in: selection starts once N days of history are held`). A pool reporting a
 warmup under `JN_WARM_FLOOR` = 15 days waits 15, when StockNN's 15-day features are complete (a
-fresh pool's warmup is ~2). Before it, selection ran
+fresh pool's warmup is ~2). The second-level JN pools (the race entries) never warm in for less
+than the **largest StockNN gate over all twelve industries**, since they learn from what StockNN
+does (logged once per pass, `JN race warm-in: floor N`). No gate exceeds `JN_RING_CAP - 1` (63),
+the deepest the ring holds. Before it, selection ran
 from the first day on nets that could not trade yet. A JN run therefore starts at the data's first
 day (`--start-day 0`) instead of StockNN's 17: the gate replaces the fixed start. A race pool keeps
 feeding its baseline window while warming in. Removal stays off in the profile; JN1's nets fell
 from 421 to 192 nodes through pruned connections, not removals.
+
+**Safety nets: champions and history (2026-11-13).** Each JN StockNN pool carries 70 candidates
+beside its 200 working nets, in extra slots that are never saved with the pool
+(`jn_set_persist`): the **champions** (slots 200-219), the 20 elites the pass was seeded from,
+before bulking, a static list for the whole pass; and the **history** (slots 220-269), the top 10
+elites of each of the last 5 days, a ring reset at each pass start -- the JN form of flat
+StockNN's 5-day elite history, which JN mode could not use (nets of different shapes do not fit
+its flat buffers). Every candidate is scored each day on the same reference book and fills as the
+working nets, exempt from the zero-trade filter, and can be chosen as an elite; a chosen one is
+copied into an elite slot (counting as traded) and breeds the next day's children, while the
+candidate itself is never mutated. Within a pass the seed can therefore always win its place
+back after one bad day, instead of being lost for good. Logged on every selection line as
+`safety nets: C champ + H hist scored, c+h chosen`; a candidate in the elite list reads `cN`/`hN`.
+Champions count toward the warm-in gate. The elite list takes **distinct nets only**: every net
+carries an identity (`jn_id`) that copies keep and breeding renews, and a candidate that is the
+same net as one already chosen is skipped -- yesterday's history entries are today's elite slots,
+so without this the list filled with clones (14 of 20 on one test day). Measured on days 32-60:
+3.9 s/day against JN2's 4.7 on the same days, so no measurable cost.
+
+The **JN race pools** get the champions only. Their lifecycle already keeps its best (a net is
+culled only after a sustained bad 16-day register, never the deployed one), so there is no
+single-bad-day loss for a history to repair. A pool started from a saved pool copies its top 20,
+before bulking, into 20 extra slots; each champion is scored daily into its own register and is
+never culled or mutated. When a mature champion would rank among the day's parents and no copy of
+it is in the pool, it is copied back in, register and all, in place of the first cull victim, and
+breeds from the next day (`champions copied back into the pool this pass: N` at the save). A
+fresh pool has no champions.
 
 **Bulking at the pass start (2026-11-13).** A pass started from elites (the run's blended seed,
 or `champion/` through `--load-dir`) keeps its 20 elites as they are and fills the other 180 slots
