@@ -184,7 +184,7 @@ static void test_constants()
 {
     current_suite = "constants";
     CHECK(PASS_JUDGE_MIN_DAYS == 15);
-    CHECK(PASS_REF_VERSION == 2);
+    CHECK(PASS_REF_VERSION == 3);   // v3: recent hard-floor top-ups charged as losses
     CHECK(PASS_JUDGE_RECENCY == 0.995);
     // half-life ~138 days -- the figure CLAUDE.md and the race header quote
     CHECK(NEAR(std::log(0.5) / std::log(PASS_JUDGE_RECENCY), 138.3, 0.5));
