@@ -1681,6 +1681,20 @@ static std::string champ_elite_path(const std::string& dir, const char* ind, int
     return elite_path(dir, ind, slot);
 }
 
+// jn_size_<ind>.txt beside an industry's elite files: "start end", the mean node count of the pool
+// at the start of the pass the elites came from and of its 20 elites at the end. It travels with
+// the elites (copy_elites), so a pass seeded from champion/ bulks by the champion pass's shrinkage.
+static std::string jn_size_path(const std::string& dir, const char* ind) {
+    return dir + "/jn_size_" + ind + ".txt";
+}
+static bool jn_read_size(const std::string& dir, const char* ind, double& start, double& end) {
+    FILE* f = fopen(jn_size_path(dir, ind).c_str(), "r");
+    if (!f) return false;
+    const bool ok = fscanf(f, "%lf %lf", &start, &end) == 2;
+    fclose(f);
+    return ok;
+}
+
 // ── Logging ────────────────────────────────────────────────────────────────────
 
 static std::mutex g_log_mutex;
@@ -3983,6 +3997,12 @@ static bool copy_elites(const std::string& from, const std::string& to, const ch
                       fs::copy_options::overwrite_existing, ec);
         if (ec) return false;
     }
+    {   // a JN pool's size record (jn_size_<ind>.txt) goes wherever its elites go
+        std::error_code ec3;
+        if (fs::exists(jn_size_path(from, ind), ec3))
+            fs::copy_file(jn_size_path(from, ind), jn_size_path(to, ind),
+                          fs::copy_options::overwrite_existing, ec3);
+    }
     // Every race model travels WITH the StockNN elites it was trained beside: a champion is the
     // pass's StockNN plus the MT1 entries raised against it that pass. Champions are crowned per
     // industry, so champion/ is a per-industry composite -- energy's models may be pass 2's while
@@ -4246,30 +4266,19 @@ static void jn_census_report(int pass_num) {
 // as jn_<ind>_elite_<k>.jnet, pass_boundary judges, crowns into champion/ and blends the next
 // pass's seed in those files, and the pool is rebuilt from them.
 static bool jn_write_elites(int ind_i, const std::string& dir) {
-    for (int k = 0; k < ELITE_POOL; k++)
-        if (!jn_save_slot(g_jn_ind[ind_i], k,
-                          champ_elite_path(dir, g_ind_names[ind_i].c_str(), k)))
-            return false;
+    const char* ind = g_ind_names[ind_i].c_str();
+    double en = 0.0;
+    for (int k = 0; k < ELITE_POOL; k++) {
+        if (!jn_save_slot(g_jn_ind[ind_i], k, champ_elite_path(dir, ind, k))) return false;
+        en += jn_slot_nodes(g_jn_ind[ind_i], k);
+    }
+    g_jn_end_nodes[ind_i] = en / ELITE_POOL;
+    // The size record travels with these elites (jn_size_path); the next pass bulks from it.
+    FILE* f = fopen(jn_size_path(dir, ind).c_str(), "w");
+    if (!f) return false;
+    fprintf(f, "%.3f %.3f\n", g_jn_start_nodes[ind_i], g_jn_end_nodes[ind_i]);
+    fclose(f);
     return true;
-}
-
-// jn_bulk.txt: each industry's last pass start / end sizes, so --continue-run can bulk the seed
-// it blends. One line per industry: name start end.
-static void jn_save_bulk_sizes(const std::string& dir) {
-    FILE* f = fopen((dir + "/jn_bulk.txt").c_str(), "w");
-    if (!f) { log_msg("WARNING: cannot write " + dir + "/jn_bulk.txt"); return; }
-    for (int i = 0; i < N_IND; i++)
-        fprintf(f, "%s %.3f %.3f\n", g_ind_names[i].c_str(), g_jn_start_nodes[i], g_jn_end_nodes[i]);
-    fclose(f);
-}
-static void jn_load_bulk_sizes(const std::string& dir) {
-    FILE* f = fopen((dir + "/jn_bulk.txt").c_str(), "r");
-    if (!f) return;
-    char name[128]; double s, e;
-    while (fscanf(f, "%127s %lf %lf", name, &s, &e) == 3)
-        for (int i = 0; i < N_IND; i++)
-            if (g_ind_names[i] == name) { g_jn_start_nodes[i] = s; g_jn_end_nodes[i] = e; }
-    fclose(f);
 }
 
 // The bulk pct for one industry from its pass's shrinkage (see g_jn_start_nodes); -1 = not
@@ -4280,12 +4289,12 @@ static double jn_bulk_pct(double start, double end) {
     return lost > 0.0 ? (1.0 / lost - 1.0) * 100.0 : 1e9;   // grew or held: bulk to the cap
 }
 
-// Slots 0..19 := the 20 elite files in dir, as they are; slots 20..199 := MUTATIONS_PER_PARENT
-// children of each. With a measured pass (start/end nodes > 0) the children are BULKED copies
-// of their parent (jn_bulk_pct, capped at JN_BULK_CAP x start); otherwise they are bred as the
-// daily selection breeds them. False, pool untouched, if any file is missing.
-static bool jn_seed_from_elites(int ind_i, const std::string& dir, uint64_t generation,
-                                double start_nodes = 0.0, double end_nodes = 0.0) {
+// Starting a pass from elites. Slots 0..19 := the 20 elite files in dir, as they are; slots
+// 20..199 := MUTATIONS_PER_PARENT children of each, BULKED from their parent by the shrinkage of
+// the pass those elites came from (dir/jn_size_<ind>.txt; jn_bulk_pct, capped at JN_BULK_CAP x
+// that pass's start size). Elites with no size record are bred as the daily selection breeds
+// them. False, pool untouched, if any elite file is missing.
+static bool jn_seed_from_elites(int ind_i, const std::string& dir, uint64_t generation) {
     if (dir.empty()) return false;
     const char* ind = g_ind_names[ind_i].c_str();
     for (int k = 0; k < ELITE_POOL; k++)
@@ -4298,7 +4307,12 @@ static bool jn_seed_from_elites(int ind_i, const std::string& dir, uint64_t gene
             return false;
         }
     const uint64_t salt = jn_fresh_seed(0x4A4E5345ULL + (uint64_t)ind_i);   // "JNSE"
+    double start_nodes = 0.0, end_nodes = 0.0;
+    jn_read_size(dir, ind, start_nodes, end_nodes);
     const double pct = jn_bulk_pct(start_nodes, end_nodes);
+    if (pct < 0.0)
+        log_msg(std::string("[") + IND_SHORT[ind_i] + "]   jn seed: no size record in " + dir +
+                " -- children mutated, not bulked");
     if (pct < 0.0) {
         for (int mut_i = 0; mut_i < N_SLOTS - ELITE_POOL; mut_i++)
             jn_mutate(p, mut_i / MUTATIONS_PER_PARENT, ELITE_POOL + mut_i, generation,
@@ -6148,10 +6162,8 @@ int main(int argc, char* argv[]) {
     // --jn-stocknn: the pool starts from the 20 elite files where there are any -- the run's own
     // seed (a continued run, just blended above), else --load-dir's (e.g. a champion/ store) --
     // with fresh children. The full saved pool, when jn_load found one, is otherwise kept.
-    if (g_jn_stocknn) jn_load_bulk_sizes(output_dir);
     for (int i = 0; i < N_IND && g_jn_stocknn; i++) {
-        const char* src = jn_seed_from_elites(i, output_dir, 0, g_jn_start_nodes[i], g_jn_end_nodes[i])
-                          ? "the run's elites"
+        const char* src = jn_seed_from_elites(i, output_dir, 0) ? "the run's elites"
                         : jn_seed_from_elites(i, load_dir, 0)   ? "--load-dir's elites" : nullptr;
         if (src) log_msg(std::string("[") + IND_SHORT[i] + "] j_neuro StockNN pool seeded from " + src);
     }
@@ -7804,15 +7816,7 @@ int main(int argc, char* argv[]) {
             if (judged)
                 pass_boundary(output_dir, pass + 1, day_start, day_end, judge, seed_next);
             for (int i = 0; i < N_IND && g_jn_stocknn; i++) {
-                double en = 0.0;
-                for (int k = 0; k < ELITE_POOL; k++) en += jn_slot_nodes(g_jn_ind[i], k);
-                g_jn_end_nodes[i] = en / ELITE_POOL;
-            }
-            if (g_jn_stocknn) jn_save_bulk_sizes(output_dir);
-            for (int i = 0; i < N_IND && g_jn_stocknn; i++) {
-                if (judged && seed_next &&
-                    !jn_seed_from_elites(i, output_dir, (uint64_t)day_end,
-                                         g_jn_start_nodes[i], g_jn_end_nodes[i]))
+                if (judged && seed_next && !jn_seed_from_elites(i, output_dir, (uint64_t)day_end))
                     log_msg("WARNING: j_neuro StockNN " + g_ind_names[i] +
                             " not reseeded from the pass seed -- it carries on as it ended");
                 if (!jn_save(g_jn_ind[i], output_dir, "jn_" + g_ind_names[i]))

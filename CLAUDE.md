@@ -1193,10 +1193,12 @@ day (`--start-day 0`) instead of StockNN's 17: the gate replaces the fixed start
 feeding its baseline window while warming in. Removal stays off in the profile; JN1's nets fell
 from 421 to 192 nodes through pruned connections, not removals.
 
-**Bulking between passes (2026-11-13).** The next pass's seed keeps its 20 elites as they are and
-fills the other 180 slots by **bulking** each elite (j_neuro `profiles/bulk.json`, `growth_budget =
+**Bulking at the pass start (2026-11-13).** A pass started from elites (the run's blended seed,
+or `champion/` through `--load-dir`) keeps its 20 elites as they are and fills the other 180 slots
+by **bulking** each elite (j_neuro `profiles/bulk.json`, `growth_budget =
 fill`: growth only, an exact percentage of the net's neurons) instead of mutating it. The
-percentage comes from how much the pass just finished shrank its nets:
+percentage comes from how much the pass those elites came from shrank its nets, recorded when
+the pass ends and its elites are saved:
 
 ```
 lost = 1 - (mean nodes of the 20 elites at pass end) / (pool mean nodes at pass start)
@@ -1207,9 +1209,10 @@ cap  = 3 x the pass-start size      a parent that would pass it bulks by the pct
 A pass that discarded most of its neurons gets a small bulk; one that kept nearly all of them
 gets a large one, for exploration. Children of one elite start at the same size; elites of
 different sizes give children of different sizes. Logged per industry as `jn bulk: pass A -> B
-nodes (lost L%) -> +P%, cap C; ...`. The sizes are kept in `RUN/jn_bulk.txt`, so `--continue-run`
-bulks the seed it blends; a seed with no measured pass (`--load-dir`, a fresh run) is mutated as
-before. `--jn-bulk-profile FILE` overrides the profile. The JN race pools are not bulked. The
+nodes (lost L%) -> +P%, cap C; ...`. The record is `jn_size_<ind>.txt` ("start end"), written
+beside the elites and copied wherever they go (`copy_elites`: staging, `champion/`, the blended
+seed), so a pass started from champions bulks by the champion pass's own shrinkage. Elites with
+no record (from before this change) are mutated as before, and the log says so. `--jn-bulk-profile FILE` overrides the profile. The JN race pools are not bulked. The
 training profile's own growth is now 1% of a net's neurons (`fill`, min 1) in 10% of generations
 for 10% of nets (j_neuro ed79fa6); removal stays off.
 

@@ -11,7 +11,7 @@ entry is in its commit message.
 ### Changed
 - **JN warm-in gate**: a JN pool is not selected, culled or scored until its history ring is
   deeper than the pass-start pool's largest warmup, and at least 15 days; JN runs start at day 0.
-- **JN bulking between passes**: the seed's 180 children are bulked copies of the 20 elites
+- **JN bulking at the pass start**: a pass started from elites or champions fills its 180 children with bulked copies of the 20 elites
   (j_neuro `bulk.json`) by `(1/lost - 1) x 100`%, `lost` being the pass's shrinkage, capped at
   3x the pass-start size. Requires j_neuro ed79fa6. `--jn-bulk-profile`.
 - **Race pools, gradient weights and MT2 are saved at pass end only** (and every `--upkeep` run).
