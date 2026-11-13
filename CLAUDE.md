@@ -1216,6 +1216,20 @@ day (`--start-day 0`) instead of StockNN's 17: the gate replaces the fixed start
 feeding its baseline window while warming in. Removal stays off in the profile; JN1's nets fell
 from 421 to 192 nodes through pruned connections, not removals.
 
+**Safety nets: champions and history (2026-11-13).** Each JN StockNN pool carries 70 candidates
+beside its 200 working nets, in extra slots that are never saved with the pool
+(`jn_set_persist`): the **champions** (slots 200-219), the 20 elites the pass was seeded from,
+before bulking, a static list for the whole pass; and the **history** (slots 220-269), the top 10
+elites of each of the last 5 days, a ring reset at each pass start -- the JN form of flat
+StockNN's 5-day elite history, which JN mode could not use (nets of different shapes do not fit
+its flat buffers). Every candidate is scored each day on the same reference book and fills as the
+working nets, exempt from the zero-trade filter, and can be chosen as an elite; a chosen one is
+copied into an elite slot (counting as traded) and breeds the next day's children, while the
+candidate itself is never mutated. Within a pass the seed can therefore always win its place
+back after one bad day, instead of being lost for good. Logged on every selection line as
+`safety nets: C champ + H hist scored, c+h chosen`; a candidate in the elite list reads `cN`/`hN`.
+Champions count toward the warm-in gate. About 35% more JN forward work per day.
+
 **Bulking at the pass start (2026-11-13).** A pass started from elites (the run's blended seed,
 or `champion/` through `--load-dir`) keeps its 20 elites as they are and fills the other 180 slots
 by **bulking** each elite (j_neuro `profiles/bulk.json`, `growth_budget =

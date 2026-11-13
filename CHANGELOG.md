@@ -9,6 +9,9 @@ entry is in its commit message.
 ## Unreleased
 
 ### Added
+- **JN safety nets**: each JN StockNN pool scores its pass's 20 seed elites (champions, before
+  bulking) and the last 5 days' top 10 elites (history) every day beside the 200 working nets; any
+  of them can be re-selected as an elite and breed, but none is mutated or saved with the pool.
 - **`JN list dec` / `JN list inc`** (`--jn-race`): whole-market j_neuro pools whose twelve outputs
   sort into a predicted order of tomorrow's industry returns, scored on how many of their first 4
   (top or bottom) are right, then pairwise order, then correlation (`jnl_score.h`, tested).

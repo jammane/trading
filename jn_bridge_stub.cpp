@@ -18,6 +18,9 @@ void    jn_mutate(JNPool*, int, int, uint64_t, uint64_t) {}
 void    jn_permute(JNPool*, const int*, int) {}
 void    jn_inject(JNPool*, int, double, uint64_t) {}
 JNStats jn_stats(const JNPool*) { return {}; }
+JNStats jn_stats_n(const JNPool*, int) { return {}; }
+void    jn_set_persist(JNPool*, int) {}
+void    jn_copy(JNPool*, int, int) {}
 bool    jn_set_bulk_profile(JNPool*, const std::string&, std::string& err) { err = "no j_neuro"; return false; }
 void    jn_bulk(JNPool*, int, int, double, uint64_t, uint64_t) {}
 int     jn_slot_nodes(const JNPool*, int) { return 0; }

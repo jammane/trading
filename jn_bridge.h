@@ -60,6 +60,15 @@ void    jn_permute(JNPool* p, const int* src_of_dst, int n);
 void    jn_inject(JNPool* p, int slot, double pct, uint64_t seed);
 
 JNStats jn_stats(const JNPool* p);
+// The same over slots [0, n) only (n <= the pool's size).
+JNStats jn_stats_n(const JNPool* p, int n);
+
+// Slots [0, n) are the pool proper: jn_save writes them and jn_load reads them. Slots past n are
+// the caller's scratch (the trainer's champion and history candidates), never persisted.
+// Default: every slot.
+void    jn_set_persist(JNPool* p, int n);
+// dst := an exact copy of src (structure and weights).
+void    jn_copy(JNPool* p, int src, int dst);
 
 // Bulking (j_neuro profiles/bulk.json, growth_budget = fill). Load the bulk profile once per pool;
 // then dst = src grown by pct% of its neurons (exactly, within rounding). pct <= 0 copies src.
