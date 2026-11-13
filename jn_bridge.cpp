@@ -120,6 +120,8 @@ void jn_push_row(JNPool* p, const float* row) {
 
 void jn_clear_rows(JNPool* p) { p->ring.clear(); }
 
+int jn_ring_len(const JNPool* p) { return (int)p->ring.size(); }
+
 void jn_replace_row(JNPool* p, const float* row) {
     if (p->ring.empty()) { jn_push_row(p, row); return; }
     p->ring.back().assign(row, row + p->n_in);

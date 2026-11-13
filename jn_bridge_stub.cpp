@@ -12,6 +12,7 @@ int     jn_n_slots(const JNPool*) { return 0; }
 void    jn_push_row(JNPool*, const float*) {}
 void    jn_replace_row(JNPool*, const float*) {}
 void    jn_clear_rows(JNPool*) {}
+int     jn_ring_len(const JNPool*) { return 0; }
 bool    jn_forward(JNPool*, int, float*) { return false; }
 void    jn_mutate(JNPool*, int, int, uint64_t, uint64_t) {}
 void    jn_permute(JNPool*, const int*, int) {}

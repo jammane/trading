@@ -44,6 +44,8 @@ void    jn_push_row(JNPool* p, const float* row);
 void    jn_clear_rows(JNPool* p);
 // Replace the newest row (same day, recomputed input).
 void    jn_replace_row(JNPool* p, const float* row);
+// Rows of history held (at most the ring capacity).
+int     jn_ring_len(const JNPool* p);
 
 // Reset slot, replay its warmup rows, step the newest row; outputs (n_out) as float.
 // Returns false, writing zeros, if the slot is not ready (or an output is not finite).

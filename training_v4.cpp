@@ -847,6 +847,14 @@ static std::string g_jn_profile = JNEURO_DEFAULT_PROFILE;
 // trades only once it has that many; 64 bounds the replay cost while leaving room for nets to
 // grow s_neuron chains well past StockNN's 15-day window.
 static constexpr int JN_RING_CAP = 64;
+// The warm-in gate. Every pass starts with an empty ring, so a net cannot trade (StockNN) or
+// predict (race) until the ring holds its warmup + 1 rows. Judging a pool before then selects on
+// nets that could not act. Each pass therefore runs forward only -- no selection, mutation,
+// culling or scoring -- until the ring is deeper than the largest warmup in the pool AS IT STOOD
+// AT THE PASS START. The gate is fixed for the pass: children born later may need more history,
+// but they are judged on the same footing as every other net that could not act yet.
+// -1 = not yet read this pass.
+static int g_jn_gate[N_IND];
 // A JN race net's raw output is multiplied by this before mt1_pred's tanh x MT1_PRED_SCALE. A net
 // starts with identity weights, so its output is in the units of its 74 inputs (|x| up to ~33),
 // not of the target. Measured on the --jn-stocknn smoke's own features (mt1_dataset.bin, 500 days,
@@ -1339,6 +1347,7 @@ struct MT1PoolScratch {
     // `pool` is a placeholder; everything else -- registers, maturity, culling, lineage, scoring
     // -- is this struct's, so a JN pool runs under exactly the lifecycle every evo entry does.
     JNPool*     jn{nullptr};
+    int         jn_gate{-1};                // warm-in gate (g_jn_gate); -1 = read at first step
     float*      mut_buf{nullptr};           // one model, breeding scratch
     MT1SlotMeta meta[MT1_POOL_SLOTS]{};
     int         best_slot{0};               // deployed model; ranked in place, never shuffled
@@ -2126,6 +2135,18 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         }
         jn_push_row(jp, jn_row);
     }
+    // Warm-in: forward only until the ring is deeper than the pass-start pool's largest warmup.
+    bool jn_warming = false;
+    if (jp) {
+        if (g_jn_gate[ind_i] < 0) {
+            g_jn_gate[ind_i] = jn_stats(jp).warm_max;
+            log_msg(std::string("[") + IND_SHORT[ind_i] + "]   JN warm-in: selection starts once " +
+                    std::to_string(g_jn_gate[ind_i] + 1) + " days of history are held (pool warmup max " +
+                    std::to_string(g_jn_gate[ind_i]) + ")");
+        }
+        jn_warming = jn_ring_len(jp) <= g_jn_gate[ind_i];
+        freeze = freeze || jn_warming;
+    }
     int jn_cold = 0;    // nets with less history than their warmup: no orders today
 
     // ── Inference + trade loop ────────────────────────────────────────────────
@@ -2593,7 +2614,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     int new_streak = 0;
     bool all_inactive = false;
     bool inactive[N_SLOTS] = {};
-    if (num_past >= HIST_WINDOW && day_num > 0) {
+    if (num_past >= HIST_WINDOW && day_num > 0 && !jn_warming) {
         int n_inactive = 0, n_spared = 0;
         for (int s = 0; s < N_SLOTS; s++) {
             if (trade_count[s]) continue;
@@ -3278,6 +3299,13 @@ static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in,
     // property of what the model can see, not of the order the loop happens to run in.
     // A JN pool's nets read the industry's row history, which the caller appended (jn_push_row)
     // before this call; `in` is that row. A net not yet warmed predicts $0.
+    // Warm-in (see g_jn_gate): until the ring is deeper than the pass-start pool's largest
+    // warmup, the pool predicts but nothing is scored, so nothing matures, culls or breeds.
+    bool jn_warming = false;
+    if (sc.jn) {
+        if (sc.jn_gate < 0) sc.jn_gate = jn_stats(sc.jn).warm_max;
+        jn_warming = jn_ring_len(sc.jn) <= sc.jn_gate;
+    }
     for (int s = 0; s < MT1_POOL_SLOTS; s++) {
         if (sc.jn) {
             float o = 0.f; jn_forward(sc.jn, s, &o);
@@ -3292,7 +3320,10 @@ static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in,
     r.pred0 = sc.pending[sc.best_slot];
 
     // ── 2. SCORE ─────────────────────────────────────────────────────────────────
-    if (have_actual) {
+    if (have_actual && jn_warming) {
+        sc.has_pending = false;              // the outcome still feeds the baseline window
+        sc.push_actual(actual, actual_day);
+    } else if (have_actual) {
         const float base = (tau >= 0.f) ? sc.quantile(tau) : sc.baseline();
         const float fl   = sc.floor_v();
         // Baseline and floor are built from sessions strictly before the one being scored:
@@ -6095,6 +6126,7 @@ int main(int argc, char* argv[]) {
                     load_or_init_mt1_pool(output_dir, load_dir, i, race[v].pool[i],
                                           RACE[v].tag, race_init(RACE[v].arch), r.salt);
                     if (race[v].pool[i].jn) jn_clear_rows(race[v].pool[i].jn);   // new calendar
+                    race[v].pool[i].jn_gate = -1;
                     continue;
                 }
                 if (RACE[v].carry && pass > g_pass_base) continue;   // keep weights, Adam moments AND lr
@@ -6163,6 +6195,7 @@ int main(int argc, char* argv[]) {
             ind_states[i].streak = 0;
             for (int s = 1; s < N_SLOTS; s++) ind_states[i].portfolios[s] = ind_states[i].portfolios[0];
             if (g_jn_ind[i]) jn_clear_rows(g_jn_ind[i]);   // the calendar restarts each pass
+            g_jn_gate[i] = -1;                                // re-read from this pass's pool
         }
         // Load MT1 head+tail pools (heads/tails redesign) and MT2 once at pass start
         for (int i = 0; i < N_IND; i++) {
