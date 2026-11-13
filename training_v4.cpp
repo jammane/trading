@@ -2205,7 +2205,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     if (jp) {
         if (g_jn_gate[ind_i] < 0) {
             const JNStats js0 = jn_stats(jp);
-            g_jn_gate[ind_i] = std::max(JN_WARM_FLOOR, js0.warm_max);
+            g_jn_gate[ind_i] = std::min(JN_RING_CAP - 1, std::max(JN_WARM_FLOOR, js0.warm_max));
             g_jn_start_nodes[ind_i] = js0.nodes_mean;
             log_msg(std::string("[") + IND_SHORT[ind_i] + "]   JN warm-in: selection starts once " +
                     std::to_string(g_jn_gate[ind_i] + 1) + " days of history are held (pool warmup max " +
@@ -3348,6 +3348,27 @@ static bool mt1_is_barred(const MT1PoolScratch& sc, uint32_t lineage) {
 // previous session's close to this one — the thing yesterday's prediction was a prediction OF.
 // `have_actual` is false only on the first day of a pass, before any outcome exists.
 
+// A second-level JN pool's warm-in gate (the race entries: JN evo, JN evo bt4, JN list dec/inc),
+// read once per pass at its first step. It is the larger of its own (the pool's largest warmup,
+// never under JN_WARM_FLOOR) and, under --jn-stocknn, the LARGEST StockNN gate over all twelve
+// industries: these nets learn from what StockNN does, so none is judged before every industry's
+// StockNN has begun selecting. Never above JN_RING_CAP - 1, the deepest the ring can hold -- a
+// gate past it would keep the pool warming in forever. Logged once per pass.
+static void jn_race_read_gate(MT1PoolScratch& sc) {
+    const JNStats js0 = jn_stats(sc.jn);
+    int stock_max = 0;
+    if (g_jn_stocknn)
+        for (int i = 0; i < N_IND; i++) stock_max = std::max(stock_max, g_jn_gate[i]);
+    sc.jn_gate = std::min(JN_RING_CAP - 1,
+                          std::max(std::max(JN_WARM_FLOOR, js0.warm_max), stock_max));
+    sc.jn_start_nodes = js0.nodes_mean;
+    static std::atomic<int> logged_pass{-1};
+    if (logged_pass.exchange(g_cur_pass) != g_cur_pass)
+        log_msg("JN race warm-in: floor " + std::to_string(stock_max) +
+                " (largest StockNN gate); first pool read gate " + std::to_string(sc.jn_gate) +
+                " (own warmup max " + std::to_string(js0.warm_max) + ")");
+}
+
 // The pool lifecycle's selection step, shared by every evolutionary race pool: rank, cull the
 // worst mature models (never the deployed one), breed replacements from the unbarred elite.
 static void mt1_pool_evolve(int ind_i, MT1PoolScratch& sc, MT1DayResult& r, int actual_day,
@@ -3416,11 +3437,7 @@ static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in,
     // warmup, the pool predicts but nothing is scored, so nothing matures, culls or breeds.
     bool jn_warming = false;
     if (sc.jn) {
-        if (sc.jn_gate < 0) {
-            const JNStats js0 = jn_stats(sc.jn);
-            sc.jn_gate = std::max(JN_WARM_FLOOR, js0.warm_max);
-            sc.jn_start_nodes = js0.nodes_mean;
-        }
+        if (sc.jn_gate < 0) jn_race_read_gate(sc);
         jn_warming = jn_ring_len(sc.jn) <= sc.jn_gate;
     }
     for (int s = 0; s < MT1_POOL_SLOTS; s++) {
@@ -3477,11 +3494,7 @@ static MT1DayResult jnl_step_day(MT1PoolScratch& sc, const float* real12, bool h
                                  int actual_day, uint64_t salt, float* dep12) {
     MT1DayResult r{};
     bool warming = false;
-    if (sc.jn_gate < 0) {
-        const JNStats js0 = jn_stats(sc.jn);
-        sc.jn_gate = std::max(JN_WARM_FLOOR, js0.warm_max);
-        sc.jn_start_nodes = js0.nodes_mean;
-    }
+    if (sc.jn_gate < 0) jn_race_read_gate(sc);
     warming = jn_ring_len(sc.jn) <= sc.jn_gate;
     static thread_local float outs[MT1_POOL_SLOTS][N_IND];
     for (int s = 0; s < MT1_POOL_SLOTS; s++)

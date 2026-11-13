@@ -1207,7 +1207,10 @@ scoring -- until the ring is deeper than the largest warmup in the pool as it st
 start (`g_jn_gate` for StockNN, `MT1PoolScratch::jn_gate` for the JN race pools; read once per pass,
 logged as `JN warm-in: selection starts once N days of history are held`). A pool reporting a
 warmup under `JN_WARM_FLOOR` = 15 days waits 15, when StockNN's 15-day features are complete (a
-fresh pool's warmup is ~2). Before it, selection ran
+fresh pool's warmup is ~2). The second-level JN pools (the race entries) never warm in for less
+than the **largest StockNN gate over all twelve industries**, since they learn from what StockNN
+does (logged once per pass, `JN race warm-in: floor N`). No gate exceeds `JN_RING_CAP - 1` (63),
+the deepest the ring holds. Before it, selection ran
 from the first day on nets that could not trade yet. A JN run therefore starts at the data's first
 day (`--start-day 0`) instead of StockNN's 17: the gate replaces the fixed start. A race pool keeps
 feeding its baseline window while warming in. Removal stays off in the profile; JN1's nets fell
