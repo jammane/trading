@@ -8,6 +8,10 @@ entry is in its commit message.
 
 ## Unreleased
 
+### Added
+- **`JN list dec` / `JN list inc`** (`--jn-race`): whole-market j_neuro pools whose twelve outputs
+  sort into a predicted order of tomorrow's industry returns, scored on how many of their first 4
+  (top or bottom) are right, then pairwise order, then correlation (`jnl_score.h`, tested).
 ### Changed
 - **JN warm-in gate**: a JN pool is not selected, culled or scored until its history ring is
   deeper than the pass-start pool's largest warmup, and at least 15 days; JN runs start at day 0.

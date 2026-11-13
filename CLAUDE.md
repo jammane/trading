@@ -563,7 +563,8 @@ pytest tests across the files in `tests/`:
   readers), `test_mt1net.py` (single-output MT1).
 - Studies, each against a process with a known answer: `test_pnl_conditional.py`,
   `test_pnl_persistence.py`, `test_depth_sweep.py`, `test_dyn_tree.py`, `test_living_bn.py`.
-- C++ (`ctest`): `test_mt1_grad.cpp` (every race backward vs finite differences),
+- C++ (`ctest`): `test_jnl_score.cpp` (the order entries' score: each level, both ends, ties,
+  the lexicographic composite), `test_mt1_grad.cpp` (every race backward vs finite differences),
   `test_sort_util.cpp` (`sort_index_prefix` orders exactly like `std::sort`), `test_fp_guards.cpp`
   (finiteness guards survive `-ffast-math`), plus `test_mt1_pool.cpp`, `test_mt1_backprop.cpp`,
   `test_pass_seeding.cpp` described above.
@@ -1167,6 +1168,25 @@ both **off by default**:
   (p1/p10/p50/p90/p99 per output column, share exactly 0, share past the sigmoid's saturation).
 - `--jn-race` (or naming them in `--race-only`) — two race entries, `JN evo` (picks the top) and
   `JN evo bt4` (flags the bottom 4), reading MT1's 74 trailing features as a daily sequence.
+- `JN list dec` / `JN list inc` (also under `--jn-race`) — **order entries**: one whole-market
+  pool each (not one per industry). A net reads all twelve industries' 74 trailing features (the
+  888-wide master vector) as a daily sequence and outputs twelve values whose sort is its
+  predicted order of tomorrow's industry returns (slot 0's book P&L / `book_prev`, the measure
+  StockNN is selected on); higher = better for both. They are trained directly on what the
+  committees do -- pick 4 winners, flag 4 losers -- and scored daily, lexicographically
+  (`jnl_score.h`, `tests/test_jnl_score.cpp`):
+  1. **primary**: how many of its first 4 are in the realised first 4 (0-4); `dec` scores the top
+     end, `inc` the bottom end;
+  2. **secondary** (tie-break): comparisons in its order that held, 66 pairs (position 1 against
+     the 11 below it, 2 against the 10 below, ...), the same for both;
+  3. **tertiary** (tie-break): correlation of the raw outputs with the realised returns.
+
+  Tied outputs score the expectation over a random order (a constant net scores 1.33 / 33 / 0).
+  The three are packed into one register value (`jnl_composite`) so the pool's usual ranking by
+  register mean is lexicographic over a full 16-day register. Stepped once a day after the
+  per-industry race loop, from `MT1_BP_START_DAY`, on days with all twelve industries scored;
+  the warm-in gate and bulking apply as to every JN pool. Pool files are tagged `all`
+  (`r_jnl_dec_all_jn_*`); there is no per-industry champion snapshot.
 - `--jn-profile FILE` — the mutation profile; default j_neuro's `profiles/training.json`.
 
 j_neuro computes in exact IEEE-754 and refuses fast-math, so it is reached only through
