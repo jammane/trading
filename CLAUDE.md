@@ -1214,6 +1214,11 @@ both **off by default**:
   mutations (1.3 at a time) and in about 69% of a bulked child's (3.3 at a time, up to 17). With
   `gc_replace` off, j_neuro 1149162 mutates byte-identically to 7fe26c6 (24 of 24 nets, 10
   generations).
+  **Known j_neuro bug (1149162):** `gc_replace` should leave a net's size unchanged, but it
+  sometimes adds one extra neuron (a slot-fill replacement adds two). The fix is due in the next
+  j_neuro release. Measured over 10 generations on JN4's elites: +0.33 nodes with it on against
+  +0.04 off, so part of JN5's and JN6's net growth (JN5 ~190 -> ~211) is this drift, not the 1%
+  growth.
 
 j_neuro computes in exact IEEE-754 and refuses fast-math, so it is reached only through
 `jn_bridge.{h,cpp}`, an opaque wrapper CMake builds with j_neuro's own flags. The build looks for a
