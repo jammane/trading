@@ -870,6 +870,9 @@ static std::string g_jn_profile = JNEURO_DEFAULT_PROFILE;
 #define JNEURO_DEFAULT_BULK_PROFILE "../j_neuro/profiles/bulk.json"
 #endif
 static std::string g_jn_bulk_profile = JNEURO_DEFAULT_BULK_PROFILE;
+// --jn-no-bulk: no bulking at a pass start. A JN StockNN seed's children are mutated with the
+// training profile, and a JN race pool carries over as saved, as before bulking existed.
+static bool g_jn_no_bulk = false;
 // Rows of history a JN pool keeps. A net replays its own get_warmup_steps() of them each day and
 // trades only once it has that many; 64 bounds the replay cost while leaving room for nets to
 // grow s_neuron chains well past StockNN's 15-day window.
@@ -4573,8 +4576,11 @@ static bool jn_seed_from_elites(int ind_i, const std::string& dir, uint64_t gene
     const uint64_t salt = jn_fresh_seed(0x4A4E5345ULL + (uint64_t)ind_i);   // "JNSE"
     double start_nodes = 0.0, end_nodes = 0.0;
     jn_read_size(dir, ind, start_nodes, end_nodes);
-    const double pct = jn_bulk_pct(start_nodes, end_nodes);
-    if (pct < 0.0)
+    const double pct = g_jn_no_bulk ? -1.0 : jn_bulk_pct(start_nodes, end_nodes);
+    if (g_jn_no_bulk)
+        log_msg(std::string("[") + IND_SHORT[ind_i] + "]   jn seed: bulking off (--jn-no-bulk) "
+                "-- children mutated");
+    else if (pct < 0.0)
         log_msg(std::string("[") + IND_SHORT[ind_i] + "]   jn seed: no size record in " + dir +
                 " -- children mutated, not bulked");
     if (pct < 0.0) {
@@ -4923,9 +4929,11 @@ static void jn_bulk_race_pool(const std::string& from, int ind_i, MT1PoolScratch
     const std::string pre = jn_pool_prefix(ind_i, tag);
     double start = 0.0, end = 0.0;
     jn_read_size(from, pre.c_str(), start, end);
-    const double pct = jn_bulk_pct(start, end);
+    const double pct = g_jn_no_bulk ? -1.0 : jn_bulk_pct(start, end);
     if (pct < 0.0) {
-        log_msg(std::string(tag) + " " + pool_ind_name(ind_i) + ": no size record -- not bulked");
+        log_msg(std::string(tag) + " " + pool_ind_name(ind_i) + (g_jn_no_bulk
+                ? ": bulking off (--jn-no-bulk) -- pool carried as saved"
+                : ": no size record -- not bulked"));
         return;
     }
     int order[MT1_POOL_SLOTS];
@@ -5435,7 +5443,7 @@ static void print_usage(const char* prog) {
         "          [--workers N] [--master-only] [--no-save] [--no-nn-race]\n"
         "          [--race-skip \"A,B,...\"]  switch race entries off (race_qualify.py RACE_SKIP)\n"
         "          [--race-only \"A,B,...\"]  run only these race entries (plus the deployed/logged two)\n"
-        "          [--jn-stocknn] [--jn-race] [--jn-profile FILE] [--jn-bulk-profile FILE]\n"
+        "          [--jn-stocknn] [--jn-race] [--jn-profile FILE] [--jn-bulk-profile FILE] [--jn-no-bulk]\n"
         "          [--seed N]   (default: clock, RE-SEEDED EVERY PASS; N derives passes from N)\n"
         "          [--trade-lock PATH | --no-trade-lock]  pause while production holds the lock\n"
         "          [--control-untrained]  NO-LEARNING CONTROL: re-randomise StockNN daily\n"
@@ -5975,6 +5983,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--jn-timing")  g_jn_timing = true;
         else if (arg == "--jn-profile" && a+1<argc) { g_jn_profile = argv[++a]; }
         else if (arg == "--jn-bulk-profile" && a+1<argc) { g_jn_bulk_profile = argv[++a]; }
+        else if (arg == "--jn-no-bulk") { g_jn_no_bulk = true; }
         else if (arg == "--continue-run") g_continue = true;
         else if (arg == "--crown" && a+1<argc) {
             std::string list = argv[++a];
@@ -6419,7 +6428,8 @@ int main(int argc, char* argv[]) {
         log_msg("#  --jn-stocknn : StockNN is a j_neuro pool, not the 928k net  #");
         log_msg("#  Compare it with a StockNN run over the SAME day range.      #");
         log_msg("################################################################");
-        log_msg("j_neuro profile: " + g_jn_profile + "; bulk profile: " + g_jn_bulk_profile);
+        log_msg("j_neuro profile: " + g_jn_profile + "; bulk profile: " + g_jn_bulk_profile +
+                (g_jn_no_bulk ? " (bulking OFF: --jn-no-bulk)" : ""));
         for (int i = 0; i < N_IND; i++) {
             std::string err;
             g_jn_ind[i] = jn_pool_create(STOCK_TODAY_DIM, STOCK_OUT_N, JN_POOL_SLOTS, JN_RING_CAP,
