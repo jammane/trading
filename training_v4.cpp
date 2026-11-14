@@ -3,7 +3,7 @@
 // Run:   ./build/training_v4_cpp --output models [--load-dir DIR] [--start-day N] [--stop-day N]
 //        [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F] [--workers N]
 
-#define TRAINER_VERSION "0.9.0.24"
+#define TRAINER_VERSION "0.9.0.26"
 
 #include <algorithm>
 #include <atomic>
@@ -920,6 +920,9 @@ static int g_jn_champ_n[N_IND];        // champions held (0 until a pass is seed
 // counts the run's resets; g_jn_champ_seen is how many StockNN's champions have answered.
 static int g_ind_resets[N_IND];
 static int g_jn_champ_seen[N_IND];
+// Champions this pass has already brought back (bit k = champion k): a repeat reset prefers one not
+// yet used; once all have been used the record clears. Reset at each pass start.
+static uint32_t g_jn_champ_used[N_IND];
 static int g_jn_hist_head[N_IND], g_jn_hist_count[N_IND];
 // A JN race pool (200 slots under the MT1 lifecycle) keeps its top 20 by rank when bulked, the
 // same count as StockNN's elites; 180 children, MUTATIONS_PER_PARENT (9) per parent.
@@ -1443,6 +1446,7 @@ struct MT1PoolScratch {
     int8_t      champ_of[MT1_POOL_SLOTS]{};
     int         champ_back{0};              // champions copied back in this pass (logged)
     int         champ_reset_seen{0};        // resets_of() already answered (copy-back gate)
+    uint32_t    champ_used{0};              // champions copied back this pass (bit k); see g_jn_champ_used
     float*      mut_buf{nullptr};           // one model, breeding scratch
     MT1SlotMeta meta[MT1_POOL_SLOTS]{};
     int         best_slot{0};               // deployed model; ranked in place, never shuffled
@@ -2574,7 +2578,9 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     int n_hist = jp ? 0 : scratch.hist_count * HIST_PER_DAY;
     // Champions only at the first selection after a reset (g_ind_resets); a reset seen on a
     // frozen (warm-in) day is answered by nothing.
-    const bool champ_open = jp && g_ind_resets[ind_i] > g_jn_champ_seen[ind_i];
+    // At most one champion enters the elites per reset, so champions chosen never exceed resets.
+    const int champ_quota = jp ? g_ind_resets[ind_i] - g_jn_champ_seen[ind_i] : 0;
+    const bool champ_open = champ_quota > 0;
     if (jp) g_jn_champ_seen[ind_i] = g_ind_resets[ind_i];
     const int n_champ = (champ_open && !freeze) ? g_jn_champ_n[ind_i] : 0;
     if (jp && !freeze) {
@@ -2848,12 +2854,20 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             int n_top = 0;
             {
                 uint64_t taken[ELITE_POOL];
+                int champ_left = champ_quota;   // the best-scoring champion(s) only, one per reset
+                uint32_t& used = g_jn_champ_used[ind_i];
+                const uint32_t all = n_champ >= 32 ? ~0u : ((1u << n_champ) - 1u);
+                if (n_champ > 0 && (used & all) == all) used = 0;   // every one used: start over
                 for (size_t q = 0; q < surviving.size() && n_top < ELITE_POOL; q++) {
                     const int sl = surviving[q].second;
+                    const bool is_champ = sl >= N_SLOTS && cand_slot[sl - N_SLOTS] < JN_HIST_BASE;
+                    const int ck = is_champ ? cand_slot[sl - N_SLOTS] - JN_CHAMP_BASE : -1;
+                    if (is_champ && (champ_left <= 0 || (used >> ck & 1u))) continue;
                     const uint64_t id = jn_id(jp, sl < N_SLOTS ? sl : cand_slot[sl - N_SLOTS]);
                     bool dup = false;
                     for (int t = 0; t < n_top && !dup; t++) dup = taken[t] == id;
                     if (dup) continue;
+                    if (is_champ) { champ_left--; used |= 1u << ck; }
                     taken[n_top] = id;
                     src[n_top++] = sl;
                 }
@@ -3519,20 +3533,30 @@ static void mt1_pool_evolve(int ind_i, MT1PoolScratch& sc, MT1DayResult& r, int 
         // hard-floor reset since the last copy-back check: champions are a fallback, not a
         // standing competitor. Their registers are kept every day so they are judged on 16 days.
         int c0 = 0;
+        // At most one champion per reset (the best-ranked eligible first), so copy-backs never
+        // exceed resets; a whole-market pool counts every industry's.
         const int resets_now = resets_of(ind_i);
-        const bool champ_open = resets_now > sc.champ_reset_seen;
+        const int champ_quota = resets_now - sc.champ_reset_seen;
         sc.champ_reset_seen = resets_now;
-        if (sc.jn && sc.jn_champ_n > 0 && champ_open) {
+        if (sc.jn && sc.jn_champ_n > 0 && champ_quota > 0) {
             const MT1SlotMeta& bar = sc.meta[parents[n_par - 1]];
             bool live[JN_CHAMP_N] = {};
             for (int s2 = 0; s2 < MT1_POOL_SLOTS; s2++)
                 if (sc.champ_of[s2] > 0) live[sc.champ_of[s2] - 1] = true;
-            for (int k = 0; k < sc.jn_champ_n && c0 < n_cull; k++) {
-                if (live[k] || !mt1_slot_mature(sc.champ_meta[k])) continue;
-                if (!mt1_slot_better(sc.champ_meta[k], bar)) continue;
+            const uint32_t all = sc.jn_champ_n >= 32 ? ~0u : ((1u << sc.jn_champ_n) - 1u);
+            if ((sc.champ_used & all) == all) sc.champ_used = 0;   // every one used: start over
+            int elig[JN_CHAMP_N], n_elig = 0;
+            for (int k = 0; k < sc.jn_champ_n; k++)
+                if (!live[k] && !(sc.champ_used >> k & 1u) && mt1_slot_mature(sc.champ_meta[k]) &&
+                    mt1_slot_better(sc.champ_meta[k], bar)) elig[n_elig++] = k;
+            std::sort(elig, elig + n_elig, [&](int a, int b) {
+                return mt1_slot_better(sc.champ_meta[a], sc.champ_meta[b]); });
+            for (int e = 0; e < n_elig && c0 < n_cull && c0 < champ_quota; e++) {
+                const int k = elig[e];
                 const int victim = order[n_mature - 1 - c0];
                 if (victim == sc.best_slot) break;
                 jn_copy(sc.jn, MT1_POOL_SLOTS + k, victim);
+                sc.champ_used |= 1u << k;
                 sc.meta[victim] = sc.champ_meta[k];
                 sc.champ_of[victim] = (int8_t)(k + 1);
                 c0++;
@@ -4573,6 +4597,7 @@ static bool jn_seed_from_elites(int ind_i, const std::string& dir, uint64_t gene
     for (int k = 0; k < JN_CHAMP_N; k++) jn_copy(p, k, JN_CHAMP_BASE + k);
     g_jn_champ_n[ind_i] = JN_CHAMP_N;
     g_jn_champ_seen[ind_i] = g_ind_resets[ind_i];   // a reset of the last pass opens nothing
+    g_jn_champ_used[ind_i] = 0;
     const uint64_t salt = jn_fresh_seed(0x4A4E5345ULL + (uint64_t)ind_i);   // "JNSE"
     double start_nodes = 0.0, end_nodes = 0.0;
     jn_read_size(dir, ind, start_nodes, end_nodes);
@@ -4984,6 +5009,7 @@ static void load_or_init_mt1_pool(const std::string& dir, const std::string& loa
     for (int s2 = 0; s2 < MT1_POOL_SLOTS; s2++) sc.champ_of[s2] = 0;
     sc.jn_champ_n = 0; sc.champ_back = 0;
     sc.champ_reset_seen = resets_of(ind_i);
+    sc.champ_used = 0;
     if (jn_from.empty()) return;
     int order[MT1_POOL_SLOTS];
     mt1_rank(sc, order);
