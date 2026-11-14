@@ -18,6 +18,9 @@ entry is in its commit message.
   sort into a predicted order of tomorrow's industry returns, scored on how many of their first 4
   (top or bottom) are right, then pairwise order, then correlation (`jnl_score.h`, tested).
 ### Changed
+- **`jn_profiles/`**: JN training and bulk profiles with `history_read_prob` 0.1, so mutation and
+  bulking can wire new connections to s_neurons' history and length nodes (j_neuro spec 0.6).
+  Used from JN5.
 - **JN champions are offered only after a reset**: a JN StockNN pool scores its champions, and can
   choose them as elites, only at the first selection after that industry's hard-floor reset; a JN
   race pool copies a champion back only on a day its industry (any industry, for the list pools)
