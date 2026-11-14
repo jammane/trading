@@ -4585,6 +4585,7 @@ static bool jn_seed_from_elites(int ind_i, const std::string& dir, uint64_t gene
     }
     const double cap = JN_BULK_CAP * start_nodes;
     double par_pct[ELITE_POOL], elite_n = 0.0;
+    int n_unbulked = 0;
     for (int k = 0; k < ELITE_POOL; k++) {
         const double n = (double)jn_slot_nodes(p, k);
         elite_n += n;
@@ -4592,9 +4593,13 @@ static bool jn_seed_from_elites(int ind_i, const std::string& dir, uint64_t gene
     }
     for (int mut_i = 0; mut_i < N_SLOTS - ELITE_POOL; mut_i++) {
         const int par = mut_i / MUTATIONS_PER_PARENT;
-        jn_bulk(p, par, ELITE_POOL + mut_i, par_pct[par], generation,
-                mix_seed(salt ^ 0x42554C4BULL ^ (uint64_t)mut_i));   // "BULK"
+        if (!jn_bulk(p, par, ELITE_POOL + mut_i, par_pct[par], generation,
+                     mix_seed(salt ^ 0x42554C4BULL ^ (uint64_t)mut_i)))   // "BULK"
+            n_unbulked++;
     }
+    if (n_unbulked)
+        log_msg(std::string("ERROR: [") + IND_SHORT[ind_i] + "] jn bulk: no bulk profile, " +
+                std::to_string(n_unbulked) + " children are plain copies of their parent");
     double child_n = 0.0; int child_max = 0, n_capped = 0;
     for (int s = ELITE_POOL; s < N_SLOTS; s++) {
         const int n = jn_slot_nodes(p, s);
@@ -4935,12 +4940,13 @@ static void jn_bulk_race_pool(const std::string& from, int ind_i, MT1PoolScratch
         const double n = (double)jn_slot_nodes(sc.jn, keep[k]);
         par_pct[k] = n > 0.0 ? std::max(0.0, std::min(pct, (cap / n - 1.0) * 100.0)) : 0.0;
     }
-    int c = 0, n_cap = 0; double child_n = 0.0;
+    int c = 0, n_cap = 0, n_unbulked = 0; double child_n = 0.0;
     for (int s = 0; s < MT1_POOL_SLOTS; s++) {
         if (kept[s]) continue;
         const int k = std::min(c / MUTATIONS_PER_PARENT, JN_RACE_KEEP - 1);
-        jn_bulk(sc.jn, keep[k], s, par_pct[k], 0,
-                mix_seed(salt ^ 0x42554C4BULL ^ ((uint64_t)ind_i << 32) ^ (uint64_t)s));
+        if (!jn_bulk(sc.jn, keep[k], s, par_pct[k], 0,
+                     mix_seed(salt ^ 0x42554C4BULL ^ ((uint64_t)ind_i << 32) ^ (uint64_t)s)))
+            n_unbulked++;
         mt1_slot_init(sc.meta[s], sc.meta[keep[k]].lineage);
         sc.champ_of[s] = 0;
         child_n += jn_slot_nodes(sc.jn, s);
@@ -4953,6 +4959,9 @@ static void jn_bulk_race_pool(const std::string& from, int ind_i, MT1PoolScratch
              tag, pool_ind_name(ind_i).c_str(), start, end, 100.0 * (1.0 - end / start),
              std::min(pct, 1e6), cap, MT1_POOL_SLOTS - c, c, c ? child_n / c : 0.0, n_cap, JN_RACE_KEEP);
     log_msg(m);
+    if (n_unbulked)
+        log_msg(std::string("ERROR: ") + tag + " " + pool_ind_name(ind_i) + ": jn bulk: no bulk profile, " +
+                std::to_string(n_unbulked) + " children are plain copies of their parent");
 }
 
 static void load_or_init_mt1_pool(const std::string& dir, const std::string& load_dir,
@@ -6305,6 +6314,12 @@ int main(int argc, char* argv[]) {
                         return 1;
                     }
                     jn_set_persist(r.pool[p].jn, MT1_POOL_SLOTS);   // champion slots are scratch
+                    // The bulk profile, as the StockNN pools load it; without it every pass-start
+                    // "bulk" was a plain copy of the parent (JN2-JN4).
+                    if (!jn_set_bulk_profile(r.pool[p].jn, g_jn_bulk_profile, err)) {
+                        log_msg("ERROR: " + race_norm_name(RACE[v].name) + ": " + err);
+                        return 1;
+                    }
                 }
                 log_msg("MT1 race: " + race_norm_name(RACE[v].name) + " -- j_neuro " +
                         (whole ? "888->12 nets, one whole-market pool" : "74->1 nets") +

@@ -23,7 +23,7 @@ void    jn_set_persist(JNPool*, int) {}
 void    jn_copy(JNPool*, int, int) {}
 uint64_t jn_id(const JNPool*, int) { return 0; }
 bool    jn_set_bulk_profile(JNPool*, const std::string&, std::string& err) { err = "no j_neuro"; return false; }
-void    jn_bulk(JNPool*, int, int, double, uint64_t, uint64_t) {}
+bool    jn_bulk(JNPool*, int, int, double, uint64_t, uint64_t) { return false; }
 int     jn_slot_nodes(const JNPool*, int) { return 0; }
 JNTiming jn_timing_take() { return {}; }
 bool    jn_save(const JNPool*, const std::string&, const std::string&) { return false; }

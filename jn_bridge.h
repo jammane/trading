@@ -76,8 +76,10 @@ uint64_t jn_id(const JNPool* p, int slot);
 
 // Bulking (j_neuro profiles/bulk.json, growth_budget = fill). Load the bulk profile once per pool;
 // then dst = src grown by pct% of its neurons (exactly, within rounding). pct <= 0 copies src.
+// Returns false when pct > 0 but the pool has no bulk profile: dst is then a plain copy, and the
+// caller must say so (race pools went unbulked for JN2-JN4 because this fell back silently).
 bool    jn_set_bulk_profile(JNPool* p, const std::string& path, std::string& err);
-void    jn_bulk(JNPool* p, int src, int dst, double pct, uint64_t generation, uint64_t seed);
+bool    jn_bulk(JNPool* p, int src, int dst, double pct, uint64_t generation, uint64_t seed);
 // Neurons (non-input nodes) in one slot's net, as jn_stats counts them.
 int     jn_slot_nodes(const JNPool* p, int slot);
 
