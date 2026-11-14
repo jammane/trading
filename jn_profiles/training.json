@@ -1,0 +1,58 @@
+{
+ "format": "j_neuro.profile",
+ "spec_version": "0.6.0",
+ "overall": {
+  "op_change_max_pct": 1.0,
+  "edit_max_pct": 20.0,
+  "growth_max_pct": 1.0,
+  "removal_max_pct": 0.0,
+  "depth_shift_max_pct": 5.0,
+  "depth_shift_mode": "uniform",
+  "sigma_weight": 0.1,
+  "sign_flip_prob": 0.02,
+  "sigma_k": 1.0,
+  "sigma_slots": 1.0,
+  "rewire_prob": 0.05,
+  "insert_inversion_prob": 0.05,
+  "min_age_for_removal": 5,
+  "add_method_weights": {
+   "slot_fill": 200,
+   "v_insert": 179,
+   "s_insert": 114,
+   "m_after_m": 64,
+   "v_tap": 29,
+   "s_tap": 29,
+   "m_tap": 14,
+   "m_clone": 173,
+   "m_insert": 58,
+   "v_link": 69,
+   "s_link": 69
+  },
+  "slot_fill_type_weights": {
+   "v": 1,
+   "s": 1,
+   "m": 1
+  },
+  "rng_mode": "fresh",
+  "growth_budget": "fill",
+  "constant_folding": "on",
+  "insert_depth": "uniform",
+  "slot_retarget_prob": 0.05,
+  "width_bias": "deficit",
+  "width_peak": 0.5,
+  "tap_peak": 0.25,
+  "prune": "any",
+  "link_max_span": 0.25,
+  "growth_gen_prob": 0.1,
+  "growth_net_prob": 0.1,
+  "no_growth_swap": "on",
+  "slot_edit": "biased",
+  "slot_add_prob": 0.75,
+  "history_read_prob": 0.1
+ },
+ "v": {},
+ "s": {},
+ "m": {
+  "edit_max_pct": 5.0
+ }
+}

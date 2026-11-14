@@ -1198,6 +1198,14 @@ both **off by default**:
   the warm-in gate and bulking apply as to every JN pool. Pool files are tagged `all`
   (`r_jnl_dec_all_jn_*`); there is no per-industry champion snapshot.
 - `--jn-profile FILE` — the mutation profile; default j_neuro's `profiles/training.json`.
+- **`jn_profiles/`** — this repo's copies of j_neuro's `training.json` and `bulk.json` (spec 0.6)
+  with **`history_read_prob` = 0.1**, from JN5 on (`--jn-profile jn_profiles/training.json
+  --jn-bulk-profile jn_profiles/bulk.json`): a new connection made by rewiring, retargeting,
+  connecting a slot or a link reads an s_neuron's length or history node (its input j steps ago)
+  instead of a node 10% of the time, so evolution can wire to what an s_neuron remembers. j_neuro's
+  own profiles keep it at 0. Measured on the JN4 seed: the seed nets carry 0 history reads,
+  bulked children 12.1 each (1.6% of connections, every child), and after 60 days the elites
+  15.6 (239 of 240 nets).
 
 j_neuro computes in exact IEEE-754 and refuses fast-math, so it is reached only through
 `jn_bridge.{h,cpp}`, an opaque wrapper CMake builds with j_neuro's own flags. The build looks for a
