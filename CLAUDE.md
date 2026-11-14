@@ -1206,6 +1206,14 @@ both **off by default**:
   own profiles keep it at 0. Measured on the JN4 seed: the seed nets carry 0 history reads,
   bulked children 12.1 each (1.6% of connections, every child), and after 60 days the elites
   15.6 (239 of 240 nets).
+  From JN5 the training profile also grows in **15% of generations for 15% of nets** (was 10%/10%;
+  still 1% of a net's neurons) and sets **`gc_replace` on** (j_neuro 1149162): every neuron a
+  mutation removes, through removal or garbage collection after a cut, is grown back elsewhere
+  with the profile's growth methods, so a net's size changes only through that 1% growth. JN5
+  runs with `--jn-no-bulk`. Measured on JN4's elites, the gc collected a neuron in 5.8% of
+  mutations (1.3 at a time) and in about 69% of a bulked child's (3.3 at a time, up to 17). With
+  `gc_replace` off, j_neuro 1149162 mutates byte-identically to 7fe26c6 (24 of 24 nets, 10
+  generations).
 
 j_neuro computes in exact IEEE-754 and refuses fast-math, so it is reached only through
 `jn_bridge.{h,cpp}`, an opaque wrapper CMake builds with j_neuro's own flags. The build looks for a
