@@ -1202,7 +1202,12 @@ both **off by default**:
 j_neuro computes in exact IEEE-754 and refuses fast-math, so it is reached only through
 `jn_bridge.{h,cpp}`, an opaque wrapper CMake builds with j_neuro's own flags. The build looks for a
 checkout at `../j_neuro` (`-DJNEURO_DIR=`; it needs `json-devel`; j_neuro ed79fa6 or later, for
-`Net::reset_state` and bulking); without one,
+`Net::reset_state` and bulking). j_neuro 7fe26c6 (spec 0.6, s_neuron length and history
+nodes) is backward compatible for saved nets: 300 of JN3's `.jnet` files load with identical
+warmups and bit-identical outputs under both versions. Its profiles are `spec_version` 0.6, which a
+trainer built against an older j_neuro refuses, and mutation and bulking produce different
+children from the same seed (an old and a new build agree to the bit through day 13 of a seeded
+run, then diverge as the bulked children with long memories start trading); without one,
 `jn_bridge_stub.cpp` is linked and every JN flag is refused at startup. JN is refused under
 `--upkeep` and the control modes, and production cannot run a JN net (it runs StockNN in torch),
 so JN champions are not promotable to paper or prod yet.
@@ -1238,7 +1243,12 @@ copied into an elite slot (counting as traded) and breeds the next day's childre
 candidate itself is never mutated. Within a pass the seed can therefore always win its place
 back after one bad day, instead of being lost for good. Logged on every selection line as
 `safety nets: C champ + H hist scored, c+h chosen`; a candidate in the elite list reads `cN`/`hN`.
-Champions count toward the warm-in gate. The elite list takes **distinct nets only**: every net
+Champions count toward the warm-in gate. **Champions are offered only after a reset
+(2026-11-13):** they are scored and eligible as elites only at the first selection after that
+industry's book hit the hard floor (the reset day itself ends before selection). In JN3, offered
+every day, they entered the elite list on ~50% of days (~2 a day, #1 on ~10%), so 18 of each
+day's 180 children were the seed's structure and no bulked neuron survived pass 1; the history
+nets are unchanged. The elite list takes **distinct nets only**: every net
 carries an identity (`jn_id`) that copies keep and breeding renews, and a candidate that is the
 same net as one already chosen is skipped -- yesterday's history entries are today's elite slots,
 so without this the list filled with clones (14 of 20 on one test day). Measured on days 32-60:
@@ -1248,8 +1258,9 @@ The **JN race pools** get the champions only. Their lifecycle already keeps its 
 culled only after a sustained bad 16-day register, never the deployed one), so there is no
 single-bad-day loss for a history to repair. A pool started from a saved pool copies its top 20,
 before bulking, into 20 extra slots; each champion is scored daily into its own register and is
-never culled or mutated. When a mature champion would rank among the day's parents and no copy of
-it is in the pool, it is copied back in, register and all, in place of the first cull victim, and
+never culled or mutated. On a day its industry has had a reset (any industry, for a whole-market
+pool), a mature champion that would rank among the day's parents, with no copy of it in the
+pool, is copied back in, register and all, in place of the first cull victim, and
 breeds from the next day (`champions copied back into the pool this pass: N` at the save). A
 fresh pool has no champions.
 

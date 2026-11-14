@@ -18,6 +18,10 @@ entry is in its commit message.
   sort into a predicted order of tomorrow's industry returns, scored on how many of their first 4
   (top or bottom) are right, then pairwise order, then correlation (`jnl_score.h`, tested).
 ### Changed
+- **JN champions are offered only after a reset**: a JN StockNN pool scores its champions, and can
+  choose them as elites, only at the first selection after that industry's hard-floor reset; a JN
+  race pool copies a champion back only on a day its industry (any industry, for the list pools)
+  was reset. Offered daily they re-seeded the seed's structure on ~half of JN3's days.
 - **Champion judging charges recent hard-floor resets** (`pass_reference.csv` v3): a reset in a
   pass's last two years scores its top-up as a loss on the rescued book instead of 0.
 - **JN warm-in gate**: a JN pool is not selected, culled or scored until its history ring is
