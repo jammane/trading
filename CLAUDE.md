@@ -1263,7 +1263,9 @@ Champions count toward the warm-in gate. **Champions are offered only after a re
 (2026-11-13):** they are scored and eligible as elites only at the first selection after that
 industry's book hit the hard floor (the reset day itself ends before selection), and **at most
 one champion per reset** enters the elites, the best-scoring one (2026-11-14), so champions chosen
-never exceed resets (JN5 chose 390 after 107 resets). In JN3, offered
+never exceed resets (JN5 chose 390 after 107 resets). A champion already brought back this pass is
+skipped on a later reset of the same industry, until all 20 have been used and the record clears
+(race pools likewise, per pool). In JN3, offered
 every day, they entered the elite list on ~50% of days (~2 a day, #1 on ~10%), so 18 of each
 day's 180 children were the seed's structure and no bulked neuron survived pass 1; the history
 nets are unchanged. The elite list takes **distinct nets only**: every net
