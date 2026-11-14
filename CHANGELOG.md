@@ -9,6 +9,8 @@ entry is in its commit message.
 ## Unreleased
 
 ### Added
+- `--jn-no-bulk`: no bulking at a JN pass start; the seed's children are mutated and the JN race
+  pools carry over as saved.
 - **JN safety nets**: each JN StockNN pool scores its pass's 20 seed elites (champions, before
   bulking) and the last 5 days' top 10 elites (history) every day beside the 200 working nets; any
   of them can be re-selected as an elite and breed, but none is mutated or saved with the pool.

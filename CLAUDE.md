@@ -1292,6 +1292,8 @@ nodes (lost L%) -> +P%, cap C; ...`. The record is `jn_size_<ind>.txt` ("start e
 beside the elites and copied wherever they go (`copy_elites`: staging, `champion/`, the blended
 seed), so a pass started from champions bulks by the champion pass's own shrinkage. Elites with
 no record (from before this change) are mutated as before, and the log says so. `--jn-bulk-profile FILE` overrides the profile.
+`--jn-no-bulk` turns bulking off: a seed's children are mutated with the training profile, and a
+JN race pool carries over as saved (logged `bulking off (--jn-no-bulk)`).
 
 The **JN race pools** are bulked the same way when a pass starts from a saved pool: the top 20 by
 rank (`JN_RACE_KEEP`, plus the deployed slot) stay as they are, every other slot becomes a bulked
