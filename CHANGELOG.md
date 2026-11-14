@@ -20,6 +20,8 @@ entry is in its commit message.
   sort into a predicted order of tomorrow's industry returns, scored on how many of their first 4
   (top or bottom) are right, then pairwise order, then correlation (`jnl_score.h`, tested).
 ### Changed
+- **JN5 training profile**: growth in 15% of generations for 15% of nets (was 10%/10%) and
+  `gc_replace` on, so removed neurons are grown back elsewhere (needs j_neuro 1149162).
 - **`jn_profiles/`**: JN training and bulk profiles with `history_read_prob` 0.1, so mutation and
   bulking can wire new connections to s_neurons' history and length nodes (j_neuro spec 0.6).
   Used from JN5.

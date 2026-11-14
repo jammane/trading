@@ -3,7 +3,7 @@
 // Run:   ./build/training_v4_cpp --output models [--load-dir DIR] [--start-day N] [--stop-day N]
 //        [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F] [--workers N]
 
-#define TRAINER_VERSION "0.9.0.21"
+#define TRAINER_VERSION "0.9.0.23"
 
 #include <algorithm>
 #include <atomic>
@@ -6325,7 +6325,7 @@ int main(int argc, char* argv[]) {
                     jn_set_persist(r.pool[p].jn, MT1_POOL_SLOTS);   // champion slots are scratch
                     // The bulk profile, as the StockNN pools load it; without it every pass-start
                     // "bulk" was a plain copy of the parent (JN2-JN4).
-                    if (!jn_set_bulk_profile(r.pool[p].jn, g_jn_bulk_profile, err)) {
+                    if (!g_jn_no_bulk && !jn_set_bulk_profile(r.pool[p].jn, g_jn_bulk_profile, err)) {
                         log_msg("ERROR: " + race_norm_name(RACE[v].name) + ": " + err);
                         return 1;
                     }
@@ -6428,15 +6428,15 @@ int main(int argc, char* argv[]) {
         log_msg("#  --jn-stocknn : StockNN is a j_neuro pool, not the 928k net  #");
         log_msg("#  Compare it with a StockNN run over the SAME day range.      #");
         log_msg("################################################################");
-        log_msg("j_neuro profile: " + g_jn_profile + "; bulk profile: " + g_jn_bulk_profile +
-                (g_jn_no_bulk ? " (bulking OFF: --jn-no-bulk)" : ""));
+        log_msg("j_neuro profile: " + g_jn_profile + "; bulk profile: " +
+                (g_jn_no_bulk ? std::string("none (bulking OFF: --jn-no-bulk)") : g_jn_bulk_profile));
         for (int i = 0; i < N_IND; i++) {
             std::string err;
             g_jn_ind[i] = jn_pool_create(STOCK_TODAY_DIM, STOCK_OUT_N, JN_POOL_SLOTS, JN_RING_CAP,
                                          g_jn_profile, jn_fresh_seed(0x5700ULL + (uint64_t)i), err);
             if (!g_jn_ind[i]) { log_msg("ERROR: --jn-stocknn: " + err); return 1; }
             jn_set_persist(g_jn_ind[i], N_SLOTS);   // champion + history slots are scratch
-            if (!jn_set_bulk_profile(g_jn_ind[i], g_jn_bulk_profile, err)) {
+            if (!g_jn_no_bulk && !jn_set_bulk_profile(g_jn_ind[i], g_jn_bulk_profile, err)) {
                 log_msg("ERROR: --jn-stocknn: " + err); return 1;
             }
             // Pools saved before sell_flag (4 outputs per stock) gain a fresh sell_flag output

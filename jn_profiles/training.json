@@ -43,12 +43,13 @@
   "tap_peak": 0.25,
   "prune": "any",
   "link_max_span": 0.25,
-  "growth_gen_prob": 0.1,
-  "growth_net_prob": 0.1,
+  "growth_gen_prob": 0.15,
+  "growth_net_prob": 0.15,
   "no_growth_swap": "on",
   "slot_edit": "biased",
   "slot_add_prob": 0.75,
-  "history_read_prob": 0.1
+  "history_read_prob": 0.1,
+  "gc_replace": "on"
  },
  "v": {},
  "s": {},
