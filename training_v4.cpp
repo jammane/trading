@@ -2574,7 +2574,9 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     int n_hist = jp ? 0 : scratch.hist_count * HIST_PER_DAY;
     // Champions only at the first selection after a reset (g_ind_resets); a reset seen on a
     // frozen (warm-in) day is answered by nothing.
-    const bool champ_open = jp && g_ind_resets[ind_i] > g_jn_champ_seen[ind_i];
+    // At most one champion enters the elites per reset, so champions chosen never exceed resets.
+    const int champ_quota = jp ? g_ind_resets[ind_i] - g_jn_champ_seen[ind_i] : 0;
+    const bool champ_open = champ_quota > 0;
     if (jp) g_jn_champ_seen[ind_i] = g_ind_resets[ind_i];
     const int n_champ = (champ_open && !freeze) ? g_jn_champ_n[ind_i] : 0;
     if (jp && !freeze) {
@@ -2848,12 +2850,16 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             int n_top = 0;
             {
                 uint64_t taken[ELITE_POOL];
+                int champ_left = champ_quota;   // the best-scoring champion(s) only, one per reset
                 for (size_t q = 0; q < surviving.size() && n_top < ELITE_POOL; q++) {
                     const int sl = surviving[q].second;
+                    const bool is_champ = sl >= N_SLOTS && cand_slot[sl - N_SLOTS] < JN_HIST_BASE;
+                    if (is_champ && champ_left <= 0) continue;
                     const uint64_t id = jn_id(jp, sl < N_SLOTS ? sl : cand_slot[sl - N_SLOTS]);
                     bool dup = false;
                     for (int t = 0; t < n_top && !dup; t++) dup = taken[t] == id;
                     if (dup) continue;
+                    if (is_champ) champ_left--;
                     taken[n_top] = id;
                     src[n_top++] = sl;
                 }
@@ -3519,17 +3525,24 @@ static void mt1_pool_evolve(int ind_i, MT1PoolScratch& sc, MT1DayResult& r, int 
         // hard-floor reset since the last copy-back check: champions are a fallback, not a
         // standing competitor. Their registers are kept every day so they are judged on 16 days.
         int c0 = 0;
+        // At most one champion per reset (the best-ranked eligible first), so copy-backs never
+        // exceed resets; a whole-market pool counts every industry's.
         const int resets_now = resets_of(ind_i);
-        const bool champ_open = resets_now > sc.champ_reset_seen;
+        const int champ_quota = resets_now - sc.champ_reset_seen;
         sc.champ_reset_seen = resets_now;
-        if (sc.jn && sc.jn_champ_n > 0 && champ_open) {
+        if (sc.jn && sc.jn_champ_n > 0 && champ_quota > 0) {
             const MT1SlotMeta& bar = sc.meta[parents[n_par - 1]];
             bool live[JN_CHAMP_N] = {};
             for (int s2 = 0; s2 < MT1_POOL_SLOTS; s2++)
                 if (sc.champ_of[s2] > 0) live[sc.champ_of[s2] - 1] = true;
-            for (int k = 0; k < sc.jn_champ_n && c0 < n_cull; k++) {
-                if (live[k] || !mt1_slot_mature(sc.champ_meta[k])) continue;
-                if (!mt1_slot_better(sc.champ_meta[k], bar)) continue;
+            int elig[JN_CHAMP_N], n_elig = 0;
+            for (int k = 0; k < sc.jn_champ_n; k++)
+                if (!live[k] && mt1_slot_mature(sc.champ_meta[k]) &&
+                    mt1_slot_better(sc.champ_meta[k], bar)) elig[n_elig++] = k;
+            std::sort(elig, elig + n_elig, [&](int a, int b) {
+                return mt1_slot_better(sc.champ_meta[a], sc.champ_meta[b]); });
+            for (int e = 0; e < n_elig && c0 < n_cull && c0 < champ_quota; e++) {
+                const int k = elig[e];
                 const int victim = order[n_mature - 1 - c0];
                 if (victim == sc.best_slot) break;
                 jn_copy(sc.jn, MT1_POOL_SLOTS + k, victim);

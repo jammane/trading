@@ -1261,7 +1261,9 @@ back after one bad day, instead of being lost for good. Logged on every selectio
 `safety nets: C champ + H hist scored, c+h chosen`; a candidate in the elite list reads `cN`/`hN`.
 Champions count toward the warm-in gate. **Champions are offered only after a reset
 (2026-11-13):** they are scored and eligible as elites only at the first selection after that
-industry's book hit the hard floor (the reset day itself ends before selection). In JN3, offered
+industry's book hit the hard floor (the reset day itself ends before selection), and **at most
+one champion per reset** enters the elites, the best-scoring one (2026-11-14), so champions chosen
+never exceed resets (JN5 chose 390 after 107 resets). In JN3, offered
 every day, they entered the elite list on ~50% of days (~2 a day, #1 on ~10%), so 18 of each
 day's 180 children were the seed's structure and no bulked neuron survived pass 1; the history
 nets are unchanged. The elite list takes **distinct nets only**: every net
@@ -1275,7 +1277,7 @@ culled only after a sustained bad 16-day register, never the deployed one), so t
 single-bad-day loss for a history to repair. A pool started from a saved pool copies its top 20,
 before bulking, into 20 extra slots; each champion is scored daily into its own register and is
 never culled or mutated. On a day its industry has had a reset (any industry, for a whole-market
-pool), a mature champion that would rank among the day's parents, with no copy of it in the
+pool), one mature champion per reset (the best-ranked) that would rank among the day's parents, with no copy of it in the
 pool, is copied back in, register and all, in place of the first cull victim, and
 breeds from the next day (`champions copied back into the pool this pass: N` at the save). A
 fresh pool has no champions.

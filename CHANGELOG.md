@@ -25,6 +25,8 @@ entry is in its commit message.
 - **`jn_profiles/`**: JN training and bulk profiles with `history_read_prob` 0.1, so mutation and
   bulking can wire new connections to s_neurons' history and length nodes (j_neuro spec 0.6).
   Used from JN5.
+- **One JN champion per reset**: after a reset only the best-scoring champion can enter the
+  elites (race pools: one copy-back per reset), so champions chosen never exceed resets.
 - **JN champions are offered only after a reset**: a JN StockNN pool scores its champions, and can
   choose them as elites, only at the first selection after that industry's hard-floor reset; a JN
   race pool copies a champion back only on a day its industry (any industry, for the list pools)
