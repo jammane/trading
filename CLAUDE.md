@@ -1300,6 +1300,14 @@ record (`jn_size_<entry>_<ind>_jn.txt`: pool mean at the pass start, top-20 mean
 written with the pool at the pass end. `champion/` holds only a race entry's deployed net, not its
 pool, so a run seeded from champions starts its JN race pools fresh, as before.
 
+**Race-pool bulking did nothing in JN2-JN4 (fixed 2026-11-13).** The race pools were created
+without the bulk profile, and `jn_bulk` silently made a plain copy when a pool had none, so every
+"bulked" child was a clone of its parent (the log's `children N mean` equalled the parents' size).
+The race pools now load `--jn-bulk-profile` like the StockNN pools, and `jn_bulk` reports a
+fallback copy, which both callers log as an `ERROR`. Race nets do not shrink during a pass (JN1:
+24 -> 24.0-24.1 nodes; the list pools, from JN2: 304 -> 304), so their recorded loss is 0% and
+they bulk to the cap, 3x: 24 -> 72 nodes, 304 -> 912.
+
 The
 training profile's own growth is now 1% of a net's neurons (`fill`, min 1) in 10% of generations
 for 10% of nets (j_neuro ed79fa6); removal stays off.

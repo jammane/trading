@@ -68,10 +68,10 @@ bool jn_set_bulk_profile(JNPool* p, const std::string& path, std::string& err) {
     }
 }
 
-void jn_bulk(JNPool* p, int src, int dst, double pct, uint64_t generation, uint64_t seed) {
+bool jn_bulk(JNPool* p, int src, int dst, double pct, uint64_t generation, uint64_t seed) {
     if (pct <= 0.0 || !p->has_bulk) {   // a plain copy, so the same net (same id)
         jn_copy(p, src, dst);
-        return;
+        return pct <= 0.0;
     }
     jneuro::Profile prof = p->bulk;
     prof.set_overall("growth_max_pct", pct);
@@ -79,6 +79,7 @@ void jn_bulk(JNPool* p, int src, int dst, double pct, uint64_t generation, uint6
     p->nets[(size_t)dst] = jneuro::mutate(p->nets[(size_t)src], prof, generation, rng, nullptr, true);
     p->warm[(size_t)dst] = -1;
     p->renew((size_t)dst);
+    return true;
 }
 
 int jn_slot_nodes(const JNPool* p, int slot) {

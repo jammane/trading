@@ -45,6 +45,11 @@ entry is in its commit message.
 - `--jn-timing`: one `TIMING day N:` line per day splitting the day's time (j_neuro forward,
   mutate, the rest; the post-industry block).
 
+### Fixed
+- **JN race pools are bulked at a pass start**: they never loaded the bulk profile, so their
+  bulked children were plain copies of the parents (JN2-JN4). A bulk that falls back to a copy is
+  now logged as an error.
+
 ## 0.9.0.0 — StockNN sell_flag (BREAKING), j_neuro nets (2026-11-12)
 
 ### Added
