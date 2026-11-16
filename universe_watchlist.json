@@ -52,37 +52,37 @@
   "replacements": {
     "tech_hardware": [
       {
-        "symbol": "STM",
-        "exchange": "NYQ",
-        "yahoo_industry": "Semiconductors",
-        "name": "STMicroelectronics N.V.",
-        "price": 44.54,
-        "vol": 0.6218,
-        "dollar_vol": 473196915,
-        "score": 0.2049,
-        "checked": "2026-11-09"
+        "symbol": "ACMR",
+        "exchange": "NGM",
+        "yahoo_industry": "Semiconductor Equipment & Materials",
+        "name": "ACM Research, Inc.",
+        "price": 44.0,
+        "vol": 0.8794,
+        "dollar_vol": 73587273,
+        "score": 0.1991,
+        "checked": "2026-11-16"
       },
       {
         "symbol": "POWI",
         "exchange": "NMS",
         "yahoo_industry": "Semiconductors",
         "name": "Power Integrations, Inc.",
-        "price": 44.29,
-        "vol": 0.611,
-        "dollar_vol": 40606534,
-        "score": 0.2281,
-        "checked": "2026-11-09"
+        "price": 42.34,
+        "vol": 0.6149,
+        "dollar_vol": 39897245,
+        "score": 0.2377,
+        "checked": "2026-11-16"
       },
       {
-        "symbol": "ACMR",
-        "exchange": "NGM",
-        "yahoo_industry": "Semiconductor Equipment & Materials",
-        "name": "ACM Research, Inc.",
-        "price": 49.75,
-        "vol": 0.8725,
-        "dollar_vol": 77549665,
-        "score": 0.2444,
-        "checked": "2026-11-09"
+        "symbol": "GFS",
+        "exchange": "NMS",
+        "yahoo_industry": "Semiconductors",
+        "name": "GLOBALFOUNDRIES Inc.",
+        "price": 39.42,
+        "vol": 0.6215,
+        "dollar_vol": 220990583,
+        "score": 0.258,
+        "checked": "2026-11-16"
       }
     ],
     "tech_software_ai": [
@@ -91,33 +91,33 @@
         "exchange": "NYQ",
         "yahoo_industry": "Software - Application",
         "name": "BILL Holdings, Inc.",
-        "price": 53.81,
-        "vol": 0.5942,
-        "dollar_vol": 84476864,
-        "score": 0.0693,
-        "checked": "2026-11-09"
+        "price": 57.63,
+        "vol": 0.5843,
+        "dollar_vol": 77878132,
+        "score": 0.0144,
+        "checked": "2026-11-16"
       },
       {
         "symbol": "GTLB",
         "exchange": "NMS",
         "yahoo_industry": "Software - Infrastructure",
         "name": "GitLab Inc.",
-        "price": 47.12,
-        "vol": 0.5902,
-        "dollar_vol": 217139712,
-        "score": 0.2088,
-        "checked": "2026-11-09"
+        "price": 47.33,
+        "vol": 0.5878,
+        "dollar_vol": 212764320,
+        "score": 0.2028,
+        "checked": "2026-11-16"
       },
       {
-        "symbol": "BLKB",
+        "symbol": "INTA",
         "exchange": "NMS",
         "yahoo_industry": "Software - Application",
-        "name": "Blackbaud, Inc.",
-        "price": 54.58,
-        "vol": 0.4815,
-        "dollar_vol": 21123480,
-        "score": 0.2654,
-        "checked": "2026-11-09"
+        "name": "Intapp, Inc.",
+        "price": 45.98,
+        "vol": 0.6087,
+        "dollar_vol": 27336087,
+        "score": 0.2523,
+        "checked": "2026-11-16"
       }
     ],
     "financials": [
@@ -126,33 +126,33 @@
         "exchange": "NYQ",
         "yahoo_industry": "Capital Markets",
         "name": "Piper Sandler Companies",
-        "price": 67.64,
-        "vol": 0.3725,
-        "dollar_vol": 55102196,
-        "score": 0.1524,
-        "checked": "2026-11-09"
+        "price": 65.85,
+        "vol": 0.3705,
+        "dollar_vol": 55416159,
+        "score": 0.135,
+        "checked": "2026-11-16"
       },
       {
         "symbol": "SHG",
         "exchange": "NYQ",
         "yahoo_industry": "Banks - Regional",
         "name": "Shinhan Financial Group Co., Ltd.",
-        "price": 64.89,
-        "vol": 0.3383,
-        "dollar_vol": 13898940,
-        "score": 0.2074,
-        "checked": "2026-11-09"
+        "price": 66.14,
+        "vol": 0.3378,
+        "dollar_vol": 14159313,
+        "score": 0.2319,
+        "checked": "2026-11-16"
       },
       {
         "symbol": "SNEX",
         "exchange": "NMS",
         "yahoo_industry": "Capital Markets",
         "name": "StoneX Group Inc.",
-        "price": 56.77,
-        "vol": 0.4719,
-        "dollar_vol": 58596004,
-        "score": 0.2591,
-        "checked": "2026-11-09"
+        "price": 56.78,
+        "vol": 0.471,
+        "dollar_vol": 57266181,
+        "score": 0.2532,
+        "checked": "2026-11-16"
       }
     ],
     "consumer_discretionary": [
@@ -161,33 +161,33 @@
         "exchange": "NMS",
         "yahoo_industry": "Auto Parts",
         "name": "Visteon Corporation",
-        "price": 78.03,
-        "vol": 0.4032,
-        "dollar_vol": 47635887,
-        "score": 0.2099,
-        "checked": "2026-11-09"
+        "price": 77.91,
+        "vol": 0.4088,
+        "dollar_vol": 48715181,
+        "score": 0.2191,
+        "checked": "2026-11-16"
       },
       {
         "symbol": "MGA",
         "exchange": "NYQ",
         "yahoo_industry": "Auto Parts",
         "name": "Magna International Inc.",
-        "price": 62.31,
-        "vol": 0.3689,
-        "dollar_vol": 74227417,
-        "score": 0.2823,
-        "checked": "2026-11-09"
+        "price": 61.27,
+        "vol": 0.369,
+        "dollar_vol": 75314372,
+        "score": 0.2809,
+        "checked": "2026-11-16"
       },
       {
         "symbol": "BC",
         "exchange": "NYQ",
         "yahoo_industry": "Recreational Vehicles",
         "name": "Brunswick Corporation",
-        "price": 79.68,
-        "vol": 0.3771,
-        "dollar_vol": 57543034,
-        "score": 0.2976,
-        "checked": "2026-11-09"
+        "price": 76.45,
+        "vol": 0.3764,
+        "dollar_vol": 55726602,
+        "score": 0.2827,
+        "checked": "2026-11-16"
       }
     ],
     "consumer_services": [
@@ -196,68 +196,68 @@
         "exchange": "NMS",
         "yahoo_industry": "Internet Content & Information",
         "name": "Baidu, Inc.",
-        "price": 81.03,
-        "vol": 0.4675,
-        "dollar_vol": 240571150,
-        "score": 0.3349,
-        "checked": "2026-11-09"
+        "price": 73.94,
+        "vol": 0.4637,
+        "dollar_vol": 206789704,
+        "score": 0.2955,
+        "checked": "2026-11-16"
       },
       {
         "symbol": "QSR",
         "exchange": "NYQ",
         "yahoo_industry": "Restaurants",
         "name": "Restaurant Brands International Inc.",
-        "price": 77.52,
-        "vol": 0.2472,
-        "dollar_vol": 223748771,
-        "score": 0.3467,
-        "checked": "2026-11-09"
+        "price": 74.74,
+        "vol": 0.2467,
+        "dollar_vol": 221726227,
+        "score": 0.361,
+        "checked": "2026-11-16"
       },
       {
         "symbol": "BJRI",
         "exchange": "NMS",
         "yahoo_industry": "Restaurants",
         "name": "BJ's Restaurants, Inc.",
-        "price": 57.71,
-        "vol": 0.4064,
-        "dollar_vol": 28630955,
-        "score": 0.4453,
-        "checked": "2026-11-09"
+        "price": 55.78,
+        "vol": 0.4097,
+        "dollar_vol": 29454399,
+        "score": 0.4536,
+        "checked": "2026-11-16"
       }
     ],
     "health_care": [
-      {
-        "symbol": "GMAB",
-        "exchange": "NMS",
-        "yahoo_industry": "Biotechnology",
-        "name": "Genmab A/S",
-        "price": 55.8,
-        "vol": 0.4337,
-        "dollar_vol": 179218879,
-        "score": 0.1421,
-        "checked": "2026-11-09"
-      },
       {
         "symbol": "CNMD",
         "exchange": "NYQ",
         "yahoo_industry": "Medical Devices",
         "name": "CONMED Corporation",
-        "price": 51.94,
-        "vol": 0.4639,
-        "dollar_vol": 17744542,
-        "score": 0.1465,
-        "checked": "2026-11-09"
+        "price": 49.35,
+        "vol": 0.4638,
+        "dollar_vol": 17258954,
+        "score": 0.1562,
+        "checked": "2026-11-16"
       },
       {
-        "symbol": "TGTX",
-        "exchange": "NCM",
+        "symbol": "GMAB",
+        "exchange": "NMS",
         "yahoo_industry": "Biotechnology",
-        "name": "TG Therapeutics, Inc.",
-        "price": 63.38,
-        "vol": 0.4586,
-        "dollar_vol": 103647950,
-        "score": 0.1902,
-        "checked": "2026-11-09"
+        "name": "Genmab A/S",
+        "price": 51.57,
+        "vol": 0.4351,
+        "dollar_vol": 185528174,
+        "score": 0.1761,
+        "checked": "2026-11-16"
+      },
+      {
+        "symbol": "AXGN",
+        "exchange": "NCM",
+        "yahoo_industry": "Medical Devices",
+        "name": "Axogen, Inc.",
+        "price": 55.38,
+        "vol": 0.586,
+        "dollar_vol": 71198067,
+        "score": 0.1929,
+        "checked": "2026-11-16"
       }
     ],
     "industrials": [
@@ -266,33 +266,33 @@
         "exchange": "NMS",
         "yahoo_industry": "Airlines",
         "name": "Ryanair Holdings plc",
-        "price": 61.75,
-        "vol": 0.3735,
-        "dollar_vol": 92547136,
-        "score": 0.3282,
-        "checked": "2026-11-09"
+        "price": 57.61,
+        "vol": 0.3754,
+        "dollar_vol": 88903186,
+        "score": 0.3299,
+        "checked": "2026-11-16"
       },
       {
-        "symbol": "EMBJ",
+        "symbol": "RGR",
         "exchange": "NYQ",
         "yahoo_industry": "Aerospace & Defense",
-        "name": "Embraer S.A.",
-        "price": 77.07,
-        "vol": 0.4189,
-        "dollar_vol": 104513959,
-        "score": 0.4352,
-        "checked": "2026-11-09"
+        "name": "Sturm, Ruger & Company, Inc.",
+        "price": 50.76,
+        "vol": 0.3251,
+        "dollar_vol": 16817321,
+        "score": 0.5176,
+        "checked": "2026-11-16"
       },
       {
         "symbol": "VVX",
         "exchange": "NYQ",
         "yahoo_industry": "Aerospace & Defense",
         "name": "V2X, Inc.",
-        "price": 81.77,
-        "vol": 0.4148,
-        "dollar_vol": 39232664,
-        "score": 0.5043,
-        "checked": "2026-11-09"
+        "price": 79.01,
+        "vol": 0.4145,
+        "dollar_vol": 38019109,
+        "score": 0.5467,
+        "checked": "2026-11-16"
       }
     ],
     "consumer_staples": [
@@ -301,33 +301,33 @@
         "exchange": "NMS",
         "yahoo_industry": "Packaged Foods",
         "name": "John B. Sanfilippo & Son, Inc.",
-        "price": 57.12,
-        "vol": 0.3139,
-        "dollar_vol": 9911251,
-        "score": 0.2646,
-        "checked": "2026-11-09"
+        "price": 60.63,
+        "vol": 0.3197,
+        "dollar_vol": 9584892,
+        "score": 0.2462,
+        "checked": "2026-11-16"
       },
       {
         "symbol": "MKC",
         "exchange": "NYQ",
         "yahoo_industry": "Packaged Foods",
         "name": "McCormick & Company, Incorporated",
-        "price": 47.88,
+        "price": 47.13,
         "vol": 0.3181,
-        "dollar_vol": 173641497,
-        "score": 0.4278,
-        "checked": "2026-11-09"
+        "dollar_vol": 173605416,
+        "score": 0.4699,
+        "checked": "2026-11-16"
       },
       {
         "symbol": "POST",
         "exchange": "NYQ",
         "yahoo_industry": "Packaged Foods",
         "name": "Post Holdings, Inc.",
-        "price": 82.25,
-        "vol": 0.3218,
-        "dollar_vol": 65713659,
-        "score": 0.5561,
-        "checked": "2026-11-09"
+        "price": 81.64,
+        "vol": 0.3223,
+        "dollar_vol": 63537021,
+        "score": 0.5358,
+        "checked": "2026-11-16"
       }
     ],
     "energy": [
@@ -336,33 +336,33 @@
         "exchange": "NMS",
         "yahoo_industry": "Oil & Gas E&P",
         "name": "APA Corporation",
-        "price": 44.55,
+        "price": 47.3,
         "vol": 0.4478,
-        "dollar_vol": 259062753,
-        "score": 0.1199,
-        "checked": "2026-11-09"
+        "dollar_vol": 253105746,
+        "score": 0.0579,
+        "checked": "2026-11-16"
       },
       {
-        "symbol": "RRC",
+        "symbol": "VIST",
         "exchange": "NYQ",
         "yahoo_industry": "Oil & Gas E&P",
-        "name": "Range Resources Corporation",
-        "price": 48.85,
-        "vol": 0.3607,
-        "dollar_vol": 175727543,
-        "score": 0.1884,
-        "checked": "2026-11-09"
+        "name": "Vista Energy, S.A.B. de C.V.",
+        "price": 53.48,
+        "vol": 0.4501,
+        "dollar_vol": 74520381,
+        "score": 0.133,
+        "checked": "2026-11-16"
       },
       {
         "symbol": "BKR",
         "exchange": "NMS",
         "yahoo_industry": "Oil & Gas Equipment & Services",
         "name": "Baker Hughes Company",
-        "price": 48.45,
-        "vol": 0.3527,
-        "dollar_vol": 448314713,
-        "score": 0.2027,
-        "checked": "2026-11-09"
+        "price": 47.94,
+        "vol": 0.3542,
+        "dollar_vol": 453786556,
+        "score": 0.2162,
+        "checked": "2026-11-16"
       }
     ],
     "utilities": [
@@ -371,33 +371,33 @@
         "exchange": "NMS",
         "yahoo_industry": "Utilities - Regulated Electric",
         "name": "Exelon Corporation",
-        "price": 45.65,
-        "vol": 0.2011,
-        "dollar_vol": 343298720,
-        "score": 0.2147,
-        "checked": "2026-11-09"
+        "price": 46.46,
+        "vol": 0.2006,
+        "dollar_vol": 350143382,
+        "score": 0.186,
+        "checked": "2026-11-16"
       },
       {
         "symbol": "NWN",
         "exchange": "NYQ",
         "yahoo_industry": "Utilities - Regulated Gas",
         "name": "Northwest Natural Holding Company",
-        "price": 52.02,
-        "vol": 0.2028,
-        "dollar_vol": 13174337,
-        "score": 0.2337,
-        "checked": "2026-11-09"
+        "price": 52.57,
+        "vol": 0.2023,
+        "dollar_vol": 13546185,
+        "score": 0.2408,
+        "checked": "2026-11-16"
       },
       {
         "symbol": "NI",
         "exchange": "NYQ",
         "yahoo_industry": "Utilities - Regulated Gas",
         "name": "NiSource Inc.",
-        "price": 45.06,
-        "vol": 0.1824,
-        "dollar_vol": 233972891,
-        "score": 0.3252,
-        "checked": "2026-11-09"
+        "price": 45.46,
+        "vol": 0.1814,
+        "dollar_vol": 233555238,
+        "score": 0.3085,
+        "checked": "2026-11-16"
       }
     ],
     "real_estate": [
@@ -406,70 +406,70 @@
         "exchange": "NYQ",
         "yahoo_industry": "Residential Construction",
         "name": "Meritage Homes Corporation",
-        "price": 70.34,
-        "vol": 0.4051,
-        "dollar_vol": 60049725,
-        "score": 0.0872,
-        "checked": "2026-11-09"
+        "price": 64.08,
+        "vol": 0.4063,
+        "dollar_vol": 59551812,
+        "score": 0.0984,
+        "checked": "2026-11-16"
       },
       {
         "symbol": "GRBK",
         "exchange": "NYQ",
         "yahoo_industry": "Residential Construction",
         "name": "Green Brick Partners, Inc.",
-        "price": 66.51,
-        "vol": 0.3426,
-        "dollar_vol": 24694780,
-        "score": 0.1623,
-        "checked": "2026-11-09"
+        "price": 59.96,
+        "vol": 0.346,
+        "dollar_vol": 23506081,
+        "score": 0.1603,
+        "checked": "2026-11-16"
       },
       {
-        "symbol": "WFG",
+        "symbol": "LPX",
         "exchange": "NYQ",
-        "yahoo_industry": "Lumber & Wood Production",
-        "name": "West Fraser Timber Co. Ltd.",
-        "price": 68.08,
-        "vol": 0.3337,
-        "dollar_vol": 14210618,
-        "score": 0.2119,
-        "checked": "2026-11-09"
+        "yahoo_industry": "Building Products & Equipment",
+        "name": "Louisiana-Pacific Corporation",
+        "price": 75.26,
+        "vol": 0.4156,
+        "dollar_vol": 84529759,
+        "score": 0.2818,
+        "checked": "2026-11-16"
       }
     ],
     "materials": [
-      {
-        "symbol": "OR",
-        "exchange": "NYQ",
-        "yahoo_industry": "Gold",
-        "name": "OR Royalties Inc.",
-        "price": 37.82,
-        "vol": 0.4709,
-        "dollar_vol": 30962079,
-        "score": 0.3614,
-        "checked": "2026-11-09"
-      },
-      {
-        "symbol": "LYB",
-        "exchange": "NYQ",
-        "yahoo_industry": "Specialty Chemicals",
-        "name": "LyondellBasell Industries N.V.",
-        "price": 59.5,
-        "vol": 0.4261,
-        "dollar_vol": 229995365,
-        "score": 0.3749,
-        "checked": "2026-11-09"
-      },
       {
         "symbol": "AVNT",
         "exchange": "NYQ",
         "yahoo_industry": "Specialty Chemicals",
         "name": "Avient Corporation",
-        "price": 46.35,
-        "vol": 0.3752,
-        "dollar_vol": 33269481,
-        "score": 0.3852,
-        "checked": "2026-11-09"
+        "price": 43.97,
+        "vol": 0.376,
+        "dollar_vol": 32630798,
+        "score": 0.3334,
+        "checked": "2026-11-16"
+      },
+      {
+        "symbol": "OR",
+        "exchange": "NYQ",
+        "yahoo_industry": "Gold",
+        "name": "OR Royalties Inc.",
+        "price": 33.58,
+        "vol": 0.4729,
+        "dollar_vol": 30491964,
+        "score": 0.3737,
+        "checked": "2026-11-16"
+      },
+      {
+        "symbol": "ESI",
+        "exchange": "NYQ",
+        "yahoo_industry": "Specialty Chemicals",
+        "name": "Element Solutions Inc",
+        "price": 31.75,
+        "vol": 0.482,
+        "dollar_vol": 156378635,
+        "score": 0.4107,
+        "checked": "2026-11-16"
       }
     ]
   },
-  "replacements_checked": "2026-11-09"
+  "replacements_checked": "2026-11-16"
 }
