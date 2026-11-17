@@ -13,6 +13,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <vector>
 
@@ -269,16 +270,39 @@ bool jn_save_slot(const JNPool* p, int slot, const std::string& path) {
     catch (const std::exception&) { return false; }
 }
 
-bool jn_load_slot(JNPool* p, int slot, const std::string& path) {
+// Strict load; a file whose only fault is dead nodes is loaded again with collect_dead and recorded.
+static std::mutex g_repaired_mu;
+static std::vector<std::string> g_repaired;
+static jneuro::AnyNet load_net_repairing(const std::string& path) {
     try {
-        if (slot < 0 || slot >= (int)p->nets.size() || !std::filesystem::exists(path)) return false;
-        JNet n = make_net(jneuro::load_net(path));
-        if (!fit_outputs(p, n, (uint64_t)slot + 1)) return false;
+        return jneuro::load_net(path);
+    } catch (const jneuro::DeadNodeError&) {
+        jneuro::AnyNet n = jneuro::load_net(path, true);
+        std::lock_guard<std::mutex> lk(g_repaired_mu);
+        g_repaired.push_back(path);
+        return n;
+    }
+}
+
+std::vector<std::string> jn_take_repaired() {
+    std::lock_guard<std::mutex> lk(g_repaired_mu);
+    std::vector<std::string> out;
+    out.swap(g_repaired);
+    return out;
+}
+
+bool jn_load_slot(JNPool* p, int slot, const std::string& path, std::string* err) {
+    try {
+        if (slot < 0 || slot >= (int)p->nets.size()) { if (err) *err = "bad slot"; return false; }
+        if (!std::filesystem::exists(path)) { if (err) *err = "missing"; return false; }
+        JNet n = make_net(load_net_repairing(path));
+        if (!fit_outputs(p, n, (uint64_t)slot + 1)) { if (err) *err = "inputs/outputs do not fit"; return false; }
         p->nets[slot] = std::move(n);
         p->warm[(size_t)slot] = -1;
         p->renew((size_t)slot);
         return true;
-    } catch (const std::exception&) {
+    } catch (const std::exception& e) {
+        if (err) *err = e.what();
         return false;
     }
 }
@@ -303,7 +327,7 @@ bool jn_load(JNPool* p, const std::string& dir, const std::string& prefix) {
         for (size_t s = 0; s < persisted(p); s++) {
             const std::string path = dir + "/" + prefix + "_" + std::to_string(s) + ".jnet";
             if (!std::filesystem::exists(path)) return false;
-            JNet n = make_net(jneuro::load_net(path));
+            JNet n = make_net(load_net_repairing(path));
             if (!fit_outputs(p, n, s + 1)) return false;
             nets.push_back(std::move(n));
         }

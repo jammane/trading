@@ -4582,18 +4582,28 @@ static double jn_bulk_pct(double start, double end) {
 // the pass those elites came from (dir/jn_size_<ind>.txt; jn_bulk_pct, capped at JN_BULK_CAP x
 // that pass's start size). Elites with no size record are bred as the daily selection breeds
 // them. False, pool untouched, if any elite file is missing.
+// Nets the bridge had to load with collect_dead (dead nodes from j_neuro before fde9c19): each is
+// logged once. Their outputs are unchanged; only nodes that reached no output were removed.
+static void jn_log_repaired() {
+    for (const std::string& f : jn_take_repaired())
+        log_msg("WARNING: " + f + " had dead nodes (j_neuro before fde9c19) -- loaded with collect_dead");
+}
+
 static bool jn_seed_from_elites(int ind_i, const std::string& dir, uint64_t generation) {
     if (dir.empty()) return false;
     const char* ind = g_ind_names[ind_i].c_str();
     for (int k = 0; k < ELITE_POOL; k++)
         if (!fs::exists(champ_elite_path(dir, ind, k))) return false;
     JNPool* p = g_jn_ind[ind_i];
-    for (int k = 0; k < ELITE_POOL; k++)
-        if (!jn_load_slot(p, k, champ_elite_path(dir, ind, k))) {
+    for (int k = 0; k < ELITE_POOL; k++) {
+        std::string err;
+        if (!jn_load_slot(p, k, champ_elite_path(dir, ind, k), &err)) {
             log_msg(std::string("[") + IND_SHORT[ind_i] + "]   jn seed: cannot load " +
-                    champ_elite_path(dir, ind, k) + " -- pool partly reseeded");
+                    champ_elite_path(dir, ind, k) + " (" + err + ") -- pool partly reseeded");
             return false;
         }
+    }
+    jn_log_repaired();
     // The pass's champions: these 20 elites as loaded, before any bulking -- a static candidate
     // list for the whole pass (JN_CHAMP_BASE).
     for (int k = 0; k < JN_CHAMP_N; k++) jn_copy(p, k, JN_CHAMP_BASE + k);
@@ -4895,9 +4905,9 @@ static void load_or_init_mt1_pool_core(const std::string& dir, const std::string
     if (sc.jn) {
         // Nets as jn_pool_create built them (minimal, one seed each) unless a saved pool exists.
         const std::string pre = jn_pool_prefix(ind_i, tag);
-        if (jn_load(sc.jn, dir, pre)) { loaded = MT1_POOL_SLOTS; jn_from = dir; }
+        if (jn_load(sc.jn, dir, pre)) { jn_log_repaired(); loaded = MT1_POOL_SLOTS; jn_from = dir; }
         else if (!load_dir.empty() && jn_load(sc.jn, load_dir, pre)) {
-            loaded = MT1_POOL_SLOTS; jn_from = load_dir;
+            jn_log_repaired(); loaded = MT1_POOL_SLOTS; jn_from = load_dir;
         }
         else
             for (int s = 0; s < MT1_POOL_SLOTS; s++) mt1_slot_init(sc.meta[s], sc.next_lineage++);
@@ -6477,6 +6487,7 @@ int main(int argc, char* argv[]) {
             const std::string pre = "jn_" + g_ind_names[i];
             const bool loaded = jn_load(g_jn_ind[i], output_dir, pre)
                              || (!load_dir.empty() && jn_load(g_jn_ind[i], load_dir, pre));
+            jn_log_repaired();
             const JNStats js = jn_stats_n(g_jn_ind[i], N_SLOTS);
             char m[200];
             snprintf(m, sizeof(m), "[%s] j_neuro StockNN pool: %s, %d nets, %.0f nodes (max %d), "

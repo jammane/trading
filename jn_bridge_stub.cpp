@@ -29,5 +29,6 @@ JNTiming jn_timing_take() { return {}; }
 bool    jn_save(const JNPool*, const std::string&, const std::string&) { return false; }
 bool    jn_load(JNPool*, const std::string&, const std::string&) { return false; }
 bool    jn_save_slot(const JNPool*, int, const std::string&) { return false; }
-bool    jn_load_slot(JNPool*, int, const std::string&) { return false; }
+bool    jn_load_slot(JNPool*, int, const std::string&, std::string*) { return false; }
+std::vector<std::string> jn_take_repaired() { return {}; }
 void    jn_set_output_migration(JNPool*, int, const std::vector<int>&) {}

@@ -41,7 +41,7 @@
   "width_bias": "deficit",
   "width_peak": 0.5,
   "tap_peak": 0.25,
-  "prune": "any",
+  "prune": "static",
   "link_max_span": 0.25,
   "growth_gen_prob": 0.15,
   "growth_net_prob": 0.15,

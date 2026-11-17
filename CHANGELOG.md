@@ -56,6 +56,9 @@ entry is in its commit message.
   mutate, the rest; the post-industry block).
 
 ### Fixed
+- **JN nets with dead nodes load**: a net saved by j_neuro before fde9c19 with dead nodes is loaded
+  with `collect_dead` and logged, instead of failing (JN7's services seed at pass 7); every JN load
+  failure now logs its reason. The JN training profile sets `prune: static`.
 - **JN race pools are bulked at a pass start**: they never loaded the bulk profile, so their
   bulked children were plain copies of the parents (JN2-JN4). A bulk that falls back to a copy is
   now logged as an error.
