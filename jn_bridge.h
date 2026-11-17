@@ -105,4 +105,8 @@ bool    jn_load(JNPool* p, const std::string& dir, const std::string& prefix);
 bool    jn_save_slot(const JNPool* p, int slot, const std::string& path);
 // Loads one net written by jn_save_slot into slot; false (slot unchanged) if missing or the
 // widths do not match. The champion store and pass seeding move nets one at a time.
-bool    jn_load_slot(JNPool* p, int slot, const std::string& path);
+bool    jn_load_slot(JNPool* p, int slot, const std::string& path, std::string* err = nullptr);
+// Nets saved by j_neuro before fde9c19 with gc_replace on could carry dead nodes (reach no output),
+// which a strict load rejects. jn_load and jn_load_slot then load them with collect_dead (garbage
+// collection only: outputs unchanged) and record the path; this returns and clears those paths.
+std::vector<std::string> jn_take_repaired();
