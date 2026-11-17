@@ -20,17 +20,38 @@ int main() {
     float real[N], pred[N];
     for (int i = 0; i < N; i++) real[i] = (float)i;   // industry 11 best, 0 worst
 
-    // Perfect order: 4 of 4 at either end, all 66 pairs, correlation 1.
+    // Perfect order: 4 of 4 at either end, no egregious error, all 66 pairs, correlation 1.
     for (int i = 0; i < N; i++) pred[i] = 10.f * i + 3.f;
     JNLScore s = jnl_score(pred, real, N, true);
-    check(near(s.primary, 4) && near(s.secondary, 66) && near(s.tertiary, 1), "perfect, top");
+    check(near(s.primary, 4) && near(s.hits, 4) && near(s.egregious, 0) && near(s.secondary, 66) &&
+          near(s.tertiary, 1), "perfect, top");
     s = jnl_score(pred, real, N, false);
     check(near(s.primary, 4) && near(s.secondary, 66), "perfect, bottom");
 
-    // Reversed: 0 of 4, 0 pairs, correlation -1.
+    // Reversed: its first 4 are the realised last 4 -- 0 hits, 4 egregious errors, primary -4.
     for (int i = 0; i < N; i++) pred[i] = (float)(N - i);
     s = jnl_score(pred, real, N, true);
-    check(near(s.primary, 0) && near(s.secondary, 0) && near(s.tertiary, -1), "reversed");
+    check(near(s.hits, 0) && near(s.egregious, 4) && near(s.primary, -4) && near(s.secondary, 0) &&
+          near(s.tertiary, -1), "reversed: -4");
+    s = jnl_score(pred, real, N, false);
+    check(near(s.primary, -4), "reversed, bottom end: -4");
+
+    // Egregious errors count only the front of the list. Top end: picks {11, 10, 0, 1} -- two
+    // hits, two realised bottom-4 losers -> 0. The rest of the order does not matter.
+    for (int i = 0; i < N; i++) pred[i] = (float)(i - 100);   // 2..9 far below, in order
+    pred[11] = 50.f; pred[10] = 49.f; pred[0] = 48.f; pred[1] = 47.f;
+    s = jnl_score(pred, real, N, true);
+    check(near(s.hits, 2) && near(s.egregious, 2) && near(s.primary, 0), "two hits, two egregious");
+    // Same picks, one loser swapped for a middling industry (5): 2 - 1 = 1.
+    pred[1] = -100.f; pred[5] = 47.f;
+    s = jnl_score(pred, real, N, true);
+    check(near(s.hits, 2) && near(s.egregious, 1) && near(s.primary, 1), "one egregious");
+    // Bottom end: predicted losers {0, 11, 5, 6} (lowest outputs) -- one hit (0), one egregious
+    // (11, a realised top-4 winner): 0.
+    for (int i = 0; i < N; i++) pred[i] = (float)(100 + i);
+    pred[0] = -50.f; pred[11] = -49.f; pred[5] = -48.f; pred[6] = -47.f;
+    s = jnl_score(pred, real, N, false);
+    check(near(s.hits, 1) && near(s.egregious, 1) && near(s.primary, 0), "bottom end egregious");
 
     // Top right, bottom wrong: the two ends score differently, the pairs do not.
     // pred: 8..11 on top in order; 0..7 reversed below them.
@@ -38,8 +59,9 @@ int main() {
     for (int i = 8; i < N; i++) pred[i] = (float)(i + 100);
     const JNLScore top = jnl_score(pred, real, N, true), bot = jnl_score(pred, real, N, false);
     check(near(top.primary, 4), "top end right");
-    // bottom 4 realised = {0,1,2,3}; predicted bottom 4 = {4,5,6,7}: none
-    check(near(bot.primary, 0), "bottom end wrong");
+    // bottom 4 realised = {0,1,2,3}; predicted bottom 4 = {4,5,6,7}: no hit, and none of them is
+    // a realised top-4 winner either
+    check(near(bot.primary, 0) && near(bot.egregious, 0), "bottom end wrong, not egregious");
     check(near(top.secondary, bot.secondary), "secondary is direction-free");
     // pairs: within 8..11 all 6 hold, 8..11 vs 0..7 all 32 hold, within 0..7 all 28 fail
     check(near(top.secondary, 38), "secondary hand count");
@@ -48,12 +70,13 @@ int main() {
     for (int i = 0; i < N; i++) pred[i] = (float)i;
     pred[8] = -1.f;   // realised 4th best pushed to the bottom; 7 moves into the predicted top 4
     s = jnl_score(pred, real, N, true);
-    check(near(s.primary, 3), "three of four");
+    check(near(s.primary, 3) && near(s.egregious, 0), "three of four");
 
     // Constant output: the random-guess values, not a universe-order answer.
     for (int i = 0; i < N; i++) pred[i] = 0.f;
     s = jnl_score(pred, real, N, true);
-    check(near(s.primary, 4.0 * 4.0 / 12.0), "all tied: primary = 16/12");
+    check(near(s.hits, 4.0 * 4.0 / 12.0) && near(s.egregious, 4.0 * 4.0 / 12.0) &&
+          near(s.primary, 0), "all tied: hits = egregious = 16/12, primary 0");
     check(near(s.secondary, 33), "all tied: secondary = 33");
     check(near(s.tertiary, 0), "all tied: tertiary 0");
 
@@ -75,6 +98,8 @@ int main() {
         };
         JNLScore lo{2, 66, 1}, hi_last{3, 0, -1}, hi{2, 0, -1};
         check(mean16(hi, hi_last) > mean16(lo, lo), "primary dominates secondary and tertiary");
+        JNLScore nlo{-3, 66, 1}, nhi_last{-2, 0, -1}, nhi{-3, 0, -1};
+        check(mean16(nhi, nhi_last) > mean16(nlo, nlo), "lexicographic below zero too");
         JNLScore a{2, 30, 1}, b{2, 30, -1}, b_last{2, 30.5, -1};
         check(mean16(b, b_last) > mean16(a, a), "secondary dominates tertiary");
         JNLScore c{2, 30, 0.2}, d{2, 30, 0.1};
@@ -92,7 +117,9 @@ int main() {
             for (int j = 0; j < N; j++)
                 if (i < j && ((pred[i] - pred[j]) > 0) == ((real[i] - real[j]) > 0)) conc++;
         if (!near(a.secondary, conc)) { check(false, "secondary vs brute force"); break; }
-        if (a.primary < 0 || a.primary > 4 || a.tertiary < -1 - 1e-9 || a.tertiary > 1 + 1e-9) {
+        if (a.primary < -4 || a.primary > 4 || !near(a.primary, a.hits - a.egregious) ||
+            a.hits < 0 || a.hits > 4 || a.egregious < 0 || a.egregious > 4 ||
+            a.tertiary < -1 - 1e-9 || a.tertiary > 1 + 1e-9) {
             check(false, "ranges"); break;
         }
         // Negating both sides swaps the ends.
