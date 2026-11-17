@@ -3,7 +3,7 @@
 // Run:   ./build/training_v4_cpp --output models [--load-dir DIR] [--start-day N] [--stop-day N]
 //        [--passes N] [--sigma F] [--master-sigma F] [--sigma-decay F] [--workers N]
 
-#define TRAINER_VERSION "0.9.0.29"
+#define TRAINER_VERSION "0.9.0.30"
 
 #include <algorithm>
 #include <atomic>
@@ -397,8 +397,10 @@ enum RaceSrch  { SRCH_EVO, SRCH_GRAD };
 //        for every entry and every consumer (race_daily.csv, committee_race, committee_alloc).
 // The ORDER entries (ARCH_JNL only). A net's twelve outputs sort into its predicted order, higher =
 // better for both. Scored daily, lexicographically (jnl_score):
-//   primary    how many of its first 4 are in the realised first 4 (0-4): LDEC's first 4 are its
-//              top 4 (winners), LINC's its bottom 4 (losers)
+//   primary    hits - egregious errors (-4..4): how many of its first 4 are in the realised first
+//              4, minus how many are in the realised LAST 4. LDEC's first 4 are its top 4
+//              (winners; a pick in the realised bottom 4 costs a point), LINC's its bottom 4
+//              (losers; a pick in the realised top 4 costs a point)
 //   secondary  pairwise comparisons in its order that held, 66 pairs (0-66): position 1 against
 //              the 11 below it, 2 against the 10 below, ... -- the same for both directions
 //   tertiary   correlation of the raw outputs with the realised returns (-1..1)

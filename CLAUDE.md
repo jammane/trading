@@ -1185,13 +1185,18 @@ both **off by default**:
   StockNN is selected on); higher = better for both. They are trained directly on what the
   committees do -- pick 4 winners, flag 4 losers -- and scored daily, lexicographically
   (`jnl_score.h`, `tests/test_jnl_score.cpp`):
-  1. **primary**: how many of its first 4 are in the realised first 4 (0-4); `dec` scores the top
-     end, `inc` the bottom end;
+  1. **primary**: hits minus egregious errors (−4 to 4): how many of its first 4 are in the
+     realised first 4, minus how many are in the realised **last** 4; `dec` scores the top end
+     (a predicted winner that finished bottom-4 costs a point), `inc` the bottom end (a predicted
+     loser that finished top-4 costs a point). Only the front of the list is scored. The penalty
+     (2026-11-17) came from JN7: both pools' first 4 landed at the opposite extreme 33% of the
+     time, exactly random, and the old 0-4 count did not care;
   2. **secondary** (tie-break): comparisons in its order that held, 66 pairs (position 1 against
      the 11 below it, 2 against the 10 below, ...), the same for both;
   3. **tertiary** (tie-break): correlation of the raw outputs with the realised returns.
 
-  Tied outputs score the expectation over a random order (a constant net scores 1.33 / 33 / 0).
+  Tied outputs score the expectation over a random order (a constant net scores 0 / 33 / 0:
+  16/12 hits less 16/12 egregious errors).
   The three are packed into one register value (`jnl_composite`) so the pool's usual ranking by
   register mean is lexicographic over a full 16-day register. Stepped once a day after the
   per-industry race loop, from `MT1_BP_START_DAY`, on days with all twelve industries scored;
