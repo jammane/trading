@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 
 import training_lib as tl
-from fees import OPEN_BUY_PREMIUM
+from fees import OPEN_BUY_PREMIUM, open_sell_price
 
 SYMS = [f"S{i}" for i in range(12)]
 
@@ -145,7 +145,7 @@ def test_sell_qty_goes_at_the_open():
     assert plan["sell_open"] == {"AAA": 2} and not plan["sell_all"]   # $56 limit: out of range
     fill("AAA", port, plan, {"open": 49.0, "high": 50.0, "low": 45.0, "close": 46.0})
     assert port["holdings"]["AAA"] == 3.0
-    assert port["cash"] == pytest.approx(tl._sell_net(2, 49.0))
+    assert port["cash"] == pytest.approx(tl._sell_net(2, open_sell_price(49.0)))   # a market sell
 
 
 def test_production_queues_the_plan():

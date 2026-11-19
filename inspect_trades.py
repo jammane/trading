@@ -46,7 +46,7 @@ from datetime import datetime, timedelta
 import torch
 import yfinance as yf
 
-from fees import BUY_FILL, OPEN_BUY_PREMIUM, _sell_net
+from fees import BUY_FILL, OPEN_BUY_PREMIUM, _sell_net, open_sell_price
 from models import StockNN, stock_close_pos, stock_close_vs_wap
 from training_lib import STOCK_OUT_PER_SYM, plan_orders
 from universe import INDUSTRIES
@@ -328,17 +328,18 @@ def simulate_trades(symbols, out_tensor, day_data, next_day_data, cash, holdings
         # Partial sell (sell_qty)
         if sym in plan['sell_open']:
             sell_amount = plan['sell_open'][sym]
-            net = _sell_net(sell_amount, nd_open)
+            sell_px = open_sell_price(nd_open)
+            net = _sell_net(sell_amount, sell_px)
             cur_holdings[sym] -= sell_amount
             cur_cash          += net
             rec['sell_actions'].append({
                 'type':       'PARTIAL_SELL',
                 'shares':     sell_amount,
-                'fill_price': nd_open,
+                'fill_price': sell_px,
                 'net_cash':   net,
                 'reason':     (f"Sell-qty {sell_qty:.3f} sh requested; "
                                f"had {cur_qty:.4f} sh → selling {sell_amount:.4f} sh "
-                               f"at next-day open ${nd_open:.2f}."),
+                               f"at next-day open ${nd_open:.2f} less the open discount: ${sell_px:.2f}."),
             })
         elif sell_qty > 1e-6 and cur_qty <= 1e-6:
             rec['sell_actions'].append({
@@ -350,16 +351,17 @@ def simulate_trades(symbols, out_tensor, day_data, next_day_data, cash, holdings
         cur_qty_after = cur_holdings[sym]
         if cur_qty_after > 1e-6:
             if nd_open >= sell_all_price:
-                net = _sell_net(cur_qty_after, nd_open)
+                sell_px = open_sell_price(nd_open, sell_all_price)
+                net = _sell_net(cur_qty_after, sell_px)
                 cur_holdings[sym] = 0.0
                 cur_cash += net
                 rec['sell_actions'].append({
                     'type':       'SELL_ALL_EXEC',
                     'shares':     cur_qty_after,
-                    'fill_price': nd_open,
+                    'fill_price': sell_px,
                     'net_cash':   net,
                     'reason':     (f"Sell-all limit ${sell_all_price:.2f}; "
-                                   f"next-day open ${nd_open:.2f} ≥ limit → gapped above, filled at open."),
+                                   f"next-day open ${nd_open:.2f} ≥ limit → gapped above, filled at the open less the discount, not below the limit: ${sell_px:.2f}."),
                 })
             elif nd_low < sell_all_price < nd_high:
                 slipped = sell_all_price   # a limit fills at the limit

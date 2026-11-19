@@ -16,6 +16,10 @@ SLIPPAGE_RATE       = 0.001      # 0.10% adverse slippage on triggered STOPS (ma
 # limit is at or above the next open fills at the open plus this premium, capped at the limit:
 # paper paid +0.60% over the open on average (119 fills, 20 sessions).
 OPEN_BUY_PREMIUM    = 0.0070
+# A sell that fills at the open (a market sell, a sell-all limit the open gaps through, a stop the
+# open gaps below) fills this far below the open, never below a limit: paper's market sells at the
+# open filled 0.91% below it and its gapped sell-all limits 0.42% (124 sells, 2026-10-14..11-18).
+OPEN_SELL_DISCOUNT  = 0.0080
 
 
 def _sell_net(shares: float, price: float) -> float:
@@ -23,6 +27,12 @@ def _sell_net(shares: float, price: float) -> float:
     gross = shares * price * SELL_FILL
     fees  = gross * SEC_FEE_RATE + min(shares * FINRA_TAF_PER_SHARE, FINRA_TAF_MAX)
     return gross - fees
+
+
+def open_sell_price(nd_open: float, limit: float = 0.0) -> float:
+    """Price a sell fills at the open: OPEN_SELL_DISCOUNT below it, never below `limit` (0 =
+    market). Mirrors open_sell_price() in training_v4.cpp."""
+    return max(nd_open * (1.0 - OPEN_SELL_DISCOUNT), limit)
 
 
 def buy_fill_price(nd_open: float, nd_low: float, nd_high: float, limit: float) -> float:

@@ -19,7 +19,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from fees import BUY_FILL, OPEN_BUY_PREMIUM, SLIPPAGE_RATE, _sell_net, buy_fill_price
+from fees import BUY_FILL, OPEN_BUY_PREMIUM, SLIPPAGE_RATE, _sell_net, buy_fill_price, open_sell_price
 from models import MasterNN, StockNN, stock_close_pos, stock_close_vs_wap
 
 DUMP_DIR = 'data_dump'  # overridden by production_v2.py to logs/ACCOUNT/SUBTYPE/data_dump
@@ -368,7 +368,7 @@ def _fill_sym_open_low(sym, port, plan, day_data, fill_data, low_first):
     qty = min(plan['sell_open'].get(sym, 0), hold.get(sym, 0.0))
     if qty > 1e-6:
         hold[sym] -= qty
-        port['cash'] += _sell_net(qty, nd_open)
+        port['cash'] += _sell_net(qty, open_sell_price(nd_open))
         sells += qty
 
     if sym in plan['sell_all']:
@@ -376,7 +376,7 @@ def _fill_sym_open_low(sym, port, plan, day_data, fill_data, low_first):
         cur = hold.get(sym, 0.0)
         if cur > 1e-6 and nd_open >= limit:
             hold[sym] = 0.0
-            port['cash'] += _sell_net(cur, nd_open)
+            port['cash'] += _sell_net(cur, open_sell_price(nd_open, limit))
             sells += cur
         cur = hold.get(sym, 0.0)
         if not low_first and cur > 1e-6 and nd_low < limit < nd_high:
@@ -390,7 +390,7 @@ def _fill_sym_open_low(sym, port, plan, day_data, fill_data, low_first):
     if sym not in plan['sold'] and sym not in plan['buys'] and stop_p > 0 and remaining > 1e-6:
         if nd_open <= stop_p:
             hold[sym] = 0.0
-            port['cash'] += _sell_net(remaining, nd_open)
+            port['cash'] += _sell_net(remaining, open_sell_price(nd_open))
             sells += remaining
         elif nd_low <= stop_p:
             hold[sym] = 0.0
@@ -444,19 +444,19 @@ def _fill_sym_from_bars(sym, port, bars, plan):
     qty = min(plan['sell_open'].get(sym, 0), hold.get(sym, 0.0))
     if qty > 1e-6:
         hold[sym] -= qty
-        port['cash'] += _sell_net(qty, nd_open)
+        port['cash'] += _sell_net(qty, open_sell_price(nd_open))
         sells += qty
     cur = hold.get(sym, 0.0)
     if sell_all is not None and cur > 1e-6 and nd_open >= sell_all:
         hold[sym] = 0.0
-        port['cash'] += _sell_net(cur, nd_open)
+        port['cash'] += _sell_net(cur, open_sell_price(nd_open, sell_all))
         sells += cur
     stop_p = port['stop_prices'].get(sym, 0.0)
     remaining = hold.get(sym, 0.0)
     if (sym not in plan['sold'] and sym not in plan['buys'] and stop_p > 0 and remaining > 1e-6
             and nd_open <= stop_p):
         hold[sym] = 0.0
-        port['cash'] += _sell_net(remaining, nd_open)
+        port['cash'] += _sell_net(remaining, open_sell_price(nd_open))
         sells += remaining
     bought = False
     if buy and nd_open <= buy[1]:

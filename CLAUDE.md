@@ -1776,8 +1776,17 @@ the two to the same numbers.
 - A buy whose limit is at or above the next open fills at the **open + `OPEN_BUY_PREMIUM`
   (0.70%), capped at the limit**.
 - A triggered stop is a market order: `SLIPPAGE_RATE` (0.1%) below the stop.
-- Market sells and sell-alls that gap through at the open fill at the open. The sell side is not
-  calibrated yet: since 2026-11-12 `fill_check.csv` records sell and stop prices on both sides
+- A sell that fills at the open -- a market sell (`sell_qty`), a sell-all limit the open gaps
+  through, a stop the open gaps below -- fills **`OPEN_SELL_DISCOUNT` (0.80%) below the open**,
+  never below a limit (`open_sell_price`, both sides; 2026-11-18). The simulator used the open
+  itself. Measured against the paper account's own fills (Alpaca activities, 2026-10-14..11-18):
+  market sells at the open filled 0.91% below the bar's open (64; median 0.78%), gapped sell-all
+  limits 0.42% below it (60); 0.80% with the limit floor leaves -9 / +11 bp. Over the same
+  sessions the real books lost **36 bp/day more than the trainer's simulation of the same books**
+  (232 industry-days, correlation 0.93, every industry worse), and open fills on both sides were
+  most of it: buys cost $76 more than simulated and sells raised $88 less. Real intraday stops
+  filled 0.47% below the stop against `SLIPPAGE_RATE`'s 0.1%, on 6 fills, too few to recalibrate.
+  Since 2026-11-12 `fill_check.csv` records sell and stop prices on both sides
   (`sim_sell_px`/`real_sell_px`, `sim_stop_px`/`real_stop_px`, share-weighted, and
   `real_sell_types`), and the session summary prints the mean broker-vs-sim difference. A file
   with the old columns is set aside as `fill_check.v1.csv`.
