@@ -4380,6 +4380,31 @@ static void reseed_for_continue(const std::string& out_dir, int last_pass) {
         if (fscanf(f, "%d", &marked) != 1) marked = -1;
         fclose(f);
     }
+    // Where each seed elite came from (g_jn_seed_new: the 10% growth chance of an unreplaced
+    // champion's elites) lives only in the process that blended the seed. When the last boundary
+    // already blended it -- every pass of a --continue-run invocation but its last -- that process
+    // has exited, so recover it from the boundary's row: the same interleave, the same rule.
+    if (FILE* f = fopen((out_dir + "/pass_reference.csv").c_str(), "r")) {
+        char line[512];
+        while (fgets(line, sizeof(line), f)) {
+            char ind_buf[64], regime[32];
+            int p, ds, de, cp, chp, slots, ncp;
+            float cpct, chpct, share, npct;
+            if (sscanf(line, "%d,%63[^,],%d,%d,%d,%f,%d,%f,%31[^,],%f,%d,%d,%f",
+                       &p, ind_buf, &ds, &de, &cp, &cpct, &chp, &chpct,
+                       regime, &share, &slots, &ncp, &npct) != 13 || p != last_pass) continue;
+            const int ii = ind_index(ind_buf);
+            if (ii < 0) continue;
+            if (std::string(regime) == "seed" || std::string(regime) == "crown") {
+                for (int k = 0; k < ELITE_POOL; k++) g_jn_seed_new[ii][k] = 1;
+                continue;
+            }
+            int src[ELITE_POOL], idx[ELITE_POOL];
+            pass_interleave(share, ELITE_POOL, src, idx);
+            for (int k = 0; k < ELITE_POOL; k++) g_jn_seed_new[ii][k] = (src[k] == 1 || ncp != cp) ? 1 : 0;
+        }
+        fclose(f);
+    }
     if (marked == last_pass) {
         log_msg("continue: pass " + std::to_string(last_pass) + " already seeded the next pass");
         return;
@@ -4397,15 +4422,9 @@ static void reseed_for_continue(const std::string& out_dir, int last_pass) {
         if (sscanf(line, "%d,%63[^,],%d,%d,%d,%f,%d,%f,%31[^,],%f,%d,%d,%f",
                    &p, ind_buf, &ds, &de, &cp, &cpct, &chp, &chpct,
                    regime, &share, &slots, &ncp, &npct) != 13 || p != last_pass) continue;
-        const int ii = ind_index(ind_buf);
-        if (std::string(regime) == "seed" || std::string(regime) == "crown") {
-            if (ii >= 0) for (int k = 0; k < ELITE_POOL; k++) g_jn_seed_new[ii][k] = 1;
-            continue;
-        }
+        if (std::string(regime) == "seed" || std::string(regime) == "crown") continue;
         int src[ELITE_POOL], idx[ELITE_POOL];
         pass_interleave(share, ELITE_POOL, src, idx);
-        if (ii >= 0)
-            for (int k = 0; k < ELITE_POOL; k++) g_jn_seed_new[ii][k] = (src[k] == 1 || ncp != cp) ? 1 : 0;
         bool ok = true;
         for (int k = 0; k < ELITE_POOL && ok; k++) {
             fs::copy_file(champ_elite_path(out_dir, ind_buf, k), champ_elite_path(stage_dir, ind_buf, k),

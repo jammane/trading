@@ -8,6 +8,13 @@ entry is in its commit message.
 
 ## Unreleased
 
+### Fixed
+- **JN seed growth chances across `--continue-run` invocations.** Which seed elites came from an
+  unreplaced champion (and so breed at 10%) was set only by the process that blended the seed;
+  a later `--continue-run` invocation found the seed already blended and treated every elite as
+  an unreplaced champion's. It now recovers the sources from `pass_reference.csv`. Seen in JN9:
+  services was crowned p3, and p4 bred its 10 p3 elites at 10% instead of 1%.
+
 ### Changed
 - **Sells at the open are priced like paper's** (`OPEN_SELL_DISCOUNT` = 0.80%, `open_sell_price`
   in `training_v4.cpp` and `fees.py`): a market sell, a sell-all limit the open gaps through, or a
