@@ -875,6 +875,11 @@ static std::string g_jn_bulk_profile = JNEURO_DEFAULT_BULK_PROFILE;
 // --jn-no-bulk: no bulking at a pass start. A JN StockNN seed's children are mutated with the
 // training profile, and a JN race pool carries over as saved, as before bulking existed.
 static bool g_jn_no_bulk = false;
+// --jn-profile-growth: decide growth with the profile's growth_gen_prob / growth_net_prob, as before
+// 2026-11-18. Default is the growth ramp (jn_bridge.h): each child grows with its parent's chance,
+// 1% to start, +0.5% for each generation in its line that did not grow, back to 1% after a growth
+// or past 50%.
+static bool g_jn_profile_growth = false;
 // Rows of history a JN pool keeps. A net replays its own get_warmup_steps() of them each day and
 // trades only once it has that many; 64 bounds the replay cost while leaving room for nets to
 // grow s_neuron chains well past StockNN's 15-day window.
@@ -2921,10 +2926,16 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                         std::to_string((sl - ELITE_POOL) % MUTATIONS_PER_PARENT + 1);
             }
             const JNStats js = jn_stats_n(jp, N_SLOTS);
-            char jl[240];
+            long long n_mut = 0, n_grown = 0;
+            jn_growth_take(jp, &n_mut, &n_grown);
+            double gch = 0.0;
+            for (int k = 0; k < N_SLOTS; k++) gch += jn_growth_chance(jp, k);
+            char jl[320];
             snprintf(jl, sizeof(jl), " | jn nodes %.0f (max %d) warm %.1f (max %d) cold %d"
+                     " | grew %lld/%lld, chance %.1f%%"
                      " | safety nets: %d champ + %d hist scored, %d+%d chosen",
                      js.nodes_mean, js.nodes_max, js.warm_mean, js.warm_max, jn_cold,
+                     n_grown, n_mut, 100.0 * gch / N_SLOTS,
                      n_champ, n_hist - n_champ, n_from_champ, n_from_hist);
             log_msg(std::string("[") + IND_SHORT[ind_i] + "]   Selection done | elite=[" + disp +
                     "] | top=$" + std::to_string((int)surviving[0].first) + jl);
@@ -4881,6 +4892,14 @@ static void save_mt1_pool(const std::string& dir, int ind_i, const MT1PoolScratc
         if (sc.jn_champ_n > 0)
             log_msg(std::string(tag) + " " + pool_ind_name(ind_i) + ": champions copied back into "
                     "the pool this pass: " + std::to_string(sc.champ_back));
+        {
+            long long n_mut = 0, n_grown = 0;
+            jn_growth_take(sc.jn, &n_mut, &n_grown);
+            char gl[200];
+            snprintf(gl, sizeof(gl), ": nodes %.1f at the pass start, top %d %.1f now; children grown "
+                     "%lld of %lld", sc.jn_start_nodes, JN_RACE_KEEP, en / JN_RACE_KEEP, n_grown, n_mut);
+            log_msg(std::string(tag) + " " + pool_ind_name(ind_i) + gl);
+        }
     } else {
         for (int s = 0; s < MT1_POOL_SLOTS; s++)
             save_bin(mt1_pool_path(dir, ind_i, s, tag), sc.slot(s), sc.n_params);
@@ -5482,6 +5501,7 @@ static void print_usage(const char* prog) {
         "          [--race-skip \"A,B,...\"]  switch race entries off (race_qualify.py RACE_SKIP)\n"
         "          [--race-only \"A,B,...\"]  run only these race entries (plus the deployed/logged two)\n"
         "          [--jn-stocknn] [--jn-race] [--jn-profile FILE] [--jn-bulk-profile FILE] [--jn-no-bulk]\n"
+        "          [--jn-profile-growth]  JN growth from the profile's draw, not the growth ramp\n"
         "          [--seed N]   (default: clock, RE-SEEDED EVERY PASS; N derives passes from N)\n"
         "          [--trade-lock PATH | --no-trade-lock]  pause while production holds the lock\n"
         "          [--control-untrained]  NO-LEARNING CONTROL: re-randomise StockNN daily\n"
@@ -6022,6 +6042,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--jn-profile" && a+1<argc) { g_jn_profile = argv[++a]; }
         else if (arg == "--jn-bulk-profile" && a+1<argc) { g_jn_bulk_profile = argv[++a]; }
         else if (arg == "--jn-no-bulk") { g_jn_no_bulk = true; }
+        else if (arg == "--jn-profile-growth") { g_jn_profile_growth = true; }
         else if (arg == "--continue-run") g_continue = true;
         else if (arg == "--crown" && a+1<argc) {
             std::string list = argv[++a];
@@ -6087,6 +6108,7 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "ERROR: j_neuro nets are not supported under --upkeep yet\n");
         return 1;
     }
+    jn_set_growth_ramp(!g_jn_profile_growth);
     if (g_upkeep) {
         if (output_dir.empty() || !account.empty()) {
             fprintf(stderr, "ERROR: --upkeep needs --output STATE (and no --account)\n");
@@ -6460,6 +6482,12 @@ int main(int argc, char* argv[]) {
         fprintf(csv, "\n");
     }
 
+    if (g_jn_stocknn || jn_any_race)
+        log_msg(g_jn_profile_growth
+            ? std::string("JN growth: profile draw (growth_gen_prob x growth_net_prob; --jn-profile-growth)")
+            : std::string("JN growth: ramp -- a child grows with its parent's chance: 1% to start, +0.5% per "
+                          "generation without growth, back to 1% after a growth or past 50%; a growth "
+                          "adds the profile's growth_max_pct of the net's neurons (min 1)"));
     if (g_jn_stocknn) {
         log_msg("");
         log_msg("################################################################");

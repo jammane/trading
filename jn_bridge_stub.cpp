@@ -15,6 +15,9 @@ void    jn_clear_rows(JNPool*) {}
 int     jn_ring_len(const JNPool*) { return 0; }
 bool    jn_forward(JNPool*, int, float*) { return false; }
 void    jn_mutate(JNPool*, int, int, uint64_t, uint64_t) {}
+void    jn_set_growth_ramp(bool) {}
+double  jn_growth_chance(JNPool*, int) { return 0.0; }
+void    jn_growth_take(JNPool*, long long* m, long long* g) { *m = *g = 0; }
 void    jn_permute(JNPool*, const int*, int) {}
 void    jn_inject(JNPool*, int, double, uint64_t) {}
 JNStats jn_stats(const JNPool*) { return {}; }

@@ -54,6 +54,16 @@ bool    jn_forward(JNPool* p, int slot, float* out);
 // dst = mutate(src) under the pool's profile. `generation` decides growth generations
 // (is_growth_generation over the pool seed) and is recorded on new neurons; `seed` is the RNG.
 void    jn_mutate(JNPool* p, int src, int dst, uint64_t generation, uint64_t seed);
+// Growth ramp (default on; jn_set_growth_ramp(false) restores the profile's growth_gen_prob /
+// growth_net_prob draw). Each net carries the chance that a child of it grows: JN_GROW_START for a
+// new, loaded or bulked net; a child that grew starts again at JN_GROW_START, a child that did not
+// carries its parent's chance + JN_GROW_STEP, and past JN_GROW_RESET it drops back to the start.
+// A child that grows does so by the profile's growth_max_pct (1% of its neurons, at least 1).
+constexpr double JN_GROW_START = 0.01, JN_GROW_STEP = 0.005, JN_GROW_RESET = 0.50;
+void    jn_set_growth_ramp(bool on);
+double  jn_growth_chance(JNPool* p, int slot);
+// Children mutated and children grown since the last call; resets both.
+void    jn_growth_take(JNPool* p, long long* mutated, long long* grown);
 // dst[k] = copy of the net now in src_of_dst[k], k in [0, n), applied simultaneously.
 void    jn_permute(JNPool* p, const int* src_of_dst, int n);
 // Re-randomise pct% of slot's v_neuron weights (spec/06 diversity injection), in place.
