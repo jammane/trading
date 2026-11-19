@@ -4370,6 +4370,68 @@ static void write_seeded_marker(const std::string& out_dir, int pass_num) {
     }
 }
 
+// ── The JN runner-up (--jn-stocknn) ──────────────────────────────────────────────────────────
+// Under --jn-stocknn the seed is not a share blend. When a pass does not beat its industry's
+// champion, that pass's 20 elites become the RUNNER-UP (RUN/runner_up/), replacing the previous
+// one: the runner-up is always the pass that just finished. The next pass is seeded with the
+// champion's 20 elites as they are, and its 180 children are split 2/3 champion, 1/3 runner-up
+// (JN_RU_CHAMP_KIDS per champion elite, JN_RU_KIDS per runner-up elite), so the structure a losing
+// pass grew is carried on instead of discarded. A crowning (a pass that beats the champion, the
+// first champion, --crown) deletes the runner-up; the next pass is seeded from the new champion
+// alone, 9 children per elite, until it finishes and becomes the runner-up itself.
+static constexpr int JN_RU_CHAMP_KIDS = 6;
+static constexpr int JN_RU_KIDS       = 3;
+static_assert(ELITE_POOL * (JN_RU_CHAMP_KIDS + JN_RU_KIDS) == N_SLOTS - ELITE_POOL,
+              "champion + runner-up children must fill the pool");
+
+static std::string runner_up_dir(const std::string& out_dir) { return out_dir + "/runner_up"; }
+static std::string runner_up_pass_path(const std::string& out_dir, const char* ind) {
+    return runner_up_dir(out_dir) + "/" + ind + ".pass";
+}
+// The pass an industry's runner-up came from, or -1 if it has none (or its files are incomplete).
+static int runner_up_pass(const std::string& out_dir, const char* ind) {
+    if (out_dir.empty()) return -1;
+    int p = -1;
+    if (FILE* f = fopen(runner_up_pass_path(out_dir, ind).c_str(), "r")) {
+        if (fscanf(f, "%d", &p) != 1) p = -1;
+        fclose(f);
+    }
+    for (int k = 0; k < ELITE_POOL && p >= 0; k++)
+        if (!fs::exists(champ_elite_path(runner_up_dir(out_dir), ind, k))) p = -1;
+    return p;
+}
+static void runner_up_clear(const std::string& out_dir, const char* ind) {
+    std::error_code ec;
+    fs::remove(runner_up_pass_path(out_dir, ind), ec);
+    for (int k = 0; k < ELITE_POOL; k++) fs::remove(champ_elite_path(runner_up_dir(out_dir), ind, k), ec);
+}
+// from/: the pass's 20 elite files. The .pass record is written last, so a partial copy reads as none.
+static bool runner_up_set(const std::string& from, const std::string& out_dir, const char* ind, int pass) {
+    runner_up_clear(out_dir, ind);
+    std::error_code ec;
+    fs::create_directories(runner_up_dir(out_dir), ec);
+    for (int k = 0; k < ELITE_POOL; k++) {
+        fs::copy_file(champ_elite_path(from, ind, k), champ_elite_path(runner_up_dir(out_dir), ind, k),
+                      fs::copy_options::overwrite_existing, ec);
+        if (ec) { runner_up_clear(out_dir, ind); return false; }
+    }
+    FILE* f = fopen(runner_up_pass_path(out_dir, ind).c_str(), "w");
+    if (!f) { runner_up_clear(out_dir, ind); return false; }
+    fprintf(f, "%d\n", pass);
+    fclose(f);
+    return true;
+}
+// The seed is the champion's elites as they are (the runner-up is bred from runner_up/).
+static bool seed_from_champion(const std::string& champ_dir, const std::string& out_dir, const char* ind) {
+    std::error_code ec;
+    for (int k = 0; k < ELITE_POOL; k++) {
+        fs::copy_file(champ_elite_path(champ_dir, ind, k), champ_elite_path(out_dir, ind, k),
+                      fs::copy_options::overwrite_existing, ec);
+        if (ec) return false;
+    }
+    return true;
+}
+
 // --continue-run start: if the last boundary did not blend a seed, blend now -- the champion and
 // that pass's elites (still in the run directory) interleaved at the recorded share_new, exactly
 // what the boundary would have written with seed_next. An industry crowned outright ("seed"
@@ -4399,6 +4461,12 @@ static void reseed_for_continue(const std::string& out_dir, int last_pass) {
                 for (int k = 0; k < ELITE_POOL; k++) g_jn_seed_new[ii][k] = 1;
                 continue;
             }
+            if (g_jn_stocknn && (runner_up_pass(out_dir, ind_buf) == last_pass || ncp == last_pass)) {
+                // Runner-up rule: the seed is the champion's elites -- unreplaced (0) after a loss,
+                // crowned at this boundary (1) after a win.
+                for (int k = 0; k < ELITE_POOL; k++) g_jn_seed_new[ii][k] = (ncp == last_pass) ? 1 : 0;
+                continue;
+            }
             int src[ELITE_POOL], idx[ELITE_POOL];
             pass_interleave(share, ELITE_POOL, src, idx);
             for (int k = 0; k < ELITE_POOL; k++) g_jn_seed_new[ii][k] = (src[k] == 1 || ncp != cp) ? 1 : 0;
@@ -4423,6 +4491,30 @@ static void reseed_for_continue(const std::string& out_dir, int last_pass) {
                    &p, ind_buf, &ds, &de, &cp, &cpct, &chp, &chpct,
                    regime, &share, &slots, &ncp, &npct) != 13 || p != last_pass) continue;
         if (std::string(regime) == "seed" || std::string(regime) == "crown") continue;
+        if (g_jn_stocknn) {
+            // Runner-up rule. The run directory still holds the last pass's elites, which ARE the
+            // runner-up (made here too if its boundary predates the rule); the seed becomes the
+            // champion's elites. A pass that won is the champion, and the directory already is it.
+            const int ii = ind_index(ind_buf);
+            if (ncp == last_pass) {
+                runner_up_clear(out_dir, ind_buf);
+                if (ii >= 0) for (int k = 0; k < ELITE_POOL; k++) g_jn_seed_new[ii][k] = 1;
+                log_msg(std::string("continue: ") + ind_buf + " seeded from champion p" +
+                        std::to_string(ncp) + " (crowned at p" + std::to_string(last_pass) + "), no runner-up");
+                continue;
+            }
+            if ((runner_up_pass(out_dir, ind_buf) != last_pass &&
+                 !runner_up_set(out_dir, out_dir, ind_buf, last_pass)) ||
+                !seed_from_champion(champ_dir, out_dir, ind_buf)) {
+                log_msg(std::string("continue: cannot seed ") + ind_buf + " from champion + runner-up "
+                        "-- seed unchanged");
+                continue;
+            }
+            if (ii >= 0) for (int k = 0; k < ELITE_POOL; k++) g_jn_seed_new[ii][k] = 0;
+            log_msg(std::string("continue: ") + ind_buf + " seeded from champion p" + std::to_string(ncp) +
+                    ", runner-up p" + std::to_string(last_pass));
+            continue;
+        }
         int src[ELITE_POOL], idx[ELITE_POOL];
         pass_interleave(share, ELITE_POOL, src, idx);
         bool ok = true;
@@ -4523,6 +4615,7 @@ static void pass_boundary(const std::string& out_dir, int pass_num,
             // First boundary, missing champion, no usable metric, or --crown: this pass becomes
             // the champion outright and the seed is left as-is — the pre-v0.6.3.0 behaviour.
             copy_elites(stage_dir, champ_dir, ind);
+            if (g_jn_stocknn) runner_up_clear(out_dir, ind);   // a crowning removes the runner-up
             for (int k = 0; k < ELITE_POOL; k++) g_jn_seed_new[i][k] = 1;
             fprintf(csv, "%d,%s,%d,%d,%d,%+.8f,%d,%+.8f,%s,%.4f,%d,%d,%+.8f\n",
                     pass_num, ind, day_start + 1, day_end, pass_num, chal_pct, 0, 0.f,
@@ -4530,6 +4623,44 @@ static void pass_boundary(const std::string& out_dir, int pass_num,
             snprintf(msg, sizeof(msg), "   pass-seed: champion = pass %d (%+.2f bp/day, eff %.0f days)%s, "
                      "seed unchanged", pass_num, chal_pct * 1e4f, judge[i].eff_days(),
                      forced ? " [--crown]" : "");
+            log_msg(std::string("[") + IND_SHORT[i] + "]" + msg);
+            continue;
+        }
+
+        if (g_jn_stocknn) {
+            // Runner-up rule (see JN_RU_CHAMP_KIDS). share_new records the share of the next
+            // pass's children bred from this pass: all of them as the new champion, 1/3 as the
+            // runner-up. slots_new: seed elite slots from this pass.
+            const bool  chal_wins = chal_pct > prev[i].champ_pct;
+            const int   nc_pass   = chal_wins ? pass_num : prev[i].champ_pass;
+            const float nc_pct    = chal_wins ? chal_pct : prev[i].champ_pct;
+            const char* what;
+            if (chal_wins) {
+                copy_elites(stage_dir, champ_dir, ind);
+                runner_up_clear(out_dir, ind);
+                what = "crowned, runner-up removed; next pass bred from it alone";
+            } else if (!runner_up_set(stage_dir, out_dir, ind, pass_num)) {
+                runner_up_clear(out_dir, ind);
+                what = "runner-up NOT written (copy failed); next pass bred from the champion alone";
+            } else {
+                what = "runner-up; next pass 2/3 champion, 1/3 runner-up children";
+            }
+            // The seed: a new champion is this pass's elites, already in out_dir.
+            if (seed_next && !chal_wins && !seed_from_champion(champ_dir, out_dir, ind))
+                log_msg(std::string("[") + IND_SHORT[i] + "]   pass-seed: cannot copy the champion's "
+                        "elites into the seed -- seed is this pass's elites");
+            for (int k = 0; k < ELITE_POOL; k++) g_jn_seed_new[i][k] = chal_wins ? 1 : 0;
+            const bool ru = !chal_wins && runner_up_pass(out_dir, ind) == pass_num;
+            fprintf(csv, "%d,%s,%d,%d,%d,%+.8f,%d,%+.8f,%s,%.4f,%d,%d,%+.8f\n",
+                    pass_num, ind, day_start + 1, day_end,
+                    prev[i].champ_pass, prev[i].champ_pct, pass_num, chal_pct,
+                    pass_regime(prev[i].champ_pct, chal_pct),
+                    chal_wins ? 1.0 : ru ? (double)JN_RU_KIDS / (JN_RU_KIDS + JN_RU_CHAMP_KIDS) : 0.0,
+                    chal_wins ? ELITE_POOL : 0, nc_pass, nc_pct);
+            snprintf(msg, sizeof(msg), "   pass-seed: p%d %+.2f vs p%d %+.2f bp/day -> p%d %s%s, "
+                     "champion = p%d", prev[i].champ_pass, prev[i].champ_pct * 1e4f, pass_num,
+                     chal_pct * 1e4f, pass_num, what,
+                     seed_next ? "" : " (final pass -- not seeded)", nc_pass);
             log_msg(std::string("[") + IND_SHORT[i] + "]" + msg);
             continue;
         }
@@ -4648,7 +4779,9 @@ static void jn_log_repaired() {
         log_msg("WARNING: " + f + " had dead nodes (j_neuro before fde9c19) -- loaded with collect_dead");
 }
 
-static bool jn_seed_from_elites(int ind_i, const std::string& dir, uint64_t generation) {
+// ru_out_dir: the run directory whose runner_up/ to breed from (empty for --load-dir's elites).
+static bool jn_seed_from_elites(int ind_i, const std::string& dir, uint64_t generation,
+                                const std::string& ru_out_dir = std::string()) {
     if (dir.empty()) return false;
     const char* ind = g_ind_names[ind_i].c_str();
     for (int k = 0; k < ELITE_POOL; k++)
@@ -4676,6 +4809,38 @@ static bool jn_seed_from_elites(int ind_i, const std::string& dir, uint64_t gene
                  ELITE_POOL - n_champ10, 100.0 * JN_GROW_START);
         log_msg(std::string("[") + IND_SHORT[ind_i] + gl);
     }
+    // The runner-up (see JN_RU_CHAMP_KIDS), loaded into the history slots, which are empty at a
+    // pass start (the ring restarts) and so serve as scratch: parents only, never candidates.
+    static_assert(JN_HIST_DAYS * JN_HIST_PER_DAY >= ELITE_POOL, "runner-up scratch slots");
+    const int ru_pass = runner_up_pass(ru_out_dir, ind);
+    bool have_ru = ru_pass >= 0;
+    for (int k = 0; k < ELITE_POOL && have_ru; k++) {
+        std::string err;
+        if (!jn_load_slot(p, JN_HIST_BASE + k, champ_elite_path(runner_up_dir(ru_out_dir), ind, k), &err)) {
+            log_msg(std::string("[") + IND_SHORT[ind_i] + "]   jn seed: cannot load runner-up " +
+                    champ_elite_path(runner_up_dir(ru_out_dir), ind, k) + " (" + err +
+                    ") -- bred from the elites alone");
+            have_ru = false;
+        }
+    }
+    if (have_ru) {
+        jn_log_repaired();
+        for (int k = 0; k < ELITE_POOL; k++) jn_set_growth_chance(p, JN_HIST_BASE + k, JN_GROW_START);
+        char rl[200];
+        snprintf(rl, sizeof(rl), "]   jn seed: runner-up p%d -- %d children from the %d elites (%d each), "
+                 "%d from the runner-up's %d (%d each)", ru_pass, ELITE_POOL * JN_RU_CHAMP_KIDS,
+                 ELITE_POOL, JN_RU_CHAMP_KIDS, ELITE_POOL * JN_RU_KIDS, ELITE_POOL, JN_RU_KIDS);
+        log_msg(std::string("[") + IND_SHORT[ind_i] + rl);
+    }
+    // Each child's parent slot: MUTATIONS_PER_PARENT per elite, or with a runner-up
+    // JN_RU_CHAMP_KIDS per elite then JN_RU_KIDS per runner-up net.
+    int parent[N_SLOTS - ELITE_POOL];
+    for (int mut_i = 0; mut_i < N_SLOTS - ELITE_POOL; mut_i++) {
+        const int nc = ELITE_POOL * JN_RU_CHAMP_KIDS;
+        parent[mut_i] = !have_ru         ? mut_i / MUTATIONS_PER_PARENT
+                      : mut_i < nc       ? mut_i / JN_RU_CHAMP_KIDS
+                                         : JN_HIST_BASE + (mut_i - nc) / JN_RU_KIDS;
+    }
     // The pass's champions: these 20 elites as loaded, before any bulking -- a static candidate
     // list for the whole pass (JN_CHAMP_BASE).
     for (int k = 0; k < JN_CHAMP_N; k++) jn_copy(p, k, JN_CHAMP_BASE + k);
@@ -4694,21 +4859,24 @@ static bool jn_seed_from_elites(int ind_i, const std::string& dir, uint64_t gene
                 " -- children mutated, not bulked");
     if (pct < 0.0) {
         for (int mut_i = 0; mut_i < N_SLOTS - ELITE_POOL; mut_i++)
-            jn_mutate(p, mut_i / MUTATIONS_PER_PARENT, ELITE_POOL + mut_i, generation,
+            jn_mutate(p, parent[mut_i], ELITE_POOL + mut_i, generation,
                       mix_seed(salt ^ (uint64_t)mut_i));
         return true;
     }
     const double cap = JN_BULK_CAP * start_nodes;
     double par_pct[ELITE_POOL], elite_n = 0.0;
     int n_unbulked = 0;
+    auto bulk_pct_of = [&](int slot) {
+        const double n = (double)jn_slot_nodes(p, slot);
+        return n > 0.0 ? std::max(0.0, std::min(pct, (cap / n - 1.0) * 100.0)) : 0.0;
+    };
     for (int k = 0; k < ELITE_POOL; k++) {
-        const double n = (double)jn_slot_nodes(p, k);
-        elite_n += n;
-        par_pct[k] = n > 0.0 ? std::max(0.0, std::min(pct, (cap / n - 1.0) * 100.0)) : 0.0;
+        elite_n += (double)jn_slot_nodes(p, k);
+        par_pct[k] = bulk_pct_of(k);
     }
     for (int mut_i = 0; mut_i < N_SLOTS - ELITE_POOL; mut_i++) {
-        const int par = mut_i / MUTATIONS_PER_PARENT;
-        if (!jn_bulk(p, par, ELITE_POOL + mut_i, par_pct[par], generation,
+        const int par = parent[mut_i];
+        if (!jn_bulk(p, par, ELITE_POOL + mut_i, par < ELITE_POOL ? par_pct[par] : bulk_pct_of(par), generation,
                      mix_seed(salt ^ 0x42554C4BULL ^ (uint64_t)mut_i)))   // "BULK"
             n_unbulked++;
     }
@@ -6672,7 +6840,7 @@ int main(int argc, char* argv[]) {
     // seed (a continued run, just blended above), else --load-dir's (e.g. a champion/ store) --
     // with fresh children. The full saved pool, when jn_load found one, is otherwise kept.
     for (int i = 0; i < N_IND && g_jn_stocknn; i++) {
-        const char* src = jn_seed_from_elites(i, output_dir, 0) ? "the run's elites"
+        const char* src = jn_seed_from_elites(i, output_dir, 0, output_dir) ? "the run's elites"
                         : jn_seed_from_elites(i, load_dir, 0)   ? "--load-dir's elites" : nullptr;
         if (src) log_msg(std::string("[") + IND_SHORT[i] + "] j_neuro StockNN pool seeded from " + src);
     }
@@ -8367,7 +8535,7 @@ int main(int argc, char* argv[]) {
             if (judged)
                 pass_boundary(output_dir, pass + 1, day_start, day_end, judge, seed_next);
             for (int i = 0; i < N_IND && g_jn_stocknn; i++) {
-                if (judged && seed_next && !jn_seed_from_elites(i, output_dir, (uint64_t)day_end))
+                if (judged && seed_next && !jn_seed_from_elites(i, output_dir, (uint64_t)day_end, output_dir))
                     log_msg("WARNING: j_neuro StockNN " + g_ind_names[i] +
                             " not reseeded from the pass seed -- it carries on as it ended");
                 if (!jn_save(g_jn_ind[i], output_dir, "jn_" + g_ind_names[i]))

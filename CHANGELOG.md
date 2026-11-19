@@ -16,6 +16,12 @@ entry is in its commit message.
   services was crowned p3, and p4 bred its 10 p3 elites at 10% instead of 1%.
 
 ### Changed
+- **JN seeds: champion + runner-up** (`--jn-stocknn`). A pass that does not beat its champion is
+  kept as the industry's runner-up (`RUN/runner_up/`, replaced by every later losing pass); the
+  next pass keeps the champion's 20 elites and breeds 120 children from them and 60 from the
+  runner-up. A crowning deletes the runner-up. Replaces the `share_new` blend for JN, which after
+  a loss usually reseeded from the champion alone, so every pass in JN9 restarted from the same
+  190-node seed and the ~120 nodes each pass grew were thrown away. Flat StockNN is unchanged.
 - **Sells at the open are priced like paper's** (`OPEN_SELL_DISCOUNT` = 0.80%, `open_sell_price`
   in `training_v4.cpp` and `fees.py`): a market sell, a sell-all limit the open gaps through, or a
   stop the open gaps below fills 0.80% below the open, never below a limit, in the trainer and in
