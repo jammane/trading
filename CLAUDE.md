@@ -1228,6 +1228,16 @@ both **off by default**:
   collection only; outputs unchanged) and logs a warning naming it, and a load failure logs its
   reason. From JN8 the profile also sets **`prune: static`**, as j_neuro's own gc profiles do
   since a38f260: mutation cuts only constant sources, never a live branch.
+  **Growth ramp (2026-11-18, default).** `growth_gen_prob` and `growth_net_prob` no longer decide
+  growth: each net carries the chance that a child of it grows (`jn_bridge.h`, `JN_GROW_*`). A
+  new, loaded or bulked net starts at 1%; a child that grew starts again at 1%; a child that did
+  not carries its parent's chance + 0.5%; and a chance past 50% drops back to 1%. Copies keep the
+  chance, the draw uses its own RNG stream, and the chance is not saved (a pass start resets it to
+  1%). A growth adds `growth_max_pct` of the net's live neurons, at least 1: 2-3 on a ~268-neuron
+  StockNN net, 1 on a ~24-neuron race net. Why: under 15% x 15% about 2.25% of children grew, the
+  pool mean rose ~30 nodes a pass (229 -> 254 in JN8 p1), and every pass restarted at the
+  unchanged champion seed's size. `--jn-profile-growth` restores the profile's draw. Logged per
+  StockNN selection as `grew G/M, chance C%` and per JN race pool at the pass end.
 
 j_neuro computes in exact IEEE-754 and refuses fast-math, so it is reached only through
 `jn_bridge.{h,cpp}`, an opaque wrapper CMake builds with j_neuro's own flags. The build looks for a

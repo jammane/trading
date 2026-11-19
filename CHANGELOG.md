@@ -9,6 +9,12 @@ entry is in its commit message.
 ## Unreleased
 
 ### Added
+- **JN growth ramp** (default; `--jn-profile-growth` restores the profile's draw): each JN child
+  grows with a chance it inherits from its parent: 1% for a new, loaded or bulked net, +0.5% for
+  each generation in its line that did not grow, and back to 1% after a growth or once past 50%.
+  A growth adds the profile's `growth_max_pct` (1% of the net's neurons, at least 1). Replaces
+  `growth_gen_prob` x `growth_net_prob` (15% x 15%). The StockNN selection line logs
+  `grew G/M, chance C%`; each JN race pool logs its children grown at the pass end.
 - `--jn-no-bulk`: no bulking at a JN pass start; the seed's children are mutated and the JN race
   pools carry over as saved.
 - **JN safety nets**: each JN StockNN pool scores its pass's 20 seed elites (champions, before
