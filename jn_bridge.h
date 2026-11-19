@@ -60,8 +60,11 @@ void    jn_mutate(JNPool* p, int src, int dst, uint64_t generation, uint64_t see
 // carries its parent's chance + JN_GROW_STEP, and past JN_GROW_RESET it drops back to the start.
 // A child that grows does so by the profile's growth_max_pct (1% of its neurons, at least 1).
 constexpr double JN_GROW_START = 0.01, JN_GROW_STEP = 0.005, JN_GROW_RESET = 0.50;
+// At a pass start, a seed elite from a champion that was not replaced breeds at this chance.
+constexpr double JN_GROW_CHAMP = 0.10;
 void    jn_set_growth_ramp(bool on);
 double  jn_growth_chance(JNPool* p, int slot);
+void    jn_set_growth_chance(JNPool* p, int slot, double chance);
 // Children mutated and children grown since the last call; resets both.
 void    jn_growth_take(JNPool* p, long long* mutated, long long* grown);
 // dst[k] = copy of the net now in src_of_dst[k], k in [0, n), applied simultaneously.

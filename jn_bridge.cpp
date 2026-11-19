@@ -242,6 +242,8 @@ void jn_set_growth_ramp(bool on) { g_growth_ramp = on; }
 
 double jn_growth_chance(JNPool* p, int slot) { return p->gc((size_t)slot); }
 
+void jn_set_growth_chance(JNPool* p, int slot, double chance) { p->gc((size_t)slot) = chance; }
+
 void jn_growth_take(JNPool* p, long long* mutated, long long* grown) {
     *mutated = p->n_mut; *grown = p->n_grown;
     p->n_mut = p->n_grown = 0;
