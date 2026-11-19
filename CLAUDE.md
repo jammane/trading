@@ -1236,7 +1236,11 @@ both **off by default**:
   1%). A growth adds `growth_max_pct` of the net's live neurons, at least 1: 2-3 on a ~268-neuron
   StockNN net, 1 on a ~24-neuron race net. Why: under 15% x 15% about 2.25% of children grew, the
   pool mean rose ~30 nodes a pass (229 -> 254 in JN8 p1), and every pass restarted at the
-  unchanged champion seed's size. `--jn-profile-growth` restores the profile's draw. Logged per
+  unchanged champion seed's size. `--jn-profile-growth` restores the profile's draw. At a pass start, a seed
+  elite that came from a **champion that was not replaced** (and a run's first seed from
+  `--load-dir`) breeds at **10%** (`JN_GROW_CHAMP`) instead of 1%, logged per industry as
+  `jn seed: N of 20 elites from an unreplaced champion breed at 10% growth chance`; elites from the
+  challenger, or from a champion crowned at that boundary, start at 1%. Logged per
   StockNN selection as `grew G/M, chance C%` and per JN race pool at the pass end.
 
 j_neuro computes in exact IEEE-754 and refuses fast-math, so it is reached only through

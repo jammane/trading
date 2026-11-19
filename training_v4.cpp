@@ -880,6 +880,15 @@ static bool g_jn_no_bulk = false;
 // 1% to start, +0.5% for each generation in its line that did not grow, back to 1% after a growth
 // or past 50%.
 static bool g_jn_profile_growth = false;
+// Per industry and seed slot: 1 when the next pass's seed elite k came from a new or replaced
+// source (a challenger's elites, or a champion crowned at that boundary); 0 when it came from a
+// champion that was not replaced, including a run's first seed from --load-dir. Under the growth
+// ramp a 0 slot breeds at JN_GROW_CHAMP (10%) instead of JN_GROW_START.
+static uint8_t g_jn_seed_new[N_IND][ELITE_POOL] = {};
+static int ind_index(const char* name) {
+    for (int i = 0; i < N_IND; i++) if (g_ind_names[i] == name) return i;
+    return -1;
+}
 // Rows of history a JN pool keeps. A net replays its own get_warmup_steps() of them each day and
 // trades only once it has that many; 64 bounds the replay cost while leaving room for nets to
 // grow s_neuron chains well past StockNN's 15-day window.
@@ -4376,9 +4385,15 @@ static void reseed_for_continue(const std::string& out_dir, int last_pass) {
         if (sscanf(line, "%d,%63[^,],%d,%d,%d,%f,%d,%f,%31[^,],%f,%d,%d,%f",
                    &p, ind_buf, &ds, &de, &cp, &cpct, &chp, &chpct,
                    regime, &share, &slots, &ncp, &npct) != 13 || p != last_pass) continue;
-        if (std::string(regime) == "seed" || std::string(regime) == "crown") continue;
+        const int ii = ind_index(ind_buf);
+        if (std::string(regime) == "seed" || std::string(regime) == "crown") {
+            if (ii >= 0) for (int k = 0; k < ELITE_POOL; k++) g_jn_seed_new[ii][k] = 1;
+            continue;
+        }
         int src[ELITE_POOL], idx[ELITE_POOL];
         pass_interleave(share, ELITE_POOL, src, idx);
+        if (ii >= 0)
+            for (int k = 0; k < ELITE_POOL; k++) g_jn_seed_new[ii][k] = (src[k] == 1 || ncp != cp) ? 1 : 0;
         bool ok = true;
         for (int k = 0; k < ELITE_POOL && ok; k++) {
             fs::copy_file(champ_elite_path(out_dir, ind_buf, k), champ_elite_path(stage_dir, ind_buf, k),
@@ -4477,6 +4492,7 @@ static void pass_boundary(const std::string& out_dir, int pass_num,
             // First boundary, missing champion, no usable metric, or --crown: this pass becomes
             // the champion outright and the seed is left as-is — the pre-v0.6.3.0 behaviour.
             copy_elites(stage_dir, champ_dir, ind);
+            for (int k = 0; k < ELITE_POOL; k++) g_jn_seed_new[i][k] = 1;
             fprintf(csv, "%d,%s,%d,%d,%d,%+.8f,%d,%+.8f,%s,%.4f,%d,%d,%+.8f\n",
                     pass_num, ind, day_start + 1, day_end, pass_num, chal_pct, 0, 0.f,
                     forced ? "crown" : "seed", 1.0, ELITE_POOL, pass_num, chal_pct);
@@ -4507,6 +4523,7 @@ static void pass_boundary(const std::string& out_dir, int pass_num,
         const int   nc_pass   = chal_wins ? pass_num : prev[i].champ_pass;
         const float nc_pct    = chal_wins ? chal_pct : prev[i].champ_pct;
         if (chal_wins) copy_elites(stage_dir, champ_dir, ind);
+        for (int k = 0; k < ELITE_POOL; k++) g_jn_seed_new[i][k] = (src[k] == 1 || chal_wins) ? 1 : 0;
 
         fprintf(csv, "%d,%s,%d,%d,%d,%+.8f,%d,%+.8f,%s,%.4f,%d,%d,%+.8f\n",
                 pass_num, ind, day_start + 1, day_end,
@@ -4615,6 +4632,19 @@ static bool jn_seed_from_elites(int ind_i, const std::string& dir, uint64_t gene
         }
     }
     jn_log_repaired();
+    if (!g_jn_profile_growth) {
+        int n_champ10 = 0;
+        for (int k = 0; k < ELITE_POOL; k++) {
+            const bool kept = !g_jn_seed_new[ind_i][k];
+            jn_set_growth_chance(p, k, kept ? JN_GROW_CHAMP : JN_GROW_START);
+            n_champ10 += kept;
+        }
+        char gl[160];
+        snprintf(gl, sizeof(gl), "]   jn seed: %d of %d elites from an unreplaced champion breed at "
+                 "%.0f%% growth chance, %d at %.0f%%", n_champ10, ELITE_POOL, 100.0 * JN_GROW_CHAMP,
+                 ELITE_POOL - n_champ10, 100.0 * JN_GROW_START);
+        log_msg(std::string("[") + IND_SHORT[ind_i] + gl);
+    }
     // The pass's champions: these 20 elites as loaded, before any bulking -- a static candidate
     // list for the whole pass (JN_CHAMP_BASE).
     for (int k = 0; k < JN_CHAMP_N; k++) jn_copy(p, k, JN_CHAMP_BASE + k);

@@ -17,6 +17,7 @@ bool    jn_forward(JNPool*, int, float*) { return false; }
 void    jn_mutate(JNPool*, int, int, uint64_t, uint64_t) {}
 void    jn_set_growth_ramp(bool) {}
 double  jn_growth_chance(JNPool*, int) { return 0.0; }
+void    jn_set_growth_chance(JNPool*, int, double) {}
 void    jn_growth_take(JNPool*, long long* m, long long* g) { *m = *g = 0; }
 void    jn_permute(JNPool*, const int*, int) {}
 void    jn_inject(JNPool*, int, double, uint64_t) {}
