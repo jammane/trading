@@ -1163,13 +1163,26 @@ both **off by default**:
   there are no weighted-average blends and no 5-day elite history (nets of different shapes cannot
   be averaged or stored in the flat buffers). Pools live in memory and are saved at each pass end
   as `jn_<industry>_<slot>.jnet`; a `JN_STOCKNN` marker is written.
-- **Champions work as for StockNN.** At each pass end the pool's 20 elites (slots 0–19, rank
-  order) are written as `jn_<industry>_elite_<k>.jnet`, and `pass_boundary` judges, crowns into
-  `champion/` and blends the next pass's seed from those files exactly as it does the flat elites
-  (`champ_elite_path`); the pool is then rebuilt from the seed with fresh children
-  (`jn_seed_from_elites`). `--continue-run` blends first and the pool starts from the run's elites;
-  a run seeded with `--load-dir champion/` starts from the champion's. A JN race entry's deployed
-  net (`race_p<N>_<entry>_<ind>.jnet`) travels into `champion/` with its pass's elites.
+- **Champions are judged as for StockNN, but the seed is champion + runner-up.** At each pass end
+  the pool's 20 elites (slots 0–19, rank order) are written as `jn_<industry>_elite_<k>.jnet`, and
+  `pass_boundary` judges and crowns into `champion/` exactly as it does the flat elites
+  (`champ_elite_path`). It does not blend a seed by `share_new` (2026-11-19). A pass that does not
+  beat its champion becomes the industry's **runner-up** (`RUN/runner_up/`, with
+  `<industry>.pass`), replacing the previous one, so the runner-up is always the pass that just
+  finished. The next pass keeps the champion's 20 elites as they are and splits the 180 children:
+  **120 from the champion** (6 per elite, `JN_RU_CHAMP_KIDS`) and **60 from the runner-up** (3 per
+  net, `JN_RU_KIDS`), so what a losing pass grew is bred on instead of discarded. A crowning (a
+  pass that beats the champion, the first champion, `--crown`) deletes the runner-up, and the
+  next pass is bred from the new champion alone, 9 children per elite. The runner-up's nets are
+  loaded into the empty history slots as parents only; they are not elites or candidates. Logged
+  per industry as `pass-seed: ... -> pN runner-up` and `jn seed: runner-up pN -- 120 children
+  ...`; `pass_reference.csv` records `share_new` as the share of children bred from the pass (1,
+  1/3 or 0) and `slots_new` as 20 or 0. Under the growth ramp the champion's elites breed at
+  `JN_GROW_CHAMP` (10%) and the runner-up's at 1%. `--continue-run` applies the same rule (making
+  the runner-up from the run's elites if the last boundary predates it); a run seeded with
+  `--load-dir champion/` starts from the champion's elites with no runner-up. A JN race entry's
+  deployed net (`race_p<N>_<entry>_<ind>.jnet`) travels into `champion/` with its pass's elites.
+  Flat StockNN keeps the `share_new` blend.
 - **Inputs are signed-log scaled** (`sign(x)·log1p(|x|)`) before they reach a JN StockNN net. The
   today vector holds raw share volumes and their daily changes (~1e6) beside dollar prices and
   O(1) ratios, and a new j_neuro net passes its inputs nearly straight through: on raw inputs the
