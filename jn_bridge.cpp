@@ -20,6 +20,8 @@
 using D   = std::uint32_t;
 using JNet = jneuro::Net<D>;
 
+static bool g_growth_ramp = true;   // jn_set_growth_ramp
+
 struct JNPool {
     int n_in = 0, n_out = 0, ring_cap = 0;
     uint64_t seed = 0;
@@ -33,6 +35,13 @@ struct JNPool {
     // 2026-11-12: ~6 s of a JN StockNN day). Cleared wherever a slot gets a different net.
     mutable std::vector<int> warm;
     std::vector<uint64_t> id;   // jn_id: per slot, kept by copies, renewed by every new net
+    // Growth ramp (jn_set_growth_ramp): per slot, the chance that a child of this net grows. A new
+    // or loaded net starts at JN_GROW_START; a child that grew resets to it, one that did not adds
+    // JN_GROW_STEP, and a chance past JN_GROW_RESET drops back to the start. Copies keep it.
+    std::vector<double> gchance;
+    jneuro::Profile profile_grow = jneuro::Profile::defaults();   // profile, growth_net_prob 1
+    long long n_mut = 0, n_grown = 0;   // since the last jn_growth_take
+    double& gc(size_t slot) { if (gchance.size() < nets.size()) gchance.resize(nets.size(), JN_GROW_START); return gchance[slot]; }
     uint64_t next_id = 1;
     void renew(size_t slot) { if (id.size() < nets.size()) id.resize(nets.size(), 0); id[slot] = next_id++; }
     void renew_all() { id.assign(nets.size(), 0); for (size_t k = 0; k < nets.size(); k++) id[k] = next_id++; }
@@ -79,6 +88,7 @@ bool jn_bulk(JNPool* p, int src, int dst, double pct, uint64_t generation, uint6
     jneuro::Rng rng(seed);
     p->nets[(size_t)dst] = jneuro::mutate(p->nets[(size_t)src], prof, generation, rng, nullptr, true);
     p->warm[(size_t)dst] = -1;
+    p->gc((size_t)dst) = JN_GROW_START;   // a bulked net has just grown
     p->renew((size_t)dst);
     return true;
 }
@@ -137,6 +147,8 @@ JNPool* jn_pool_create(int n_in, int n_out, int n_slots, int ring_cap,
         if (!f) { delete p; err = "cannot read j_neuro profile " + profile_path; return nullptr; }
         std::stringstream ss; ss << f.rdbuf();
         p->profile = jneuro::profile_from_json(ss.str());
+        p->profile_grow = p->profile;
+        p->profile_grow.set_overall("growth_net_prob", 1.0);
         p->nets.reserve(n_slots);
         for (int s = 0; s < n_slots; s++) {
             jneuro::Rng rng(seed ^ (0xD1B54A32D192ED03ULL * (uint64_t)(s + 1)));
@@ -144,6 +156,7 @@ JNPool* jn_pool_create(int n_in, int n_out, int n_slots, int ring_cap,
                                                       jneuro::Priority::Speed, rng)));
         }
         p->warm.assign(p->nets.size(), -1);
+        p->gchance.assign(p->nets.size(), JN_GROW_START);
         p->renew_all();
         p->in.assign(n_in, 0.0);
         return p;
@@ -201,10 +214,37 @@ void jn_mutate(JNPool* p, int src, int dst, uint64_t generation, uint64_t seed) 
     tcount(C_MUT);
     jneuro::Rng rng(seed);
     bool grow;
-    { TScope tg(T_GROW); grow = jneuro::is_growth_generation(p->seed, generation, p->profile); }
-    p->nets[dst] = jneuro::mutate(p->nets[src], p->profile, generation, rng, nullptr, grow);
+    double next = JN_GROW_START;
+    {
+        TScope tg(T_GROW);
+        if (g_growth_ramp) {
+            // The child's own draw, on a stream apart from the mutation's RNG.
+            const double chance = p->gc((size_t)src);
+            jneuro::Rng gr(seed ^ 0x6A09E667F3BCC909ULL);
+            grow = gr.u() < chance;
+            next = grow ? JN_GROW_START : chance + JN_GROW_STEP;
+            if (next > JN_GROW_RESET) next = JN_GROW_START;
+        } else {
+            grow = jneuro::is_growth_generation(p->seed, generation, p->profile);
+        }
+    }
+    p->nets[dst] = g_growth_ramp && grow
+        ? jneuro::mutate(p->nets[src], p->profile_grow, generation, rng, nullptr, true)
+        : jneuro::mutate(p->nets[src], p->profile, generation, rng, nullptr, g_growth_ramp ? false : grow);
+    p->gc((size_t)dst) = next;
+    p->n_mut++;
+    if (g_growth_ramp && grow) p->n_grown++;
     p->warm[(size_t)dst] = -1;
     p->renew((size_t)dst);
+}
+
+void jn_set_growth_ramp(bool on) { g_growth_ramp = on; }
+
+double jn_growth_chance(JNPool* p, int slot) { return p->gc((size_t)slot); }
+
+void jn_growth_take(JNPool* p, long long* mutated, long long* grown) {
+    *mutated = p->n_mut; *grown = p->n_grown;
+    p->n_mut = p->n_grown = 0;
 }
 
 void jn_permute(JNPool* p, const int* src_of_dst, int n) {
@@ -214,9 +254,14 @@ void jn_permute(JNPool* p, const int* src_of_dst, int n) {
     for (int k = 0; k < n; k++) tmp.push_back(p->nets[src_of_dst[k]].copy_genome());
     std::vector<int> tw(n);
     std::vector<uint64_t> ti(n);
-    for (int k = 0; k < n; k++) { tw[k] = p->warm[(size_t)src_of_dst[k]]; ti[k] = p->id[(size_t)src_of_dst[k]]; }
+    std::vector<double> tg(n);
+    for (int k = 0; k < n; k++) {
+        tw[k] = p->warm[(size_t)src_of_dst[k]]; ti[k] = p->id[(size_t)src_of_dst[k]];
+        tg[k] = p->gc((size_t)src_of_dst[k]);
+    }
     for (int k = 0; k < n; k++) {
         p->nets[k] = std::move(tmp[k]); p->warm[(size_t)k] = tw[k]; p->id[(size_t)k] = ti[k];
+        p->gc((size_t)k) = tg[k];
     }
 }
 
@@ -261,6 +306,7 @@ void jn_copy(JNPool* p, int src, int dst) {
     p->nets[(size_t)dst] = p->nets[(size_t)src].copy_genome();
     p->warm[(size_t)dst] = p->warm[(size_t)src];
     p->id[(size_t)dst] = p->id[(size_t)src];
+    p->gc((size_t)dst) = p->gc((size_t)src);
 }
 
 uint64_t jn_id(const JNPool* p, int slot) { return p->id[(size_t)slot]; }
@@ -299,6 +345,7 @@ bool jn_load_slot(JNPool* p, int slot, const std::string& path, std::string* err
         if (!fit_outputs(p, n, (uint64_t)slot + 1)) { if (err) *err = "inputs/outputs do not fit"; return false; }
         p->nets[slot] = std::move(n);
         p->warm[(size_t)slot] = -1;
+        p->gc((size_t)slot) = JN_GROW_START;
         p->renew((size_t)slot);
         return true;
     } catch (const std::exception& e) {
@@ -344,7 +391,9 @@ bool jn_load(JNPool* p, const std::string& dir, const std::string& prefix) {
             if (!ok) return false;
         }
         // Persisted slots are replaced; scratch slots past them keep their nets.
-        for (size_t s = 0; s < nets.size(); s++) { p->nets[s] = std::move(nets[s]); p->renew(s); }
+        for (size_t s = 0; s < nets.size(); s++) {
+            p->nets[s] = std::move(nets[s]); p->gc(s) = JN_GROW_START; p->renew(s);
+        }
         p->warm.assign(p->nets.size(), -1);
         p->ring = std::move(ring);
         while ((int)p->ring.size() > p->ring_cap) p->ring.pop_front();
