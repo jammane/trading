@@ -8,6 +8,14 @@ entry is in its commit message.
 
 ## Unreleased
 
+### Changed
+- **Sells at the open are priced like paper's** (`OPEN_SELL_DISCOUNT` = 0.80%, `open_sell_price`
+  in `training_v4.cpp` and `fees.py`): a market sell, a sell-all limit the open gaps through, or a
+  stop the open gaps below fills 0.80% below the open, never below a limit, in the trainer and in
+  every Python simulator. They filled at the open itself, while paper's market sells at the open
+  filled 0.91% below it and gapped limits 0.42% (124 sells, 2026-10-14..11-18). On those sessions
+  the real books lost 36 bp/day more than the trainer's simulation of them.
+
 ### Added
 - **JN growth ramp** (default; `--jn-profile-growth` restores the profile's draw): each JN child
   grows with a chance it inherits from its parent: 1% for a new, loaded or bulked net, +0.5% for

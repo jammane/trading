@@ -11,10 +11,11 @@ after trading has already started. Safe to run any time; read-only against the b
 
 What the simulator assumes (training_v4.cpp / training_lib.py):
   BUY limit at L on fill-day bar (O,H,L,C):
-      open <= L            -> fills at `open`            (gap, no slippage)
-      low  <  L  <  high   -> fills at L*(1+SLIPPAGE)    (intraday touch, ALWAYS fills)
+      open <= L            -> fills at min(open*(1+OPEN_BUY_PREMIUM), L)   (gap at the open)
+      low  <  L  <  high   -> fills at L                                   (intraday touch)
       otherwise            -> no fill
-  SELL/stop mirror it with (1-SLIPPAGE).
+  SELL limit mirrors it: open >= L fills at max(open*(1-OPEN_SELL_DISCOUNT), L); a market sell
+  fills at open*(1-OPEN_SELL_DISCOUNT); a triggered stop at the stop less SLIPPAGE_RATE.
 
 The three questions:
   1. FILL RATE  — of orders the simulator says fill, what fraction actually did?
@@ -34,7 +35,7 @@ import os
 import sys
 from collections import defaultdict
 
-from fees import OPEN_BUY_PREMIUM  # the trainer's fill model (training_v4.cpp buy_fill_price)
+from fees import OPEN_BUY_PREMIUM, OPEN_SELL_DISCOUNT, open_sell_price  # the trainer's fill model (training_v4.cpp buy_fill_price)
 STOCK_DATA_DIR = 'stock_data'
 
 
@@ -56,7 +57,7 @@ def simulate(side, limit, bar):
     """What the trainer's fill model would do. Returns (fills, price, reason)."""
     o, h, low = bar['open'], bar['high'], bar['low']
     if limit is None:
-        return True, o, 'market@open'
+        return True, (o if side == 'buy' else open_sell_price(o)), 'market@open'
     if side == 'buy':
         if o <= limit:
             return True, min(o * (1.0 + OPEN_BUY_PREMIUM), limit), 'gap@open'
@@ -64,7 +65,7 @@ def simulate(side, limit, bar):
             return True, limit, 'touch@limit'
         return False, None, 'no-touch'
     if o >= limit:
-        return True, o, 'gap@open'
+        return True, open_sell_price(o, limit), 'gap@open'
     if low < limit < h:
         return True, limit, 'touch@limit'
     return False, None, 'no-touch'
@@ -172,7 +173,8 @@ def main():
         n = len(errs)
         print(f'   n={n}  mean={1e4*sum(errs)/n:+.1f} bp  median={1e4*errs[n//2]:+.1f} bp'
               f'  p10={1e4*errs[n//10]:+.1f}  p90={1e4*errs[9*n//10]:+.1f}')
-        print(f'   (simulator: limits at the limit, open buys at open +{1e4*OPEN_BUY_PREMIUM:.0f} bp; '
+        print(f'   (simulator: limits at the limit, open buys at open +{1e4*OPEN_BUY_PREMIUM:.0f} bp, '
+              f'open sells at open -{1e4*OPEN_SELL_DISCOUNT:.0f} bp; '
               'positive = we paid worse)')
     else:
         print('   no filled orders with a comparable simulated price yet')

@@ -71,3 +71,62 @@ int main() {
                          capture_output=True, text=True, check=True).stdout.split()
     for c, got in zip(cases, out, strict=True):
         assert float(got) == pytest.approx(buy_fill_price(*c), rel=1e-6, abs=1e-6), c
+
+
+# ── The sell side at the open (2026-11-18) ─────────────────────────────────────────────────────
+# Paper's market sells at the open filled 0.91% below the bar's open and its gapped sell-all
+# limits 0.42% below it (124 sells, 2026-10-14..11-18); the simulator used the open itself.
+
+from fees import OPEN_SELL_DISCOUNT, open_sell_price  # noqa: E402
+
+
+def test_market_sell_at_open_takes_the_discount():
+    assert open_sell_price(50.0) == pytest.approx(50.0 * (1 - OPEN_SELL_DISCOUNT))
+
+
+def test_gapped_sell_limit_never_fills_below_its_limit():
+    assert open_sell_price(50.0, 49.9) == 49.9          # the discount would cross the limit
+    assert open_sell_price(50.0, 45.0) == pytest.approx(50.0 * (1 - OPEN_SELL_DISCOUNT))
+
+
+def test_sell_discount_is_the_calibrated_value():
+    assert OPEN_SELL_DISCOUNT == pytest.approx(0.0080)
+
+
+def test_simulators_sell_at_the_discounted_open():
+    from training_lib import _fill_sym_open_low
+    day = {"X": {"open": 50.0, "high": 51.0, "low": 49.0, "close": 50.0}}
+    nxt = {"X": {"open": 52.0, "high": 53.0, "low": 51.5, "close": 52.5}}
+    plan = {"sell_open": {"X": 2}, "sell_all": {}, "sold": {"X"}, "buys": {}}
+    port = {"cash": 0.0, "holdings": {"X": 5.0}, "stop_prices": {}}
+    _fill_sym_open_low("X", port, plan, day, nxt, low_first=True)
+    from fees import _sell_net
+    assert port["cash"] == pytest.approx(_sell_net(2, 52.0 * (1 - OPEN_SELL_DISCOUNT)))
+
+
+def test_cpp_open_sell_twin_matches(tmp_path):
+    cxx = shutil.which("g++")
+    if not cxx:
+        pytest.skip("g++ not available")
+    src = Path("training_v4.cpp").read_text()
+    block = (re.search(r"static constexpr float OPEN_SELL_DISCOUNT\s*=[^;]+;", src).group(0) + "\n"
+             + re.search(r"static inline float open_sell_price\(.*?\n}\n", src, re.S).group(0))
+    prog = tmp_path / "sell.cpp"
+    prog.write_text("#include <algorithm>\n#include <cstdio>\n" + block + r"""
+int main() {
+    float o, lim;
+    while (scanf("%f %f", &o, &lim) == 2) printf("%.6f\n", open_sell_price(o, lim));
+}
+""")
+    exe = tmp_path / "sell"
+    subprocess.run([cxx, "-O2", "-std=c++17", "-o", str(exe), str(prog)], check=True)
+    rng = random.Random(20261118)
+    cases = []
+    for _ in range(2000):
+        o = float(np.float32(rng.uniform(20, 90)))
+        lim = float(np.float32(rng.choice([0.0, o, o * 0.995, o * rng.uniform(0.95, 1.0)])))
+        cases.append((o, lim))
+    out = subprocess.run([str(exe)], input="\n".join(f"{o!r} {lim!r}" for o, lim in cases) + "\n",
+                         capture_output=True, text=True, check=True).stdout.split()
+    for c, got in zip(cases, out, strict=True):
+        assert float(got) == pytest.approx(open_sell_price(*c), rel=1e-6, abs=1e-6), c

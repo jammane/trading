@@ -256,8 +256,20 @@ static constexpr float FINRA_TAF_MAX       = 8.30f;
 //     (119 fills, 20 sessions, 19 of them positive; per-fill sd 1.3%), so 82% of buys were
 //     0.58% cheaper in training than in paper. 0.70% is the premium that leaves zero mean error
 //     once the limit cap is applied. Recalibrate from fill_check.csv as sessions accumulate.
+//   A sell that fills at the open -- a market sell (sell_qty), a sell-all limit the open gaps
+//     through, a stop the open gaps below -- fills OPEN_SELL_DISCOUNT below the open, never below
+//     a limit. The simulator used the open itself, and paper's market sells at the open filled
+//     0.91% below it (64 sells, 2026-10-14..11-18; median 0.78%), its gapped sell-all limits
+//     0.42% below it (60). 0.80% with the limit floor leaves near-zero mean error over the 124
+//     (market -9 bp, limits +11 bp). Together with the buy premium, every round trip through the
+//     open was ~1.5% cheaper in training than in paper.
 static constexpr float SLIPPAGE_RATE       = 0.001f;
 static constexpr float OPEN_BUY_PREMIUM    = 0.0070f;
+static constexpr float OPEN_SELL_DISCOUNT  = 0.0080f;
+// Price a sell fills at the open: below the open by the discount, never below `limit` (0 = market).
+static inline float open_sell_price(float nd_open, float limit) {
+    return std::max(nd_open * (1.f - OPEN_SELL_DISCOUNT), limit);
+}
 // Price a limit buy fills at against the next bar, or 0 if it does not fill (strict at the low).
 static inline float buy_fill_price(float nd_open, float nd_low, float nd_high, float buy_lim) {
     if (nd_open <= buy_lim) return std::min(nd_open * (1.f + OPEN_BUY_PREMIUM), buy_lim);
@@ -2454,20 +2466,20 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             if (plan.sell_open[j] > 0.f && port.holdings[j] > 1e-6f) {
                 float amt = std::min(plan.sell_open[j], port.holdings[j]);
                 port.holdings[j] -= amt;
-                port.cash        += sell_net(amt, nd_open);
-                sym_cash[j]        += sell_net(amt, nd_open);
+                port.cash        += sell_net(amt, open_sell_price(nd_open, 0.f));
+                sym_cash[j]        += sell_net(amt, open_sell_price(nd_open, 0.f));
                 local_sell       += amt;
-                if (slot == 0) { ex.sold_open_q = amt; ex.sold_open_px = nd_open; }
+                if (slot == 0) { ex.sold_open_q = amt; ex.sold_open_px = open_sell_price(nd_open, 0.f); }
             }
 
             // Gap-up sell_all at open
             if (sell_lim > 0.f && port.holdings[j] > 1e-6f && nd_open >= sell_lim) {
                 float amt = port.holdings[j];
                 port.holdings[j] = 0.f;
-                port.cash        += sell_net(amt, nd_open);
-                sym_cash[j]        += sell_net(amt, nd_open);
+                port.cash        += sell_net(amt, open_sell_price(nd_open, sell_lim));
+                sym_cash[j]        += sell_net(amt, open_sell_price(nd_open, sell_lim));
                 local_sell       += amt;
-                if (slot == 0) { ex.sold_all_q = amt; ex.sold_all_px = nd_open; }
+                if (slot == 0) { ex.sold_all_q = amt; ex.sold_all_px = open_sell_price(nd_open, sell_lim); }
             }
 
             // High-first: intraday sell_all fires before buy
@@ -2491,10 +2503,10 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                 if (nd_open <= stop_p) {
                     float amt = port.holdings[j];
                     port.holdings[j] = 0.f;
-                    port.cash        += sell_net(amt, nd_open);
-                    sym_cash[j]        += sell_net(amt, nd_open);
+                    port.cash        += sell_net(amt, open_sell_price(nd_open, 0.f));
+                    sym_cash[j]        += sell_net(amt, open_sell_price(nd_open, 0.f));
                     local_sell       += amt;
-                    if (slot == 0) { ex.stopped_q = amt; ex.stopped_px = nd_open; }
+                    if (slot == 0) { ex.stopped_q = amt; ex.stopped_px = open_sell_price(nd_open, 0.f); }
                 } else if (nd_low <= stop_p) {
                     float slipped = stop_p * (1.f - SLIPPAGE_RATE);
                     float amt = port.holdings[j];
@@ -2631,13 +2643,13 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             if (hp.sell_open[j] > 0.f && port.holdings[j] > 1e-6f) {
                 float amt = std::min(hp.sell_open[j], port.holdings[j]);
                 port.holdings[j] -= amt;
-                port.cash        += sell_net(amt, nd_open);
+                port.cash        += sell_net(amt, open_sell_price(nd_open, 0.f));
                 local_sell       += amt;
             }
             if (sell_lim > 0.f && port.holdings[j] > 1e-6f && nd_open >= sell_lim) {
                 float amt = port.holdings[j];
                 port.holdings[j] = 0.f;
-                port.cash        += sell_net(amt, nd_open);
+                port.cash        += sell_net(amt, open_sell_price(nd_open, sell_lim));
                 local_sell       += amt;
             }
             if (sell_lim > 0.f && !low_first && port.holdings[j] > 1e-6f &&
@@ -2655,7 +2667,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                 if (nd_open <= stop_p) {
                     float amt = port.holdings[j];
                     port.holdings[j] = 0.f;
-                    port.cash        += sell_net(amt, nd_open);
+                    port.cash        += sell_net(amt, open_sell_price(nd_open, 0.f));
                     local_sell       += amt;
                 } else if (nd_low <= stop_p) {
                     float slipped = stop_p * (1.f - SLIPPAGE_RATE);
