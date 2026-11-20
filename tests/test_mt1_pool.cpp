@@ -7,7 +7,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <initializer_list>
+#include <limits>
 
 #include "mt1_pool.h"
 
@@ -165,6 +167,55 @@ static void test_ordering_is_a_strict_weak_ordering() {
     CHECK(!mt1_slot_better(a, b));      // equal -> neither is better
     CHECK(!mt1_slot_better(b, a));
     CHECK(!mt1_slot_better(a, a));      // irreflexive
+}
+
+// A NaN score (a net or input gone non-finite) must not reach a register: the comparator cannot
+// order it, and sorting with an unordered comparator is undefined. In JN9 p5 (2026-11-19)
+// stable_sort's unguarded insertion walked off the start of the pool's order array and segfaulted.
+static void test_nan_scores_cannot_break_the_ordering() {
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    MT1SlotMeta m;
+    mt1_slot_init(m, 1);
+    mt1_slot_record(m, nan);
+    mt1_slot_record(m, inf);
+    mt1_slot_record(m, -inf);
+    CHECK(m.score[0] == 0.f && m.score[1] == 0.f && m.score[2] == 0.f);   // recorded as the worst
+
+    // Registers that already hold NaN (e.g. loaded from an older sidecar) rank below every real
+    // score, and the comparator stays irreflexive and asymmetric.
+    MT1SlotMeta good, poisoned;
+    mt1_slot_init(good, 1);
+    mt1_slot_init(poisoned, 2);
+    for (int i = 0; i < MT1_SCORE_HIST; i++) { mt1_slot_record(good, 0.01f); mt1_slot_record(poisoned, 0.9f); }
+    poisoned.score[3] = nan;
+    CHECK(mt1_slot_better(good, poisoned));
+    CHECK(!mt1_slot_better(poisoned, good));
+    CHECK(!mt1_slot_better(poisoned, poisoned));
+
+    // A pool with every fourth register poisoned sorts into a valid permutation with the real
+    // scores in order (stable_sort is what mt1_rank uses).
+    static MT1SlotMeta pool[MT1_POOL_SLOTS];
+    int order[MT1_POOL_SLOTS];
+    for (int s = 0; s < MT1_POOL_SLOTS; s++) {
+        mt1_slot_init(pool[s], (uint32_t)s);
+        for (int i = 0; i < MT1_SCORE_HIST; i++) mt1_slot_record(pool[s], 0.1f + 0.8f * ((s * 37) % 200) / 200.f);
+        if (s % 4 == 0) pool[s].score[s % MT1_SCORE_HIST] = nan;
+        order[s] = s;
+    }
+    std::stable_sort(order, order + MT1_POOL_SLOTS,
+                     [&](int a, int b) { return mt1_slot_better(pool[a], pool[b]); });
+    bool seen[MT1_POOL_SLOTS] = {}, perm = true;
+    for (int k = 0; k < MT1_POOL_SLOTS; k++) {
+        if (order[k] < 0 || order[k] >= MT1_POOL_SLOTS || seen[order[k]]) perm = false;
+        else seen[order[k]] = true;
+    }
+    CHECK(perm);
+    bool sorted = true;
+    for (int k = 1; k < MT1_POOL_SLOTS && perm; k++)
+        if (mt1_slot_better(pool[order[k]], pool[order[k - 1]])) sorted = false;
+    CHECK(sorted);
+    CHECK(perm && order[MT1_POOL_SLOTS - 1] % 4 == 0);   // the poisoned slots sort last
 }
 
 static void test_lifecycle_constants() {
@@ -343,6 +394,7 @@ int main() {
     test_window_rolls();
     test_immature_never_outranks_a_record();
     test_ordering_is_a_strict_weak_ordering();
+    test_nan_scores_cannot_break_the_ordering();
     test_lifecycle_constants();
     test_life_bucket_boundaries();
     test_every_bucket_is_in_range();
