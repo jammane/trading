@@ -1473,6 +1473,8 @@ struct MT1PoolScratch {
     float       champ_pending[JN_CHAMP_N]{};
     int8_t      champ_of[MT1_POOL_SLOTS]{};
     int         champ_back{0};              // champions copied back in this pass (logged)
+    const char* tag{nullptr};               // race entry name for logs (nullptr: the logged MT1 pool)
+    int         nonfinite_n{0};             // days with a non-finite prediction or outcome (logged)
     int         champ_reset_seen{0};        // resets_of() already answered (copy-back gate)
     uint32_t    champ_used{0};              // champions copied back this pass (bit k); see g_jn_champ_used
     float*      mut_buf{nullptr};           // one model, breeding scratch
@@ -3649,16 +3651,35 @@ static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in,
         if (sc.jn_gate < 0) jn_race_read_gate(sc);
         jn_warming = jn_ring_len(sc.jn) <= sc.jn_gate;
     }
+    // A non-finite prediction (NaN/inf from the net or its inputs) is published as $0 and scored
+    // 0, the worst score; a non-finite outcome is not scored at all. Either would otherwise put a
+    // NaN in a score register, which mt1_rank's sort cannot order: on 2026-11-19 that walked
+    // stable_sort off the start of `order` and crashed JN9 p5 (rc 139) on day 409.
+    bool bad[MT1_POOL_SLOTS] = {};
+    int n_bad = 0;
     for (int s = 0; s < MT1_POOL_SLOTS; s++) {
         if (sc.jn) {
             float o = 0.f; jn_forward(sc.jn, s, &o);
             sc.pending[s] = mt1_pred(o * JN_RACE_OUT_SCALE);
         }
         else       sc.pending[s] = mt1_pred(fwd(sc.slot(s), in, 0.f));
+        if (!std::isfinite(sc.pending[s])) { sc.pending[s] = 0.f; bad[s] = true; n_bad++; }
     }
     for (int k = 0; k < sc.jn_champ_n; k++) {
         float o = 0.f; jn_forward(sc.jn, MT1_POOL_SLOTS + k, &o);
         sc.champ_pending[k] = mt1_pred(o * JN_RACE_OUT_SCALE);
+    }
+    const bool bad_actual = have_actual && !std::isfinite(actual);
+    if (bad_actual) have_actual = false;
+    if (n_bad || bad_actual) {
+        if (++sc.nonfinite_n <= 5) {
+            char m[220];
+            snprintf(m, sizeof(m), "WARNING: [%s] %s pool, day %d: %d of %d predictions non-finite%s%s",
+                     ind_i >= 0 ? IND_SHORT[ind_i] : "all", sc.tag ? sc.tag : "MT1", actual_day,
+                     n_bad, MT1_POOL_SLOTS, bad_actual ? "; outcome non-finite, day not scored" : "",
+                     sc.nonfinite_n == 5 ? " (further days not logged)" : "");
+            log_msg(m);
+        }
     }
     sc.has_pending = true;
     sc.pending_day = actual_day;
@@ -3679,7 +3700,8 @@ static MT1DayResult mt1_step_day(int ind_i, MT1PoolScratch& sc, const float* in,
         r.baseline = base; r.floor_v = fl; r.scored = true;
         double sum = 0.0; float best = -1.f, worst = 2.f;
         for (int s = 0; s < MT1_POOL_SLOTS; s++) {
-            const float v = (tau >= 0.f) ? mt1_score_q(actual, sc.pending[s], base, fl, tau)
+            const float v = bad[s] ? 0.f
+                          : (tau >= 0.f) ? mt1_score_q(actual, sc.pending[s], base, fl, tau)
                                          : mt1_score(actual, sc.pending[s], base, fl);
             mt1_slot_record(sc.meta[s], v);
             sum += v;
@@ -6599,7 +6621,10 @@ int main(int argc, char* argv[]) {
         if (RACE[v].search == SRCH_EVO) {
             const int npools = race_pools(RACE[v].arch);
             r.pool = std::make_unique<MT1PoolScratch[]>(npools);
-            for (int p = 0; p < npools; p++) r.pool[p].alloc(race_pool_params(RACE[v].arch));
+            for (int p = 0; p < npools; p++) {
+                r.pool[p].alloc(race_pool_params(RACE[v].arch));
+                r.pool[p].tag = RACE[v].name;
+            }
             if (RACE[v].arch == ARCH_JN || RACE[v].arch == ARCH_JNL) {
                 const bool whole = RACE[v].arch == ARCH_JNL;
                 for (int p = 0; p < npools; p++) {

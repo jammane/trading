@@ -336,9 +336,12 @@ static inline void mt1_slot_init(MT1SlotMeta& m, uint32_t lineage) {
 
 // Push today's score, shifting the window. n_pred saturates so a long-lived model is still
 // judged on its most recent MT1_SCORE_HIST predictions.
+// A non-finite score is recorded as 0, the worst a score can be: a NaN in a register makes
+// mt1_slot_better unable to order the slot, and sorting with such a comparator is undefined
+// (stable_sort's unguarded insertion walked off the array and crashed JN9 p5, 2026-11-19).
 static inline void mt1_slot_record(MT1SlotMeta& m, float score) {
     for (int i = MT1_SCORE_HIST - 1; i > 0; i--) m.score[i] = m.score[i - 1];
-    m.score[0] = score;
+    m.score[0] = std::isfinite(score) ? score : 0.f;
     if (m.n_pred < 0xFFFF) m.n_pred++;
 }
 
@@ -391,9 +394,12 @@ static inline int mt1_life_bucket(uint32_t age) {
 static inline bool mt1_slot_better(const MT1SlotMeta& a, const MT1SlotMeta& b) {
     const bool ma = mt1_slot_mature(a), mb = mt1_slot_mature(b);
     if (ma != mb) return ma;
-    const float sa = mt1_slot_score(a), sb = mt1_slot_score(b);
+    // Non-finite keys (a register loaded from an older sidecar) rank below every real score,
+    // so the comparator stays a strict weak ordering whatever the registers hold.
+    auto key = [](float x) { return std::isfinite(x) ? x : -1.f; };
+    const float sa = key(mt1_slot_score(a)), sb = key(mt1_slot_score(b));
     if (sa != sb) return sa > sb;
-    return mt1_slot_mean(a) > mt1_slot_mean(b);
+    return key(mt1_slot_mean(a)) > key(mt1_slot_mean(b));
 }
 
 #endif  // MT1_POOL_H
