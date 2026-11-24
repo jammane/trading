@@ -8,6 +8,25 @@ entry is in its commit message.
 
 ## Unreleased
 
+### Added
+- **`--jn-frozen` measurement pass** (`--frozen-slots N`). Seeds a JN pool from `--load-dir`'s
+  elites and then neither selects, mutates nor crowns: slot 0 trades its own book through the
+  window and every child is scored beside its parent. Prints each industry's champion-judge score
+  (`FROZEN SCORE`) and the mutation probe (children vs parents: identical outputs, identical
+  orders, W/T/L, delta buckets).
+- **`--jn-diag-arms`.** During a JN training pass, scores on slot 0's book every warm day: no
+  orders, the pass's champions frozen, and 20 untrained nets made new each day, plus the pool
+  median and the share of the pool slot 0 beat. `diag_arms.csv` and a table at each pass end.
+- **`FILL_MODEL` and `rescore_champions.py`.** The fill simulation is versioned (3; `fees.py`
+  mirrors it). A new `pass_reference.csv` records it in `fill_model.txt`; a JN run whose record
+  differs is refused until `rescore_champions.py rescore RUN` re-scores its champions under the
+  current model (frozen, elite 0). `rescore_champions.py unfair` replays later passes against
+  re-scored champions and lists the crowns the stale scores cost.
+
+### Changed
+- **`mut_ok` prints its tie share** (`mut_ok=W% tie=T%`), and a difference under 1e-5 of the book
+  counts as a tie: identical orders on the same book can score a few float ulps apart.
+
 ### Fixed
 - **JN seed growth chances across `--continue-run` invocations.** Which seed elites came from an
   unreplaced champion (and so breed at 10%) was set only by the process that blended the seed;
