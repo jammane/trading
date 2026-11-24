@@ -51,7 +51,8 @@ def frozen_scores(trainer, champion_dir, out_dir, profile="jn_profiles/training.
         rc = subprocess.call(cmd, stdout=f, stderr=subprocess.STDOUT)
     if rc != 0:
         sys.exit(f"trainer exited {rc}; see {log}")
-    out = parse_frozen(open(log).read())
+    with open(log) as f:
+        out = parse_frozen(f.read())
     if not out:
         sys.exit(f"no FROZEN SCORE lines in {log}")
     return out
@@ -75,7 +76,7 @@ def read_rows(ref_path):
                 cols = t
                 continue
             if len(t) == len(cols):
-                rows.append(dict(zip(cols, t)))
+                rows.append(dict(zip(cols, t, strict=True)))
     return rows
 
 
