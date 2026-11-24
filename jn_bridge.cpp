@@ -275,6 +275,15 @@ void jn_inject(JNPool* p, int slot, double pct, uint64_t seed) {
     p->renew((size_t)slot);   // weights only, so unchanged in principle; recomputed to be safe
 }
 
+void jn_fresh(JNPool* p, int slot, uint64_t seed) {
+    jneuro::Rng rng(seed);
+    p->nets[(size_t)slot] = make_net(jneuro::create(p->n_in, p->n_out, jneuro::DepthType::U32, 5,
+                                                    jneuro::Priority::Speed, rng));
+    p->warm[(size_t)slot] = -1;
+    p->gc((size_t)slot) = JN_GROW_START;
+    p->renew((size_t)slot);
+}
+
 JNStats jn_stats(const JNPool* p) { return jn_stats_n(p, (int)p->nets.size()); }
 
 JNStats jn_stats_n(const JNPool* p, int n_slots) {

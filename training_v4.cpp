@@ -902,6 +902,12 @@ static bool g_jn_profile_growth = false;
 //  - the mutation probe: every child against its parent, every day (jn_probe_report).
 // --frozen-slots N: only slots 0..N-1 run their nets; the rest copy slot 0's orders (cheap).
 static bool g_jn_frozen = false;
+// --jn-diag-arms (2026-11-23): during a JN training pass, also score on slot 0's book every warm
+// day (a) no orders, (b) the pass's champions frozen, every day rather than only after a reset,
+// (c) JN_CTRL_N untrained nets made new each day; plus the median of the working pool and the
+// share of it slot 0 beat. One row per industry-day to diag_arms.csv; a table at the pass end.
+// Read only: nothing here changes selection.
+static bool g_jn_diag_arms = false;
 static int  g_frozen_slots = 0;   // set to N_SLOTS unless --frozen-slots
 // FILL_MODEL: the fill simulation's version, mirrored as fees.FILL_MODEL (tests/test_fill_price.py
 // holds the two equal). Bump it whenever a fill price changes. A champion's score is only
@@ -968,7 +974,11 @@ static constexpr int JN_HIST_DAYS    = HIST_DAYS;
 static constexpr int JN_HIST_PER_DAY = HIST_PER_DAY;
 static constexpr int JN_CHAMP_BASE   = N_SLOTS;
 static constexpr int JN_HIST_BASE    = N_SLOTS + JN_CHAMP_N;
-static constexpr int JN_POOL_SLOTS   = JN_HIST_BASE + JN_HIST_DAYS * JN_HIST_PER_DAY;
+// CONTROL    slots 270..289: --jn-diag-arms' untrained nets, made new every day (jn_fresh), only
+//              scored, never candidates
+static constexpr int JN_CTRL_N       = 20;
+static constexpr int JN_CTRL_BASE    = JN_HIST_BASE + JN_HIST_DAYS * JN_HIST_PER_DAY;
+static constexpr int JN_POOL_SLOTS   = JN_CTRL_BASE + JN_CTRL_N;
 static constexpr int JN_CAND_MAX     = JN_CHAMP_N + JN_HIST_DAYS * JN_HIST_PER_DAY;
 static_assert(JN_HIST_PER_DAY <= ELITE_POOL, "history takes the top elites of a day");
 static int g_jn_champ_n[N_IND];        // champions held (0 until a pass is seeded from elites)
@@ -1976,7 +1986,20 @@ static void wavg_mst_portfolio(const MasterPortfolio* ports[], const float* weig
     }
 }
 
+// --jn-diag-arms (2026-11-23): what else would have earned on slot 0's book that day, scored by
+// the same fill simulation. ok is false on warm-in and reset days. Dollar books.
+struct DiagArms {
+    bool  ok = false;
+    float hold = 0.f;                          // no orders at all: the book and its stops
+    float champ0 = 0.f, champ_mean = 0.f, champ_best = 0.f;   // the pass's seed, frozen
+    float ctrl_mean = 0.f, ctrl_best = 0.f;    // fresh untrained nets, new every day
+    float pool_med = 0.f;                      // median of today's 200 working slots
+    float s0_pct = 0.f;                        // share of the other 199 that slot 0 beat (ties half)
+    int   n_champ = 0, ctrl_cold = 0;
+};
+
 struct IndResult {
+    DiagArms dg;
     // The three marks that decompose a day. All on slot 0 (the deployed model):
     //   book_prev   = reference book (yesterday's holdings, no trades) at TODAY's close
     //   baseline    = the same holdings at the NEXT day's close  -> price move, no trading
@@ -2769,6 +2792,54 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                                            hist_ports[h]);
     }
 
+    // ── --jn-diag-arms: the alternatives, on the same book and day (read only) ──────────────
+    DiagArms dg;
+    if (jp && g_jn_diag_arms && !jn_warming && book_prev > 1.f) {
+        dg.ok = true;
+        float cso[STOCK_OUT_N];
+        Portfolio tp;
+        // (a) no orders: zero quantities and a sell flag of 0 place nothing; the stops stand.
+        float zo[STOCK_OUT_N] = {};
+        dg.hold = score_plan(zo, tp);
+        // (b) the pass's champions (slots JN_CHAMP_BASE..), frozen all pass
+        double cs = 0.0; float cb = -1e30f;
+        for (int k = 0; k < g_jn_champ_n[ind_i]; k++) {
+            jn_forward(jp, JN_CHAMP_BASE + k, cso);
+            jn_stock_outputs(cso);
+            const float v = score_plan(cso, tp);
+            if (k == 0) dg.champ0 = v;
+            cs += v; cb = std::max(cb, v);
+        }
+        dg.n_champ = g_jn_champ_n[ind_i];
+        dg.champ_mean = dg.n_champ ? (float)(cs / dg.n_champ) : 0.f;
+        dg.champ_best = dg.n_champ ? cb : 0.f;
+        // (c) untrained nets, new every day
+        double us = 0.0; float ub = -1e30f;
+        for (int k = 0; k < JN_CTRL_N; k++) {
+            jn_fresh(jp, JN_CTRL_BASE + k,
+                     mix_seed(((uint64_t)actual_day << 20) ^ ((uint64_t)ind_i << 8) ^ (uint64_t)k ^
+                              0x4354524CULL));   // "CTRL"
+            if (!jn_forward(jp, JN_CTRL_BASE + k, cso)) dg.ctrl_cold++;
+            jn_stock_outputs(cso);
+            const float v = score_plan(cso, tp);
+            us += v; ub = std::max(ub, v);
+        }
+        dg.ctrl_mean = (float)(us / JN_CTRL_N);
+        dg.ctrl_best = ub;
+        // the working pool: its median, and where yesterday's winner (slot 0) landed in it
+        float srt[N_SLOTS];
+        memcpy(srt, slot_scores, sizeof(srt));
+        std::nth_element(srt, srt + N_SLOTS / 2, srt + N_SLOTS);
+        dg.pool_med = srt[N_SLOTS / 2];
+        const float tol = 1e-5f * book_prev;
+        double beat = 0.0;
+        for (int s2 = 1; s2 < N_SLOTS; s2++) {
+            const float d = slot_scores[0] - slot_scores[s2];
+            beat += std::fabs(d) <= tol ? 0.5 : d > 0.f ? 1.0 : 0.0;
+        }
+        dg.s0_pct = (float)(beat / (N_SLOTS - 1));
+    }
+
     // ── Score, flags, floor check ────────────────────────────────────────────
     float best_score  = *std::max_element(slot_scores, slot_scores + N_SLOTS);
     float best_delta  = best_score - baseline;
@@ -2778,13 +2849,19 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     // the parent assignment in the forward pass (uniform, MUTATIONS_PER_PARENT children each).
     // A tie (the same score) is counted apart from a loss: a child whose mutation changed nothing
     // the market saw is not evidence that the mutation did harm (2026-11-23).
+    // Tie tolerance: identical orders on the same book can still score a few float ulps apart,
+    // because a Portfolio is 100 bytes and -ffast-math's vectorised sums peel differently with
+    // each slot's alignment (measured: 0.1% of child-days of a no-mutation probe). 1e-5 of the
+    // book is $0.25 on $25k, far below one share of any symbol.
+    const float tie_tol = 1e-5f * std::max(1.f, book_prev);
     int mut_wins = 0, mut_ties = 0, mut_total = 0;
     for (int slot = ELITE_POOL; slot < N_SLOTS; slot++) {
         int parent = (slot - ELITE_POOL) / MUTATIONS_PER_PARENT;
         if (parent >= ELITE_POOL) continue;
         mut_total++;
-        if (slot_scores[slot] > slot_scores[parent]) mut_wins++;
-        else if (slot_scores[slot] == slot_scores[parent]) mut_ties++;
+        const float d = slot_scores[slot] - slot_scores[parent];
+        if (std::fabs(d) <= tie_tol) mut_ties++;
+        else if (d > 0.f) mut_wins++;
     }
     float mut_success = mut_total > 0 ? (float)mut_wins / (float)mut_total : 0.f;
     float mut_tie     = mut_total > 0 ? (float)mut_ties / (float)mut_total : 0.f;
@@ -2800,9 +2877,10 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             if (slot_cold[slot] && !slot_cold[parent]) pr.cold++;
             if (!memcmp(slot_out[slot], slot_out[parent], sizeof(slot_out[slot]))) pr.out_same++;
             if (!memcmp(&slot_plan[slot], &slot_plan[parent], sizeof(OrderPlan))) pr.plan_same++;
-            const double d = 1e4 * ((double)slot_scores[slot] - slot_scores[parent]) / book_prev;
-            if (slot_scores[slot] > slot_scores[parent]) pr.win++;
-            else if (slot_scores[slot] == slot_scores[parent]) pr.tie++;
+            const float dd = slot_scores[slot] - slot_scores[parent];
+            const double d = std::fabs(dd) <= tie_tol ? 0.0 : 1e4 * (double)dd / book_prev;
+            if (d > 0.0) pr.win++;
+            else if (d == 0.0) pr.tie++;
             else pr.loss++;
             pr.d_sum += d;
             const int b = d <= -100.0 ? 0 : d <= -10.0 ? 1 : d < 0.0 ? 2 : d == 0.0 ? 3
@@ -3288,6 +3366,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
     res.top_cash      = slot0_own.cash;
     res.new_streak    = new_streak;
     res.mut_success   = mut_success;
+    res.dg = dg;
     res.elite_max_val = elite_max_val;
     res.elite_min_val = elite_min_val;
     res.elite_mean_val= elite_mean_val;
@@ -4858,6 +4937,61 @@ static void jn_probe_report() {
     line("ALL", tot);
 }
 
+// --jn-diag-arms accumulators: per industry, warm non-reset days. Differences are taken against
+// slot 0 on the same book and day, in bp of the book, so the common market move cancels.
+struct DiagSums {
+    long n = 0, n_champ = 0;
+    double hold = 0, champ0 = 0, champ_mean = 0, champ_best = 0, ctrl_mean = 0, ctrl_best = 0,
+           med = 0, s0_pct = 0, s0_ret = 0;
+    double hold2 = 0, champ02 = 0, ctrl2 = 0;     // squares, for a naive per-day sd
+    long hold_wins = 0, champ0_wins = 0, ctrl_wins = 0;
+    void add(double b, double s0, const DiagArms& g) {
+        auto bp = [&](double v) { return 1e4 * (v - s0) / b; };
+        n++;
+        const double h = bp(g.hold), c = bp(g.ctrl_mean);
+        hold += h; hold2 += h * h; hold_wins += h > 0;
+        ctrl_mean += c; ctrl2 += c * c; ctrl_wins += c > 0;
+        ctrl_best += bp(g.ctrl_best);
+        med += bp(g.pool_med); s0_pct += g.s0_pct;
+        s0_ret += 1e4 * (s0 - b) / b;
+        if (g.n_champ > 0) {
+            const double c0 = bp(g.champ0);
+            n_champ++; champ0 += c0; champ02 += c0 * c0; champ0_wins += c0 > 0;
+            champ_mean += bp(g.champ_mean); champ_best += bp(g.champ_best);
+        }
+    }
+};
+static FILE* g_diag_csv = nullptr;   // <log_dir>/diag_arms.csv, opened at startup
+
+static void diag_arms_report(int pass_num, const DiagSums* d) {
+    log_msg("DIAG ARMS, pass " + std::to_string(pass_num) + ": each arm minus slot 0, same book "
+            "and day, bp of the book per day (mean; share of days the arm was ahead). s0 ret is "
+            "slot 0's own book return; s0 beat is the share of the other 199 working slots it "
+            "beat (0.5 = yesterday's winner is a median net today).");
+    DiagSums t;
+    auto line = [](const char* nm, const DiagSums& x) {
+        if (x.n == 0) { log_msg(std::string("   ") + nm + ": no warm days"); return; }
+        const double n = (double)x.n, nc = (double)std::max(1L, x.n_champ);
+        char m[420];
+        snprintf(m, sizeof(m), "   %-24s days %5ld | s0 ret %+6.2f | hold %+7.2f (%3.0f%%) | champ0 %+7.2f "
+                 "(%3.0f%%) mean %+7.2f best %+7.2f | untrained mean %+7.2f (%3.0f%%) best %+7.2f | "
+                 "pool median %+7.2f | s0 beat %.3f", nm, x.n, x.s0_ret / n, x.hold / n,
+                 100.0 * x.hold_wins / n, x.champ0 / nc, 100.0 * x.champ0_wins / nc,
+                 x.champ_mean / nc, x.champ_best / nc, x.ctrl_mean / n, 100.0 * x.ctrl_wins / n,
+                 x.ctrl_best / n, x.med / n, x.s0_pct / n);
+        log_msg(m);
+    };
+    for (int i = 0; i < N_IND; i++) {
+        line(g_ind_names[i].c_str(), d[i]);
+        const DiagSums& x = d[i];
+        t.n += x.n; t.n_champ += x.n_champ; t.hold += x.hold; t.champ0 += x.champ0;
+        t.champ_mean += x.champ_mean; t.champ_best += x.champ_best; t.ctrl_mean += x.ctrl_mean;
+        t.ctrl_best += x.ctrl_best; t.med += x.med; t.s0_pct += x.s0_pct; t.s0_ret += x.s0_ret;
+        t.hold_wins += x.hold_wins; t.champ0_wins += x.champ0_wins; t.ctrl_wins += x.ctrl_wins;
+    }
+    line("ALL", t);
+}
+
 static void jn_census_report(int pass_num) {
     std::vector<float> col[STOCK_OUT_PER_SYM];
     long seen = 0;
@@ -5884,6 +6018,7 @@ static void print_usage(const char* prog) {
         "          [--race-only \"A,B,...\"]  run only these race entries (plus the deployed/logged two)\n"
         "          [--jn-stocknn] [--jn-race] [--jn-profile FILE] [--jn-bulk-profile FILE] [--jn-no-bulk]\n"
         "          [--jn-profile-growth]  JN growth from the profile's draw, not the growth ramp\n"
+        "          [--jn-diag-arms]  also score hold / frozen champions / untrained nets daily\n"
         "          [--jn-frozen [--frozen-slots N]]  MEASUREMENT: no selection; score --load-dir's\n"
         "                       elites and their children all pass (champion re-score, mutation probe)\n"
         "          [--seed N]   (default: clock, RE-SEEDED EVERY PASS; N derives passes from N)\n"
@@ -6428,6 +6563,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--jn-no-bulk") { g_jn_no_bulk = true; }
         else if (arg == "--jn-profile-growth") { g_jn_profile_growth = true; }
         else if (arg == "--jn-frozen") { g_jn_frozen = true; }
+        else if (arg == "--jn-diag-arms") { g_jn_diag_arms = true; }
         else if (arg == "--frozen-slots" && a+1<argc) { g_frozen_slots = atoi(argv[++a]); }
         else if (arg == "--continue-run") g_continue = true;
         else if (arg == "--crown" && a+1<argc) {
@@ -6499,6 +6635,10 @@ int main(int argc, char* argv[]) {
                         g_frozen_slots < 1 || g_frozen_slots > N_SLOTS)) {
         fprintf(stderr, "ERROR: --jn-frozen needs --jn-stocknn, --load-dir DIR and --passes 1 "
                         "(not --upkeep or --continue-run); --frozen-slots is 1..%d\n", N_SLOTS);
+        return 1;
+    }
+    if (g_jn_diag_arms && (!g_jn_stocknn || g_jn_frozen)) {
+        fprintf(stderr, "ERROR: --jn-diag-arms needs --jn-stocknn and a training pass (not --jn-frozen)\n");
         return 1;
     }
     if (!g_jn_frozen && g_frozen_slots != N_SLOTS) {
@@ -6875,6 +7015,14 @@ int main(int argc, char* argv[]) {
     // Deliberately NOT training_log.csv. Every plotting and analysis script in the repo reads
     // that exact name, and a control run's numbers look entirely ordinary — the only thing that
     // makes them safe is that nothing can load them by accident.
+    if (g_jn_diag_arms) {
+        g_diag_csv = fopen((log_dir + "/diag_arms.csv").c_str(), "w");
+        if (g_diag_csv)
+            fprintf(g_diag_csv, "pass,day,date,industry,book_prev,slot0,hold,champ0,champ_mean,"
+                                "champ_best,ctrl_mean,ctrl_best,pool_median,s0_beat,n_champ,ctrl_cold\n");
+        else
+            log_msg("WARNING: cannot write " + log_dir + "/diag_arms.csv");
+    }
     std::string csv_path = log_dir +
         (g_control_untrained ? "/training_log_CONTROL.csv" : "/training_log.csv");
     FILE* csv = fopen(csv_path.c_str(), "w");
@@ -7049,6 +7197,9 @@ int main(int argc, char* argv[]) {
         // Pass-boundary champion score, per industry: slot 0's recency-weighted mean daily book
         // return over the whole pass (PassJudge). Fresh each pass so a pass is judged on itself.
         PassJudge judge[N_IND];
+        // --jn-diag-arms: per industry, sums over warm days of (arm - slot 0) / book_prev in bp,
+        // and of slot 0's share beaten. Printed at the pass end (diag_arms_report).
+        DiagSums dsum[N_IND];
 
         // Fresh MT1 for this pass -- see the declaration for why it is never carried over.
         for (int v = 0; v < RACE_N; v++) {
@@ -8522,6 +8673,17 @@ int main(int argc, char* argv[]) {
                     : static_cast<float>(IND_STARTING_CASH);
                 // A reset day is charged its top-up as a loss (PassJudge::add_reset); any other
                 // day scores its book return.
+                if (g_jn_diag_arms && results[i].dg.ok) {
+                    const DiagArms& g = results[i].dg;
+                    const double b = results[i].book_prev, s0 = results[i].slot0_score;
+                    if (g_diag_csv)
+                        fprintf(g_diag_csv, "%d,%d,%s,%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
+                                "%.4f,%d,%d\n", pass + 1, actual_day, dates[actual_day].c_str(),
+                                g_ind_names[i].c_str(), b, s0, g.hold, g.champ0, g.champ_mean,
+                                g.champ_best, g.ctrl_mean, g.ctrl_best, g.pool_med, g.s0_pct,
+                                g.n_champ, g.ctrl_cold);
+                    dsum[i].add(b, s0, g);
+                }
                 if (judge_win) {
                     const int age = (day_end - 1) - actual_day;
                     if (results[i].topup > 0.f)
@@ -8695,6 +8857,7 @@ int main(int argc, char* argv[]) {
 
         // Save MT1/MT2 after each pass (industry elites already saved by step_industry)
         {
+            if (g_jn_diag_arms) diag_arms_report(pass + 1, dsum);
             if (g_jn_frozen) {
                 // A measurement pass: report and stop. Nothing is saved, judged against a
                 // champion or crowned -- these are someone else's models (--load-dir), unchanged.
@@ -8962,6 +9125,7 @@ int main(int argc, char* argv[]) {
     for (auto& t : workers) t.join();
 
     if (csv)    fclose(csv);
+    if (g_diag_csv) fclose(g_diag_csv);
     if (mt_log) fclose(mt_log);
     if (ds_log) fclose(ds_log);
 

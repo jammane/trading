@@ -21,6 +21,7 @@ void    jn_set_growth_chance(JNPool*, int, double) {}
 void    jn_growth_take(JNPool*, long long* m, long long* g) { *m = *g = 0; }
 void    jn_permute(JNPool*, const int*, int) {}
 void    jn_inject(JNPool*, int, double, uint64_t) {}
+void    jn_fresh(JNPool*, int, uint64_t) {}
 JNStats jn_stats(const JNPool*) { return {}; }
 JNStats jn_stats_n(const JNPool*, int) { return {}; }
 void    jn_set_persist(JNPool*, int) {}
