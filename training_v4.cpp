@@ -892,6 +892,35 @@ static bool g_jn_no_bulk = false;
 // 1% to start, +0.5% for each generation in its line that did not grow, back to 1% after a growth
 // or past 50%.
 static bool g_jn_profile_growth = false;
+// --jn-frozen (2026-11-23): a measurement pass, not training. The pool is seeded from --load-dir's
+// elites as usual (20 elites + 180 children mutated with the training profile), and then nothing
+// is selected, mutated or crowned for the whole pass: slot 0 is elite 0 and trades its own book
+// through the window, and every child is scored each day on that same book beside its parent.
+// The MT1/MT2/race block is skipped. Two uses:
+//  - re-scoring a champion store under the current fill model (rescore_champions.py, with
+//    --frozen-slots 1): each industry's "FROZEN SCORE" line is slot 0's PassJudge score;
+//  - the mutation probe: every child against its parent, every day (jn_probe_report).
+// --frozen-slots N: only slots 0..N-1 run their nets; the rest copy slot 0's orders (cheap).
+static bool g_jn_frozen = false;
+static int  g_frozen_slots = 0;   // set to N_SLOTS unless --frozen-slots
+// FILL_MODEL: the fill simulation's version, mirrored as fees.FILL_MODEL (tests/test_fill_price.py
+// holds the two equal). Bump it whenever a fill price changes. A champion's score is only
+// comparable with a pass trained under the same fill model, so a JN run whose RUN/fill_model.txt
+// differs (or is missing while it has champions) is refused until rescore_champions.py has
+// re-scored them under this one (user rule 2026-11-23: re-scored at once, never replaced).
+//   1  the open itself for open buys, 0.1% beyond the limit for intraday limits  (to 2026-11-12)
+//   2  open buys pay OPEN_BUY_PREMIUM, limits fill at the limit                  (2026-11-12)
+//   3  open sells receive OPEN_SELL_DISCOUNT below the open                       (2026-11-18)
+static constexpr int FILL_MODEL = 3;
+// Mutation probe, per industry, accumulated on every scored day under --jn-frozen: each child
+// slot against the parent it was mutated from, on the same book and the same day.
+struct JNMutProbe {
+    long long n = 0, out_same = 0, plan_same = 0, win = 0, tie = 0, loss = 0, cold = 0;
+    // delta = (child - parent) / book, in bp; buckets by size (see jn_probe_report)
+    long long bucket[7] = {};
+    double d_sum = 0.0;
+};
+static JNMutProbe g_jn_probe[N_IND];
 // Per industry and seed slot: 1 when the next pass's seed elite k came from a new or replaced
 // source (a challenger's elites, or a champion crowned at that boundary); 0 when it came from a
 // champion that was not replaced, including a run's first seed from --load-dir. Under the growth
@@ -2296,7 +2325,7 @@ static IndResult step_industry(int ind_i, IndustryState& state,
                     std::to_string(JN_WARM_FLOOR) + ")");
         }
         jn_warming = jn_ring_len(jp) <= g_jn_gate[ind_i];
-        freeze = freeze || jn_warming;
+        freeze = freeze || jn_warming || g_jn_frozen;
     }
     int jn_cold = 0;    // nets with less history than their warmup: no orders today
 
@@ -2354,12 +2383,22 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         d_low[j] = day_sym[j].low; d_high[j] = day_sym[j].high; d_close[j] = day_sym[j].close;
     }
     OrderPlan plan;
+    // Every slot's outputs (after jn_stock_outputs) and orders, kept so a mutation child can be
+    // set beside its parent: identical outputs, identical orders, or a real change (mut_ok's tie
+    // count and the --jn-frozen probe). thread_local for the same reason as res_sym_pnl.
+    static thread_local float     slot_out[N_SLOTS][STOCK_OUT_N];
+    static thread_local OrderPlan slot_plan[N_SLOTS];
+    static thread_local bool      slot_cold[N_SLOTS];
     for (int slot = 0; slot < N_SLOTS; slot++) {
         Portfolio& port = state.portfolios[slot];
 
-        if (jp) {
+        slot_cold[slot] = false;
+        if (jp && g_jn_frozen && slot >= g_frozen_slots) {
+            // --frozen-slots: this net is not run; it places slot 0's orders.
+            memcpy(sout, slot_out[0], sizeof(sout));
+        } else if (jp) {
             // The JN children already exist (bred at the end of the previous day's selection).
-            if (!jn_forward(jp, slot, sout)) jn_cold++;   // not warm: zeros, so no buys
+            if (!jn_forward(jp, slot, sout)) { jn_cold++; slot_cold[slot] = true; }   // zeros: no buys
             else for (int j = 0; j < IND_SYMS; j++)
                 if (day_sym[j].valid) g_jn_cen[ind_i].add(sout + STOCK_OUT_PER_SYM * j);
             jn_stock_outputs(sout);
@@ -2385,6 +2424,8 @@ static IndResult step_industry(int ind_i, IndustryState& state,
         float sym_cash[IND_SYMS] = {};
         // Production's orders for this slot, decided at the close; the fills below fill these.
         plan_orders(sout, d_low, d_high, d_close, d_valid, ref_hold, ref_cash, plan);
+        memcpy(slot_out[slot], sout, sizeof(sout));
+        slot_plan[slot] = plan;
 
         // ── Phase 1: partial sells, gap sell_all, high-first sell_all, stops, buys ─
         for (int j = 0; j < IND_SYMS; j++) {
@@ -2735,14 +2776,40 @@ static IndResult step_industry(int ind_i, IndustryState& state,
 
     // Mutation success rate: each mutation slot against the parent it was mutated FROM, matching
     // the parent assignment in the forward pass (uniform, MUTATIONS_PER_PARENT children each).
-    int mut_wins = 0, mut_total = 0;
+    // A tie (the same score) is counted apart from a loss: a child whose mutation changed nothing
+    // the market saw is not evidence that the mutation did harm (2026-11-23).
+    int mut_wins = 0, mut_ties = 0, mut_total = 0;
     for (int slot = ELITE_POOL; slot < N_SLOTS; slot++) {
         int parent = (slot - ELITE_POOL) / MUTATIONS_PER_PARENT;
         if (parent >= ELITE_POOL) continue;
         mut_total++;
         if (slot_scores[slot] > slot_scores[parent]) mut_wins++;
+        else if (slot_scores[slot] == slot_scores[parent]) mut_ties++;
     }
     float mut_success = mut_total > 0 ? (float)mut_wins / (float)mut_total : 0.f;
+    float mut_tie     = mut_total > 0 ? (float)mut_ties / (float)mut_total : 0.f;
+    // --jn-frozen probe: the children are the pass-start mutations of the 20 elites, unchanged
+    // all pass, so each day measures the same 180 mutations again on a new market day. Counted
+    // once the pool is warm and only on slots that ran their own net.
+    if (jp && g_jn_frozen && !jn_warming && book_prev > 1.f) {
+        JNMutProbe& pr = g_jn_probe[ind_i];
+        const int n_run = std::min(g_frozen_slots, N_SLOTS);
+        for (int slot = ELITE_POOL; slot < n_run; slot++) {
+            const int parent = (slot - ELITE_POOL) / MUTATIONS_PER_PARENT;
+            pr.n++;
+            if (slot_cold[slot] && !slot_cold[parent]) pr.cold++;
+            if (!memcmp(slot_out[slot], slot_out[parent], sizeof(slot_out[slot]))) pr.out_same++;
+            if (!memcmp(&slot_plan[slot], &slot_plan[parent], sizeof(OrderPlan))) pr.plan_same++;
+            const double d = 1e4 * ((double)slot_scores[slot] - slot_scores[parent]) / book_prev;
+            if (slot_scores[slot] > slot_scores[parent]) pr.win++;
+            else if (slot_scores[slot] == slot_scores[parent]) pr.tie++;
+            else pr.loss++;
+            pr.d_sum += d;
+            const int b = d <= -100.0 ? 0 : d <= -10.0 ? 1 : d < 0.0 ? 2 : d == 0.0 ? 3
+                        : d < 10.0 ? 4 : d < 100.0 ? 5 : 6;
+            pr.bucket[b]++;
+        }
+    }
 
     // Elite stats (slots 0..ELITE_COUNT-1 portfolio values)
     float elite_max_val = *std::max_element(slot_scores, slot_scores + ELITE_COUNT);
@@ -2758,7 +2825,8 @@ static IndResult step_industry(int ind_i, IndustryState& state,
             " | buys=" + std::to_string(safe_int(buy_exec)) +
             " sells=" + std::to_string(safe_int(sell_exec)) +
             " | prod=$" + std::to_string(safe_int(baseline)) +
-            " | mut_ok=" + std::to_string((int)(mut_success * 100.f + 0.5f)) + "%");
+            " | mut_ok=" + std::to_string((int)(mut_success * 100.f + 0.5f)) + "%" +
+            " tie=" + std::to_string((int)(mut_tie * 100.f + 0.5f)) + "%");
 
     // Hard floor reset. Never under --upkeep: that book is real money, and recapitalising the
     // simulation would train every race entry on a day that did not happen.
@@ -4366,6 +4434,33 @@ static bool copy_elites(const std::string& from, const std::string& to, const ch
     return true;
 }
 
+// RUN/fill_model.txt: the FILL_MODEL the run's pass_reference.csv scores were measured under.
+static int read_fill_model(const std::string& dir) {
+    int v = -1;
+    if (FILE* f = fopen((dir + "/fill_model.txt").c_str(), "r")) {
+        if (fscanf(f, "%d", &v) != 1) v = -1;
+        fclose(f);
+    }
+    return v;
+}
+static void write_fill_model(const std::string& dir) {
+    if (FILE* f = fopen((dir + "/fill_model.txt").c_str(), "w")) {
+        fprintf(f, "%d\n", FILL_MODEL);
+        fclose(f);
+    }
+}
+
+// True if pass_reference.csv holds any scored row (a seed's pass-0 rows count).
+static bool ref_has_rows(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "r");
+    if (!f) return false;
+    char line[512];
+    bool any = false;
+    while (!any && fgets(line, sizeof(line), f)) any = line[0] >= '0' && line[0] <= '9';
+    fclose(f);
+    return any;
+}
+
 // The highest pass number recorded in pass_reference.csv (0 if none).
 static int last_pass_in_ref(const std::string& path) {
     int last = 0;
@@ -4601,10 +4696,14 @@ static void pass_boundary(const std::string& out_dir, int pass_num,
         log_msg("WARNING: cannot write " + ref_path + " — pass seeding skipped at this boundary");
         return;
     }
-    if (fresh)
+    if (fresh) {
         fprintf(csv, "# pass_reference v%d — see PASS_SEEDING.md\n"
                      "pass,industry,day_start,day_end,champ_pass,champ_pct,chal_pass,chal_pct,"
                      "regime,share_new,slots_new,new_champ_pass,new_champ_pct\n", PASS_REF_VERSION);
+        // The scores this file starts with are this fill model's (see FILL_MODEL). Written only
+        // with a new file: an existing run's record is changed by rescore_champions.py alone.
+        write_fill_model(out_dir);
+    }
 
     for (int i = 0; i < N_IND; i++) {
         const char* ind  = g_ind_names[i].c_str();
@@ -4727,6 +4826,38 @@ static void pass_boundary(const std::string& out_dir, int pass_num,
 }
 
 // Pass-end summary of g_jn_cen over all industries, then reset.
+// --jn-frozen: the mutation probe (JNMutProbe), one line per industry and a total. A child is one
+// pass-start mutation of an elite, scored on the elite's book on every warm day.
+//   out=   the child's outputs are bit-identical to its parent's     (the mutation is silent)
+//   plan=  its orders are identical (outputs moved, orders did not)
+//   W/T/L  its day beat / tied / lost to its parent's
+//   delta  (child - parent) / book in bp: mean, then the share in each size bucket
+static void jn_probe_report() {
+    static const char* BK[7] = {"<=-100", "-100..-10", "-10..0", "0", "0..10", "10..100", ">=100"};
+    JNMutProbe tot;
+    log_msg("JN MUTATION PROBE: each child vs its parent, same book, same day (warm days only)");
+    auto line = [](const char* name, const JNMutProbe& p) {
+        if (p.n == 0) { log_msg(std::string("   ") + name + ": no warm child-days"); return; }
+        const double n = (double)p.n;
+        char m[400];
+        int k = snprintf(m, sizeof(m), "   %-24s n %7lld | out= %5.1f%% plan= %5.1f%% | W %5.1f%% T %5.1f%% "
+                         "L %5.1f%% | cold %4.1f%% | delta mean %+7.2f bp |", name, p.n,
+                         100.0 * p.out_same / n, 100.0 * p.plan_same / n, 100.0 * p.win / n,
+                         100.0 * p.tie / n, 100.0 * p.loss / n, 100.0 * p.cold / n, p.d_sum / n);
+        for (int b = 0; b < 7 && k > 0 && k < (int)sizeof(m); b++)
+            k += snprintf(m + k, sizeof(m) - k, " %s %.1f%%", BK[b], 100.0 * p.bucket[b] / n);
+        log_msg(m);
+    };
+    for (int i = 0; i < N_IND; i++) {
+        const JNMutProbe& p = g_jn_probe[i];
+        line(g_ind_names[i].c_str(), p);
+        tot.n += p.n; tot.out_same += p.out_same; tot.plan_same += p.plan_same; tot.win += p.win;
+        tot.tie += p.tie; tot.loss += p.loss; tot.cold += p.cold; tot.d_sum += p.d_sum;
+        for (int b = 0; b < 7; b++) tot.bucket[b] += p.bucket[b];
+    }
+    line("ALL", tot);
+}
+
 static void jn_census_report(int pass_num) {
     std::vector<float> col[STOCK_OUT_PER_SYM];
     long seen = 0;
@@ -5753,6 +5884,8 @@ static void print_usage(const char* prog) {
         "          [--race-only \"A,B,...\"]  run only these race entries (plus the deployed/logged two)\n"
         "          [--jn-stocknn] [--jn-race] [--jn-profile FILE] [--jn-bulk-profile FILE] [--jn-no-bulk]\n"
         "          [--jn-profile-growth]  JN growth from the profile's draw, not the growth ramp\n"
+        "          [--jn-frozen [--frozen-slots N]]  MEASUREMENT: no selection; score --load-dir's\n"
+        "                       elites and their children all pass (champion re-score, mutation probe)\n"
         "          [--seed N]   (default: clock, RE-SEEDED EVERY PASS; N derives passes from N)\n"
         "          [--trade-lock PATH | --no-trade-lock]  pause while production holds the lock\n"
         "          [--control-untrained]  NO-LEARNING CONTROL: re-randomise StockNN daily\n"
@@ -6294,6 +6427,8 @@ int main(int argc, char* argv[]) {
         else if (arg == "--jn-bulk-profile" && a+1<argc) { g_jn_bulk_profile = argv[++a]; }
         else if (arg == "--jn-no-bulk") { g_jn_no_bulk = true; }
         else if (arg == "--jn-profile-growth") { g_jn_profile_growth = true; }
+        else if (arg == "--jn-frozen") { g_jn_frozen = true; }
+        else if (arg == "--frozen-slots" && a+1<argc) { g_frozen_slots = atoi(argv[++a]); }
         else if (arg == "--continue-run") g_continue = true;
         else if (arg == "--crown" && a+1<argc) {
             std::string list = argv[++a];
@@ -6359,6 +6494,17 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "ERROR: j_neuro nets are not supported under --upkeep yet\n");
         return 1;
     }
+    if (g_frozen_slots == 0) g_frozen_slots = N_SLOTS;
+    if (g_jn_frozen && (!g_jn_stocknn || g_upkeep || g_continue || load_dir.empty() || passes != 1 ||
+                        g_frozen_slots < 1 || g_frozen_slots > N_SLOTS)) {
+        fprintf(stderr, "ERROR: --jn-frozen needs --jn-stocknn, --load-dir DIR and --passes 1 "
+                        "(not --upkeep or --continue-run); --frozen-slots is 1..%d\n", N_SLOTS);
+        return 1;
+    }
+    if (!g_jn_frozen && g_frozen_slots != N_SLOTS) {
+        fprintf(stderr, "ERROR: --frozen-slots needs --jn-frozen\n");
+        return 1;
+    }
     jn_set_growth_ramp(!g_jn_profile_growth);
     if (g_upkeep) {
         if (output_dir.empty() || !account.empty()) {
@@ -6401,6 +6547,17 @@ int main(int argc, char* argv[]) {
                 : output_dir;  // diagnostic: co-locate logs with models
     }
     if (output_dir.empty()) { print_usage(argv[0]); return 1; }
+    // A JN run's champions must have been scored under this fill model (see FILL_MODEL).
+    if (g_jn_stocknn && !g_jn_frozen && ref_has_rows(output_dir + "/pass_reference.csv") &&
+        read_fill_model(output_dir) != FILL_MODEL) {
+        const int had = read_fill_model(output_dir);
+        fprintf(stderr, "ERROR: %s's champions were scored under fill model %s, this trainer fills "
+                        "with model %d. Re-score them first:\n"
+                        "  python rescore_champions.py rescore %s\n",
+                        output_dir.c_str(), had < 0 ? "(unrecorded)" : std::to_string(had).c_str(),
+                        FILL_MODEL, output_dir.c_str());
+        return 1;
+    }
     if (master_sigma  < 0.f) master_sigma  = sigma;
     // Per-component defaults: dir/acc keep master_sigma; rng=2/3, cfd=1/2, mt2=1/3
     if (mt1_sigma     < 0.f) mt1_sigma     = master_sigma;
@@ -8406,7 +8563,7 @@ int main(int argc, char* argv[]) {
             blk_day[0]        = day_ptr;
             blk_actual_day[0] = actual_day;
             const auto tm_blk0 = std::chrono::steady_clock::now();
-            process_block(1);
+            if (!g_jn_frozen) process_block(1);   // a frozen pass measures StockNN only
             if (g_jn_timing) {
                 const auto tm_end = std::chrono::steady_clock::now();
                 auto sec = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
@@ -8538,6 +8695,25 @@ int main(int argc, char* argv[]) {
 
         // Save MT1/MT2 after each pass (industry elites already saved by step_industry)
         {
+            if (g_jn_frozen) {
+                // A measurement pass: report and stop. Nothing is saved, judged against a
+                // champion or crowned -- these are someone else's models (--load-dir), unchanged.
+                log_msg("Frozen pass complete -- slot 0 (elite 0 of --load-dir) per industry, "
+                        "scored by the champion judge (pass_reference v3) under fill model " +
+                        std::to_string(FILL_MODEL) + ":");
+                for (int i = 0; i < N_IND; i++) {
+                    char m[300];
+                    // Parsed by rescore_champions.py: keep the field order.
+                    snprintf(m, sizeof(m), "FROZEN SCORE %s %+.4f bp/day days %d-%d resets %d recent %d "
+                             "topup %.0f eff_days %.0f", g_ind_names[i].c_str(),
+                             judge[i].have() ? judge[i].score() * 1e4 : 0.0, day_start, day_end,
+                             judge[i].resets, judge[i].resets_recent, judge[i].topup_recent,
+                             judge[i].eff_days());
+                    log_msg(m);
+                }
+                jn_probe_report();
+                break;
+            }
             log_msg("Pass " + std::to_string(pass+1) + " complete — saving MT1/MT2 elites");
             for (int i = 0; i < N_IND; i++) {
             }
