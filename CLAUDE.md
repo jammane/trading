@@ -550,9 +550,13 @@ pytest tests across the files in `tests/`:
   rejected symbol, swaps happen only for stopped data or drift, the replacement is the first that
   rechecks and keeps the band, the book forgets exactly the swapped slot, and promotion clears
   exactly one industry's state even where industry names share words.
+- `test_rescore_champions.py` -- `rescore_champions.py`: the `FROZEN SCORE` parse, the re-score
+  rows (13 fields, same pass, champion kept, score replaced) and the counterfactual replay that
+  counts crowns lost to a stale score.
 - `test_fill_price.py` -- the paper-calibrated fill prices: open buys pay the premium but never
   more than the limit, intraday limits fill at the limit, nothing fills at the low, and the C++
-  `buy_fill_price` matches `fees.buy_fill_price` on 2,000 random bars.
+  `buy_fill_price` matches `fees.buy_fill_price` on 2,000 random bars, and `FILL_MODEL` is the
+  same on both sides.
 - `test_fill_check.py` -- the simulated-vs-real comparison: a matching day agrees at every level,
   each way a fill can disagree is counted on its own side, a different intent is flagged as the
   first cause, and sells and stops compare the quantities that left the book.
@@ -1366,6 +1370,63 @@ they bulk to the cap, 3x: 24 -> 72 nodes, 304 -> 912.
 The
 training profile's own growth is now 1% of a net's neurons (`fill`, min 1) in 10% of generations
 for 10% of nets (j_neuro ed79fa6); removal stays off.
+
+**Measurement modes (2026-11-23).** Two read-only instruments, built to answer why JN passes
+stopped improving (JN4-JN8 averaged about -6 bp/day with no trend, and JN9 about -26 after the
+fill change).
+
+- **`--jn-frozen [--frozen-slots N]`** needs `--load-dir`, `--passes 1`, no `--continue-run`. The
+  pool is seeded as usual (20 elites + 180 children mutated with `--jn-profile`), and then nothing
+  is selected, mutated, saved or crowned, and the MT1/MT2/race block is skipped. Slot 0 (elite 0)
+  trades its own book through the window. At the end, one `FROZEN SCORE <industry> <bp/day> ...`
+  line per industry (the champion judge, pass_reference v3), and the **mutation probe**: every
+  child against its parent, same book and day, every warm day. Columns: `out=`, children whose
+  outputs are bit-identical to the parent's; `plan=`, children whose orders are identical; W/T/L;
+  the mean delta and its size buckets in bp of the book. `--frozen-slots N` runs only slots
+  0..N-1 (the rest copy slot 0's orders), which is all a re-score needs.
+  **Measured on JN9's champions** (days 1100-1260, `jn_profiles/training.json`): 9.1% of children
+  had identical outputs but **60.3% identical orders**; W 16.6% / T 66.3% / L 17.0%, mean
+  -0.37 bp. So `mut_ok`'s ~20% is mostly ties, not harm: most mutations change nothing the
+  market sees, and the ones that do win and lose about equally. The proposed lighter profile
+  (`edit_max_pct` 5, `op_change_max_pct` 0.25, `rewire_prob` 0.0125) leaves 82.7% of
+  children's orders unchanged, so it was not raced. Each mutation type alone, at its share of
+  the full profile, changed orders in: op change 16.7%, s history length 17.1%, v weight 14.1%,
+  growth 9.5%, m slots 3.3%, rewire 2.8%, sign flip 1.7%, depth shift 0%; wins matched losses
+  in every one (mean delta -0.03 to -0.25 bp). Probe profiles: `/root/jn_test/mkprof.py`.
+- **`--jn-diag-arms`** (a training pass) also scores, on slot 0's book every warm day: no orders
+  (the book and its stops), the pass's champions frozen (every day, not only after a reset), and
+  `JN_CTRL_N` = 20 untrained nets made new each day (`jn_fresh`, pool slots 270-289); plus the
+  working pool's median and the share of the other 199 slots that slot 0, yesterday's winner,
+  beat. Rows go to `diag_arms.csv`; the pass end prints each arm minus slot 0 in bp of the book.
+  Nothing here changes selection.
+
+`mut_ok` prints its tie share (`mut_ok=W% tie=T%`). A difference under 1e-5 of the book is a tie:
+a `Portfolio` is 100 bytes, so each slot's arrays sit at a different alignment and `-ffast-math`'s
+vectorised sums peel differently, and a no-mutation probe scored 0.1% of identical-order
+child-days a few ulps apart.
+
+**The fill model is versioned (`FILL_MODEL`, 2026-11-23).** `FILL_MODEL` in `training_v4.cpp`
+(3, mirrored as `fees.FILL_MODEL`; `tests/test_fill_price.py` holds them equal) is bumped with
+any change to a fill price: 1 = the open for open buys and 0.1% past the limit (to 2026-11-12),
+2 = `OPEN_BUY_PREMIUM`, 3 = `OPEN_SELL_DISCOUNT` (2026-11-18). A champion's score is comparable
+only with a pass trained under the same fills: measured on JN9's seed over days 17-873, the
+fill-3 run scored -15.1 bp/day against -3.5 under fill 2, worse in all 12 industries. **A fill
+change re-scores the champions at once and replaces none** (user rule). A new
+`pass_reference.csv` writes `RUN/fill_model.txt`; a JN run whose file differs, or is missing
+while it has champions, is refused at startup with the command to run:
+
+```bash
+python rescore_champions.py rescore RUN          # frozen elite 0 of RUN/champion, full window
+python rescore_champions.py unfair RUN --seed-dir DIR --from-pass P
+```
+
+`rescore` appends one `rescore-f<N>` row per industry (same pass number; champion kept, its score
+replaced, the old one in `champ_pct`) and writes `fill_model.txt`. Note what the new number is:
+the champion **model** run frozen, while the old score was the **pass** that produced it, a pool
+evolving daily; challengers are still passes. `unfair` re-scores DIR (the champions standing
+before pass P) and replays passes P.. against them: boundaries that would have crowned and did
+not are the crowns the stale scores cost (first-order: an earlier crown would have seeded later
+passes differently). Flat StockNN runs are not gated yet: `--jn-frozen` is JN only.
 
 **Speed (2026-11-13).** `--jn-timing` logs one `TIMING day N:` line per day: the industries'
 time split into j_neuro forward (warmup lookup, reset, step, µs/step), mutate, permute, inject and

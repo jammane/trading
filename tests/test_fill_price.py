@@ -130,3 +130,11 @@ int main() {
                          capture_output=True, text=True, check=True).stdout.split()
     for c, got in zip(cases, out, strict=True):
         assert float(got) == pytest.approx(open_sell_price(*c), rel=1e-6, abs=1e-6), c
+
+
+def test_fill_model_version_matches_the_trainer():
+    # A fill-price change must bump both, or champions scored under the old fills keep standing.
+    import fees
+    src = Path("training_v4.cpp").read_text()
+    m = re.search(r"static constexpr int FILL_MODEL = (\d+);", src)
+    assert m and int(m.group(1)) == fees.FILL_MODEL

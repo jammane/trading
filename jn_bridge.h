@@ -71,6 +71,8 @@ void    jn_growth_take(JNPool* p, long long* mutated, long long* grown);
 void    jn_permute(JNPool* p, const int* src_of_dst, int n);
 // Re-randomise pct% of slot's v_neuron weights (spec/06 diversity injection), in place.
 void    jn_inject(JNPool* p, int slot, double pct, uint64_t seed);
+// A brand-new net in this slot, made as a fresh pool makes its nets (jneuro::create): untrained.
+void    jn_fresh(JNPool* p, int slot, uint64_t seed);
 
 JNStats jn_stats(const JNPool* p);
 // The same over slots [0, n) only (n <= the pool's size).

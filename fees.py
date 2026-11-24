@@ -20,6 +20,10 @@ OPEN_BUY_PREMIUM    = 0.0070
 # open gaps below) fills this far below the open, never below a limit: paper's market sells at the
 # open filled 0.91% below it and its gapped sell-all limits 0.42% (124 sells, 2026-10-14..11-18).
 OPEN_SELL_DISCOUNT  = 0.0080
+# The fill simulation's version (training_v4.cpp FILL_MODEL, which lists them). Bump it with any
+# change to a fill price: a run's champions are re-scored under the new model before it trains on
+# (rescore_champions.py).
+FILL_MODEL          = 3
 
 
 def _sell_net(shares: float, price: float) -> float:
